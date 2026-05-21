@@ -22,8 +22,8 @@ from telegram.ext import (
 # ─────────────────────────────────────────────
 #  CONFIG  (paste your keys here)
 # ─────────────────────────────────────────────
-TELEGRAM_TOKEN = "8630120864:AAHImRB-22H8BK_58j8WRkXuYymqO2roC78"
-GEMINI_API_KEY = "AIzaSyDQd-PBQP-UdBvr68QZ0Yxg4OEiLqPy1sg"
+TELEGRAM_TOKEN = "8630120864:AAEh433QwQIdRnAxoBFJl1E5EJqMQhs_sIY"
+GEMINI_API_KEY = "AIzaSyCICHbuEipB33WtjSxNXMXhSK3lbtKtFik"
 GEMINI_MODEL   = "gemini-2.0-flash"
 GEMINI_URL     = (
     f"https://generativelanguage.googleapis.com/v1beta/models/"

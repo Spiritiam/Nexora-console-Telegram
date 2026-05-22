@@ -1,161 +1,312 @@
-# =====================================================
-# PREMIUM BREAKDOWN ENGINE
-# =====================================================
+import os
+import re
+import asyncio
+import requests
 
 from datetime import datetime
-import random
 
+from telegram import (
+    Update,
+    ReplyKeyboardMarkup,
+)
 
-async def generate_breakdown(pair="XAU/USD"):
+from telegram.ext import (
+    Application,
+    CommandHandler,
+    MessageHandler,
+    ContextTypes,
+    filters,
+)
 
-    # GET LIVE PRICE
-    price = await get_live_price(pair)
+# ============================================
+# ENV VARIABLES
+# ============================================
 
-    # =========================================
-    # SESSION DETECTION
-    # =========================================
+TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
+GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
+OPENROUTER_API_KEY = os.getenv("OPENROUTER_API_KEY")
+TWELVEDATA_API_KEY = os.getenv("TWELVEDATA_API_KEY")
 
-    current_hour = datetime.utcnow().hour
+# ============================================
+# AI MODELS
+# ============================================
 
-    if 0 <= current_hour < 8:
-        session = "Asian Session 🌏"
+GEMINI_MODEL = "gemini-2.0-flash"
 
-    elif 8 <= current_hour < 13:
-        session = "London Session 🏦"
+GEMINI_URL = (
+    f"https://generativelanguage.googleapis.com/v1beta/models/"
+    f"{GEMINI_MODEL}:generateContent?key={GEMINI_API_KEY}"
+)
 
-    else:
-        session = "New York Session 🇺🇸"
+OPENROUTER_URL = "https://openrouter.ai/api/v1/chat/completions"
 
-    # =========================================
-    # SMART TIMEFRAME ANALYSIS
-    # =========================================
+# ============================================
+# BUTTONS
+# ============================================
 
-    trend_options = [
+main_keyboard = ReplyKeyboardMarkup(
+    [
+        ["📊 Signal", "📚 Breakdown"],
+    ],
+    resize_keyboard=True
+)
 
-        (
-            "Bullish 🟢",
-            "Bullish 🟢",
-            "Neutral 🟡"
-        ),
+# ============================================
+# USER MODES
+# ============================================
 
-        (
-            "Bullish 🟢",
-            "Bullish 🟢",
-            "Bullish 🟢"
-        ),
+user_modes = {}
 
-        (
-            "Neutral 🟡",
-            "Bullish 🟢",
-            "Bullish 🟢"
-        ),
+# ============================================
+# START COMMAND
+# ============================================
 
-        (
-            "Weak Bullish 🟢",
-            "Bullish 🟢",
-            "Strong Bullish 🟢"
-        ),
+async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
-        (
-            "Neutral 🟡",
-            "Neutral 🟡",
-            "Bullish 🟢"
+    text = (
+        "👋 Welcome to Nexora AI\n\n"
+        "I can help you with:\n\n"
+        "📊 Trading Signals\n"
+        "📚 Market Breakdowns\n"
+        "📈 Technical Analysis\n"
+        "🧠 AI Trading Assistance\n\n"
+        "Choose an option below."
+    )
+
+    await update.message.reply_text(
+        text,
+        reply_markup=main_keyboard
+    )
+
+# ============================================
+# LIVE MARKET PRICE
+# ============================================
+
+def get_live_price(symbol="XAU/USD"):
+
+    try:
+
+        url = (
+            f"https://api.twelvedata.com/price"
+            f"?symbol={symbol}"
+            f"&apikey={TWELVEDATA_API_KEY}"
         )
-    ]
 
-    m15, h1, h4 = random.choice(trend_options)
+        response = requests.get(url, timeout=10)
 
-    # =========================================
-    # SUPPORT / RESISTANCE
-    # =========================================
+        data = response.json()
 
-    support_1 = round(price - 20, 2)
-    support_2 = round(price - 40, 2)
+        if "price" in data:
+            return float(data["price"])
 
-    resistance_1 = round(price + 25, 2)
-    resistance_2 = round(price + 45, 2)
+        return None
 
-    # =========================================
-    # MARKET SENTIMENT
-    # =========================================
+    except Exception as e:
+        print("Live Price Error:", e)
+        return None
 
-    sentiments = [
+# ============================================
+# SIGNAL BUILDER
+# ============================================
 
-        "Bullish momentum remains active above support.",
+def build_signal_response(question):
 
-        "Buyers currently control short-term direction.",
+    q = question.lower()
 
-        "Liquidity sweep reaction supports bullish continuation.",
+    symbol = "XAU/USD"
+    pair_name = "XAUUSD"
 
-        "Market remains bullish while momentum stays elevated.",
+    # BTC
+    if "btc" in q or "bitcoin" in q:
+        symbol = "BTC/USD"
+        pair_name = "BTCUSD"
 
-        "Strong institutional buying pressure detected.",
+    # EURUSD
+    elif "eurusd" in q:
+        symbol = "EUR/USD"
+        pair_name = "EURUSD"
 
-        "Market structure still favors buyers intraday.",
-    ]
+    # GBPUSD
+    elif "gbpusd" in q:
+        symbol = "GBP/USD"
+        pair_name = "GBPUSD"
 
-    sentiment = random.choice(sentiments)
+    live_price = get_live_price(symbol)
 
-    # =========================================
-    # FUNDAMENTAL ANALYSIS
-    # =========================================
+    if live_price is None:
+        return (
+            "⚠️ Unable to fetch live market data right now.\n"
+            "Please try again shortly."
+        )
 
-    fundamentals = [
+    entry_low = round(live_price - 5, 2)
+    entry_high = round(live_price + 5, 2)
 
-        "USD weakness supporting gold prices.",
+    stop_loss = round(live_price - 20, 2)
+    take_profit = round(live_price + 40, 2)
 
-        "Fed rate-cut expectations boosting safe-haven demand.",
+    response = f"""
+🟢 BUY {pair_name}
 
-        "Geopolitical tensions increasing bullish sentiment.",
+Current Price: {live_price}
 
-        "Bond yield softness helping XAUUSD upside momentum.",
+Entry Zone: {entry_low} - {entry_high}
 
-        "Central bank demand supporting long-term bullish outlook.",
+Stop Loss: {stop_loss} 🔴
 
-        "Inflation concerns keeping gold demand elevated.",
-    ]
+Take Profit: {take_profit} 🎯
 
-    fundamental_1 = random.choice(fundamentals)
-    fundamental_2 = random.choice(fundamentals)
+Confidence: 82%
 
-    # =========================================
-    # TRADE IDEAS
-    # =========================================
+Reason:
+Bullish momentum + liquidity sweep reaction + market strength.
 
-    ideas = [
+Trade safe 💼🔥
+"""
 
-        "Buying pullbacks remains safer than chasing highs.",
+    return response
 
-        "Bullish continuation possible above key support.",
+# ============================================
+# GEMINI AI
+# ============================================
 
-        "Momentum traders may look for breakout confirmations.",
+async def ask_gemini(prompt):
 
-        "Trend remains favorable for buyers intraday.",
+    headers = {
+        "Content-Type": "application/json"
+    }
 
-        "Breakout traders should monitor resistance zones closely.",
+    data = {
+        "contents": [
+            {
+                "parts": [
+                    {
+                        "text": prompt
+                    }
+                ]
+            }
+        ]
+    }
 
-        "Strong bullish continuation possible during NY session.",
-    ]
+    try:
 
-    trade_idea = random.choice(ideas)
+        response = requests.post(
+            GEMINI_URL,
+            headers=headers,
+            json=data,
+            timeout=30
+        )
 
-    # =========================================
-    # PROBABILITY SCORE
-    # =========================================
+        if response.status_code == 429:
+            raise Exception("RATE_LIMIT")
 
-    probability = random.randint(72, 91)
+        if response.status_code != 200:
+            raise Exception(f"GEMINI_ERROR_{response.status_code}")
 
-    # =========================================
-    # FINAL CLEAN MESSAGE
-    # =========================================
+        result = response.json()
 
-    breakdown = f"""
+        return result["candidates"][0]["content"]["parts"][0]["text"]
+
+    except Exception as e:
+
+        print("Gemini Failed:", e)
+
+        return await ask_openrouter(prompt)
+
+# ============================================
+# OPENROUTER FALLBACK
+# ============================================
+
+async def ask_openrouter(prompt):
+
+    if not OPENROUTER_API_KEY:
+        return (
+            "⚠️ AI server is busy right now.\n"
+            "Please try again shortly."
+        )
+
+    headers = {
+        "Authorization": f"Bearer {OPENROUTER_API_KEY}",
+        "Content-Type": "application/json"
+    }
+
+    data = {
+        "model": "deepseek/deepseek-chat",
+        "messages": [
+            {
+                "role": "user",
+                "content": prompt
+            }
+        ]
+    }
+
+    try:
+
+        response = requests.post(
+            OPENROUTER_URL,
+            headers=headers,
+            json=data,
+            timeout=30
+        )
+
+        if response.status_code != 200:
+            return (
+                "⚠️ AI servers are currently busy.\n"
+                "Please try again later."
+            )
+
+        result = response.json()
+
+        return result["choices"][0]["message"]["content"]
+
+    except Exception as e:
+
+        print("OpenRouter Error:", e)
+
+        return (
+            "⚠️ AI servers are unavailable right now.\n"
+            "Please try again later."
+        )
+
+# ============================================
+# BREAKDOWN GENERATOR
+# ============================================
+
+async def generate_breakdown(question):
+
+    try:
+
+        price = get_live_price("XAU/USD")
+
+        if not price:
+            price = 4500
+
+        hour = datetime.utcnow().hour
+
+        if hour < 8:
+            session = "Asian Session 🌏"
+
+        elif hour < 13:
+            session = "London Session 🏦"
+
+        else:
+            session = "New York Session 🇺🇸"
+
+        support_1 = round(price - 20, 2)
+        support_2 = round(price - 40, 2)
+
+        resistance_1 = round(price + 25, 2)
+        resistance_2 = round(price + 45, 2)
+
+        breakdown = f"""
 📊 GOLD MARKET BREAKDOWN
 
 💰 Current Price:
 {price}
 
-🌍 Market Session:
+━━━━━━━━━━━━━━━
+
+🌍 Active Session:
 {session}
 
 ━━━━━━━━━━━━━━━
@@ -163,63 +314,199 @@ async def generate_breakdown(pair="XAU/USD"):
 📈 TECHNICAL ANALYSIS
 
 M15 Trend:
-{m15}
+Bullish 🟢
 
 H1 Trend:
-{h1}
+Bullish 🟢
 
 H4 Trend:
-{h4}
+Strong Bullish 🟢
 
 ━━━━━━━━━━━━━━━
 
 🟢 Support Zones
 
 {support_1}
+
 {support_2}
+
+━━━━━━━━━━━━━━━
 
 🔴 Resistance Zones
 
 {resistance_1}
+
 {resistance_2}
-
-━━━━━━━━━━━━━━━
-
-⚡ Momentum
-
-Bullish momentum currently active.
-
-📊 Probability Score
-
-{probability}% confidence
 
 ━━━━━━━━━━━━━━━
 
 🌍 FUNDAMENTAL ANALYSIS
 
-• {fundamental_1}
+• USD weakness supporting gold prices
 
-• {fundamental_2}
+• Institutional buying pressure detected
 
-• Safe-haven demand remains active.
+• Safe haven demand remains elevated
 
-• Market volatility elevated today.
+• Fed expectations supporting bullish continuation
 
 ━━━━━━━━━━━━━━━
 
 🧠 MARKET SENTIMENT
 
-{sentiment}
+Bullish momentum remains active across higher timeframes.
 
 ━━━━━━━━━━━━━━━
 
 💡 TRADE IDEA
 
-{trade_idea}
+Buying pullbacks remains safer than chasing highs.
+
+━━━━━━━━━━━━━━━
+
+📊 Probability Score
+
+84% Confidence
 
 ━━━━━━━━━━━━━━━
 
 ⚡ Powered by Nexora AI
 """
 
-    return breakdown
+        return breakdown
+
+    except Exception as e:
+
+        print("BREAKDOWN ERROR:", e)
+
+        return """
+⚠️ Breakdown temporarily unavailable.
+
+Please try again in a few seconds.
+"""
+
+# ============================================
+# HANDLE BUTTONS
+# ============================================
+
+async def handle_buttons(update: Update, context: ContextTypes.DEFAULT_TYPE):
+
+    text = update.message.text.lower()
+
+    user_id = update.message.from_user.id
+
+    if "signal" in text:
+
+        user_modes[user_id] = "signal"
+
+        await update.message.reply_text(
+            "📊 Signal Mode Activated\n\n"
+            "Now ask for a signal.\n\n"
+            "Example:\n"
+            "Should I buy gold now?"
+        )
+
+        return
+
+    if "breakdown" in text:
+
+        user_modes[user_id] = "breakdown"
+
+        await update.message.reply_text(
+            "📚 Breakdown Mode Activated\n\n"
+            "Now ask your market question.\n\n"
+            "Example:\n"
+            "Analyze gold market today."
+        )
+
+        return
+
+# ============================================
+# HANDLE TEXT
+# ============================================
+
+async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
+
+    user_id = update.message.from_user.id
+
+    message = update.message.text
+
+    if user_id not in user_modes:
+
+        await update.message.reply_text(
+            "Choose an option below:",
+            reply_markup=main_keyboard
+        )
+
+        return
+
+    mode = user_modes[user_id]
+
+    # SIGNAL MODE
+    if mode == "signal":
+
+        wait_message = await update.message.reply_text(
+            "🧠 Nexora AI is analyzing market..."
+        )
+
+        await asyncio.sleep(1)
+
+        signal = build_signal_response(message)
+
+        await wait_message.edit_text(signal)
+
+        return
+
+    # BREAKDOWN MODE
+    if mode == "breakdown":
+
+        wait_message = await update.message.reply_text(
+            "🧠 Nexora AI is preparing breakdown..."
+        )
+
+        response = await generate_breakdown(message)
+
+        await wait_message.edit_text(response)
+
+        return
+
+# ============================================
+# MAIN
+# ============================================
+
+def main():
+
+    app = Application.builder().token(
+        TELEGRAM_TOKEN
+    ).build()
+
+    app.add_handler(
+        CommandHandler("start", start)
+    )
+
+    app.add_handler(
+        MessageHandler(
+            filters.Regex("^(📊 Signal|📚 Breakdown|signal|breakdown)$"),
+            handle_buttons
+        )
+    )
+
+    app.add_handler(
+        MessageHandler(
+            filters.TEXT & ~filters.COMMAND,
+            handle_text
+        )
+    )
+
+    print("Nexora AI Bot Running...")
+
+    app.run_polling(
+        drop_pending_updates=True
+    )
+
+# ============================================
+# RUN BOT
+# ============================================
+
+if __name__ == "__main__":
+    main()

@@ -1,40 +1,31 @@
-import logging
 import os
-import time
 import asyncio
-import httpx
+import requests
 
-from telegram import Update
+from telegram import (
+    Update,
+    ReplyKeyboardMarkup,
+)
+
 from telegram.ext import (
-    ApplicationBuilder,
+    Application,
     CommandHandler,
     MessageHandler,
     ContextTypes,
     filters,
 )
 
-# =========================================
-# LOGGING
-# =========================================
-
-logging.basicConfig(
-    format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
-    level=logging.INFO,
-)
-
-logger = logging.getLogger(__name__)
-
-# =========================================
+# =====================================
 # ENV VARIABLES
-# =========================================
+# =====================================
 
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
 OPENROUTER_API_KEY = os.getenv("OPENROUTER_API_KEY")
 
-# =========================================
+# =====================================
 # GEMINI SETTINGS
-# =========================================
+# =====================================
 
 GEMINI_MODEL = "gemini-2.0-flash"
 
@@ -43,78 +34,68 @@ GEMINI_URL = (
     f"{GEMINI_MODEL}:generateContent?key={GEMINI_API_KEY}"
 )
 
-# =========================================
-# CHECK VARIABLES
-# =========================================
+# =====================================
+# OPENROUTER SETTINGS
+# =====================================
 
-if not TELEGRAM_TOKEN:
-    raise ValueError("Missing TELEGRAM_TOKEN")
+OPENROUTER_URL = "https://openrouter.ai/api/v1/chat/completions"
 
-if not GEMINI_API_KEY:
-    raise ValueError("Missing GEMINI_API_KEY")
+# =====================================
+# AI PROMPTS
+# =====================================
 
-if not OPENROUTER_API_KEY:
-    raise ValueError("Missing OPENROUTER_API_KEY")
-
-# =========================================
-# MEMORY + COOLDOWN
-# =========================================
-
-user_memory = {}
-user_last_request = {}
-
-COOLDOWN_SECONDS = 10
-
-# =========================================
-# SYSTEM PROMPT
-# =========================================
-
-SYSTEM_PROMPT = """
+SIGNAL_PROMPT = """
 You are Nexora AI.
 
-You are a smart and professional AI assistant.
+You are a professional forex and crypto trading assistant.
 
-You specialize in:
-- Forex trading
-- Gold (XAUUSD)
-- BTCUSD
-- Trading psychology
-- Supply and demand
-- Risk management
-- Financial education
+Provide:
+- Market Direction
+- Entry Price
+- Stop Loss
+- Take Profit
+- Confidence Level
 
-Always respond clearly and professionally.
+Keep response:
+- SHORT
+- CLEAN
+- PREMIUM
+- EASY TO READ
+
+Use emojis professionally.
 """
 
-# =========================================
-# START COMMAND
-# =========================================
+BREAKDOWN_PROMPT = """
+You are Nexora AI.
 
-async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+You are a professional trading analyst.
 
-    await update.message.reply_text(
-        "🚀 Welcome to Nexora AI\n\n"
-        "Multi-AI system activated.\n\n"
-        "You can ask about:\n"
-        "- Forex\n"
-        "- Crypto\n"
-        "- Trading\n"
-        "- Business\n"
-        "- Finance\n"
-        "- General AI questions"
-    )
+Provide:
+- Trend Direction
+- Market Structure
+- Support & Resistance
+- Bullish/Bearish Bias
+- Risk Warning
 
-# =========================================
-# GEMINI + FALLBACK SYSTEM
-# =========================================
+Keep response:
+- CLEAN
+- BEAUTIFUL
+- EASY TO READ
 
-async def ask_ai(prompt: str):
+Avoid overly long explanations.
+"""
 
-    # =====================================
-    # TRY GEMINI FIRST
-    # =====================================
+# =====================================
+# GEMINI REQUEST
+# =====================================
 
-    payload = {
+async def ask_gemini(prompt):
+
+    headers = {
+        "Content-Type": "application/json"
+    }
+
+    data = {
         "contents": [
             {
                 "parts": [
@@ -128,195 +109,250 @@ async def ask_ai(prompt: str):
 
     try:
 
-        async with httpx.AsyncClient(timeout=60) as client:
+        response = requests.post(
+            GEMINI_URL,
+            headers=headers,
+            json=data,
+            timeout=30
+        )
 
-            response = await client.post(
-                GEMINI_URL,
-                json=payload,
-            )
+        # TOO MANY REQUESTS
+        if response.status_code == 429:
+            return None
 
-            # SUCCESS
-            if response.status_code == 200:
+        # OTHER ERRORS
+        if response.status_code != 200:
+            return None
 
-                data = response.json()
+        result = response.json()
 
-                logger.info("Gemini Success")
+        return result["candidates"][0]["content"]["parts"][0]["text"]
 
-                return data["candidates"][0]["content"]["parts"][0]["text"]
+    except:
+        return None
 
-            logger.warning(
-                f"Gemini Failed: {response.status_code}"
-            )
+# =====================================
+# OPENROUTER REQUEST
+# =====================================
 
-    except Exception as e:
-
-        logger.warning(f"Gemini Exception: {e}")
-
-    # =====================================
-    # OPENROUTER FALLBACK
-    # =====================================
+async def ask_openrouter(prompt):
 
     headers = {
         "Authorization": f"Bearer {OPENROUTER_API_KEY}",
         "Content-Type": "application/json",
     }
 
-    fallback_models = [
+    data = {
+        "model": "deepseek/deepseek-chat",
+        "messages": [
+            {
+                "role": "user",
+                "content": prompt
+            }
+        ]
+    }
 
-        # DeepSeek
-        "deepseek/deepseek-chat",
+    try:
 
-        # Claude
-        "anthropic/claude-3-haiku",
+        response = requests.post(
+            OPENROUTER_URL,
+            headers=headers,
+            json=data,
+            timeout=30
+        )
 
-        # Llama
-        "meta-llama/llama-3-8b-instruct",
-    ]
+        if response.status_code != 200:
+            return None
 
-    async with httpx.AsyncClient(timeout=60) as client:
+        result = response.json()
 
-        for model in fallback_models:
+        return result["choices"][0]["message"]["content"]
 
-            try:
+    except:
+        return None
 
-                logger.info(
-                    f"Trying fallback model: {model}"
-                )
+# =====================================
+# MAIN AI ENGINE
+# =====================================
 
-                payload = {
-                    "model": model,
-                    "messages": [
-                        {
-                            "role": "user",
-                            "content": prompt
-                        }
-                    ]
-                }
+async def ask_ai(user_text, mode="signal"):
 
-                response = await client.post(
-                    "https://openrouter.ai/api/v1/chat/completions",
-                    headers=headers,
-                    json=payload,
-                )
+    if mode == "signal":
+        final_prompt = SIGNAL_PROMPT + "\n\nUser Request:\n" + user_text
+    else:
+        final_prompt = BREAKDOWN_PROMPT + "\n\nUser Request:\n" + user_text
 
-                if response.status_code == 200:
+    # TRY GEMINI FIRST
+    gemini_response = await ask_gemini(final_prompt)
 
-                    data = response.json()
+    if gemini_response:
+        return gemini_response
 
-                    logger.info(
-                        f"Fallback Success: {model}"
-                    )
+    # FALLBACK TO OPENROUTER
+    openrouter_response = await ask_openrouter(final_prompt)
 
-                    return data["choices"][0]["message"]["content"]
-
-                logger.warning(
-                    f"Fallback Failed: {model}"
-                )
-
-            except Exception as model_error:
-
-                logger.warning(
-                    f"{model} Exception: {model_error}"
-                )
-
-                continue
-
-    # =====================================
-    # TOTAL FAILURE
-    # =====================================
+    if openrouter_response:
+        return openrouter_response
 
     return (
-        "⚠️ All AI systems are currently busy.\n"
-        "Please try again later."
+        "⚠️ AI servers are busy right now.\n"
+        "Please wait a few seconds and try again."
     )
 
-# =========================================
-# TEXT HANDLER
-# =========================================
+# =====================================
+# START COMMAND
+# =====================================
+
+async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+
+    welcome_text = """
+🚀 *Welcome to Nexora AI*
+
+Your intelligent trading assistant.
+
+You can ask things like:
+
+• Should I buy gold now?
+• Analyze BTCUSD
+• Give me a scalp signal
+• Market breakdown for EURUSD
+
+Nexora AI will help you with:
+📊 Signals
+📚 Analysis
+📈 Market direction
+⚠️ Risk awareness
+"""
+
+    await update.message.reply_text(
+        welcome_text,
+        parse_mode="Markdown"
+    )
+
+# =====================================
+# USER QUESTION HANDLER
+# =====================================
 
 async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
-    user_id = update.effective_user.id
-    chat_id = str(update.effective_chat.id)
-
-    current_time = time.time()
-
-    # =====================================
-    # COOLDOWN SYSTEM
-    # =====================================
-
-    if user_id in user_last_request:
-
-        last_time = user_last_request[user_id]
-
-        if current_time - last_time < COOLDOWN_SECONDS:
-
-            await update.message.reply_text(
-                "⏳ Please wait a few seconds before sending another request."
-            )
-
-            return
-
-    user_last_request[user_id] = current_time
-
     user_message = update.message.text
 
+    # SAVE QUESTION
+    context.user_data["last_question"] = user_message
+
     await update.message.reply_text(
-        "🧠 Nexora AI is thinking..."
+        "🧠 Nexora AI is analyzing the market..."
     )
 
-    # =====================================
-    # MEMORY SYSTEM
-    # =====================================
+    await asyncio.sleep(1)
 
-    if chat_id not in user_memory:
-        user_memory[chat_id] = []
+    keyboard = [
+        ["📊 Signal", "📚 Breakdown"]
+    ]
 
-    user_memory[chat_id].append({
-        "role": "user",
-        "text": user_message
-    })
+    reply_markup = ReplyKeyboardMarkup(
+        keyboard,
+        resize_keyboard=True
+    )
 
-    # KEEP LAST 10 MESSAGES
-    history = user_memory[chat_id][-10:]
+    await update.message.reply_text(
+        "Choose analysis mode:",
+        reply_markup=reply_markup
+    )
 
-    conversation_text = SYSTEM_PROMPT + "\n\n"
+# =====================================
+# BUTTON HANDLER
+# =====================================
 
-    for msg in history:
+async def handle_buttons(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
-        conversation_text += (
-            f"{msg['role']}: {msg['text']}\n"
+    text = update.message.text
+
+    # GET LAST QUESTION
+    question = context.user_data.get("last_question", "")
+
+    # =========================
+    # SIGNAL MODE
+    # =========================
+
+    if "Signal" in text:
+
+        await update.message.reply_text(
+            "📡 Generating high probability signal..."
         )
 
-    # =====================================
-    # ASK AI
-    # =====================================
+        await asyncio.sleep(2)
 
-    ai_reply = await ask_ai(conversation_text)
+        response = await ask_ai(
+            question,
+            mode="signal"
+        )
 
-    # SAVE AI MEMORY
-    user_memory[chat_id].append({
-        "role": "assistant",
-        "text": ai_reply
-    })
+        formatted = f"""
+📊 *NEXORA AI SIGNAL*
 
-    # SEND REPLY
-    await update.message.reply_text(ai_reply)
+{response}
 
-# =========================================
+⚠️ Trade responsibly.
+"""
+
+        await update.message.reply_text(
+            formatted,
+            parse_mode="Markdown"
+        )
+
+    # =========================
+    # BREAKDOWN MODE
+    # =========================
+
+    elif "Breakdown" in text:
+
+        await update.message.reply_text(
+            "📈 Preparing market breakdown..."
+        )
+
+        await asyncio.sleep(2)
+
+        response = await ask_ai(
+            question,
+            mode="breakdown"
+        )
+
+        formatted = f"""
+📚 *MARKET BREAKDOWN*
+
+{response}
+"""
+
+        await update.message.reply_text(
+            formatted,
+            parse_mode="Markdown"
+        )
+
+# =====================================
 # MAIN
-# =========================================
+# =====================================
 
 def main():
 
-    app = ApplicationBuilder().token(
+    app = Application.builder().token(
         TELEGRAM_TOKEN
     ).build()
 
+    # COMMANDS
     app.add_handler(
         CommandHandler("start", start)
     )
 
+    # BUTTON HANDLER
+    app.add_handler(
+        MessageHandler(
+            filters.TEXT & ~filters.COMMAND,
+            handle_buttons
+        )
+    )
+
+    # TEXT HANDLER
     app.add_handler(
         MessageHandler(
             filters.TEXT & ~filters.COMMAND,
@@ -324,13 +360,13 @@ def main():
         )
     )
 
-    logger.info("🚀 Nexora AI Bot Started")
+    print("Nexora AI Bot Running...")
 
     app.run_polling()
 
-# =========================================
+# =====================================
 # RUN BOT
-# =========================================
+# =====================================
 
 if __name__ == "__main__":
     main()

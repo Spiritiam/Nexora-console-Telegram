@@ -49,40 +49,52 @@ You are Nexora AI.
 
 You are a professional forex and crypto trading assistant.
 
-Provide:
-- Market Direction
-- Entry Price
-- Stop Loss
-- Take Profit
-- Confidence Level
+When giving signals:
+- Give direction
+- Give entry
+- Give stop loss
+- Give take profit
+- Give confidence level
 
 Keep response:
-- SHORT
-- CLEAN
-- PREMIUM
-- EASY TO READ
+- Clean
+- Professional
+- Short
+- Easy to read
 
-Use emojis professionally.
+Use premium formatting.
+
+Example format:
+
+📊 XAUUSD BUY SIGNAL
+
+Entry: 3345
+SL: 3335
+TP1: 3360
+TP2: 3375
+
+Confidence: High ✅
 """
 
 BREAKDOWN_PROMPT = """
 You are Nexora AI.
 
-You are a professional trading analyst.
+You are a professional market analyst.
 
 Provide:
-- Trend Direction
-- Market Structure
-- Support & Resistance
-- Bullish/Bearish Bias
-- Risk Warning
+- Trend direction
+- Momentum
+- Bias
+- Key support/resistance
+- Risk warning
 
 Keep response:
-- CLEAN
-- BEAUTIFUL
-- EASY TO READ
+- Beautiful
+- Premium
+- Easy to read
+- Short but useful
 
-Avoid overly long explanations.
+Use clean formatting and emojis professionally.
 """
 
 # =====================================
@@ -116,7 +128,7 @@ async def ask_gemini(prompt):
             timeout=30
         )
 
-        # TOO MANY REQUESTS
+        # RATE LIMIT
         if response.status_code == 429:
             return None
 
@@ -206,38 +218,40 @@ async def ask_ai(user_text, mode="signal"):
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     welcome_text = """
-🚀 *Welcome to Nexora AI*
+🚀 Welcome to Nexora AI
 
 Your intelligent trading assistant.
 
-You can ask things like:
+You can ask:
 
 • Should I buy gold now?
 • Analyze BTCUSD
 • Give me a scalp signal
 • Market breakdown for EURUSD
 
-Nexora AI will help you with:
-📊 Signals
-📚 Analysis
-📈 Market direction
-⚠️ Risk awareness
+Nexora AI helps with:
+
+📊 Trading Signals
+📈 Market Analysis
+📚 Trade Breakdowns
+⚠️ Risk Awareness
 """
 
-    await update.message.reply_text(
-        welcome_text,
-        parse_mode="Markdown"
-    )
+    await update.message.reply_text(welcome_text)
 
 # =====================================
-# USER QUESTION HANDLER
+# NORMAL USER MESSAGE
 # =====================================
 
 async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     user_message = update.message.text
 
-    # SAVE QUESTION
+    # IGNORE BUTTON MESSAGES
+    if user_message in ["📊 Signal", "📚 Breakdown"]:
+        return
+
+    # SAVE USER QUESTION
     context.user_data["last_question"] = user_message
 
     await update.message.reply_text(
@@ -268,14 +282,13 @@ async def handle_buttons(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     text = update.message.text
 
-    # GET LAST QUESTION
     question = context.user_data.get("last_question", "")
 
     # =========================
-    # SIGNAL MODE
+    # SIGNAL
     # =========================
 
-    if "Signal" in text:
+    if text == "📊 Signal":
 
         await update.message.reply_text(
             "📡 Generating high probability signal..."
@@ -289,23 +302,20 @@ async def handle_buttons(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
 
         formatted = f"""
-📊 *NEXORA AI SIGNAL*
+📊 NEXORA AI SIGNAL
 
 {response}
 
 ⚠️ Trade responsibly.
 """
 
-        await update.message.reply_text(
-            formatted,
-            parse_mode="Markdown"
-        )
+        await update.message.reply_text(formatted)
 
     # =========================
-    # BREAKDOWN MODE
+    # BREAKDOWN
     # =========================
 
-    elif "Breakdown" in text:
+    elif text == "📚 Breakdown":
 
         await update.message.reply_text(
             "📈 Preparing market breakdown..."
@@ -319,15 +329,12 @@ async def handle_buttons(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
 
         formatted = f"""
-📚 *MARKET BREAKDOWN*
+📚 MARKET BREAKDOWN
 
 {response}
 """
 
-        await update.message.reply_text(
-            formatted,
-            parse_mode="Markdown"
-        )
+        await update.message.reply_text(formatted)
 
 # =====================================
 # MAIN
@@ -339,7 +346,7 @@ def main():
         TELEGRAM_TOKEN
     ).build()
 
-    # COMMANDS
+    # START COMMAND
     app.add_handler(
         CommandHandler("start", start)
     )
@@ -347,12 +354,12 @@ def main():
     # BUTTON HANDLER
     app.add_handler(
         MessageHandler(
-            filters.TEXT & ~filters.COMMAND,
+            filters.Regex("📊 Signal|📚 Breakdown"),
             handle_buttons
         )
     )
 
-    # TEXT HANDLER
+    # NORMAL TEXT HANDLER
     app.add_handler(
         MessageHandler(
             filters.TEXT & ~filters.COMMAND,
@@ -362,7 +369,9 @@ def main():
 
     print("Nexora AI Bot Running...")
 
-    app.run_polling()
+    app.run_polling(
+        drop_pending_updates=True
+    )
 
 # =====================================
 # RUN BOT

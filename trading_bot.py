@@ -1,14 +1,8 @@
-#!/usr/bin/env python3
-"""
-Nexora AI Trading Bot
-Stable Production Version
-"""
-
 import logging
-import base64
-import httpx
 import os
 import time
+import asyncio
+import httpx
 
 from telegram import Update
 from telegram.ext import (
@@ -19,14 +13,28 @@ from telegram.ext import (
     filters,
 )
 
-# ==============================
+# =========================================
+# LOGGING
+# =========================================
+
+logging.basicConfig(
+    format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
+    level=logging.INFO,
+)
+
+logger = logging.getLogger(__name__)
+
+# =========================================
 # ENV VARIABLES
-# ==============================
+# =========================================
 
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
 
-# MORE STABLE MODEL
+# =========================================
+# GEMINI SETTINGS
+# =========================================
+
 GEMINI_MODEL = "gemini-2.0-flash"
 
 GEMINI_URL = (
@@ -40,309 +48,207 @@ if not TELEGRAM_TOKEN:
 if not GEMINI_API_KEY:
     raise ValueError("Missing GEMINI_API_KEY environment variable")
 
+# =========================================
+# MEMORY + COOLDOWN
+# =========================================
 
-# ==============================
-# RATE LIMIT / COOLDOWN
-# ==============================
-
-LAST_REQUEST = {}
+user_memory = {}
+user_last_request = {}
 
 COOLDOWN_SECONDS = 10
 
-
-def can_request(user_id):
-
-    now = time.time()
-
-    if user_id in LAST_REQUEST:
-
-        if now - LAST_REQUEST[user_id] < COOLDOWN_SECONDS:
-            return False
-
-    LAST_REQUEST[user_id] = now
-
-    return True
-
-
-# ==============================
+# =========================================
 # SYSTEM PROMPT
-# ==============================
+# =========================================
 
 SYSTEM_PROMPT = """
-You are Nexora AI, a professional trading analyst.
+You are Nexora AI.
 
-You analyze:
-- Forex
+You are a smart and professional AI assistant.
+
+You specialize in:
+- Forex trading
 - Gold (XAUUSD)
-- Crypto
+- BTCUSD
+- Trading psychology
+- Supply and demand
+- Risk management
+- Financial education
 
-Always give:
-- BUY or SELL bias
-- Entry
-- Stop Loss
-- Take Profit
-- Short explanation
-- Risk warning
-
-Be professional, clear, and concise.
+Always respond clearly and professionally.
 """
 
-
-# ==============================
-# GEMINI FUNCTIONS
-# ==============================
-
-async def ask_gemini_text(user_message: str) -> str:
-
-    payload = {
-        "contents": [
-            {
-                "parts": [
-                    {
-                        "text": f"{SYSTEM_PROMPT}\n\nUser Question: {user_message}"
-                    }
-                ]
-            }
-        ]
-    }
-
-    try:
-
-        async with httpx.AsyncClient(timeout=60) as client:
-
-            response = await client.post(
-                GEMINI_URL,
-                json=payload,
-                headers={"Content-Type": "application/json"},
-            )
-
-            # HANDLE RATE LIMIT
-            if response.status_code == 429:
-                return (
-                    "⚠️ AI server is busy right now.\n"
-                    "Please wait a few seconds and try again."
-                )
-
-            # HANDLE OTHER ERRORS
-            if response.status_code != 200:
-                return f"❌ Gemini Error: {response.status_code}"
-
-            data = response.json()
-
-            if "candidates" not in data:
-                return f"❌ Gemini Error: {data}"
-
-            return data["candidates"][0]["content"]["parts"][0]["text"]
-
-    except Exception as e:
-
-        logging.exception("TEXT ERROR")
-
-        return f"❌ Error: {str(e)}"
-
-
-async def ask_gemini_image(
-    image_bytes: bytes,
-    mime_type: str,
-    caption: str = ""
-) -> str:
-
-    image_b64 = base64.b64encode(image_bytes).decode()
-
-    payload = {
-        "contents": [
-            {
-                "parts": [
-                    {
-                        "text": f"{SYSTEM_PROMPT}\n\nAnalyze this chart. {caption}"
-                    },
-                    {
-                        "inline_data": {
-                            "mime_type": mime_type,
-                            "data": image_b64,
-                        }
-                    }
-                ]
-            }
-        ]
-    }
-
-    try:
-
-        async with httpx.AsyncClient(timeout=90) as client:
-
-            response = await client.post(
-                GEMINI_URL,
-                json=payload,
-                headers={"Content-Type": "application/json"},
-            )
-
-            # HANDLE RATE LIMIT
-            if response.status_code == 429:
-                return (
-                    "⚠️ AI image analysis is temporarily busy.\n"
-                    "Please try again later."
-                )
-
-            # HANDLE OTHER ERRORS
-            if response.status_code != 200:
-                return f"❌ Gemini Image Error: {response.status_code}"
-
-            data = response.json()
-
-            if "candidates" not in data:
-                return f"❌ Gemini Error: {data}"
-
-            return data["candidates"][0]["content"]["parts"][0]["text"]
-
-    except Exception as e:
-
-        logging.exception("IMAGE ERROR")
-
-        return f"❌ Image Error: {str(e)}"
-
-
-# ==============================
-# TELEGRAM COMMANDS
-# ==============================
+# =========================================
+# START COMMAND
+# =========================================
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
-    text = """
-👋 Welcome to Nexora AI
-
-I can:
-• Analyze Gold, Forex & Crypto
-• Give BUY/SELL signals
-• Analyze chart screenshots
-• Answer trading questions
-
-Send a message or chart screenshot to begin.
-"""
-
-    await update.message.reply_text(text)
-
-
-async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-
     await update.message.reply_text(
-        "Send any trading question or chart screenshot."
+        "🚀 Welcome to Nexora AI\n\n"
+        "Ask me anything about forex, crypto, trading, business, or general questions."
     )
 
+# =========================================
+# GEMINI REQUEST
+# =========================================
+
+async def ask_gemini_text(prompt: str):
+
+    payload = {
+        "contents": [
+            {
+                "parts": [
+                    {
+                        "text": prompt
+                    }
+                ]
+            }
+        ]
+    }
+
+    async with httpx.AsyncClient(timeout=60) as client:
+
+        for attempt in range(3):
+
+            try:
+
+                response = await client.post(
+                    GEMINI_URL,
+                    json=payload,
+                )
+
+                # =====================================
+                # RATE LIMIT HANDLING
+                # =====================================
+
+                if response.status_code == 429:
+
+                    logger.warning("429 RATE LIMIT HIT")
+
+                    if attempt < 2:
+                        await asyncio.sleep(5)
+                        continue
+
+                    return (
+                        "⚠️ AI server is busy right now.\n"
+                        "Please wait a few seconds and try again."
+                    )
+
+                # =====================================
+                # OTHER ERRORS
+                # =====================================
+
+                if response.status_code != 200:
+
+                    logger.error(
+                        f"Gemini Error: {response.status_code}"
+                    )
+
+                    return (
+                        f"❌ Gemini Error: "
+                        f"{response.status_code}"
+                    )
+
+                data = response.json()
+
+                return data["candidates"][0]["content"]["parts"][0]["text"]
+
+            except Exception as e:
+
+                logger.error(f"GEMINI EXCEPTION: {e}")
+
+                return (
+                    "⚠️ AI temporarily unavailable.\n"
+                    "Please try again later."
+                )
+
+# =========================================
+# TEXT HANDLER
+# =========================================
 
 async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
-    user_message = update.message.text
-
     user_id = update.effective_user.id
+    chat_id = str(update.effective_chat.id)
 
-    # COOLDOWN PROTECTION
-    if not can_request(user_id):
+    current_time = time.time()
 
-        await update.message.reply_text(
-            "⏳ Please wait a few seconds before sending another message."
-        )
+    # =====================================
+    # COOLDOWN SYSTEM
+    # =====================================
 
-        return
+    if user_id in user_last_request:
+
+        last_time = user_last_request[user_id]
+
+        if current_time - last_time < COOLDOWN_SECONDS:
+
+            await update.message.reply_text(
+                "⏳ Please wait a few seconds before sending another request."
+            )
+
+            return
+
+    user_last_request[user_id] = current_time
+
+    user_message = update.message.text
 
     await update.message.reply_text(
         "🧠 Analyzing... please wait ⏳"
     )
 
-    try:
+    # =====================================
+    # MEMORY SYSTEM
+    # =====================================
 
-        result = await ask_gemini_text(user_message)
+    if chat_id not in user_memory:
+        user_memory[chat_id] = []
 
-        if len(result) > 4000:
+    user_memory[chat_id].append({
+        "role": "user",
+        "text": user_message
+    })
 
-            for i in range(0, len(result), 4000):
+    # KEEP LAST 10 MESSAGES
+    history = user_memory[chat_id][-10:]
 
-                await update.message.reply_text(
-                    result[i:i + 4000]
-                )
+    conversation_text = SYSTEM_PROMPT + "\n\n"
 
-        else:
+    for msg in history:
 
-            await update.message.reply_text(result)
-
-    except Exception as e:
-
-        logging.exception("TEXT ERROR")
-
-        await update.message.reply_text(
-            f"❌ Error:\n{str(e)}"
+        conversation_text += (
+            f"{msg['role']}: {msg['text']}\n"
         )
 
+    # =====================================
+    # ASK AI
+    # =====================================
 
-async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    ai_reply = await ask_gemini_text(conversation_text)
 
-    user_id = update.effective_user.id
+    # SAVE MEMORY
+    user_memory[chat_id].append({
+        "role": "assistant",
+        "text": ai_reply
+    })
 
-    # COOLDOWN PROTECTION
-    if not can_request(user_id):
+    # SEND REPLY
+    await update.message.reply_text(ai_reply)
 
-        await update.message.reply_text(
-            "⏳ Please wait a few seconds before sending another image."
-        )
-
-        return
-
-    await update.message.reply_text(
-        "📸 Chart received. Analyzing..."
-    )
-
-    try:
-
-        photo = update.message.photo[-1]
-
-        file = await context.bot.get_file(photo.file_id)
-
-        image_bytes = await file.download_as_bytearray()
-
-        caption = update.message.caption or ""
-
-        result = await ask_gemini_image(
-            bytes(image_bytes),
-            "image/jpeg",
-            caption
-        )
-
-        if len(result) > 4000:
-
-            for i in range(0, len(result), 4000):
-
-                await update.message.reply_text(
-                    result[i:i + 4000]
-                )
-
-        else:
-
-            await update.message.reply_text(result)
-
-    except Exception as e:
-
-        logging.exception("IMAGE ERROR")
-
-        await update.message.reply_text(
-            f"❌ Image Error:\n{str(e)}"
-        )
-
-
-# ==============================
+# =========================================
 # MAIN
-# ==============================
+# =========================================
 
 def main():
 
-    logging.basicConfig(
-        format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
-        level=logging.INFO,
+    app = ApplicationBuilder().token(
+        TELEGRAM_TOKEN
+    ).build()
+
+    app.add_handler(
+        CommandHandler("start", start)
     )
-
-    app = ApplicationBuilder().token(TELEGRAM_TOKEN).build()
-
-    app.add_handler(CommandHandler("start", start))
-    app.add_handler(CommandHandler("help", help_command))
 
     app.add_handler(
         MessageHandler(
@@ -351,17 +257,13 @@ def main():
         )
     )
 
-    app.add_handler(
-        MessageHandler(
-            filters.PHOTO,
-            handle_photo
-        )
-    )
+    logger.info("Nexora AI Bot Started")
 
-    print("✅ Nexora AI Bot is LIVE")
+    app.run_polling()
 
-    app.run_polling(drop_pending_updates=True)
-
+# =========================================
+# RUN BOT
+# =========================================
 
 if __name__ == "__main__":
     main()

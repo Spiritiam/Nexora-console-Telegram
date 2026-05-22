@@ -470,33 +470,83 @@ async def ask_openrouter(prompt):
 
 async def generate_breakdown(question):
 
-    session = get_market_session()
+    q = question.lower()
 
+    symbol = "XAU/USD"
+    pair_name = "Gold (XAUUSD)"
+
+    # DETECT PAIRS
+    if "btc" in q or "bitcoin" in q:
+        symbol = "BTC/USD"
+        pair_name = "Bitcoin (BTCUSD)"
+
+    elif "eurusd" in q or "eur/usd" in q:
+        symbol = "EUR/USD"
+        pair_name = "EURUSD"
+
+    elif "gbpusd" in q or "gbp/usd" in q:
+        symbol = "GBP/USD"
+        pair_name = "GBPUSD"
+
+    elif "nzdusd" in q or "nzd/usd" in q:
+        symbol = "NZD/USD"
+        pair_name = "NZDUSD"
+
+    # GET LIVE PRICE
+    live_price = get_live_price(symbol)
+
+    if live_price is None:
+        live_price_text = "Live price unavailable"
+    else:
+        live_price_text = str(round(live_price, 4))
+
+    # SESSION DETECTION
+    hour = datetime.utcnow().hour
+
+    if 7 <= hour < 13:
+        session = "London Session 🇬🇧"
+
+    elif 13 <= hour < 22:
+        session = "New York Session 🇺🇸"
+
+    else:
+        session = "Asian Session 🇯🇵"
+
+    # AI PROMPT
     prompt = f"""
 You are Nexora AI.
 
-Give a PROFESSIONAL market breakdown.
+Generate a PROFESSIONAL market breakdown.
 
-IMPORTANT RULES:
+IMPORTANT:
+Use the REAL LIVE PRICE provided below.
+Do NOT invent fake prices.
+Do NOT use old market prices.
 
-1. NO markdown
-2. NO hashtags
-3. NO ###
-4. NO **
-5. Clean formatting only
-6. Modern professional structure
-7. Beginner friendly
-8. Include:
-   - technical analysis
-   - fundamental analysis
-   - sentiment
-   - session analysis
-   - market outlook
-   - trade idea
-9. Mention current session:
+PAIR:
+{pair_name}
+
+LIVE PRICE:
+{live_price_text}
+
+SESSION:
 {session}
 
-Question:
+RULES:
+- Clean formatting
+- No markdown symbols
+- No hashtags
+- No stars
+- No fake data
+- Beginner friendly
+- Professional tone
+- Include BOTH technical and fundamental analysis
+- Include sentiment
+- Include trade idea
+- Use current live price in analysis
+- Keep formatting modern and clean
+
+QUESTION:
 {question}
 """
 

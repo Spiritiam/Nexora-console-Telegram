@@ -30,6 +30,7 @@ logger = logging.getLogger(__name__)
 
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
+OPENROUTER_API_KEY = os.getenv("OPENROUTER_API_KEY")
 
 # =========================================
 # GEMINI SETTINGS
@@ -42,11 +43,18 @@ GEMINI_URL = (
     f"{GEMINI_MODEL}:generateContent?key={GEMINI_API_KEY}"
 )
 
+# =========================================
+# CHECK VARIABLES
+# =========================================
+
 if not TELEGRAM_TOKEN:
-    raise ValueError("Missing TELEGRAM_TOKEN environment variable")
+    raise ValueError("Missing TELEGRAM_TOKEN")
 
 if not GEMINI_API_KEY:
-    raise ValueError("Missing GEMINI_API_KEY environment variable")
+    raise ValueError("Missing GEMINI_API_KEY")
+
+if not OPENROUTER_API_KEY:
+    raise ValueError("Missing OPENROUTER_API_KEY")
 
 # =========================================
 # MEMORY + COOLDOWN
@@ -86,14 +94,25 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     await update.message.reply_text(
         "🚀 Welcome to Nexora AI\n\n"
-        "Ask me anything about forex, crypto, trading, business, or general questions."
+        "Multi-AI system activated.\n\n"
+        "You can ask about:\n"
+        "- Forex\n"
+        "- Crypto\n"
+        "- Trading\n"
+        "- Business\n"
+        "- Finance\n"
+        "- General AI questions"
     )
 
 # =========================================
-# GEMINI REQUEST
+# GEMINI + FALLBACK SYSTEM
 # =========================================
 
-async def ask_gemini_text(prompt: str):
+async def ask_ai(prompt: str):
+
+    # =====================================
+    # TRY GEMINI FIRST
+    # =====================================
 
     payload = {
         "contents": [
@@ -107,61 +126,109 @@ async def ask_gemini_text(prompt: str):
         ]
     }
 
-    async with httpx.AsyncClient(timeout=60) as client:
+    try:
 
-        for attempt in range(3):
+        async with httpx.AsyncClient(timeout=60) as client:
 
-            try:
+            response = await client.post(
+                GEMINI_URL,
+                json=payload,
+            )
 
-                response = await client.post(
-                    GEMINI_URL,
-                    json=payload,
-                )
-
-                # =====================================
-                # RATE LIMIT HANDLING
-                # =====================================
-
-                if response.status_code == 429:
-
-                    logger.warning("429 RATE LIMIT HIT")
-
-                    if attempt < 2:
-                        await asyncio.sleep(5)
-                        continue
-
-                    return (
-                        "⚠️ AI server is busy right now.\n"
-                        "Please wait a few seconds and try again."
-                    )
-
-                # =====================================
-                # OTHER ERRORS
-                # =====================================
-
-                if response.status_code != 200:
-
-                    logger.error(
-                        f"Gemini Error: {response.status_code}"
-                    )
-
-                    return (
-                        f"❌ Gemini Error: "
-                        f"{response.status_code}"
-                    )
+            # SUCCESS
+            if response.status_code == 200:
 
                 data = response.json()
 
+                logger.info("Gemini Success")
+
                 return data["candidates"][0]["content"]["parts"][0]["text"]
 
-            except Exception as e:
+            logger.warning(
+                f"Gemini Failed: {response.status_code}"
+            )
 
-                logger.error(f"GEMINI EXCEPTION: {e}")
+    except Exception as e:
 
-                return (
-                    "⚠️ AI temporarily unavailable.\n"
-                    "Please try again later."
+        logger.warning(f"Gemini Exception: {e}")
+
+    # =====================================
+    # OPENROUTER FALLBACK
+    # =====================================
+
+    headers = {
+        "Authorization": f"Bearer {OPENROUTER_API_KEY}",
+        "Content-Type": "application/json",
+    }
+
+    fallback_models = [
+
+        # DeepSeek
+        "deepseek/deepseek-chat",
+
+        # Claude
+        "anthropic/claude-3-haiku",
+
+        # Llama
+        "meta-llama/llama-3-8b-instruct",
+    ]
+
+    async with httpx.AsyncClient(timeout=60) as client:
+
+        for model in fallback_models:
+
+            try:
+
+                logger.info(
+                    f"Trying fallback model: {model}"
                 )
+
+                payload = {
+                    "model": model,
+                    "messages": [
+                        {
+                            "role": "user",
+                            "content": prompt
+                        }
+                    ]
+                }
+
+                response = await client.post(
+                    "https://openrouter.ai/api/v1/chat/completions",
+                    headers=headers,
+                    json=payload,
+                )
+
+                if response.status_code == 200:
+
+                    data = response.json()
+
+                    logger.info(
+                        f"Fallback Success: {model}"
+                    )
+
+                    return data["choices"][0]["message"]["content"]
+
+                logger.warning(
+                    f"Fallback Failed: {model}"
+                )
+
+            except Exception as model_error:
+
+                logger.warning(
+                    f"{model} Exception: {model_error}"
+                )
+
+                continue
+
+    # =====================================
+    # TOTAL FAILURE
+    # =====================================
+
+    return (
+        "⚠️ All AI systems are currently busy.\n"
+        "Please try again later."
+    )
 
 # =========================================
 # TEXT HANDLER
@@ -195,7 +262,7 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_message = update.message.text
 
     await update.message.reply_text(
-        "🧠 Analyzing... please wait ⏳"
+        "🧠 Nexora AI is thinking..."
     )
 
     # =====================================
@@ -225,9 +292,9 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
     # ASK AI
     # =====================================
 
-    ai_reply = await ask_gemini_text(conversation_text)
+    ai_reply = await ask_ai(conversation_text)
 
-    # SAVE MEMORY
+    # SAVE AI MEMORY
     user_memory[chat_id].append({
         "role": "assistant",
         "text": ai_reply
@@ -257,7 +324,7 @@ def main():
         )
     )
 
-    logger.info("Nexora AI Bot Started")
+    logger.info("🚀 Nexora AI Bot Started")
 
     app.run_polling()
 

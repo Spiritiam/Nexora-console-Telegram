@@ -1,14 +1,14 @@
-
 #!/usr/bin/env python3
 """
 Nexora AI Trading Bot
-Fixed & Improved Version
+Stable Production Version
 """
 
 import logging
 import base64
 import httpx
 import os
+import time
 
 from telegram import Update
 from telegram.ext import (
@@ -26,7 +26,8 @@ from telegram.ext import (
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
 
-GEMINI_MODEL = "gemini-2.0-flash"
+# MORE STABLE MODEL
+GEMINI_MODEL = "gemini-1.5-flash"
 
 GEMINI_URL = (
     f"https://generativelanguage.googleapis.com/v1beta/models/"
@@ -38,6 +39,29 @@ if not TELEGRAM_TOKEN:
 
 if not GEMINI_API_KEY:
     raise ValueError("Missing GEMINI_API_KEY environment variable")
+
+
+# ==============================
+# RATE LIMIT / COOLDOWN
+# ==============================
+
+LAST_REQUEST = {}
+
+COOLDOWN_SECONDS = 10
+
+
+def can_request(user_id):
+
+    now = time.time()
+
+    if user_id in LAST_REQUEST:
+
+        if now - LAST_REQUEST[user_id] < COOLDOWN_SECONDS:
+            return False
+
+    LAST_REQUEST[user_id] = now
+
+    return True
 
 
 # ==============================
@@ -82,25 +106,46 @@ async def ask_gemini_text(user_message: str) -> str:
         ]
     }
 
-    async with httpx.AsyncClient(timeout=60) as client:
+    try:
 
-        response = await client.post(
-            GEMINI_URL,
-            json=payload,
-            headers={"Content-Type": "application/json"},
-        )
+        async with httpx.AsyncClient(timeout=60) as client:
 
-        response.raise_for_status()
+            response = await client.post(
+                GEMINI_URL,
+                json=payload,
+                headers={"Content-Type": "application/json"},
+            )
 
-        data = response.json()
+            # HANDLE RATE LIMIT
+            if response.status_code == 429:
+                return (
+                    "⚠️ AI server is busy right now.\n"
+                    "Please wait a few seconds and try again."
+                )
 
-        if "candidates" not in data:
-            return f"Gemini Error: {data}"
+            # HANDLE OTHER ERRORS
+            if response.status_code != 200:
+                return f"❌ Gemini Error: {response.status_code}"
 
-        return data["candidates"][0]["content"]["parts"][0]["text"]
+            data = response.json()
+
+            if "candidates" not in data:
+                return f"❌ Gemini Error: {data}"
+
+            return data["candidates"][0]["content"]["parts"][0]["text"]
+
+    except Exception as e:
+
+        logging.exception("TEXT ERROR")
+
+        return f"❌ Error: {str(e)}"
 
 
-async def ask_gemini_image(image_bytes: bytes, mime_type: str, caption: str = "") -> str:
+async def ask_gemini_image(
+    image_bytes: bytes,
+    mime_type: str,
+    caption: str = ""
+) -> str:
 
     image_b64 = base64.b64encode(image_bytes).decode()
 
@@ -122,22 +167,39 @@ async def ask_gemini_image(image_bytes: bytes, mime_type: str, caption: str = ""
         ]
     }
 
-    async with httpx.AsyncClient(timeout=90) as client:
+    try:
 
-        response = await client.post(
-            GEMINI_URL,
-            json=payload,
-            headers={"Content-Type": "application/json"},
-        )
+        async with httpx.AsyncClient(timeout=90) as client:
 
-        response.raise_for_status()
+            response = await client.post(
+                GEMINI_URL,
+                json=payload,
+                headers={"Content-Type": "application/json"},
+            )
 
-        data = response.json()
+            # HANDLE RATE LIMIT
+            if response.status_code == 429:
+                return (
+                    "⚠️ AI image analysis is temporarily busy.\n"
+                    "Please try again later."
+                )
 
-        if "candidates" not in data:
-            return f"Gemini Error: {data}"
+            # HANDLE OTHER ERRORS
+            if response.status_code != 200:
+                return f"❌ Gemini Image Error: {response.status_code}"
 
-        return data["candidates"][0]["content"]["parts"][0]["text"]
+            data = response.json()
+
+            if "candidates" not in data:
+                return f"❌ Gemini Error: {data}"
+
+            return data["candidates"][0]["content"]["parts"][0]["text"]
+
+    except Exception as e:
+
+        logging.exception("IMAGE ERROR")
+
+        return f"❌ Image Error: {str(e)}"
 
 
 # ==============================
@@ -172,16 +234,35 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     user_message = update.message.text
 
-    await update.message.reply_text("🧠 Analyzing... please wait ⏳")
+    user_id = update.effective_user.id
+
+    # COOLDOWN PROTECTION
+    if not can_request(user_id):
+
+        await update.message.reply_text(
+            "⏳ Please wait a few seconds before sending another message."
+        )
+
+        return
+
+    await update.message.reply_text(
+        "🧠 Analyzing... please wait ⏳"
+    )
 
     try:
 
         result = await ask_gemini_text(user_message)
 
         if len(result) > 4000:
+
             for i in range(0, len(result), 4000):
-                await update.message.reply_text(result[i:i+4000])
+
+                await update.message.reply_text(
+                    result[i:i + 4000]
+                )
+
         else:
+
             await update.message.reply_text(result)
 
     except Exception as e:
@@ -194,6 +275,17 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
+
+    user_id = update.effective_user.id
+
+    # COOLDOWN PROTECTION
+    if not can_request(user_id):
+
+        await update.message.reply_text(
+            "⏳ Please wait a few seconds before sending another image."
+        )
+
+        return
 
     await update.message.reply_text(
         "📸 Chart received. Analyzing..."
@@ -216,9 +308,15 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
 
         if len(result) > 4000:
+
             for i in range(0, len(result), 4000):
-                await update.message.reply_text(result[i:i+4000])
+
+                await update.message.reply_text(
+                    result[i:i + 4000]
+                )
+
         else:
+
             await update.message.reply_text(result)
 
     except Exception as e:
@@ -247,11 +345,17 @@ def main():
     app.add_handler(CommandHandler("help", help_command))
 
     app.add_handler(
-        MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text)
+        MessageHandler(
+            filters.TEXT & ~filters.COMMAND,
+            handle_text
+        )
     )
 
     app.add_handler(
-        MessageHandler(filters.PHOTO, handle_photo)
+        MessageHandler(
+            filters.PHOTO,
+            handle_photo
+        )
     )
 
     print("✅ Nexora AI Bot is LIVE")

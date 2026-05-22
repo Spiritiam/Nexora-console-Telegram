@@ -98,7 +98,7 @@ def get_market_session():
     return "Market Closing Session 🌙"
 
 # ============================================
-# LIVE MARKET PRICE
+# LIVE PRICE
 # ============================================
 
 def get_live_price(symbol="XAU/USD"):
@@ -121,11 +121,13 @@ def get_live_price(symbol="XAU/USD"):
         return None
 
     except Exception as e:
+
         print("PRICE ERROR:", e)
+
         return None
 
 # ============================================
-# TREND LOGIC
+# MARKET BIAS
 # ============================================
 
 def generate_market_bias():
@@ -145,31 +147,53 @@ def generate_market_bias():
     return direction, strength, confidence
 
 # ============================================
-# DYNAMIC REASONS
+# BUY REASONS
 # ============================================
 
 BUY_REASONS = [
-    "Bullish momentum across higher timeframes.",
-    "Liquidity sweep reaction from support zone.",
-    "London session bullish continuation.",
-    "Strong buyer pressure detected.",
-    "Breakout structure confirmation on H1.",
-    "Momentum expansion during NY session.",
-    "Demand zone rejection with bullish pressure.",
-]
 
-SELL_REASONS = [
-    "Bearish rejection from resistance zone.",
-    "Strong seller momentum detected.",
-    "Liquidity sweep from highs.",
-    "H1 bearish continuation setup.",
-    "NY session reversal pressure.",
-    "Breakdown below key support.",
-    "Supply zone reaction confirmed.",
+    "Bullish momentum across higher timeframes.",
+
+    "Liquidity sweep reaction from support zone.",
+
+    "London bullish continuation detected.",
+
+    "Strong buyer pressure detected.",
+
+    "Breakout confirmation on H1 timeframe.",
+
+    "New York session momentum expansion.",
+
+    "Demand zone rejection with bullish structure.",
+
+    "Multi-timeframe bullish alignment confirmed.",
 ]
 
 # ============================================
-# SIGNAL GENERATOR
+# SELL REASONS
+# ============================================
+
+SELL_REASONS = [
+
+    "Bearish rejection from resistance zone.",
+
+    "Strong seller pressure detected.",
+
+    "Liquidity sweep from recent highs.",
+
+    "H1 bearish continuation setup active.",
+
+    "New York session reversal pressure.",
+
+    "Breakdown below key support level.",
+
+    "Supply zone reaction confirmed.",
+
+    "Multi-timeframe bearish alignment confirmed.",
+]
+
+# ============================================
+# SIGNAL BUILDER
 # ============================================
 
 def build_signal_response(question):
@@ -182,30 +206,35 @@ def build_signal_response(question):
     pip_size = 10
 
     # ========================================
-    # PAIRS
+    # FOREX / CRYPTO PAIRS
     # ========================================
 
     if "eurusd" in q:
+
         symbol = "EUR/USD"
         pair_name = "EURUSD"
         pip_size = 0.0020
 
     elif "gbpusd" in q:
+
         symbol = "GBP/USD"
         pair_name = "GBPUSD"
         pip_size = 0.0025
 
     elif "nzdusd" in q:
+
         symbol = "NZD/USD"
         pair_name = "NZDUSD"
         pip_size = 0.0020
 
     elif "usdjpy" in q:
+
         symbol = "USD/JPY"
         pair_name = "USDJPY"
         pip_size = 0.30
 
     elif "btc" in q or "bitcoin" in q:
+
         symbol = "BTC/USD"
         pair_name = "BTCUSD"
         pip_size = 300
@@ -224,13 +253,13 @@ def build_signal_response(question):
         )
 
     # ========================================
-    # MARKET BIAS
+    # MARKET LOGIC
     # ========================================
 
     direction, strength, confidence = generate_market_bias()
 
     # ========================================
-    # ENTRY / SL / TP
+    # BUY
     # ========================================
 
     if direction == "BUY":
@@ -245,6 +274,10 @@ def build_signal_response(question):
         reason = random.choice(BUY_REASONS)
 
         signal_emoji = "🟢"
+
+    # ========================================
+    # SELL
+    # ========================================
 
     else:
 
@@ -270,11 +303,20 @@ def build_signal_response(question):
     # ========================================
 
     timeframe_confirmation = random.choice([
-        "M15 bullish structure",
-        "H1 trend continuation",
-        "H4 momentum alignment",
-        "Multi-timeframe confirmation",
-        "M15 liquidity sweep confirmation",
+
+        "M15 bullish structure confirmation",
+
+        "H1 trend continuation active",
+
+        "H4 momentum alignment confirmed",
+
+        "Multi-timeframe confirmation detected",
+
+        "Liquidity sweep confirmation on M15",
+
+        "London session continuation setup",
+
+        "New York volatility expansion detected",
     ])
 
     # ========================================
@@ -328,7 +370,7 @@ Trade safe 💼🔥
     return response
 
 # ============================================
-# GEMINI
+# GEMINI AI
 # ============================================
 
 async def ask_gemini(prompt):
@@ -375,16 +417,14 @@ async def ask_gemini(prompt):
         return await ask_openrouter(prompt)
 
 # ============================================
-# OPENROUTER
+# OPENROUTER FALLBACK
 # ============================================
 
 async def ask_openrouter(prompt):
 
     if not OPENROUTER_API_KEY:
 
-        return (
-            "⚠️ AI service unavailable."
-        )
+        return "⚠️ AI service unavailable."
 
     headers = {
         "Authorization": f"Bearer {OPENROUTER_API_KEY}",
@@ -412,9 +452,7 @@ async def ask_openrouter(prompt):
 
         if response.status_code != 200:
 
-            return (
-                "⚠️ AI server busy."
-            )
+            return "⚠️ AI server busy."
 
         result = response.json()
 
@@ -424,9 +462,7 @@ async def ask_openrouter(prompt):
 
         print("OpenRouter Error:", e)
 
-        return (
-            "⚠️ AI servers unavailable."
-        )
+        return "⚠️ AI servers unavailable."
 
 # ============================================
 # BREAKDOWN GENERATOR
@@ -439,24 +475,25 @@ async def generate_breakdown(question):
     prompt = f"""
 You are Nexora AI.
 
-Give a PROFESSIONAL forex and market breakdown.
+Give a PROFESSIONAL market breakdown.
 
-IMPORTANT:
+IMPORTANT RULES:
 
-1. Use CLEAN formatting
-2. NO markdown stars
-3. NO hashtags
-4. NO weird symbols
-5. Use professional structure
-6. Include:
+1. NO markdown
+2. NO hashtags
+3. NO ###
+4. NO **
+5. Clean formatting only
+6. Modern professional structure
+7. Beginner friendly
+8. Include:
    - technical analysis
    - fundamental analysis
    - sentiment
-   - session behavior
+   - session analysis
    - market outlook
    - trade idea
-7. Make it look elite and modern.
-8. Mention current session:
+9. Mention current session:
 {session}
 
 Question:
@@ -466,7 +503,21 @@ Question:
     return await ask_gemini(prompt)
 
 # ============================================
-# BUTTON HANDLER
+# CLEAN AI RESPONSE
+# ============================================
+
+def clean_text(text):
+
+    text = text.replace("###", "")
+    text = text.replace("##", "")
+    text = text.replace("**", "")
+    text = text.replace("---", "")
+    text = text.replace("__", "")
+
+    return text.strip()
+
+# ============================================
+# HANDLE BUTTONS
 # ============================================
 
 async def handle_buttons(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -475,7 +526,7 @@ async def handle_buttons(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     user_id = update.message.from_user.id
 
-    # SIGNAL
+    # SIGNAL MODE
     if "signal" in text:
 
         user_modes[user_id] = "signal"
@@ -485,14 +536,15 @@ async def handle_buttons(update: Update, context: ContextTypes.DEFAULT_TYPE):
             "Now ask for a signal.\n\n"
             "Examples:\n"
             "• EURUSD\n"
-            "• XAUUSD\n"
+            "• GBPUSD\n"
             "• BTCUSD\n"
+            "• XAUUSD\n"
             "• Should I buy gold now?"
         )
 
         return
 
-    # BREAKDOWN
+    # BREAKDOWN MODE
     if "breakdown" in text:
 
         user_modes[user_id] = "breakdown"
@@ -502,8 +554,8 @@ async def handle_buttons(update: Update, context: ContextTypes.DEFAULT_TYPE):
             "Now ask your market question.\n\n"
             "Examples:\n"
             "• Analyze gold market today\n"
-            "• GBPUSD outlook\n"
-            "• BTC market analysis"
+            "• BTCUSD outlook\n"
+            "• GBPUSD market analysis"
         )
 
         return
@@ -518,7 +570,10 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     message = update.message.text
 
+    # ========================================
     # NO MODE
+    # ========================================
+
     if user_id not in user_modes:
 
         await update.message.reply_text(
@@ -560,6 +615,8 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
         response = await generate_breakdown(message)
 
+        response = clean_text(response)
+
         await wait_message.edit_text(response)
 
         return
@@ -574,12 +631,12 @@ def main():
         TELEGRAM_TOKEN
     ).build()
 
-    # START
+    # START COMMAND
     app.add_handler(
         CommandHandler("start", start)
     )
 
-    # BUTTONS
+    # BUTTON HANDLER
     app.add_handler(
         MessageHandler(
             filters.Regex(
@@ -589,7 +646,7 @@ def main():
         )
     )
 
-    # TEXT
+    # NORMAL TEXT
     app.add_handler(
         MessageHandler(
             filters.TEXT & ~filters.COMMAND,

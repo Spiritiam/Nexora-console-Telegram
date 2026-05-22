@@ -2,11 +2,7 @@ import os
 import asyncio
 import requests
 
-from telegram import (
-    Update,
-    ReplyKeyboardMarkup,
-)
-
+from telegram import ReplyKeyboardMarkup, Update
 from telegram.ext import (
     Application,
     CommandHandler,
@@ -15,343 +11,411 @@ from telegram.ext import (
     filters,
 )
 
-# =====================================
+# ============================================
 # ENV VARIABLES
-# =====================================
+# ============================================
 
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
+
+# GEMINI
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
-OPENROUTER_API_KEY = os.getenv("OPENROUTER_API_KEY")
-
-# =====================================
-# GEMINI SETTINGS
-# =====================================
-
 GEMINI_MODEL = "gemini-2.0-flash"
 
-GEMINI_URL = (
-    f"https://generativelanguage.googleapis.com/v1beta/models/"
-    f"{GEMINI_MODEL}:generateContent?key={GEMINI_API_KEY}"
+# OPENROUTER
+OPENROUTER_API_KEY = os.getenv("OPENROUTER_API_KEY")
+
+# ============================================
+# CHECK VARIABLES
+# ============================================
+
+if not TELEGRAM_TOKEN:
+    raise ValueError("Missing TELEGRAM_TOKEN")
+
+# ============================================
+# BUTTONS
+# ============================================
+
+reply_keyboard = [
+    ["📊 Signal", "📚 Breakdown"]
+]
+
+markup = ReplyKeyboardMarkup(
+    reply_keyboard,
+    resize_keyboard=True
 )
 
-# =====================================
-# OPENROUTER SETTINGS
-# =====================================
+# ============================================
+# USER MEMORY
+# ============================================
 
-OPENROUTER_URL = "https://openrouter.ai/api/v1/chat/completions"
+user_mode = {}
 
-# =====================================
-# AI PROMPTS
-# =====================================
-
-SIGNAL_PROMPT = """
-You are Nexora AI.
-
-You are a professional forex and crypto trading assistant.
-
-When giving signals:
-- Give direction
-- Give entry
-- Give stop loss
-- Give take profit
-- Give confidence level
-
-Keep response:
-- Clean
-- Professional
-- Short
-- Easy to read
-
-Use premium formatting.
-
-Example format:
-
-📊 XAUUSD BUY SIGNAL
-
-Entry: 3345
-SL: 3335
-TP1: 3360
-TP2: 3375
-
-Confidence: High ✅
-"""
-
-BREAKDOWN_PROMPT = """
-You are Nexora AI.
-
-You are a professional market analyst.
-
-Provide:
-- Trend direction
-- Momentum
-- Bias
-- Key support/resistance
-- Risk warning
-
-Keep response:
-- Beautiful
-- Premium
-- Easy to read
-- Short but useful
-
-Use clean formatting and emojis professionally.
-"""
-
-# =====================================
-# GEMINI REQUEST
-# =====================================
-
-async def ask_gemini(prompt):
-
-    headers = {
-        "Content-Type": "application/json"
-    }
-
-    data = {
-        "contents": [
-            {
-                "parts": [
-                    {
-                        "text": prompt
-                    }
-                ]
-            }
-        ]
-    }
-
-    try:
-
-        response = requests.post(
-            GEMINI_URL,
-            headers=headers,
-            json=data,
-            timeout=30
-        )
-
-        # RATE LIMIT
-        if response.status_code == 429:
-            return None
-
-        # OTHER ERRORS
-        if response.status_code != 200:
-            return None
-
-        result = response.json()
-
-        return result["candidates"][0]["content"]["parts"][0]["text"]
-
-    except:
-        return None
-
-# =====================================
-# OPENROUTER REQUEST
-# =====================================
-
-async def ask_openrouter(prompt):
-
-    headers = {
-        "Authorization": f"Bearer {OPENROUTER_API_KEY}",
-        "Content-Type": "application/json",
-    }
-
-    data = {
-        "model": "deepseek/deepseek-chat",
-        "messages": [
-            {
-                "role": "user",
-                "content": prompt
-            }
-        ]
-    }
-
-    try:
-
-        response = requests.post(
-            OPENROUTER_URL,
-            headers=headers,
-            json=data,
-            timeout=30
-        )
-
-        if response.status_code != 200:
-            return None
-
-        result = response.json()
-
-        return result["choices"][0]["message"]["content"]
-
-    except:
-        return None
-
-# =====================================
-# MAIN AI ENGINE
-# =====================================
-
-async def ask_ai(user_text, mode="signal"):
-
-    if mode == "signal":
-        final_prompt = SIGNAL_PROMPT + "\n\nUser Request:\n" + user_text
-    else:
-        final_prompt = BREAKDOWN_PROMPT + "\n\nUser Request:\n" + user_text
-
-    # TRY GEMINI FIRST
-    gemini_response = await ask_gemini(final_prompt)
-
-    if gemini_response:
-        return gemini_response
-
-    # FALLBACK TO OPENROUTER
-    openrouter_response = await ask_openrouter(final_prompt)
-
-    if openrouter_response:
-        return openrouter_response
-
-    return (
-        "⚠️ AI servers are busy right now.\n"
-        "Please wait a few seconds and try again."
-    )
-
-# =====================================
-# START COMMAND
-# =====================================
+# ============================================
+# START
+# ============================================
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     welcome_text = """
-🚀 Welcome to Nexora AI
+👋 Welcome to Nexora AI
 
-Your intelligent trading assistant.
-
-You can ask:
-
-• Should I buy gold now?
-• Analyze BTCUSD
-• Give me a scalp signal
-• Market breakdown for EURUSD
-
-Nexora AI helps with:
+I can help you with:
 
 📊 Trading Signals
-📈 Market Analysis
-📚 Trade Breakdowns
-⚠️ Risk Awareness
+📚 Market Breakdowns
+📈 Technical Analysis
+🧠 AI Trading Assistance
+
+Choose an option below.
 """
 
-    await update.message.reply_text(welcome_text)
-
-# =====================================
-# NORMAL USER MESSAGE
-# =====================================
-
-async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
-
-    user_message = update.message.text
-
-    # IGNORE BUTTON MESSAGES
-    if user_message in ["📊 Signal", "📚 Breakdown"]:
-        return
-
-    # SAVE USER QUESTION
-    context.user_data["last_question"] = user_message
-
     await update.message.reply_text(
-        "🧠 Nexora AI is analyzing the market..."
+        welcome_text,
+        reply_markup=markup
     )
 
-    await asyncio.sleep(1)
+# ============================================
+# GEMINI REQUEST
+# ============================================
 
-    keyboard = [
-        ["📊 Signal", "📚 Breakdown"]
-    ]
+async def ask_gemini(prompt):
 
-    reply_markup = ReplyKeyboardMarkup(
-        keyboard,
-        resize_keyboard=True
-    )
+    if not GEMINI_API_KEY:
+        return None
 
-    await update.message.reply_text(
-        "Choose analysis mode:",
-        reply_markup=reply_markup
-    )
+    try:
 
-# =====================================
+        gemini_url = (
+            f"https://generativelanguage.googleapis.com/v1beta/models/"
+            f"{GEMINI_MODEL}:generateContent?key={GEMINI_API_KEY}"
+        )
+
+        payload = {
+            "contents": [
+                {
+                    "parts": [
+                        {
+                            "text": prompt
+                        }
+                    ]
+                }
+            ]
+        }
+
+        response = requests.post(
+            gemini_url,
+            json=payload,
+            timeout=60
+        )
+
+        # ====================================
+        # RATE LIMIT HANDLING
+        # ====================================
+
+        if response.status_code == 429:
+            print("Gemini Rate Limited")
+            return None
+
+        # ====================================
+        # OTHER ERRORS
+        # ====================================
+
+        if response.status_code != 200:
+            print(f"Gemini Error: {response.status_code}")
+            return None
+
+        data = response.json()
+
+        text = (
+            data["candidates"][0]
+            ["content"]["parts"][0]["text"]
+        )
+
+        return text
+
+    except Exception as e:
+        print("Gemini Exception:", e)
+        return None
+
+# ============================================
+# OPENROUTER FALLBACK
+# ============================================
+
+async def ask_openrouter(prompt):
+
+    if not OPENROUTER_API_KEY:
+        return """
+⚠️ AI server busy right now.
+
+Please try again later.
+"""
+
+    try:
+
+        response = requests.post(
+            "https://openrouter.ai/api/v1/chat/completions",
+            headers={
+                "Authorization": f"Bearer {OPENROUTER_API_KEY}",
+                "Content-Type": "application/json",
+            },
+            json={
+                "model": "deepseek/deepseek-chat",
+                "messages": [
+                    {
+                        "role": "user",
+                        "content": prompt
+                    }
+                ]
+            },
+            timeout=60
+        )
+
+        if response.status_code != 200:
+            print("OpenRouter Error:", response.text)
+
+            return """
+⚠️ AI server busy right now.
+
+Please wait a few seconds and try again.
+"""
+
+        data = response.json()
+
+        text = (
+            data["choices"][0]
+            ["message"]["content"]
+        )
+
+        return text
+
+    except Exception as e:
+
+        print("OpenRouter Exception:", e)
+
+        return """
+⚠️ AI server busy right now.
+
+Please try again later.
+"""
+
+# ============================================
+# MAIN AI LOGIC
+# ============================================
+
+async def generate_ai_response(user_text, mode):
+
+    # ====================================
+    # SIGNAL MODE
+    # ====================================
+
+    if mode == "signal":
+
+        ai_prompt = f"""
+You are Nexora AI, a professional forex signal provider.
+
+User asked:
+{user_text}
+
+Give:
+- Bias (BUY or SELL)
+- Entry Zone
+- Stop Loss
+- Take Profit
+- Confidence Level
+- Short reason
+
+Make response VERY clean.
+Use emojis.
+Keep it short and premium.
+"""
+
+    # ====================================
+    # BREAKDOWN MODE
+    # ====================================
+
+    else:
+
+        ai_prompt = f"""
+You are Nexora AI.
+
+User asked:
+{user_text}
+
+Give:
+- professional breakdown
+- technical analysis
+- fundamental explanation
+- trading insight
+
+Make it clean and easy to read.
+Use spacing properly.
+Avoid huge paragraphs.
+"""
+
+    # ====================================
+    # TRY GEMINI FIRST
+    # ====================================
+
+    response = await ask_gemini(ai_prompt)
+
+    if response:
+        return response
+
+    # ====================================
+    # FALLBACK TO OPENROUTER
+    # ====================================
+
+    print("Switching to OpenRouter...")
+
+    response = await ask_openrouter(ai_prompt)
+
+    return response
+
+# ============================================
 # BUTTON HANDLER
-# =====================================
+# ============================================
 
 async def handle_buttons(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     text = update.message.text
+    user_id = update.effective_user.id
 
-    question = context.user_data.get("last_question", "")
-
-    # =========================
-    # SIGNAL
-    # =========================
+    # ====================================
+    # SIGNAL MODE
+    # ====================================
 
     if text == "📊 Signal":
 
+        user_mode[user_id] = "signal"
+
         await update.message.reply_text(
-            "📡 Generating high probability signal..."
-        )
+            """
+📊 Signal Mode Activated
 
-        await asyncio.sleep(2)
+Now send:
+- pair
+- market
+- chart question
 
-        response = await ask_ai(
-            question,
-            mode="signal"
-        )
-
-        formatted = f"""
-📊 NEXORA AI SIGNAL
-
-{response}
-
-⚠️ Trade responsibly.
+Example:
+Should I buy gold now?
 """
+        )
 
-        await update.message.reply_text(formatted)
-
-    # =========================
-    # BREAKDOWN
-    # =========================
+    # ====================================
+    # BREAKDOWN MODE
+    # ====================================
 
     elif text == "📚 Breakdown":
 
+        user_mode[user_id] = "breakdown"
+
         await update.message.reply_text(
-            "📈 Preparing market breakdown..."
-        )
+            """
+📚 Breakdown Mode Activated
 
-        await asyncio.sleep(2)
+Send your market question.
 
-        response = await ask_ai(
-            question,
-            mode="breakdown"
-        )
-
-        formatted = f"""
-📚 MARKET BREAKDOWN
-
-{response}
+Example:
+Why is gold bullish today?
 """
+        )
 
-        await update.message.reply_text(formatted)
+# ============================================
+# TEXT HANDLER
+# ============================================
 
-# =====================================
+async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
+
+    user_id = update.effective_user.id
+    user_text = update.message.text
+
+    # ====================================
+    # DEFAULT MODE
+    # ====================================
+
+    mode = user_mode.get(user_id)
+
+    if not mode:
+
+        await update.message.reply_text(
+            """
+Choose a mode first:
+
+📊 Signal
+or
+📚 Breakdown
+""",
+            reply_markup=markup
+        )
+
+        return
+
+    # ====================================
+    # TYPING EFFECT
+    # ====================================
+
+    await context.bot.send_chat_action(
+        chat_id=update.effective_chat.id,
+        action="typing"
+    )
+
+    thinking_message = await update.message.reply_text(
+        "🧠 Nexora AI is thinking..."
+    )
+
+    # ====================================
+    # GENERATE RESPONSE
+    # ====================================
+
+    response = await generate_ai_response(
+        user_text,
+        mode
+    )
+
+    # ====================================
+    # DELETE THINKING MESSAGE
+    # ====================================
+
+    try:
+        await thinking_message.delete()
+    except:
+        pass
+
+    # ====================================
+    # SEND RESPONSE
+    # ====================================
+
+    await update.message.reply_text(response)
+
+# ============================================
 # MAIN
-# =====================================
+# ============================================
 
 def main():
 
-    app = Application.builder().token(
-        TELEGRAM_TOKEN
-    ).build()
-
-    # START COMMAND
-    app.add_handler(
-        CommandHandler("start", start)
+    app = (
+        Application.builder()
+        .token(TELEGRAM_TOKEN)
+        .concurrent_updates(True)
+        .build()
     )
 
+    # ====================================
+    # START COMMAND
+    # ====================================
+
+    app.add_handler(
+        CommandHandler(
+            "start",
+            start
+        )
+    )
+
+    # ====================================
     # BUTTON HANDLER
+    # ====================================
+
     app.add_handler(
         MessageHandler(
             filters.Regex("📊 Signal|📚 Breakdown"),
@@ -359,7 +423,10 @@ def main():
         )
     )
 
-    # NORMAL TEXT HANDLER
+    # ====================================
+    # TEXT HANDLER
+    # ====================================
+
     app.add_handler(
         MessageHandler(
             filters.TEXT & ~filters.COMMAND,
@@ -369,13 +436,19 @@ def main():
 
     print("Nexora AI Bot Running...")
 
+    # ====================================
+    # RUN BOT
+    # ====================================
+
     app.run_polling(
-        drop_pending_updates=True
+        drop_pending_updates=True,
+        close_loop=False,
+        allowed_updates=Update.ALL_TYPES
     )
 
-# =====================================
-# RUN BOT
-# =====================================
+# ============================================
+# START BOT
+# ============================================
 
 if __name__ == "__main__":
     main()

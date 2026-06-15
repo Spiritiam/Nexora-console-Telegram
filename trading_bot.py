@@ -8,6 +8,8 @@ from datetime import datetime
 from telegram import (
     Update,
     ReplyKeyboardMarkup,
+    InlineKeyboardButton,
+    InlineKeyboardMarkup,
 )
 
 from telegram.ext import (
@@ -35,7 +37,13 @@ CHANNEL_1_ID = os.getenv("CHANNEL_1_ID", "-1001722756645")
 CHANNEL_2_ID = os.getenv("CHANNEL_2_ID", "-1002468228698")
 
 # ============================================
-# BUY / SELL IMAGE FILE IDs  ← FILL THESE IN
+# BOT USERNAME
+# ============================================
+
+BOT_USERNAME = "NexoraConsoleBot"
+
+# ============================================
+# BUY / SELL IMAGE FILE IDs
 # ============================================
 
 BUY_IMAGE_FILE_ID = "YOUR_BUY_IMAGE_FILE_ID_HERE"
@@ -81,6 +89,20 @@ main_keyboard = ReplyKeyboardMarkup(
     ],
     resize_keyboard=True
 )
+
+# ============================================
+# INLINE BUTTON FOR CHANNEL POSTS
+# ============================================
+
+def get_channel_button():
+    return InlineKeyboardMarkup([
+        [
+            InlineKeyboardButton(
+                "🤖 Get Your Own Signal",
+                url=f"https://t.me/{BOT_USERNAME}"
+            )
+        ]
+    ])
 
 # ============================================
 # USER MODES
@@ -630,6 +652,8 @@ async def post_auto_signal(context: ContextTypes.DEFAULT_TYPE):
 
     channel_ids = [CHANNEL_1_ID, CHANNEL_2_ID]
 
+    button = get_channel_button()
+
     for channel_id in channel_ids:
         try:
 
@@ -640,13 +664,15 @@ async def post_auto_signal(context: ContextTypes.DEFAULT_TYPE):
                 await context.bot.send_photo(
                     chat_id=channel_id,
                     photo=image_file_id,
-                    caption=signal
+                    caption=signal,
+                    reply_markup=button
                 )
 
             else:
                 await context.bot.send_message(
                     chat_id=channel_id,
-                    text=signal
+                    text=signal,
+                    reply_markup=button
                 )
 
             print(f"[AUTO SIGNAL] ✅ Posted to {channel_id} at {now}")
@@ -678,13 +704,11 @@ def main():
         TELEGRAM_TOKEN
     ).build()
 
-    # START COMMAND
     app.add_handler(CommandHandler("start", start))
 
-    # TEMP: image file ID getter — REMOVE AFTER USE
+    # TEMP: REMOVE AFTER GETTING IMAGE FILE IDs
     app.add_handler(MessageHandler(filters.PHOTO, get_image_file_id))
 
-    # BUTTON HANDLER
     app.add_handler(
         MessageHandler(
             filters.Regex(
@@ -694,7 +718,6 @@ def main():
         )
     )
 
-    # NORMAL TEXT
     app.add_handler(
         MessageHandler(
             filters.TEXT & ~filters.COMMAND,
@@ -722,11 +745,12 @@ def main():
         )
 
     print("Nexora AI Running...")
-    print(f"Auto signals scheduled daily at (UTC):")
+    print("Auto signals scheduled daily at (UTC):")
     for t in SIGNAL_TIMES:
         print(f"  ⏰ {t} UTC")
     print(f"Channel 1: {CHANNEL_1_ID}")
     print(f"Channel 2: {CHANNEL_2_ID}")
+    print(f"Bot: @{BOT_USERNAME}")
 
     app.run_polling(drop_pending_updates=True)
 

@@ -28,6 +28,34 @@ OPENROUTER_API_KEY = os.getenv("OPENROUTER_API_KEY")
 TWELVEDATA_API_KEY = os.getenv("TWELVEDATA_API_KEY")
 
 # ============================================
+# YOUR TWO CHANNEL IDs
+# ============================================
+
+CHANNEL_1_ID = os.getenv("CHANNEL_1_ID", "-1001722756645")
+CHANNEL_2_ID = os.getenv("CHANNEL_2_ID", "-1002468228698")
+
+# ============================================
+# BUY / SELL IMAGE FILE IDs  ← FILL THESE IN
+# ============================================
+# Step 1: Run the bot
+# Step 2: Send your BUY image to the bot in private chat
+# Step 3: It replies with the file ID — paste it below
+# Step 4: Do the same for SELL image
+# Step 5: Remove the get_image_file_id handler from main()
+
+BUY_IMAGE_FILE_ID = "YOUR_BUY_IMAGE_FILE_ID_HERE"
+SELL_IMAGE_FILE_ID = "YOUR_SELL_IMAGE_FILE_ID_HERE"
+
+# ============================================
+# SIGNAL TIMES (UTC)
+# ============================================
+# 08:00 UTC = 09:00 Lagos time
+# 16:00 UTC = 17:00 Lagos time
+
+SIGNAL_TIME_1 = "08:00"
+SIGNAL_TIME_2 = "16:00"
+
+# ============================================
 # AI CONFIG
 # ============================================
 
@@ -202,149 +230,89 @@ def build_signal_response(question):
 
     symbol = "XAU/USD"
     pair_name = "XAUUSD"
-
     pip_size = 10
 
-    # ========================================
-    # FOREX / CRYPTO PAIRS
-    # ========================================
-
     if "eurusd" in q:
-
         symbol = "EUR/USD"
         pair_name = "EURUSD"
         pip_size = 0.0020
 
     elif "gbpusd" in q:
-
         symbol = "GBP/USD"
         pair_name = "GBPUSD"
         pip_size = 0.0025
 
     elif "nzdusd" in q:
-
         symbol = "NZD/USD"
         pair_name = "NZDUSD"
         pip_size = 0.0020
 
     elif "usdjpy" in q:
-
         symbol = "USD/JPY"
         pair_name = "USDJPY"
         pip_size = 0.30
 
     elif "btc" in q or "bitcoin" in q:
-
         symbol = "BTC/USD"
         pair_name = "BTCUSD"
         pip_size = 300
 
-    # ========================================
-    # LIVE PRICE
-    # ========================================
-
     live_price = get_live_price(symbol)
 
     if live_price is None:
-
-        return (
+        return None, None, (
             "⚠️ Unable to fetch live market data.\n"
             "Please try again shortly."
         )
 
-    # ========================================
-    # MARKET LOGIC
-    # ========================================
-
     direction, strength, confidence = generate_market_bias()
-
-    # ========================================
-    # BUY
-    # ========================================
 
     if direction == "BUY":
 
         entry_low = live_price - pip_size
         entry_high = live_price + pip_size
-
         stop_loss = live_price - (pip_size * 3)
-
         take_profit = live_price + (pip_size * 6)
-
         reason = random.choice(BUY_REASONS)
-
         signal_emoji = "🟢"
-
-    # ========================================
-    # SELL
-    # ========================================
+        image_file_id = BUY_IMAGE_FILE_ID
 
     else:
 
         entry_low = live_price - pip_size
         entry_high = live_price + pip_size
-
         stop_loss = live_price + (pip_size * 3)
-
         take_profit = live_price - (pip_size * 6)
-
         reason = random.choice(SELL_REASONS)
-
         signal_emoji = "🔴"
-
-    # ========================================
-    # SESSION
-    # ========================================
+        image_file_id = SELL_IMAGE_FILE_ID
 
     session = get_market_session()
 
-    # ========================================
-    # TIMEFRAME CONFIRMATION
-    # ========================================
-
     timeframe_confirmation = random.choice([
-
         "M15 bullish structure confirmation",
-
         "H1 trend continuation active",
-
         "H4 momentum alignment confirmed",
-
         "Multi-timeframe confirmation detected",
-
         "Liquidity sweep confirmation on M15",
-
         "London session continuation setup",
-
         "New York volatility expansion detected",
     ])
 
-    # ========================================
-    # FORMAT DECIMALS
-    # ========================================
-
     if live_price < 10:
-
         live_price = round(live_price, 5)
         entry_low = round(entry_low, 5)
         entry_high = round(entry_high, 5)
         stop_loss = round(stop_loss, 5)
         take_profit = round(take_profit, 5)
-
     else:
-
         live_price = round(live_price, 2)
         entry_low = round(entry_low, 2)
         entry_high = round(entry_high, 2)
         stop_loss = round(stop_loss, 2)
         take_profit = round(take_profit, 2)
 
-    # ========================================
-    # FINAL RESPONSE
-    # ========================================
-
-    response = f"""
-{signal_emoji} {strength} {direction} {pair_name}
+    response = f"""{signal_emoji} {strength} {direction} {pair_name}
 
 Current Price: {live_price}
 
@@ -364,10 +332,9 @@ Timeframe Confirmation:
 Reason:
 {reason}
 
-Trade safe 💼🔥
-"""
+Trade safe 💼🔥"""
 
-    return response
+    return image_file_id, direction, response
 
 # ============================================
 # GEMINI AI
@@ -375,18 +342,12 @@ Trade safe 💼🔥
 
 async def ask_gemini(prompt):
 
-    headers = {
-        "Content-Type": "application/json"
-    }
+    headers = {"Content-Type": "application/json"}
 
     data = {
         "contents": [
             {
-                "parts": [
-                    {
-                        "text": prompt
-                    }
-                ]
+                "parts": [{"text": prompt}]
             }
         ]
     }
@@ -423,7 +384,6 @@ async def ask_gemini(prompt):
 async def ask_openrouter(prompt):
 
     if not OPENROUTER_API_KEY:
-
         return "⚠️ AI service unavailable."
 
     headers = {
@@ -433,12 +393,7 @@ async def ask_openrouter(prompt):
 
     data = {
         "model": "deepseek/deepseek-chat",
-        "messages": [
-            {
-                "role": "user",
-                "content": prompt
-            }
-        ]
+        "messages": [{"role": "user", "content": prompt}]
     }
 
     try:
@@ -451,7 +406,6 @@ async def ask_openrouter(prompt):
         )
 
         if response.status_code != 200:
-
             return "⚠️ AI server busy."
 
         result = response.json()
@@ -475,7 +429,6 @@ async def generate_breakdown(question):
     symbol = "XAU/USD"
     pair_name = "Gold (XAUUSD)"
 
-    # DETECT PAIRS
     if "btc" in q or "bitcoin" in q:
         symbol = "BTC/USD"
         pair_name = "Bitcoin (BTCUSD)"
@@ -492,7 +445,6 @@ async def generate_breakdown(question):
         symbol = "NZD/USD"
         pair_name = "NZDUSD"
 
-    # GET LIVE PRICE
     live_price = get_live_price(symbol)
 
     if live_price is None:
@@ -500,19 +452,15 @@ async def generate_breakdown(question):
     else:
         live_price_text = str(round(live_price, 4))
 
-    # SESSION DETECTION
     hour = datetime.utcnow().hour
 
     if 7 <= hour < 13:
         session = "London Session 🇬🇧"
-
     elif 13 <= hour < 22:
         session = "New York Session 🇺🇸"
-
     else:
         session = "Asian Session 🇯🇵"
 
-    # AI PROMPT
     prompt = f"""
 You are Nexora AI.
 
@@ -573,10 +521,8 @@ def clean_text(text):
 async def handle_buttons(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     text = update.message.text.lower()
-
     user_id = update.message.from_user.id
 
-    # SIGNAL MODE
     if "signal" in text:
 
         user_modes[user_id] = "signal"
@@ -594,7 +540,6 @@ async def handle_buttons(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
         return
 
-    # BREAKDOWN MODE
     if "breakdown" in text:
 
         user_modes[user_id] = "breakdown"
@@ -617,12 +562,7 @@ async def handle_buttons(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     user_id = update.message.from_user.id
-
     message = update.message.text
-
-    # ========================================
-    # NO MODE
-    # ========================================
 
     if user_id not in user_modes:
 
@@ -636,7 +576,7 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
     mode = user_modes[user_id]
 
     # ========================================
-    # SIGNAL MODE
+    # SIGNAL MODE — sends image + caption
     # ========================================
 
     if mode == "signal":
@@ -647,9 +587,21 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
         await asyncio.sleep(1)
 
-        signal = build_signal_response(message)
+        image_file_id, direction, signal = build_signal_response(message)
 
-        await wait_message.edit_text(signal)
+        await wait_message.delete()
+
+        if image_file_id and image_file_id not in [
+            "YOUR_BUY_IMAGE_FILE_ID_HERE",
+            "YOUR_SELL_IMAGE_FILE_ID_HERE"
+        ]:
+            await update.message.reply_photo(
+                photo=image_file_id,
+                caption=signal
+            )
+
+        else:
+            await update.message.reply_text(signal)
 
         return
 
@@ -664,12 +616,61 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
 
         response = await generate_breakdown(message)
-
         response = clean_text(response)
 
         await wait_message.edit_text(response)
 
         return
+
+# ============================================
+# AUTO SIGNAL — POSTED TO BOTH CHANNELS
+# ============================================
+
+async def post_auto_signal(context: ContextTypes.DEFAULT_TYPE):
+
+    print(f"[AUTO SIGNAL] Firing at {datetime.utcnow().strftime('%H:%M UTC')}")
+
+    image_file_id, direction, signal = build_signal_response("xauusd")
+
+    channel_ids = [CHANNEL_1_ID, CHANNEL_2_ID]
+
+    for channel_id in channel_ids:
+        try:
+
+            if image_file_id and image_file_id not in [
+                "YOUR_BUY_IMAGE_FILE_ID_HERE",
+                "YOUR_SELL_IMAGE_FILE_ID_HERE"
+            ]:
+                await context.bot.send_photo(
+                    chat_id=channel_id,
+                    photo=image_file_id,
+                    caption=signal
+                )
+
+            else:
+                await context.bot.send_message(
+                    chat_id=channel_id,
+                    text=signal
+                )
+
+            print(f"[AUTO SIGNAL] Posted to {channel_id} ✅")
+
+        except Exception as e:
+
+            print(f"[AUTO SIGNAL] Failed for {channel_id}: {e}")
+
+# ============================================
+# TEMP: GET FILE IDs FOR YOUR IMAGES
+# ============================================
+# DELETE this function and its handler in main()
+# once you have both file IDs
+
+async def get_image_file_id(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if update.message.photo:
+        file_id = update.message.photo[-1].file_id
+        await update.message.reply_text(
+            f"✅ File ID (copy this):\n\n{file_id}"
+        )
 
 # ============================================
 # MAIN
@@ -682,9 +683,10 @@ def main():
     ).build()
 
     # START COMMAND
-    app.add_handler(
-        CommandHandler("start", start)
-    )
+    app.add_handler(CommandHandler("start", start))
+
+    # TEMP: image file ID getter — REMOVE AFTER USE
+    app.add_handler(MessageHandler(filters.PHOTO, get_image_file_id))
 
     # BUTTON HANDLER
     app.add_handler(
@@ -704,11 +706,36 @@ def main():
         )
     )
 
-    print("Nexora AI Running...")
+    # ========================================
+    # SCHEDULE AUTO SIGNALS
+    # ========================================
 
-    app.run_polling(
-        drop_pending_updates=True
+    job_queue = app.job_queue
+
+    def parse_time(t):
+        h, m = map(int, t.split(":"))
+        return datetime.now().replace(
+            hour=h, minute=m, second=0, microsecond=0
+        ).time()
+
+    job_queue.run_daily(
+        post_auto_signal,
+        time=parse_time(SIGNAL_TIME_1),
+        name="auto_signal_morning"
     )
+
+    job_queue.run_daily(
+        post_auto_signal,
+        time=parse_time(SIGNAL_TIME_2),
+        name="auto_signal_afternoon"
+    )
+
+    print("Nexora AI Running...")
+    print(f"Auto signals scheduled: {SIGNAL_TIME_1} UTC and {SIGNAL_TIME_2} UTC")
+    print(f"Channel 1: {CHANNEL_1_ID}")
+    print(f"Channel 2: {CHANNEL_2_ID}")
+
+    app.run_polling(drop_pending_updates=True)
 
 # ============================================
 # RUN BOT

@@ -37,23 +37,26 @@ CHANNEL_2_ID = os.getenv("CHANNEL_2_ID", "-1002468228698")
 # ============================================
 # BUY / SELL IMAGE FILE IDs  ← FILL THESE IN
 # ============================================
-# Step 1: Run the bot
-# Step 2: Send your BUY image to the bot in private chat
-# Step 3: It replies with the file ID — paste it below
-# Step 4: Do the same for SELL image
-# Step 5: Remove the get_image_file_id handler from main()
 
 BUY_IMAGE_FILE_ID = "YOUR_BUY_IMAGE_FILE_ID_HERE"
 SELL_IMAGE_FILE_ID = "YOUR_SELL_IMAGE_FILE_ID_HERE"
 
 # ============================================
-# SIGNAL TIMES (UTC)
+# SIGNAL TIMES (UTC) — 5 SIGNALS DAILY
 # ============================================
-# 08:00 UTC = 09:00 Lagos time
-# 16:00 UTC = 17:00 Lagos time
+# 07:00 UTC = 08:00 Lagos
+# 09:00 UTC = 10:00 Lagos
+# 12:00 UTC = 13:00 Lagos
+# 15:00 UTC = 16:00 Lagos
+# 18:00 UTC = 19:00 Lagos
 
-SIGNAL_TIME_1 = "08:00"
-SIGNAL_TIME_2 = "16:00"
+SIGNAL_TIMES = [
+    "07:00",
+    "09:00",
+    "12:00",
+    "15:00",
+    "18:00",
+]
 
 # ============================================
 # AI CONFIG
@@ -575,10 +578,6 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     mode = user_modes[user_id]
 
-    # ========================================
-    # SIGNAL MODE — sends image + caption
-    # ========================================
-
     if mode == "signal":
 
         wait_message = await update.message.reply_text(
@@ -605,10 +604,6 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
         return
 
-    # ========================================
-    # BREAKDOWN MODE
-    # ========================================
-
     if mode == "breakdown":
 
         wait_message = await update.message.reply_text(
@@ -628,7 +623,8 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def post_auto_signal(context: ContextTypes.DEFAULT_TYPE):
 
-    print(f"[AUTO SIGNAL] Firing at {datetime.utcnow().strftime('%H:%M UTC')}")
+    now = datetime.utcnow().strftime('%H:%M UTC')
+    print(f"[AUTO SIGNAL] Firing at {now}")
 
     image_file_id, direction, signal = build_signal_response("xauusd")
 
@@ -653,11 +649,11 @@ async def post_auto_signal(context: ContextTypes.DEFAULT_TYPE):
                     text=signal
                 )
 
-            print(f"[AUTO SIGNAL] Posted to {channel_id} ✅")
+            print(f"[AUTO SIGNAL] ✅ Posted to {channel_id} at {now}")
 
         except Exception as e:
 
-            print(f"[AUTO SIGNAL] Failed for {channel_id}: {e}")
+            print(f"[AUTO SIGNAL] ❌ Failed for {channel_id}: {e}")
 
 # ============================================
 # TEMP: GET FILE IDs FOR YOUR IMAGES
@@ -707,7 +703,7 @@ def main():
     )
 
     # ========================================
-    # SCHEDULE AUTO SIGNALS
+    # SCHEDULE 5 AUTO SIGNALS DAILY
     # ========================================
 
     job_queue = app.job_queue
@@ -718,20 +714,17 @@ def main():
             hour=h, minute=m, second=0, microsecond=0
         ).time()
 
-    job_queue.run_daily(
-        post_auto_signal,
-        time=parse_time(SIGNAL_TIME_1),
-        name="auto_signal_morning"
-    )
-
-    job_queue.run_daily(
-        post_auto_signal,
-        time=parse_time(SIGNAL_TIME_2),
-        name="auto_signal_afternoon"
-    )
+    for i, signal_time in enumerate(SIGNAL_TIMES):
+        job_queue.run_daily(
+            post_auto_signal,
+            time=parse_time(signal_time),
+            name=f"auto_signal_{i+1}"
+        )
 
     print("Nexora AI Running...")
-    print(f"Auto signals scheduled: {SIGNAL_TIME_1} UTC and {SIGNAL_TIME_2} UTC")
+    print(f"Auto signals scheduled daily at (UTC):")
+    for t in SIGNAL_TIMES:
+        print(f"  ⏰ {t} UTC")
     print(f"Channel 1: {CHANNEL_1_ID}")
     print(f"Channel 2: {CHANNEL_2_ID}")
 

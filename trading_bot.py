@@ -28,17 +28,17 @@ TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
 OPENROUTER_API_KEY = os.getenv("OPENROUTER_API_KEY")
 TWELVEDATA_API_KEY = os.getenv("TWELVEDATA_API_KEY")
+NEWS_API_KEY = os.getenv("NEWS_API_KEY")
+
+# ============================================
+# METAAPI CONFIG
+# ============================================
+
 METAAPI_TOKEN = os.getenv("METAAPI_TOKEN")
 METAAPI_ACCOUNT_ID = os.getenv("METAAPI_ACCOUNT_ID")
 
 # ============================================
-# NEWS API KEY
-# ============================================
-
-NEWSAPI_KEY = os.getenv("NEWSAPI_KEY", "fe030adf325d4c95b2f72b09659cd203")
-
-# ============================================
-# CHANNEL IDs
+# YOUR TWO CHANNEL IDs
 # ============================================
 
 CHANNEL_1_ID = os.getenv("CHANNEL_1_ID", "-1001722756645")
@@ -60,24 +60,20 @@ TP_HIT_IMAGE_FILE_ID = "AgACAgQAAxkBAAIBI2owI-2IToLB1YLPMxCa132jhJMKAAJCD2sbbT2B
 SL_HIT_IMAGE_FILE_ID = "AgACAgQAAxkBAAIBIWowI9Lxu93CIKFD5YSHFbJ8_MB-AAJBD2sbbT2BUT1NzWx8We6EAQADAgADeQADPAQ"
 
 # ============================================
-# DAILY SCHEDULE
+# DAILY SCHEDULE (UTC)
 # ============================================
-# Format: (UTC time, type, keyword)
-# type: "news" or "signal"
-# keyword for news: "morning" / "midday" / "afternoon"
-# keyword for signal: pair name
+# Lagos = UTC + 1
 
 DAILY_SCHEDULE = [
-    ("06:00", "news",   "morning"),     # 07:00 Lagos — Morning News
-    ("07:00", "signal", "xauusd"),      # 08:00 Lagos — Gold
-    ("08:00", "signal", "btcusd"),      # 09:00 Lagos — Bitcoin
-    ("10:00", "news",   "midday"),      # 11:00 Lagos — Midday News
-    ("11:00", "signal", "xagusd"),      # 12:00 Lagos — Silver
-    ("12:00", "signal", "usoil"),       # 13:00 Lagos — US Oil
-    ("14:00", "news",   "afternoon"),   # 15:00 Lagos — Afternoon News
-    ("15:00", "signal", "gbpusd"),      # 16:00 Lagos — GBPUSD
-    ("16:00", "signal", "eurusd"),      # 17:00 Lagos — EURUSD
-    ("17:00", "signal", "gbpjpy"),      # 18:00 Lagos — GBPJPY
+    ("06:00", "news",   "morning"),   # 7:00 AM Lagos
+    ("07:00", "signal", "xauusd"),    # 8:00 AM Lagos
+    ("09:00", "signal", "btcusd"),    # 10:00 AM Lagos
+    ("11:00", "news",   "midday"),    # 12:00 PM Lagos
+    ("13:00", "signal", "xagusd"),    # 2:00 PM Lagos
+    ("15:00", "signal", "usoil"),     # 4:00 PM Lagos
+    ("17:00", "news",   "afternoon"), # 6:00 PM Lagos
+    ("19:00", "signal", "gbpusd"),    # 8:00 PM Lagos
+    ("21:00", "signal", "gbpjpy"),    # 10:00 PM Lagos
 ]
 
 # ============================================
@@ -98,9 +94,15 @@ OPENROUTER_URL = "https://openrouter.ai/api/v1/chat/completions"
 # ============================================
 
 main_keyboard = ReplyKeyboardMarkup(
-    [["📊 Signal", "📚 Breakdown"]],
+    [
+        ["📊 Signal", "📚 Breakdown"],
+    ],
     resize_keyboard=True
 )
+
+# ============================================
+# INLINE BUTTON FOR CHANNEL POSTS
+# ============================================
 
 def get_channel_button():
     return InlineKeyboardMarkup([
@@ -117,6 +119,55 @@ def get_channel_button():
 # ============================================
 
 user_modes = {}
+
+# ============================================
+# PAIR CONFIG
+# ============================================
+
+PAIR_CONFIG = {
+    "xauusd": {
+        "symbol": "XAU/USD",
+        "pair_name": "XAUUSD",
+        "pip_size": 10,
+        "mt5_symbol": "XAUUSDm",
+        "display": "Gold (XAUUSD) 🥇",
+    },
+    "btcusd": {
+        "symbol": "BTC/USD",
+        "pair_name": "BTCUSD",
+        "pip_size": 300,
+        "mt5_symbol": "BTCUSDm",
+        "display": "Bitcoin (BTCUSD) ₿",
+    },
+    "xagusd": {
+        "symbol": "XAG/USD",
+        "pair_name": "XAGUSD",
+        "pip_size": 0.30,
+        "mt5_symbol": "XAGUSDm",
+        "display": "Silver (XAGUSD) 🥈",
+    },
+    "usoil": {
+        "symbol": "WTI/USD",
+        "pair_name": "USOIL",
+        "pip_size": 0.50,
+        "mt5_symbol": "USOILm",
+        "display": "US Oil (WTI) 🛢️",
+    },
+    "gbpusd": {
+        "symbol": "GBP/USD",
+        "pair_name": "GBPUSD",
+        "pip_size": 0.0025,
+        "mt5_symbol": "GBPUSDm",
+        "display": "GBP/USD 🇬🇧",
+    },
+    "gbpjpy": {
+        "symbol": "GBP/JPY",
+        "pair_name": "GBPJPY",
+        "pip_size": 0.30,
+        "mt5_symbol": "GBPJPYm",
+        "display": "GBP/JPY 🇯🇵",
+    },
+}
 
 # ============================================
 # START COMMAND
@@ -187,9 +238,11 @@ def get_live_price(symbol="XAU/USD"):
 # ============================================
 
 def generate_market_bias():
+
     direction = random.choice(["BUY", "SELL"])
     strength = random.choice(["STRONG", "WEAK"])
     confidence = random.randint(72, 94)
+
     return direction, strength, confidence
 
 # ============================================
@@ -217,62 +270,6 @@ SELL_REASONS = [
     "Supply zone reaction confirmed.",
     "Multi-timeframe bearish alignment confirmed.",
 ]
-
-# ============================================
-# PAIR CONFIG
-# ============================================
-
-PAIR_CONFIG = {
-    "xauusd": {
-        "symbol": "XAU/USD",
-        "pair_name": "XAUUSD",
-        "pip_size": 10,
-        "mt5_symbol": "XAUUSDm",
-        "display": "Gold (XAUUSD) 🥇",
-    },
-    "btcusd": {
-        "symbol": "BTC/USD",
-        "pair_name": "BTCUSD",
-        "pip_size": 300,
-        "mt5_symbol": "BTCUSDm",
-        "display": "Bitcoin (BTCUSD) ₿",
-    },
-    "xagusd": {
-        "symbol": "XAG/USD",
-        "pair_name": "XAGUSD",
-        "pip_size": 0.30,
-        "mt5_symbol": "XAGUSDm",
-        "display": "Silver (XAGUSD) 🥈",
-    },
-    "usoil": {
-        "symbol": "WTI/USD",
-        "pair_name": "USOIL",
-        "pip_size": 0.50,
-        "mt5_symbol": "USOILm",
-        "display": "US Oil (WTI) 🛢️",
-    },
-    "gbpusd": {
-        "symbol": "GBP/USD",
-        "pair_name": "GBPUSD",
-        "pip_size": 0.0025,
-        "mt5_symbol": "GBPUSDm",
-        "display": "GBP/USD 🇬🇧",
-    },
-    "eurusd": {
-        "symbol": "EUR/USD",
-        "pair_name": "EURUSD",
-        "pip_size": 0.0020,
-        "mt5_symbol": "EURUSDm",
-        "display": "EUR/USD 🇪🇺",
-    },
-    "gbpjpy": {
-        "symbol": "GBP/JPY",
-        "pair_name": "GBPJPY",
-        "pip_size": 0.30,
-        "mt5_symbol": "GBPJPYm",
-        "display": "GBP/JPY 🇯🇵",
-    },
-}
 
 # ============================================
 # SIGNAL BUILDER
@@ -308,6 +305,7 @@ def build_signal_response(question):
         reason = random.choice(BUY_REASONS)
         signal_emoji = "🟢"
         image_file_id = BUY_IMAGE_FILE_ID
+
     else:
         entry_price = round(live_price, 2)
         stop_loss = round(live_price + (pip_size * 3), 2)
@@ -364,191 +362,140 @@ Trade safe 💼🔥"""
 # NEWS FETCHER
 # ============================================
 
-def fetch_market_news(session_type="morning"):
+def fetch_market_news():
 
-    queries = {
-        "morning": "forex gold stock market financial",
-        "midday":  "Elon Musk economy oil Bitcoin stocks",
-        "afternoon": "US market Federal Reserve trading Wall Street",
-    }
-
-    query = queries.get(session_type, "financial markets")
+    if not NEWS_API_KEY:
+        return None
 
     try:
 
         url = (
-            f"https://newsapi.org/v2/everything"
-            f"?q={query}"
+            f"https://newsapi.org/v2/top-headlines"
+            f"?category=business"
             f"&language=en"
-            f"&sortBy=publishedAt"
             f"&pageSize=10"
-            f"&apiKey={NEWSAPI_KEY}"
+            f"&apiKey={NEWS_API_KEY}"
         )
 
         response = requests.get(url, timeout=10)
         data = response.json()
 
         if data.get("status") != "ok":
-            return None, None, None
+            return None
 
-        articles = data.get("articles", [])
+        articles = [
+            a for a in data.get("articles", [])
+            if a.get("urlToImage") and a.get("title") and a.get("description")
+        ]
 
-        # Find first article with an image
-        for article in articles:
-            title = article.get("title", "")
-            description = article.get("description", "")
-            image_url = article.get("urlToImage", "")
-            source = article.get("source", {}).get("name", "")
-            article_url = article.get("url", "")
+        if not articles:
+            return None
 
-            if image_url and title and description:
-                return title, description, image_url, source, article_url
-
-        return None, None, None, None, None
+        return random.choice(articles)
 
     except Exception as e:
-        print(f"[NEWS] Error: {e}")
-        return None, None, None, None, None
+        print(f"[NEWS] Fetch error: {e}")
+        return None
 
 # ============================================
-# AI NEWS SUMMARY
+# NEWS SUMMARY GENERATOR
 # ============================================
 
-async def generate_news_summary(title, description, session_type):
+async def generate_news_summary(article, session_type):
 
-    session_labels = {
-        "morning": "Morning Market Briefing 🌅",
-        "midday": "Midday Market Update ☀️",
-        "afternoon": "Afternoon Trading Briefing 🌆",
-    }
+    title = article.get("title", "")
+    description = article.get("description", "")
+    source = article.get("source", {}).get("name", "")
 
-    label = session_labels.get(session_type, "Market Update")
+    if session_type == "morning":
+        session_label = "Morning Market Briefing 🌅"
+        prompt_context = "morning trading session opening"
+
+    elif session_type == "midday":
+        session_label = "Midday Market Update ☀️"
+        prompt_context = "midday trading activity"
+
+    else:
+        session_label = "Afternoon Market Briefing 🌆"
+        prompt_context = "afternoon and closing session"
 
     prompt = f"""
 You are Nexora AI, a professional financial news analyst.
 
-Write a SHORT engaging market update for a Telegram trading channel.
+Write a SHORT, ENGAGING market news post for a Telegram trading channel.
 
-NEWS HEADLINE:
-{title}
+SESSION: {session_label}
+CONTEXT: {prompt_context}
 
-NEWS DETAILS:
-{description}
-
-SESSION:
-{label}
+NEWS HEADLINE: {title}
+NEWS DETAILS: {description}
+SOURCE: {source}
 
 RULES:
-- Maximum 5 sentences
-- Engaging and professional tone
-- Mention how this affects traders
-- No markdown, no stars, no hashtags
-- End with one trading insight or what to watch
-- Keep it punchy and interesting
+- Maximum 150 words
+- Start with a punchy opening line
+- Include what this means for traders
+- Mention impact on gold, forex, or crypto if relevant
+- End with a motivational trading line
+- No markdown symbols like ** or ##
+- No hashtags
+- Professional but exciting tone
+- Use emojis naturally (not excessively)
+- Make traders feel informed and ready to trade
 """
 
-    try:
-
-        headers = {"Content-Type": "application/json"}
-
-        data = {
-            "contents": [
-                {"parts": [{"text": prompt}]}
-            ]
-        }
-
-        response = requests.post(
-            GEMINI_URL,
-            headers=headers,
-            json=data,
-            timeout=30
-        )
-
-        if response.status_code == 200:
-            result = response.json()
-            return result["candidates"][0]["content"]["parts"][0]["text"]
-
-        return description
-
-    except Exception as e:
-        print(f"[NEWS SUMMARY] Error: {e}")
-        return description
+    return await ask_gemini(prompt)
 
 # ============================================
 # POST NEWS TO CHANNELS
 # ============================================
 
-async def post_news(bot, session_type):
+async def post_news(context: ContextTypes.DEFAULT_TYPE):
 
-    session_labels = {
-        "morning":   "🌅 MORNING MARKET BRIEFING",
-        "midday":    "☀️ MIDDAY MARKET UPDATE",
-        "afternoon": "🌆 AFTERNOON TRADING BRIEFING",
-    }
+    session_type = context.job.data
+    now = datetime.utcnow().strftime('%H:%M UTC')
 
-    label = session_labels.get(session_type, "📰 MARKET UPDATE")
+    print(f"[NEWS] Posting {session_type} news at {now}")
 
-    print(f"[NEWS] Fetching {session_type} news...")
+    article = fetch_market_news()
 
-    result = fetch_market_news(session_type)
-
-    title, description, image_url, source, article_url = result
-
-    if not title:
+    if article is None:
         print("[NEWS] No article found. Skipping.")
         return
 
-    summary = await generate_news_summary(title, description, session_type)
-    summary = summary.replace("**", "").replace("###", "").replace("##", "").strip()
-
-    caption = (
-        f"{label}\n\n"
-        f"📌 {title}\n\n"
-        f"{summary}\n\n"
-        f"Source: {source}"
-    )
-
-    news_button = InlineKeyboardMarkup([
-        [
-            InlineKeyboardButton(
-                "📖 Read Full Article",
-                url=article_url
-            )
-        ],
-        [
-            InlineKeyboardButton(
-                "🤖 Get Trading Signal",
-                url=f"https://t.me/{BOT_USERNAME}"
-            )
-        ]
-    ])
+    image_url = article.get("urlToImage")
+    summary = await generate_news_summary(article, session_type)
+    summary = clean_text(summary)
 
     channel_ids = [CHANNEL_1_ID, CHANNEL_2_ID]
 
     for channel_id in channel_ids:
         try:
 
-            await bot.send_photo(
+            # Send news without button
+            if image_url:
+                await context.bot.send_photo(
+                    chat_id=channel_id,
+                    photo=image_url,
+                    caption=summary
+                )
+            else:
+                await context.bot.send_message(
+                    chat_id=channel_id,
+                    text=summary
+                )
+
+            # Send standalone button — invisible text, clean look
+            await context.bot.send_message(
                 chat_id=channel_id,
-                photo=image_url,
-                caption=caption,
-                reply_markup=news_button
+                text="\u200b",
+                reply_markup=get_channel_button()
             )
 
             print(f"[NEWS] ✅ {session_type} news posted to {channel_id}")
 
         except Exception as e:
-
-            # If image fails, send text only
-            try:
-                await bot.send_message(
-                    chat_id=channel_id,
-                    text=caption,
-                    reply_markup=news_button
-                )
-                print(f"[NEWS] ✅ {session_type} news (text only) posted to {channel_id}")
-            except Exception as e2:
-                print(f"[NEWS] ❌ Failed for {channel_id}: {e2}")
+            print(f"[NEWS] ❌ Failed for {channel_id}: {e}")
 
 # ============================================
 # METAAPI — PLACE TRADE ON MT5
@@ -602,6 +549,7 @@ async def place_mt5_trade(signal_data):
             order_id = result.get("orderId", "unknown")
             print(f"[MT5] ✅ Trade placed — Order ID: {order_id}")
             return order_id
+
         else:
             print(f"[MT5] ❌ Trade failed: {response.status_code} — {response.text}")
             return None
@@ -625,7 +573,7 @@ async def monitor_signal(bot, channel_id, message_id, signal_data):
 
     print(f"[MONITOR] Watching {pair_name} | TP: {take_profit} | SL: {stop_loss}")
 
-    max_checks = 1440  # 24 hours max
+    max_checks = 1440
 
     for _ in range(max_checks):
 
@@ -799,23 +747,33 @@ Generate a PROFESSIONAL market breakdown.
 IMPORTANT:
 Use the REAL LIVE PRICE provided below.
 Do NOT invent fake prices.
+Do NOT use old market prices.
 
-PAIR: {pair_name}
-LIVE PRICE: {live_price_text}
-SESSION: {session}
+PAIR:
+{pair_name}
+
+LIVE PRICE:
+{live_price_text}
+
+SESSION:
+{session}
 
 RULES:
 - Clean formatting
 - No markdown symbols
 - No hashtags
 - No stars
+- No fake data
 - Beginner friendly
 - Professional tone
-- Include technical and fundamental analysis
-- Include sentiment and trade idea
+- Include BOTH technical and fundamental analysis
+- Include sentiment
+- Include trade idea
+- Use current live price in analysis
 - Keep formatting modern and clean
 
-QUESTION: {question}
+QUESTION:
+{question}
 """
 
     return await ask_gemini(prompt)
@@ -825,11 +783,13 @@ QUESTION: {question}
 # ============================================
 
 def clean_text(text):
+
     text = text.replace("###", "")
     text = text.replace("##", "")
     text = text.replace("**", "")
     text = text.replace("---", "")
     text = text.replace("__", "")
+
     return text.strip()
 
 # ============================================
@@ -854,7 +814,6 @@ async def handle_buttons(update: Update, context: ContextTypes.DEFAULT_TYPE):
             "• XAGUSD\n"
             "• USOIL\n"
             "• GBPUSD\n"
-            "• EURUSD\n"
             "• GBPJPY"
         )
 
@@ -870,7 +829,7 @@ async def handle_buttons(update: Update, context: ContextTypes.DEFAULT_TYPE):
             "Examples:\n"
             "• Analyze gold market today\n"
             "• BTCUSD outlook\n"
-            "• GBPUSD market analysis"
+            "• GBPJPY market analysis"
         )
 
         return
@@ -933,61 +892,56 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
 # ============================================
-# SCHEDULED JOB DISPATCHER
+# AUTO SIGNAL — POSTED TO BOTH CHANNELS
 # ============================================
 
-async def run_scheduled_job(context: ContextTypes.DEFAULT_TYPE):
+async def post_auto_signal(context: ContextTypes.DEFAULT_TYPE):
 
-    job_type = context.job.data["type"]
-    keyword = context.job.data["keyword"]
-
+    pair_keyword = context.job.data
     now = datetime.utcnow().strftime('%H:%M UTC')
 
-    # NEWS POST
-    if job_type == "news":
+    print(f"[AUTO SIGNAL] {pair_keyword.upper()} firing at {now}")
 
-        print(f"[SCHEDULE] News ({keyword}) at {now}")
-        await post_news(context.bot, keyword)
+    image_file_id, direction, signal, signal_data = build_signal_response(pair_keyword)
 
-    # SIGNAL POST
-    elif job_type == "signal":
+    if signal_data is None:
+        print(f"[AUTO SIGNAL] ❌ Could not fetch price for {pair_keyword}. Skipping.")
+        return
 
-        print(f"[SCHEDULE] Signal ({keyword.upper()}) at {now}")
+    channel_ids = [CHANNEL_1_ID, CHANNEL_2_ID]
 
-        image_file_id, direction, signal, signal_data = build_signal_response(keyword)
+    for channel_id in channel_ids:
+        try:
 
-        if signal_data is None:
-            print(f"[SCHEDULE] ❌ No price for {keyword}. Skipping.")
-            return
+            # Send signal without button
+            sent = await context.bot.send_photo(
+                chat_id=channel_id,
+                photo=image_file_id,
+                caption=signal
+            )
 
-        button = get_channel_button()
-        channel_ids = [CHANNEL_1_ID, CHANNEL_2_ID]
+            # Send standalone button — invisible text, clean look
+            await context.bot.send_message(
+                chat_id=channel_id,
+                text="\u200b",
+                reply_markup=get_channel_button()
+            )
 
-        for channel_id in channel_ids:
-            try:
+            print(f"[AUTO SIGNAL] ✅ {pair_keyword.upper()} posted to {channel_id}")
 
-                sent = await context.bot.send_photo(
-                    chat_id=channel_id,
-                    photo=image_file_id,
-                    caption=signal,
-                    reply_markup=button
+            asyncio.create_task(place_mt5_trade(signal_data))
+
+            asyncio.create_task(
+                monitor_signal(
+                    context.bot,
+                    channel_id,
+                    sent.message_id,
+                    signal_data
                 )
+            )
 
-                print(f"[SCHEDULE] ✅ {keyword.upper()} posted to {channel_id}")
-
-                asyncio.create_task(place_mt5_trade(signal_data))
-
-                asyncio.create_task(
-                    monitor_signal(
-                        context.bot,
-                        channel_id,
-                        sent.message_id,
-                        signal_data
-                    )
-                )
-
-            except Exception as e:
-                print(f"[SCHEDULE] ❌ Failed for {channel_id}: {e}")
+        except Exception as e:
+            print(f"[AUTO SIGNAL] ❌ Failed for {channel_id}: {e}")
 
 # ============================================
 # MAIN
@@ -1018,7 +972,7 @@ def main():
     )
 
     # ========================================
-    # SCHEDULE ALL 10 DAILY POSTS
+    # SCHEDULE ALL 9 DAILY POSTS
     # ========================================
 
     job_queue = app.job_queue
@@ -1029,20 +983,33 @@ def main():
             hour=h, minute=m, second=0, microsecond=0
         ).time()
 
-    for i, (utc_time, job_type, keyword) in enumerate(DAILY_SCHEDULE):
-        job_queue.run_daily(
-            run_scheduled_job,
-            time=parse_time(utc_time),
-            name=f"job_{i+1}_{keyword}",
-            data={"type": job_type, "keyword": keyword}
-        )
+    for i, (utc_time, post_type, data) in enumerate(DAILY_SCHEDULE):
+
+        if post_type == "news":
+
+            job_queue.run_daily(
+                post_news,
+                time=parse_time(utc_time),
+                name=f"news_{i}_{data}",
+                data=data
+            )
+
+        elif post_type == "signal":
+
+            job_queue.run_daily(
+                post_auto_signal,
+                time=parse_time(utc_time),
+                name=f"signal_{i}_{data}",
+                data=data
+            )
 
     print("Nexora AI Running...")
     print("Daily schedule (UTC):")
-    for utc_time, job_type, keyword in DAILY_SCHEDULE:
-        icon = "📰" if job_type == "news" else "📊"
-        print(f"  {icon} {utc_time} UTC — {keyword.upper()}")
-    print(f"Channels: {CHANNEL_1_ID} | {CHANNEL_2_ID}")
+    for utc_time, post_type, data in DAILY_SCHEDULE:
+        emoji = "📰" if post_type == "news" else "📊"
+        print(f"  {emoji} {utc_time} UTC — {data.upper()}")
+    print(f"Channel 1: {CHANNEL_1_ID}")
+    print(f"Channel 2: {CHANNEL_2_ID}")
     print(f"Bot: @{BOT_USERNAME}")
 
     app.run_polling(drop_pending_updates=True)

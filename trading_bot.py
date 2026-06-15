@@ -2,8 +2,10 @@ import os
 import asyncio
 import random
 import requests
+import json
 
 from datetime import datetime
+from pathlib import Path
 
 from telegram import (
     Update,
@@ -45,6 +47,18 @@ CHANNEL_1_ID = os.getenv("CHANNEL_1_ID", "-1001722756645")
 CHANNEL_2_ID = os.getenv("CHANNEL_2_ID", "-1002468228698")
 
 # ============================================
+# VERIFICATION GROUP ID
+# ============================================
+
+VERIFY_GROUP_ID = "-1002400215654"
+
+# ============================================
+# EXNESS AFFILIATE LINK
+# ============================================
+
+EXNESS_LINK = "https://www.exness.com/boarding/sign-up/a/vlnafmua"
+
+# ============================================
 # BOT USERNAME
 # ============================================
 
@@ -62,7 +76,6 @@ SL_HIT_IMAGE_FILE_ID = "AgACAgQAAxkBAAIBIWowI9Lxu93CIKFD5YSHFbJ8_MB-AAJBD2sbbT2B
 # ============================================
 # DAILY SCHEDULE (UTC)
 # ============================================
-# Lagos = UTC + 1
 
 DAILY_SCHEDULE = [
     ("06:00", "news",   "morning"),   # 7:00 AM Lagos
@@ -90,13 +103,11 @@ GEMINI_URL = (
 OPENROUTER_URL = "https://openrouter.ai/api/v1/chat/completions"
 
 # ============================================
-# BUTTONS
+# KEYBOARDS
 # ============================================
 
 main_keyboard = ReplyKeyboardMarkup(
-    [
-        ["📊 Signal", "📚 Breakdown"],
-    ],
+    [["📊 Signal", "📚 Breakdown"]],
     resize_keyboard=True
 )
 
@@ -106,19 +117,33 @@ main_keyboard = ReplyKeyboardMarkup(
 
 def get_channel_button():
     return InlineKeyboardMarkup([
-        [
-            InlineKeyboardButton(
-                "🤖 Get Your Own Signal",
-                url=f"https://t.me/{BOT_USERNAME}"
-            )
-        ]
+        [InlineKeyboardButton(
+            "🤖 Get Your Own Signal",
+            url=f"https://t.me/{BOT_USERNAME}"
+        )]
     ])
 
 # ============================================
-# USER MODES
+# USER MODES & VERIFIED USERS
 # ============================================
 
 user_modes = {}
+
+VERIFIED_FILE = "verified_users.json"
+
+def load_verified():
+    if Path(VERIFIED_FILE).exists():
+        with open(VERIFIED_FILE, "r") as f:
+            return json.load(f)
+    return {}
+
+def save_verified(data):
+    with open(VERIFIED_FILE, "w") as f:
+        json.dump(data, f)
+
+verified_users = load_verified()
+
+pending_verifications = {}
 
 # ============================================
 # PAIR CONFIG
@@ -175,20 +200,53 @@ PAIR_CONFIG = {
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
-    text = (
-        "👋 Welcome to Nexora AI\n\n"
-        "I can help you with:\n\n"
-        "📊 Trading Signals\n"
-        "📚 Market Breakdowns\n"
-        "📈 Technical Analysis\n"
-        "🧠 AI Trading Assistance\n\n"
-        "Choose an option below."
-    )
+    user_id = str(update.message.from_user.id)
+    username = update.message.from_user.username or "Trader"
+
+    if user_id in verified_users:
+        await update.message.reply_text(
+            f"👋 Welcome back, {username}!\n\n"
+            f"✅ You're a verified Nexora AI trader.\n\n"
+            f"Choose an option below to get started.",
+            reply_markup=main_keyboard
+        )
+        return
 
     await update.message.reply_text(
-        text,
-        reply_markup=main_keyboard
+        f"👋 Hello {username}, welcome to Nexora AI! 🤖\n\n"
+        f"I am your personal AI trading assistant — I deliver "
+        f"FREE unlimited professional trading signals, live market "
+        f"analysis and AI-powered breakdowns straight to you.\n\n"
+        f"━━━━━━━━━━━━━━━━━━━━\n"
+        f"🔓 HOW TO GET FREE ACCESS\n"
+        f"━━━━━━━━━━━━━━━━━━━━\n\n"
+        f"To unlock full access, there is just ONE requirement:\n\n"
+        f"📌 You must have a trading account with our official "
+        f"broker partner — Exness — registered through our unique link.\n\n"
+        f"That's it. No payment. No subscription. Completely FREE.\n\n"
+        f"━━━━━━━━━━━━━━━━━━━━\n"
+        f"👇 CHOOSE YOUR SITUATION BELOW:\n"
+        f"━━━━━━━━━━━━━━━━━━━━\n\n"
+        f"✅ SITUATION 1 — I have already registered on Exness "
+        f"using the Nexora AI link in the past:\n"
+        f"👉 Simply type the email address you used to register "
+        f"on Exness below and we will verify you instantly.\n\n"
+        f"📝 SITUATION 2 — I have NOT registered on Exness yet "
+        f"or I registered without using our link:\n"
+        f"👉 Click the button below to create your FREE Exness "
+        f"account using our official link. Once done, come back "
+        f"here and type the email you registered with.\n\n"
+        f"━━━━━━━━━━━━━━━━━━━━\n"
+        f"📧 Already registered? Type your Exness email now 👇",
+        reply_markup=InlineKeyboardMarkup([
+            [InlineKeyboardButton(
+                "📝 I'm New — Register on Exness FREE 👆",
+                url=EXNESS_LINK
+            )]
+        ])
     )
+
+    user_modes[user_id] = "awaiting_email"
 
 # ============================================
 # SESSION DETECTION
@@ -214,13 +272,11 @@ def get_market_session():
 def get_live_price(symbol="XAU/USD"):
 
     try:
-
         url = (
             f"https://api.twelvedata.com/price"
             f"?symbol={symbol}"
             f"&apikey={TWELVEDATA_API_KEY}"
         )
-
         response = requests.get(url, timeout=10)
         data = response.json()
 
@@ -238,11 +294,9 @@ def get_live_price(symbol="XAU/USD"):
 # ============================================
 
 def generate_market_bias():
-
     direction = random.choice(["BUY", "SELL"])
     strength = random.choice(["STRONG", "WEAK"])
     confidence = random.randint(72, 94)
-
     return direction, strength, confidence
 
 # ============================================
@@ -278,7 +332,6 @@ SELL_REASONS = [
 def build_signal_response(question):
 
     q = question.lower()
-
     config = PAIR_CONFIG["xauusd"]
 
     for key in PAIR_CONFIG:
@@ -305,7 +358,6 @@ def build_signal_response(question):
         reason = random.choice(BUY_REASONS)
         signal_emoji = "🟢"
         image_file_id = BUY_IMAGE_FILE_ID
-
     else:
         entry_price = round(live_price, 2)
         stop_loss = round(live_price + (pip_size * 3), 2)
@@ -368,7 +420,6 @@ def fetch_market_news():
         return None
 
     try:
-
         url = (
             f"https://newsapi.org/v2/top-headlines"
             f"?category=business"
@@ -376,7 +427,6 @@ def fetch_market_news():
             f"&pageSize=10"
             f"&apiKey={NEWS_API_KEY}"
         )
-
         response = requests.get(url, timeout=10)
         data = response.json()
 
@@ -410,11 +460,9 @@ async def generate_news_summary(article, session_type):
     if session_type == "morning":
         session_label = "Morning Market Briefing 🌅"
         prompt_context = "morning trading session opening"
-
     elif session_type == "midday":
         session_label = "Midday Market Update ☀️"
         prompt_context = "midday trading activity"
-
     else:
         session_label = "Afternoon Market Briefing 🌆"
         prompt_context = "afternoon and closing session"
@@ -467,32 +515,25 @@ async def post_news(context: ContextTypes.DEFAULT_TYPE):
     summary = await generate_news_summary(article, session_type)
     summary = clean_text(summary)
 
+    button = get_channel_button()
     channel_ids = [CHANNEL_1_ID, CHANNEL_2_ID]
 
     for channel_id in channel_ids:
         try:
-
-            # Send news without button
             if image_url:
                 await context.bot.send_photo(
                     chat_id=channel_id,
                     photo=image_url,
-                    caption=summary
+                    caption=summary,
+                    reply_markup=button
                 )
             else:
                 await context.bot.send_message(
                     chat_id=channel_id,
-                    text=summary
+                    text=summary,
+                    reply_markup=button
                 )
-
-            # Send standalone button — invisible text, clean look
-            await context.bot.send_message(
-                chat_id=channel_id,
-                text="\u200b",
-                reply_markup=get_channel_button()
-            )
-
-            print(f"[NEWS] ✅ {session_type} news posted to {channel_id}")
+            print(f"[NEWS] ✅ {session_type} posted to {channel_id}")
 
         except Exception as e:
             print(f"[NEWS] ❌ Failed for {channel_id}: {e}")
@@ -508,7 +549,6 @@ async def place_mt5_trade(signal_data):
         return None
 
     try:
-
         headers = {
             "auth-token": METAAPI_TOKEN,
             "Content-Type": "application/json"
@@ -516,7 +556,6 @@ async def place_mt5_trade(signal_data):
 
         direction = signal_data["direction"]
         mt5_symbol = signal_data["mt5_symbol"]
-
         order_type = (
             "ORDER_TYPE_BUY" if direction == "BUY"
             else "ORDER_TYPE_SELL"
@@ -533,15 +572,11 @@ async def place_mt5_trade(signal_data):
 
         url = (
             f"https://mt-client-api-v1.london.agiliumtrade.ai"
-            f"/users/current/accounts/{METAAPI_ACCOUNT_ID}"
-            f"/trade"
+            f"/users/current/accounts/{METAAPI_ACCOUNT_ID}/trade"
         )
 
         response = requests.post(
-            url,
-            headers=headers,
-            json=payload,
-            timeout=30
+            url, headers=headers, json=payload, timeout=30
         )
 
         if response.status_code in [200, 201]:
@@ -549,7 +584,6 @@ async def place_mt5_trade(signal_data):
             order_id = result.get("orderId", "unknown")
             print(f"[MT5] ✅ Trade placed — Order ID: {order_id}")
             return order_id
-
         else:
             print(f"[MT5] ❌ Trade failed: {response.status_code} — {response.text}")
             return None
@@ -595,9 +629,7 @@ async def monitor_signal(bot, channel_id, message_id, signal_data):
         )
 
         if tp_hit:
-
             print(f"[MONITOR] ✅ TP HIT {pair_name} at {current_price}")
-
             await bot.send_photo(
                 chat_id=channel_id,
                 photo=TP_HIT_IMAGE_FILE_ID,
@@ -613,9 +645,7 @@ async def monitor_signal(bot, channel_id, message_id, signal_data):
             break
 
         elif sl_hit:
-
             print(f"[MONITOR] ❌ SL HIT {pair_name} at {current_price}")
-
             await bot.send_photo(
                 chat_id=channel_id,
                 photo=SL_HIT_IMAGE_FILE_ID,
@@ -637,20 +667,11 @@ async def monitor_signal(bot, channel_id, message_id, signal_data):
 async def ask_gemini(prompt):
 
     headers = {"Content-Type": "application/json"}
-
-    data = {
-        "contents": [
-            {"parts": [{"text": prompt}]}
-        ]
-    }
+    data = {"contents": [{"parts": [{"text": prompt}]}]}
 
     try:
-
         response = requests.post(
-            GEMINI_URL,
-            headers=headers,
-            json=data,
-            timeout=30
+            GEMINI_URL, headers=headers, json=data, timeout=30
         )
 
         if response.status_code == 429:
@@ -660,7 +681,6 @@ async def ask_gemini(prompt):
             raise Exception("GEMINI_ERROR")
 
         result = response.json()
-
         return result["candidates"][0]["content"]["parts"][0]["text"]
 
     except Exception as e:
@@ -687,19 +707,14 @@ async def ask_openrouter(prompt):
     }
 
     try:
-
         response = requests.post(
-            OPENROUTER_URL,
-            headers=headers,
-            json=data,
-            timeout=30
+            OPENROUTER_URL, headers=headers, json=data, timeout=30
         )
 
         if response.status_code != 200:
             return "⚠️ AI server busy."
 
         result = response.json()
-
         return result["choices"][0]["message"]["content"]
 
     except Exception as e:
@@ -713,7 +728,6 @@ async def ask_openrouter(prompt):
 async def generate_breakdown(question):
 
     q = question.lower()
-
     symbol = "XAU/USD"
     pair_name = "Gold (XAUUSD)"
 
@@ -724,14 +738,12 @@ async def generate_breakdown(question):
             break
 
     live_price = get_live_price(symbol)
-
-    if live_price is None:
-        live_price_text = "Live price unavailable"
-    else:
-        live_price_text = str(round(live_price, 4))
+    live_price_text = (
+        str(round(live_price, 4)) if live_price
+        else "Live price unavailable"
+    )
 
     hour = datetime.utcnow().hour
-
     if 7 <= hour < 13:
         session = "London Session 🇬🇧"
     elif 13 <= hour < 22:
@@ -747,33 +759,23 @@ Generate a PROFESSIONAL market breakdown.
 IMPORTANT:
 Use the REAL LIVE PRICE provided below.
 Do NOT invent fake prices.
-Do NOT use old market prices.
 
-PAIR:
-{pair_name}
-
-LIVE PRICE:
-{live_price_text}
-
-SESSION:
-{session}
+PAIR: {pair_name}
+LIVE PRICE: {live_price_text}
+SESSION: {session}
 
 RULES:
 - Clean formatting
 - No markdown symbols
 - No hashtags
 - No stars
-- No fake data
 - Beginner friendly
 - Professional tone
 - Include BOTH technical and fundamental analysis
-- Include sentiment
-- Include trade idea
-- Use current live price in analysis
+- Include sentiment and trade idea
 - Keep formatting modern and clean
 
-QUESTION:
-{question}
+QUESTION: {question}
 """
 
     return await ask_gemini(prompt)
@@ -783,13 +785,8 @@ QUESTION:
 # ============================================
 
 def clean_text(text):
-
-    text = text.replace("###", "")
-    text = text.replace("##", "")
-    text = text.replace("**", "")
-    text = text.replace("---", "")
-    text = text.replace("__", "")
-
+    text = text.replace("###", "").replace("##", "")
+    text = text.replace("**", "").replace("---", "").replace("__", "")
     return text.strip()
 
 # ============================================
@@ -798,13 +795,18 @@ def clean_text(text):
 
 async def handle_buttons(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
+    user_id = str(update.message.from_user.id)
     text = update.message.text.lower()
-    user_id = update.message.from_user.id
+
+    if user_id not in verified_users:
+        await update.message.reply_text(
+            "🔐 You need to verify your Exness account first.\n\n"
+            "Type /start to begin verification."
+        )
+        return
 
     if "signal" in text:
-
         user_modes[user_id] = "signal"
-
         await update.message.reply_text(
             "📊 Signal Mode Activated\n\n"
             "Now ask for a signal.\n\n"
@@ -816,13 +818,10 @@ async def handle_buttons(update: Update, context: ContextTypes.DEFAULT_TYPE):
             "• GBPUSD\n"
             "• GBPJPY"
         )
-
         return
 
     if "breakdown" in text:
-
         user_modes[user_id] = "breakdown"
-
         await update.message.reply_text(
             "📚 Breakdown Mode Activated\n\n"
             "Now ask your market question.\n\n"
@@ -831,8 +830,87 @@ async def handle_buttons(update: Update, context: ContextTypes.DEFAULT_TYPE):
             "• BTCUSD outlook\n"
             "• GBPJPY market analysis"
         )
-
         return
+
+# ============================================
+# APPROVE COMMAND
+# ============================================
+
+async def approve_user(update: Update, context: ContextTypes.DEFAULT_TYPE):
+
+    if str(update.message.chat_id) != VERIFY_GROUP_ID:
+        return
+
+    if not context.args:
+        await update.message.reply_text("Usage: /approve <user_id>")
+        return
+
+    target_id = context.args[0]
+    email = pending_verifications.get(target_id, "unknown")
+
+    verified_users[target_id] = {
+        "email": email,
+        "verified_at": str(datetime.utcnow())
+    }
+    save_verified(verified_users)
+
+    if target_id in pending_verifications:
+        del pending_verifications[target_id]
+
+    try:
+        await context.bot.send_message(
+            chat_id=int(target_id),
+            text=(
+                "🎉 Congratulations! You're now a verified Nexora AI trader!\n\n"
+                "✅ Full access unlocked — unlimited signals, live market "
+                "breakdowns and AI analysis are all yours.\n\n"
+                "Welcome to the winning side. Let's get to work! 💼🔥"
+            ),
+            reply_markup=main_keyboard
+        )
+    except Exception as e:
+        print(f"[APPROVE] Could not message user: {e}")
+
+    await update.message.reply_text(
+        f"✅ User {target_id} ({email}) approved!"
+    )
+
+# ============================================
+# REJECT COMMAND
+# ============================================
+
+async def reject_user(update: Update, context: ContextTypes.DEFAULT_TYPE):
+
+    if str(update.message.chat_id) != VERIFY_GROUP_ID:
+        return
+
+    if not context.args:
+        await update.message.reply_text("Usage: /reject <user_id>")
+        return
+
+    target_id = context.args[0]
+
+    if target_id in pending_verifications:
+        del pending_verifications[target_id]
+
+    try:
+        await context.bot.send_message(
+            chat_id=int(target_id),
+            text=(
+                "❌ Verification failed.\n\n"
+                "We could not find your email linked to an Exness "
+                "account registered through our link.\n\n"
+                "Please register using our official link and try again:\n\n"
+                f"🔗 {EXNESS_LINK}\n\n"
+                "Once registered, come back and type your email to verify."
+            )
+        )
+    except Exception as e:
+        print(f"[REJECT] Could not message user: {e}")
+
+    await update.message.reply_text(
+        f"❌ User {target_id} rejected."
+    )
 
 # ============================================
 # HANDLE TEXT
@@ -840,20 +918,57 @@ async def handle_buttons(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
-    user_id = update.message.from_user.id
-    message = update.message.text
+    user_id = str(update.message.from_user.id)
+    username = update.message.from_user.username or "Trader"
+    message = update.message.text.strip()
 
-    if user_id not in user_modes:
+    # ── AWAITING EMAIL ────────────────────────────
+    if user_modes.get(user_id) == "awaiting_email":
+
+        email = message.strip().lower()
+
+        if "@" not in email or "." not in email:
+            await update.message.reply_text(
+                "⚠️ That doesn't look like a valid email address.\n\n"
+                "Please enter the email you used to register on Exness 👇"
+            )
+            return
+
+        pending_verifications[user_id] = email
 
         await update.message.reply_text(
-            "Choose an option below:",
-            reply_markup=main_keyboard
+            "⏳ Got it! Your verification request has been submitted.\n\n"
+            "Our team is reviewing your details right now. "
+            "You'll receive a confirmation message shortly.\n\n"
+            "Sit tight — greatness is loading! 🚀"
         )
 
+        await context.bot.send_message(
+            chat_id=VERIFY_GROUP_ID,
+            text=(
+                f"🔔 NEW VERIFICATION REQUEST\n\n"
+                f"👤 User: @{username}\n"
+                f"🆔 ID: {user_id}\n"
+                f"📧 Email: {email}\n\n"
+                f"✅ Approve: /approve {user_id}\n"
+                f"❌ Reject: /reject {user_id}"
+            )
+        )
+
+        user_modes[user_id] = None
         return
 
-    mode = user_modes[user_id]
+    # ── NOT VERIFIED ──────────────────────────────
+    if user_id not in verified_users:
+        await update.message.reply_text(
+            "🔐 Please verify your account first.\n\n"
+            "Type /start to begin."
+        )
+        return
 
+    mode = user_modes.get(user_id)
+
+    # ── SIGNAL MODE ───────────────────────────────
     if mode == "signal":
 
         wait_message = await update.message.reply_text(
@@ -873,11 +988,12 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
             )
         else:
             await update.message.reply_text(
-                "⚠️ Unable to fetch live market data.\nPlease try again shortly."
+                "⚠️ Unable to fetch live market data.\n"
+                "Please try again shortly."
             )
-
         return
 
+    # ── BREAKDOWN MODE ────────────────────────────
     if mode == "breakdown":
 
         wait_message = await update.message.reply_text(
@@ -888,8 +1004,13 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
         response = clean_text(response)
 
         await wait_message.edit_text(response)
-
         return
+
+    # ── DEFAULT ───────────────────────────────────
+    await update.message.reply_text(
+        "Choose an option below:",
+        reply_markup=main_keyboard
+    )
 
 # ============================================
 # AUTO SIGNAL — POSTED TO BOTH CHANNELS
@@ -905,7 +1026,7 @@ async def post_auto_signal(context: ContextTypes.DEFAULT_TYPE):
     image_file_id, direction, signal, signal_data = build_signal_response(pair_keyword)
 
     if signal_data is None:
-        print(f"[AUTO SIGNAL] ❌ Could not fetch price for {pair_keyword}. Skipping.")
+        print(f"[AUTO SIGNAL] ❌ Could not fetch price for {pair_keyword}.")
         return
 
     channel_ids = [CHANNEL_1_ID, CHANNEL_2_ID]
@@ -913,17 +1034,10 @@ async def post_auto_signal(context: ContextTypes.DEFAULT_TYPE):
     for channel_id in channel_ids:
         try:
 
-            # Send signal without button
             sent = await context.bot.send_photo(
                 chat_id=channel_id,
                 photo=image_file_id,
-                caption=signal
-            )
-
-            # Send standalone button — invisible text, clean look
-            await context.bot.send_message(
-                chat_id=channel_id,
-                text="\u200b",
+                caption=signal,
                 reply_markup=get_channel_button()
             )
 
@@ -949,21 +1063,22 @@ async def post_auto_signal(context: ContextTypes.DEFAULT_TYPE):
 
 def main():
 
-    app = Application.builder().token(
-        TELEGRAM_TOKEN
-    ).build()
+    app = Application.builder().token(TELEGRAM_TOKEN).build()
 
+    # Commands
     app.add_handler(CommandHandler("start", start))
+    app.add_handler(CommandHandler("approve", approve_user))
+    app.add_handler(CommandHandler("reject", reject_user))
 
+    # Button handler
     app.add_handler(
         MessageHandler(
-            filters.Regex(
-                "^(📊 Signal|📚 Breakdown|signal|breakdown)$"
-            ),
+            filters.Regex("^(📊 Signal|📚 Breakdown|signal|breakdown)$"),
             handle_buttons
         )
     )
 
+    # Text handler
     app.add_handler(
         MessageHandler(
             filters.TEXT & ~filters.COMMAND,
@@ -971,10 +1086,7 @@ def main():
         )
     )
 
-    # ========================================
-    # SCHEDULE ALL 9 DAILY POSTS
-    # ========================================
-
+    # ── SCHEDULE ALL 9 DAILY POSTS ────────────────
     job_queue = app.job_queue
 
     def parse_time(t):
@@ -984,18 +1096,14 @@ def main():
         ).time()
 
     for i, (utc_time, post_type, data) in enumerate(DAILY_SCHEDULE):
-
         if post_type == "news":
-
             job_queue.run_daily(
                 post_news,
                 time=parse_time(utc_time),
                 name=f"news_{i}_{data}",
                 data=data
             )
-
         elif post_type == "signal":
-
             job_queue.run_daily(
                 post_auto_signal,
                 time=parse_time(utc_time),
@@ -1010,6 +1118,7 @@ def main():
         print(f"  {emoji} {utc_time} UTC — {data.upper()}")
     print(f"Channel 1: {CHANNEL_1_ID}")
     print(f"Channel 2: {CHANNEL_2_ID}")
+    print(f"Verify Group: {VERIFY_GROUP_ID}")
     print(f"Bot: @{BOT_USERNAME}")
 
     app.run_polling(drop_pending_updates=True)

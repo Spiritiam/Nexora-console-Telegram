@@ -18,6 +18,7 @@ from telegram.ext import (
     Application,
     CommandHandler,
     MessageHandler,
+    CallbackQueryHandler,
     ContextTypes,
     filters,
 )
@@ -65,6 +66,12 @@ EXNESS_LINK = "https://www.exness.com/boarding/sign-up/a/vlnafmua"
 BOT_USERNAME = "NexoraConsoleBot"
 
 # ============================================
+# FREE TRIAL LIMIT
+# ============================================
+
+FREE_TRIAL_LIMIT = 3
+
+# ============================================
 # IMAGE FILE IDs
 # ============================================
 
@@ -78,15 +85,15 @@ SL_HIT_IMAGE_FILE_ID = "AgACAgQAAxkBAAIBIWowI9Lxu93CIKFD5YSHFbJ8_MB-AAJBD2sbbT2B
 # ============================================
 
 DAILY_SCHEDULE = [
-    ("06:00", "news",   "morning"),   # 7:00 AM Lagos
-    ("07:00", "signal", "xauusd"),    # 8:00 AM Lagos
-    ("09:00", "signal", "btcusd"),    # 10:00 AM Lagos
-    ("11:00", "news",   "midday"),    # 12:00 PM Lagos
-    ("13:00", "signal", "xagusd"),    # 2:00 PM Lagos
-    ("15:00", "signal", "usoil"),     # 4:00 PM Lagos
-    ("17:00", "news",   "afternoon"), # 6:00 PM Lagos
-    ("19:00", "signal", "gbpusd"),    # 8:00 PM Lagos
-    ("21:00", "signal", "gbpjpy"),    # 10:00 PM Lagos
+    ("06:00", "news",   "morning"),
+    ("07:00", "signal", "xauusd"),
+    ("09:00", "signal", "btcusd"),
+    ("11:00", "news",   "midday"),
+    ("13:00", "signal", "xagusd"),
+    ("15:00", "signal", "usoil"),
+    ("17:00", "news",   "afternoon"),
+    ("19:00", "signal", "gbpusd"),
+    ("21:00", "signal", "gbpjpy"),
 ]
 
 # ============================================
@@ -124,25 +131,26 @@ def get_channel_button():
     ])
 
 # ============================================
-# USER MODES & VERIFIED USERS
+# USER DATA STORAGE
 # ============================================
 
 user_modes = {}
 
 VERIFIED_FILE = "verified_users.json"
+TRIAL_FILE = "trial_users.json"
 
-def load_verified():
-    if Path(VERIFIED_FILE).exists():
-        with open(VERIFIED_FILE, "r") as f:
+def load_json(filename):
+    if Path(filename).exists():
+        with open(filename, "r") as f:
             return json.load(f)
     return {}
 
-def save_verified(data):
-    with open(VERIFIED_FILE, "w") as f:
+def save_json(filename, data):
+    with open(filename, "w") as f:
         json.dump(data, f)
 
-verified_users = load_verified()
-
+verified_users = load_json(VERIFIED_FILE)
+trial_users = load_json(TRIAL_FILE)
 pending_verifications = {}
 
 # ============================================
@@ -195,49 +203,56 @@ PAIR_CONFIG = {
 }
 
 # ============================================
-# START COMMAND
+# TRIAL HELPERS
 # ============================================
 
-async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+def get_trial_count(user_id):
+    return trial_users.get(str(user_id), {}).get("count", 0)
 
-    user_id = str(update.message.from_user.id)
-    username = update.message.from_user.username or "Trader"
+def increment_trial(user_id):
+    uid = str(user_id)
+    if uid not in trial_users:
+        trial_users[uid] = {"count": 0}
+    trial_users[uid]["count"] += 1
+    save_json(TRIAL_FILE, trial_users)
+    return trial_users[uid]["count"]
 
-    if user_id in verified_users:
-        await update.message.reply_text(
-            f"👋 Welcome back, {username}!\n\n"
-            f"✅ You're a verified Nexora AI trader.\n\n"
-            f"Choose an option below to get started.",
-            reply_markup=main_keyboard
-        )
-        return
+def is_verified(user_id):
+    return str(user_id) in verified_users
 
+def trial_remaining(user_id):
+    return max(0, FREE_TRIAL_LIMIT - get_trial_count(user_id))
+
+# ============================================
+# VERIFICATION GATE MESSAGE
+# ============================================
+
+async def send_verification_gate(update):
     await update.message.reply_text(
-        f"👋 Hello {username}, welcome to Nexora AI! 🤖\n\n"
-        f"I am your personal AI trading assistant — I deliver "
-        f"FREE unlimited professional trading signals, live market "
-        f"analysis and AI-powered breakdowns straight to you.\n\n"
-        f"━━━━━━━━━━━━━━━━━━━━\n"
-        f"🔓 HOW TO GET FREE ACCESS\n"
-        f"━━━━━━━━━━━━━━━━━━━━\n\n"
-        f"To unlock full access, there is just ONE requirement:\n\n"
-        f"📌 You must have a trading account with our official "
-        f"broker partner — Exness — registered through our unique link.\n\n"
-        f"That's it. No payment. No subscription. Completely FREE.\n\n"
-        f"━━━━━━━━━━━━━━━━━━━━\n"
-        f"👇 CHOOSE YOUR SITUATION BELOW:\n"
-        f"━━━━━━━━━━━━━━━━━━━━\n\n"
-        f"✅ SITUATION 1 — I have already registered on Exness "
-        f"using the Nexora AI link in the past:\n"
-        f"👉 Simply type the email address you used to register "
-        f"on Exness below and we will verify you instantly.\n\n"
-        f"📝 SITUATION 2 — I have NOT registered on Exness yet "
-        f"or I registered without using our link:\n"
-        f"👉 Click the button below to create your FREE Exness "
-        f"account using our official link. Once done, come back "
-        f"here and type the email you registered with.\n\n"
-        f"━━━━━━━━━━━━━━━━━━━━\n"
-        f"📧 Already registered? Type your Exness email now 👇",
+        "🔐 You've used your 3 FREE trial signals!\n\n"
+        "Hope you loved what you saw! 🔥\n\n"
+        "To continue enjoying UNLIMITED FREE signals, "
+        "live market analysis and AI breakdowns — "
+        "you just need ONE simple step:\n\n"
+        "━━━━━━━━━━━━━━━━━━━━\n"
+        "🔓 HOW TO UNLOCK FULL ACCESS\n"
+        "━━━━━━━━━━━━━━━━━━━━\n\n"
+        "📌 Register a FREE trading account with our official "
+        "broker partner — Exness — using our unique link.\n\n"
+        "No payment. No subscription. Completely FREE.\n\n"
+        "━━━━━━━━━━━━━━━━━━━━\n"
+        "👇 CHOOSE YOUR SITUATION:\n"
+        "━━━━━━━━━━━━━━━━━━━━\n\n"
+        "✅ SITUATION 1 — Already registered on Exness "
+        "using our link before:\n"
+        "👉 Type the email you used to register on Exness "
+        "and we will verify you instantly.\n\n"
+        "📝 SITUATION 2 — Not yet registered or registered "
+        "without our link:\n"
+        "👉 Click the button below to create your FREE Exness "
+        "account. Once done, come back and type your email.\n\n"
+        "━━━━━━━━━━━━━━━━━━━━\n"
+        "📧 Already registered? Type your Exness email now 👇",
         reply_markup=InlineKeyboardMarkup([
             [InlineKeyboardButton(
                 "📝 I'm New — Register on Exness FREE 👆",
@@ -246,23 +261,53 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         ])
     )
 
+# ============================================
+# START COMMAND
+# ============================================
+
+async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+
+    user_id = str(update.message.from_user.id)
+    username = update.message.from_user.username or "Trader"
+
+    if is_verified(user_id):
+        await update.message.reply_text(
+            f"👋 Welcome back, {username}!\n\n"
+            f"✅ You're a verified Nexora AI trader.\n\n"
+            f"Choose an option below to get started.",
+            reply_markup=main_keyboard
+        )
+        return
+
+    remaining = trial_remaining(user_id)
+
+    if remaining > 0:
+        await update.message.reply_text(
+            f"👋 Hello {username}, welcome to Nexora AI! 🤖\n\n"
+            f"I am your personal AI trading assistant — delivering "
+            f"professional trading signals, live market analysis "
+            f"and AI-powered breakdowns.\n\n"
+            f"🎁 You have {remaining} FREE trial signal(s) to use!\n\n"
+            f"Choose an option below to get started 👇",
+            reply_markup=main_keyboard
+        )
+        return
+
     user_modes[user_id] = "awaiting_email"
+    await send_verification_gate(update)
 
 # ============================================
 # SESSION DETECTION
 # ============================================
 
 def get_market_session():
-
     hour = datetime.utcnow().hour
-
     if 0 <= hour < 7:
         return "Asian Session 🌏"
     elif 7 <= hour < 13:
         return "London Session 🇬🇧"
     elif 13 <= hour < 21:
         return "New York Session 🇺🇸"
-
     return "Market Closing Session 🌙"
 
 # ============================================
@@ -270,7 +315,6 @@ def get_market_session():
 # ============================================
 
 def get_live_price(symbol="XAU/USD"):
-
     try:
         url = (
             f"https://api.twelvedata.com/price"
@@ -279,12 +323,9 @@ def get_live_price(symbol="XAU/USD"):
         )
         response = requests.get(url, timeout=10)
         data = response.json()
-
         if "price" in data:
             return float(data["price"])
-
         return None
-
     except Exception as e:
         print("PRICE ERROR:", e)
         return None
@@ -415,34 +456,25 @@ Trade safe 💼🔥"""
 # ============================================
 
 def fetch_market_news():
-
     if not NEWS_API_KEY:
         return None
-
     try:
         url = (
             f"https://newsapi.org/v2/top-headlines"
-            f"?category=business"
-            f"&language=en"
-            f"&pageSize=10"
-            f"&apiKey={NEWS_API_KEY}"
+            f"?category=business&language=en"
+            f"&pageSize=10&apiKey={NEWS_API_KEY}"
         )
         response = requests.get(url, timeout=10)
         data = response.json()
-
         if data.get("status") != "ok":
             return None
-
         articles = [
             a for a in data.get("articles", [])
             if a.get("urlToImage") and a.get("title") and a.get("description")
         ]
-
         if not articles:
             return None
-
         return random.choice(articles)
-
     except Exception as e:
         print(f"[NEWS] Fetch error: {e}")
         return None
@@ -469,12 +501,10 @@ async def generate_news_summary(article, session_type):
 
     prompt = f"""
 You are Nexora AI, a professional financial news analyst.
-
 Write a SHORT, ENGAGING market news post for a Telegram trading channel.
 
 SESSION: {session_label}
 CONTEXT: {prompt_context}
-
 NEWS HEADLINE: {title}
 NEWS DETAILS: {description}
 SOURCE: {source}
@@ -488,8 +518,7 @@ RULES:
 - No markdown symbols like ** or ##
 - No hashtags
 - Professional but exciting tone
-- Use emojis naturally (not excessively)
-- Make traders feel informed and ready to trade
+- Use emojis naturally
 """
 
     return await ask_gemini(prompt)
@@ -502,11 +531,9 @@ async def post_news(context: ContextTypes.DEFAULT_TYPE):
 
     session_type = context.job.data
     now = datetime.utcnow().strftime('%H:%M UTC')
-
     print(f"[NEWS] Posting {session_type} news at {now}")
 
     article = fetch_market_news()
-
     if article is None:
         print("[NEWS] No article found. Skipping.")
         return
@@ -534,7 +561,6 @@ async def post_news(context: ContextTypes.DEFAULT_TYPE):
                     reply_markup=button
                 )
             print(f"[NEWS] ✅ {session_type} posted to {channel_id}")
-
         except Exception as e:
             print(f"[NEWS] ❌ Failed for {channel_id}: {e}")
 
@@ -553,14 +579,12 @@ async def place_mt5_trade(signal_data):
             "auth-token": METAAPI_TOKEN,
             "Content-Type": "application/json"
         }
-
         direction = signal_data["direction"]
         mt5_symbol = signal_data["mt5_symbol"]
         order_type = (
             "ORDER_TYPE_BUY" if direction == "BUY"
             else "ORDER_TYPE_SELL"
         )
-
         payload = {
             "symbol": mt5_symbol,
             "volume": 0.01,
@@ -569,25 +593,21 @@ async def place_mt5_trade(signal_data):
             "takeProfit": signal_data["take_profit"],
             "comment": "NexoraAI Signal"
         }
-
         url = (
             f"https://mt-client-api-v1.london.agiliumtrade.ai"
             f"/users/current/accounts/{METAAPI_ACCOUNT_ID}/trade"
         )
-
         response = requests.post(
             url, headers=headers, json=payload, timeout=30
         )
-
         if response.status_code in [200, 201]:
             result = response.json()
             order_id = result.get("orderId", "unknown")
             print(f"[MT5] ✅ Trade placed — Order ID: {order_id}")
             return order_id
         else:
-            print(f"[MT5] ❌ Trade failed: {response.status_code} — {response.text}")
+            print(f"[MT5] ❌ Trade failed: {response.status_code}")
             return None
-
     except Exception as e:
         print(f"[MT5] ❌ Exception: {e}")
         return None
@@ -610,9 +630,7 @@ async def monitor_signal(bot, channel_id, message_id, signal_data):
     max_checks = 1440
 
     for _ in range(max_checks):
-
         await asyncio.sleep(60)
-
         current_price = get_live_price(symbol)
 
         if current_price is None:
@@ -622,7 +640,6 @@ async def monitor_signal(bot, channel_id, message_id, signal_data):
             (direction == "BUY" and current_price >= take_profit) or
             (direction == "SELL" and current_price <= take_profit)
         )
-
         sl_hit = (
             (direction == "BUY" and current_price <= stop_loss) or
             (direction == "SELL" and current_price >= stop_loss)
@@ -673,16 +690,12 @@ async def ask_gemini(prompt):
         response = requests.post(
             GEMINI_URL, headers=headers, json=data, timeout=30
         )
-
         if response.status_code == 429:
             raise Exception("RATE_LIMIT")
-
         if response.status_code != 200:
             raise Exception("GEMINI_ERROR")
-
         result = response.json()
         return result["candidates"][0]["content"]["parts"][0]["text"]
-
     except Exception as e:
         print("Gemini Error:", e)
         return await ask_openrouter(prompt)
@@ -700,7 +713,6 @@ async def ask_openrouter(prompt):
         "Authorization": f"Bearer {OPENROUTER_API_KEY}",
         "Content-Type": "application/json"
     }
-
     data = {
         "model": "deepseek/deepseek-chat",
         "messages": [{"role": "user", "content": prompt}]
@@ -710,13 +722,10 @@ async def ask_openrouter(prompt):
         response = requests.post(
             OPENROUTER_URL, headers=headers, json=data, timeout=30
         )
-
         if response.status_code != 200:
             return "⚠️ AI server busy."
-
         result = response.json()
         return result["choices"][0]["message"]["content"]
-
     except Exception as e:
         print("OpenRouter Error:", e)
         return "⚠️ AI servers unavailable."
@@ -753,27 +762,19 @@ async def generate_breakdown(question):
 
     prompt = f"""
 You are Nexora AI.
-
 Generate a PROFESSIONAL market breakdown.
-
-IMPORTANT:
-Use the REAL LIVE PRICE provided below.
-Do NOT invent fake prices.
+IMPORTANT: Use the REAL LIVE PRICE. Do NOT invent fake prices.
 
 PAIR: {pair_name}
 LIVE PRICE: {live_price_text}
 SESSION: {session}
 
 RULES:
-- Clean formatting
-- No markdown symbols
-- No hashtags
-- No stars
-- Beginner friendly
-- Professional tone
-- Include BOTH technical and fundamental analysis
+- Clean formatting, no markdown, no hashtags, no stars
+- Beginner friendly, professional tone
+- Include technical and fundamental analysis
 - Include sentiment and trade idea
-- Keep formatting modern and clean
+- Modern clean formatting
 
 QUESTION: {question}
 """
@@ -798,11 +799,9 @@ async def handle_buttons(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = str(update.message.from_user.id)
     text = update.message.text.lower()
 
-    if user_id not in verified_users:
-        await update.message.reply_text(
-            "🔐 You need to verify your Exness account first.\n\n"
-            "Type /start to begin verification."
-        )
+    if not is_verified(user_id) and get_trial_count(user_id) >= FREE_TRIAL_LIMIT:
+        user_modes[user_id] = "awaiting_email"
+        await send_verification_gate(update)
         return
 
     if "signal" in text:
@@ -811,12 +810,7 @@ async def handle_buttons(update: Update, context: ContextTypes.DEFAULT_TYPE):
             "📊 Signal Mode Activated\n\n"
             "Now ask for a signal.\n\n"
             "Examples:\n"
-            "• XAUUSD\n"
-            "• BTCUSD\n"
-            "• XAGUSD\n"
-            "• USOIL\n"
-            "• GBPUSD\n"
-            "• GBPJPY"
+            "• XAUUSD\n• BTCUSD\n• XAGUSD\n• USOIL\n• GBPUSD\n• GBPJPY"
         )
         return
 
@@ -833,84 +827,103 @@ async def handle_buttons(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
 # ============================================
-# APPROVE COMMAND
+# CALLBACK HANDLER — APPROVE / REJECT BUTTONS
 # ============================================
 
-async def approve_user(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
-    if str(update.message.chat_id) != VERIFY_GROUP_ID:
-        return
+    query = update.callback_query
+    await query.answer()
 
-    if not context.args:
-        await update.message.reply_text("Usage: /approve <user_id>")
-        return
+    data = query.data
 
-    target_id = context.args[0]
-    email = pending_verifications.get(target_id, "unknown")
+    # ── APPROVE ───────────────────────────────────
+    if data.startswith("approve_"):
 
-    verified_users[target_id] = {
-        "email": email,
-        "verified_at": str(datetime.utcnow())
-    }
-    save_verified(verified_users)
+        target_id = data.replace("approve_", "")
+        email = pending_verifications.get(target_id, "unknown")
 
-    if target_id in pending_verifications:
-        del pending_verifications[target_id]
+        verified_users[target_id] = {
+            "email": email,
+            "verified_at": str(datetime.utcnow())
+        }
+        save_json(VERIFIED_FILE, verified_users)
 
-    try:
-        await context.bot.send_message(
-            chat_id=int(target_id),
+        if target_id in pending_verifications:
+            del pending_verifications[target_id]
+
+        # Notify the user
+        try:
+            await context.bot.send_message(
+                chat_id=int(target_id),
+                text=(
+                    "🎉 Congratulations! You're now a verified "
+                    "Nexora AI trader!\n\n"
+                    "✅ Full access unlocked — unlimited signals, "
+                    "live market breakdowns and AI analysis "
+                    "are all yours.\n\n"
+                    "Welcome to the winning side. "
+                    "Let's get to work! 💼🔥"
+                ),
+                reply_markup=main_keyboard
+            )
+        except Exception as e:
+            print(f"[APPROVE] Could not message user: {e}")
+
+        # Update the group message
+        await query.edit_message_text(
             text=(
-                "🎉 Congratulations! You're now a verified Nexora AI trader!\n\n"
-                "✅ Full access unlocked — unlimited signals, live market "
-                "breakdowns and AI analysis are all yours.\n\n"
-                "Welcome to the winning side. Let's get to work! 💼🔥"
-            ),
-            reply_markup=main_keyboard
-        )
-    except Exception as e:
-        print(f"[APPROVE] Could not message user: {e}")
-
-    await update.message.reply_text(
-        f"✅ User {target_id} ({email}) approved!"
-    )
-
-# ============================================
-# REJECT COMMAND
-# ============================================
-
-async def reject_user(update: Update, context: ContextTypes.DEFAULT_TYPE):
-
-    if str(update.message.chat_id) != VERIFY_GROUP_ID:
-        return
-
-    if not context.args:
-        await update.message.reply_text("Usage: /reject <user_id>")
-        return
-
-    target_id = context.args[0]
-
-    if target_id in pending_verifications:
-        del pending_verifications[target_id]
-
-    try:
-        await context.bot.send_message(
-            chat_id=int(target_id),
-            text=(
-                "❌ Verification failed.\n\n"
-                "We could not find your email linked to an Exness "
-                "account registered through our link.\n\n"
-                "Please register using our official link and try again:\n\n"
-                f"🔗 {EXNESS_LINK}\n\n"
-                "Once registered, come back and type your email to verify."
+                f"✅ APPROVED\n\n"
+                f"🆔 User ID: {target_id}\n"
+                f"📧 Email: {email}\n\n"
+                f"User has been notified and granted full access."
             )
         )
-    except Exception as e:
-        print(f"[REJECT] Could not message user: {e}")
 
-    await update.message.reply_text(
-        f"❌ User {target_id} rejected."
-    )
+    # ── REJECT ────────────────────────────────────
+    elif data.startswith("reject_"):
+
+        target_id = data.replace("reject_", "")
+        email = pending_verifications.get(target_id, "unknown")
+
+        if target_id in pending_verifications:
+            del pending_verifications[target_id]
+
+        # Notify the user
+        try:
+            await context.bot.send_message(
+                chat_id=int(target_id),
+                text=(
+                    "❌ Verification Failed.\n\n"
+                    "Unfortunately, we could not find an Exness account "
+                    "linked to your email that was registered through "
+                    "our official link.\n\n"
+                    "This could mean:\n"
+                    "• You registered on Exness without using our link\n"
+                    "• You used a different email address\n\n"
+                    "━━━━━━━━━━━━━━━━━━━━\n"
+                    "✅ HOW TO FIX THIS:\n"
+                    "━━━━━━━━━━━━━━━━━━━━\n\n"
+                    "Click the link below to create a NEW Exness account "
+                    "using our official link. It's completely FREE and "
+                    "takes less than 2 minutes.\n\n"
+                    f"🔗 {EXNESS_LINK}\n\n"
+                    "Once done, come back here and type your new "
+                    "email address to get verified instantly. 🚀"
+                )
+            )
+        except Exception as e:
+            print(f"[REJECT] Could not message user: {e}")
+
+        # Update the group message
+        await query.edit_message_text(
+            text=(
+                f"❌ REJECTED\n\n"
+                f"🆔 User ID: {target_id}\n"
+                f"📧 Email: {email}\n\n"
+                f"User has been notified to register via the correct link."
+            )
+        )
 
 # ============================================
 # HANDLE TEXT
@@ -930,7 +943,8 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if "@" not in email or "." not in email:
             await update.message.reply_text(
                 "⚠️ That doesn't look like a valid email address.\n\n"
-                "Please enter the email you used to register on Exness 👇"
+                "Please enter the email you used to "
+                "register on Exness 👇"
             )
             return
 
@@ -943,27 +957,40 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
             "Sit tight — greatness is loading! 🚀"
         )
 
-        await context.bot.send_message(
-            chat_id=VERIFY_GROUP_ID,
-            text=(
-                f"🔔 NEW VERIFICATION REQUEST\n\n"
-                f"👤 User: @{username}\n"
-                f"🆔 ID: {user_id}\n"
-                f"📧 Email: {email}\n\n"
-                f"✅ Approve: /approve {user_id}\n"
-                f"❌ Reject: /reject {user_id}"
+        # Send to verification group with tap buttons
+        try:
+            await context.bot.send_message(
+                chat_id=VERIFY_GROUP_ID,
+                text=(
+                    f"🔔 NEW VERIFICATION REQUEST\n\n"
+                    f"👤 User: @{username}\n"
+                    f"🆔 ID: {user_id}\n"
+                    f"📧 Email: {email}\n\n"
+                    f"Tap a button below to approve or reject:"
+                ),
+                reply_markup=InlineKeyboardMarkup([
+                    [
+                        InlineKeyboardButton(
+                            "✅ Approve",
+                            callback_data=f"approve_{user_id}"
+                        ),
+                        InlineKeyboardButton(
+                            "❌ Reject",
+                            callback_data=f"reject_{user_id}"
+                        )
+                    ]
+                ])
             )
-        )
+        except Exception as e:
+            print(f"[VERIFY] Failed to send to group: {e}")
 
         user_modes[user_id] = None
         return
 
-    # ── NOT VERIFIED ──────────────────────────────
-    if user_id not in verified_users:
-        await update.message.reply_text(
-            "🔐 Please verify your account first.\n\n"
-            "Type /start to begin."
-        )
+    # ── TRIAL / VERIFIED CHECK ────────────────────
+    if not is_verified(user_id) and get_trial_count(user_id) >= FREE_TRIAL_LIMIT:
+        user_modes[user_id] = "awaiting_email"
+        await send_verification_gate(update)
         return
 
     mode = user_modes.get(user_id)
@@ -971,13 +998,22 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
     # ── SIGNAL MODE ───────────────────────────────
     if mode == "signal":
 
+        if not is_verified(user_id):
+            count = increment_trial(user_id)
+            if count > FREE_TRIAL_LIMIT:
+                user_modes[user_id] = "awaiting_email"
+                await send_verification_gate(update)
+                return
+
         wait_message = await update.message.reply_text(
             "🧠 Nexora AI analyzing live market..."
         )
 
         await asyncio.sleep(1)
 
-        image_file_id, direction, signal, signal_data = build_signal_response(message)
+        image_file_id, direction, signal, signal_data = (
+            build_signal_response(message)
+        )
 
         await wait_message.delete()
 
@@ -986,6 +1022,19 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 photo=image_file_id,
                 caption=signal
             )
+
+            if not is_verified(user_id):
+                remaining = trial_remaining(user_id)
+                if remaining > 0:
+                    await update.message.reply_text(
+                        f"⚡ You have {remaining} free trial "
+                        f"signal(s) remaining.\n"
+                        f"Verify your Exness account for "
+                        f"unlimited access!"
+                    )
+                else:
+                    user_modes[user_id] = "awaiting_email"
+                    await send_verification_gate(update)
         else:
             await update.message.reply_text(
                 "⚠️ Unable to fetch live market data.\n"
@@ -996,6 +1045,13 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
     # ── BREAKDOWN MODE ────────────────────────────
     if mode == "breakdown":
 
+        if not is_verified(user_id):
+            count = increment_trial(user_id)
+            if count > FREE_TRIAL_LIMIT:
+                user_modes[user_id] = "awaiting_email"
+                await send_verification_gate(update)
+                return
+
         wait_message = await update.message.reply_text(
             "🧠 Nexora AI preparing market breakdown..."
         )
@@ -1004,6 +1060,19 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
         response = clean_text(response)
 
         await wait_message.edit_text(response)
+
+        if not is_verified(user_id):
+            remaining = trial_remaining(user_id)
+            if remaining > 0:
+                await update.message.reply_text(
+                    f"⚡ You have {remaining} free trial "
+                    f"signal(s) remaining.\n"
+                    f"Verify your Exness account for "
+                    f"unlimited access!"
+                )
+            else:
+                user_modes[user_id] = "awaiting_email"
+                await send_verification_gate(update)
         return
 
     # ── DEFAULT ───────────────────────────────────
@@ -1023,7 +1092,9 @@ async def post_auto_signal(context: ContextTypes.DEFAULT_TYPE):
 
     print(f"[AUTO SIGNAL] {pair_keyword.upper()} firing at {now}")
 
-    image_file_id, direction, signal, signal_data = build_signal_response(pair_keyword)
+    image_file_id, direction, signal, signal_data = (
+        build_signal_response(pair_keyword)
+    )
 
     if signal_data is None:
         print(f"[AUTO SIGNAL] ❌ Could not fetch price for {pair_keyword}.")
@@ -1033,18 +1104,18 @@ async def post_auto_signal(context: ContextTypes.DEFAULT_TYPE):
 
     for channel_id in channel_ids:
         try:
-
             sent = await context.bot.send_photo(
                 chat_id=channel_id,
                 photo=image_file_id,
                 caption=signal,
                 reply_markup=get_channel_button()
             )
-
-            print(f"[AUTO SIGNAL] ✅ {pair_keyword.upper()} posted to {channel_id}")
+            print(
+                f"[AUTO SIGNAL] ✅ {pair_keyword.upper()} "
+                f"posted to {channel_id}"
+            )
 
             asyncio.create_task(place_mt5_trade(signal_data))
-
             asyncio.create_task(
                 monitor_signal(
                     context.bot,
@@ -1053,7 +1124,6 @@ async def post_auto_signal(context: ContextTypes.DEFAULT_TYPE):
                     signal_data
                 )
             )
-
         except Exception as e:
             print(f"[AUTO SIGNAL] ❌ Failed for {channel_id}: {e}")
 
@@ -1065,10 +1135,11 @@ def main():
 
     app = Application.builder().token(TELEGRAM_TOKEN).build()
 
-    # Commands
+    # Handlers
     app.add_handler(CommandHandler("start", start))
-    app.add_handler(CommandHandler("approve", approve_user))
-    app.add_handler(CommandHandler("reject", reject_user))
+
+    # Inline button callback — approve/reject
+    app.add_handler(CallbackQueryHandler(handle_callback))
 
     # Button handler
     app.add_handler(
@@ -1086,7 +1157,7 @@ def main():
         )
     )
 
-    # ── SCHEDULE ALL 9 DAILY POSTS ────────────────
+    # Schedule
     job_queue = app.job_queue
 
     def parse_time(t):
@@ -1122,10 +1193,6 @@ def main():
     print(f"Bot: @{BOT_USERNAME}")
 
     app.run_polling(drop_pending_updates=True)
-
-# ============================================
-# RUN BOT
-# ============================================
 
 if __name__ == "__main__":
     main()

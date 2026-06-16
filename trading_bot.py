@@ -89,18 +89,14 @@ SL_HIT_IMAGE_FILE_ID = "AgACAgQAAxkBAAIBIWowI9Lxu93CIKFD5YSHFbJ8_MB-AAJBD2sbbT2B
 
 # ============================================
 # DAILY SCHEDULE (UTC)
+# 3 signals + 1 news per day
 # ============================================
 
 DAILY_SCHEDULE = [
-    ("06:00", "news",   "morning"),
-    ("07:00", "signal", "xauusd"),
-    ("09:00", "signal", "btcusd"),
-    ("11:00", "news",   "midday"),
-    ("13:00", "signal", "usoil"),
-    ("15:00", "signal", "gbpusd"),
-    ("17:00", "news",   "afternoon"),
-    ("19:00", "signal", "gbpjpy"),
-    ("21:00", "signal", "xauusd"),
+    ("06:00", "news",   "morning"),   # 7:00 AM Lagos
+    ("07:00", "signal", "xauusd"),    # 8:00 AM Lagos
+    ("13:00", "signal", "btcusd"),    # 2:00 PM Lagos
+    ("19:00", "signal", "usoil"),     # 8:00 PM Lagos
 ]
 
 # ============================================
@@ -208,7 +204,7 @@ def trial_remaining(user_id):
     return max(0, FREE_TRIAL_LIMIT - get_trial_count(user_id))
 
 # ============================================
-# PAIR CONFIG
+# PAIR CONFIG — FIXED USOIL SYMBOL
 # ============================================
 
 PAIR_CONFIG = {
@@ -222,6 +218,7 @@ PAIR_CONFIG = {
         "display": "Gold (XAUUSD) 🥇",
         "av_symbol": "XAU",
         "av_type": "forex",
+        "td_symbol": "XAU/USD",
     },
     "btcusd": {
         "symbol": "BTC/USD",
@@ -233,6 +230,7 @@ PAIR_CONFIG = {
         "display": "Bitcoin (BTCUSD) ₿",
         "av_symbol": "BTC",
         "av_type": "crypto",
+        "td_symbol": "BTC/USD",
     },
     "xagusd": {
         "symbol": "XAG/USD",
@@ -244,9 +242,10 @@ PAIR_CONFIG = {
         "display": "Silver (XAGUSD) 🥈",
         "av_symbol": "XAG",
         "av_type": "forex",
+        "td_symbol": "XAG/USD",
     },
     "usoil": {
-        "symbol": "WTI/USD",
+        "symbol": "USO",
         "pair_name": "USOIL",
         "pip_size": 0.50,
         "pip_value": 0.01,
@@ -255,6 +254,9 @@ PAIR_CONFIG = {
         "display": "US Oil (WTI) 🛢️",
         "av_symbol": "WTI",
         "av_type": "commodity",
+        # Use direct crude oil price from multiple sources
+        "td_symbol": "CL1!",
+        "use_oil_api": True,
     },
     "gbpusd": {
         "symbol": "GBP/USD",
@@ -266,6 +268,7 @@ PAIR_CONFIG = {
         "display": "GBP/USD 🇬🇧",
         "av_symbol": "GBP",
         "av_type": "forex",
+        "td_symbol": "GBP/USD",
     },
     "gbpjpy": {
         "symbol": "GBP/JPY",
@@ -277,6 +280,7 @@ PAIR_CONFIG = {
         "display": "GBP/JPY 🇯🇵",
         "av_symbol": "GBPJPY",
         "av_type": "forex",
+        "td_symbol": "GBP/JPY",
     },
 }
 
@@ -297,6 +301,70 @@ def calculate_pips(pair_name, entry_price, exit_price, direction, config):
     except Exception as e:
         print(f"[PIPS] Calculation error: {e}")
         return 0, "pips"
+
+# ============================================
+# LIVE PRICE — OIL SPECIFIC (FREE APIs)
+# ============================================
+
+def get_oil_price():
+    """Get accurate WTI crude oil price from free sources."""
+
+    # Try 1: Twelvedata with correct symbol
+    try:
+        symbols_to_try = ["CL1!", "USOIL", "WTI/USD"]
+        for sym in symbols_to_try:
+            url = (
+                f"https://api.twelvedata.com/price"
+                f"?symbol={sym}"
+                f"&apikey={TWELVEDATA_API_KEY}"
+            )
+            response = requests.get(url, timeout=10)
+            data = response.json()
+            if "price" in data:
+                price = float(data["price"])
+                # Validate oil price is realistic (between 50 and 150)
+                if 50 <= price <= 150:
+                    print(f"[OIL] Twelvedata {sym}: {price}")
+                    return price
+    except Exception as e:
+        print(f"[OIL] Twelvedata error: {e}")
+
+    # Try 2: Alpha Vantage WTI
+    try:
+        if ALPHA_VANTAGE_API_KEY:
+            url = (
+                f"https://www.alphavantage.co/query"
+                f"?function=WTI"
+                f"&interval=daily"
+                f"&apikey={ALPHA_VANTAGE_API_KEY}"
+            )
+            response = requests.get(url, timeout=10)
+            data = response.json()
+            latest = data.get("data", [{}])[0]
+            value = latest.get("value")
+            if value and value != ".":
+                price = float(value)
+                if 50 <= price <= 150:
+                    print(f"[OIL] Alpha Vantage WTI: {price}")
+                    return price
+    except Exception as e:
+        print(f"[OIL] Alpha Vantage error: {e}")
+
+    # Try 3: Free commodity price API
+    try:
+        url = "https://query1.finance.yahoo.com/v8/finance/chart/CL=F"
+        headers = {"User-Agent": "Mozilla/5.0"}
+        response = requests.get(url, headers=headers, timeout=10)
+        data = response.json()
+        price = data["chart"]["result"][0]["meta"]["regularMarketPrice"]
+        if price and 50 <= float(price) <= 150:
+            print(f"[OIL] Yahoo Finance: {price}")
+            return float(price)
+    except Exception as e:
+        print(f"[OIL] Yahoo Finance error: {e}")
+
+    print("[OIL] All oil price APIs failed")
+    return None
 
 # ============================================
 # LIVE PRICE — TWELVEDATA PRIMARY
@@ -343,19 +411,6 @@ def get_price_alphavantage(config):
             ).get("5. Exchange Rate")
             if rate:
                 return float(rate)
-        elif av_type == "commodity":
-            url = (
-                f"https://www.alphavantage.co/query"
-                f"?function=WTI"
-                f"&interval=daily"
-                f"&apikey={ALPHA_VANTAGE_API_KEY}"
-            )
-            response = requests.get(url, timeout=10)
-            data = response.json()
-            latest = data.get("data", [{}])[0]
-            value = latest.get("value")
-            if value and value != ".":
-                return float(value)
         return None
     except Exception as e:
         print(f"[ALPHAVANTAGE] Error: {e}")
@@ -366,6 +421,14 @@ def get_price_alphavantage(config):
 # ============================================
 
 def get_live_price(symbol="XAU/USD", config=None):
+    # Special handling for oil
+    if config and config.get("use_oil_api"):
+        price = get_oil_price()
+        if price:
+            return price
+        print("[PRICE] All oil APIs failed")
+        return None
+
     price = get_price_twelvedata(symbol)
     if price is not None:
         return price
@@ -742,7 +805,6 @@ async def post_news(context: ContextTypes.DEFAULT_TYPE):
         print("[NEWS] No article found from any source. Skipping.")
         return
 
-    # Generate AI image from Pollinations.ai
     headline = article.get("title", "financial market news trading")
     image_prompt = (
         f"professional financial news illustration: {headline}, "
@@ -754,17 +816,14 @@ async def post_news(context: ContextTypes.DEFAULT_TYPE):
         f"?width=800&height=450&nologo=true"
     )
 
-    # Generate short news summary
     summary = await generate_news_summary(article, session_type)
     summary = clean_text(summary)
 
-    # Fetch economic calendar and append
     calendar = fetch_economic_calendar()
     if calendar:
         summary += calendar
 
-    # ── NEWS ONLY GOES TO CHANNEL 1 ──────────────
-    # Inner Circle (Channel 2) receives signals only
+    # News goes to Channel 1 ONLY
     try:
         await context.bot.send_photo(
             chat_id=CHANNEL_1_ID,
@@ -783,7 +842,7 @@ async def post_news(context: ContextTypes.DEFAULT_TYPE):
             )
             print(f"[NEWS] ✅ {session_type} posted (text only) to Channel 1")
         except Exception as e2:
-            print(f"[NEWS] ❌ Failed for Channel 1: {e2}")
+            print(f"[NEWS] ❌ Failed: {e2}")
 
 # ============================================
 # METAAPI — PLACE TRADE ON MT5
@@ -854,7 +913,12 @@ async def monitor_signal(bot, channel_id, message_id, signal_data):
 
     for _ in range(max_checks):
         await asyncio.sleep(60)
-        current_price = get_live_price(symbol, config=config)
+
+        # Use oil-specific price fetch for oil signals
+        if config and config.get("use_oil_api"):
+            current_price = get_oil_price()
+        else:
+            current_price = get_live_price(symbol, config=config)
 
         if current_price is None:
             continue
@@ -873,10 +937,7 @@ async def monitor_signal(bot, channel_id, message_id, signal_data):
             pips, pip_label = calculate_pips(
                 pair_name, entry_price, exit_price, direction, config
             )
-            print(
-                f"[MONITOR] ✅ TP HIT {pair_name} "
-                f"at {exit_price} | +{pips} {pip_label}"
-            )
+            print(f"[MONITOR] ✅ TP HIT {pair_name} at {exit_price}")
             await bot.send_photo(
                 chat_id=channel_id,
                 photo=TP_HIT_IMAGE_FILE_ID,
@@ -900,10 +961,7 @@ async def monitor_signal(bot, channel_id, message_id, signal_data):
                 pair_name, entry_price, exit_price, direction, config
             )
             pips_lost = abs(pips)
-            print(
-                f"[MONITOR] ❌ SL HIT {pair_name} "
-                f"at {exit_price} | -{pips_lost} {pip_label}"
-            )
+            print(f"[MONITOR] ❌ SL HIT {pair_name} at {exit_price}")
             await bot.send_photo(
                 chat_id=channel_id,
                 photo=SL_HIT_IMAGE_FILE_ID,
@@ -1539,7 +1597,6 @@ async def post_auto_signal(context: ContextTypes.DEFAULT_TYPE):
         print(f"[AUTO SIGNAL] ❌ Could not fetch price for {pair_keyword}.")
         return
 
-    # Signals go to BOTH channels
     for channel_id in [CHANNEL_1_ID, CHANNEL_2_ID]:
         try:
             sent = await context.bot.send_photo(
@@ -1622,7 +1679,7 @@ def main():
         emoji = "📰" if post_type == "news" else "📊"
         print(f"  {emoji} {utc_time} UTC — {data.upper()}")
     print(f"Channel 1 (Public): {CHANNEL_1_ID}")
-    print(f"Channel 2 (Inner Circle — signals only): {CHANNEL_2_ID}")
+    print(f"Channel 2 (Inner Circle): {CHANNEL_2_ID}")
     print(f"Verify Group: {VERIFY_GROUP_ID}")
     print(f"Bot: @{BOT_USERNAME}")
 

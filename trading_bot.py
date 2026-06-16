@@ -68,9 +68,9 @@ SELL_IMAGE_FILE_ID = "AgACAgQAAxkBAAIBH2owIQ4F4GQEnXyDhVLRoQZ3Vg06AAI_D2sbbT2BUe
 
 DAILY_SCHEDULE = [
     ("06:00", "news",   "morning"),  # 7:00 AM Lagos
-    ("07:00", "signal", "xauusd"),   # 8:00 AM Lagos - Gold
-    ("13:00", "signal", "gbpjpy"),   # 2:00 PM Lagos - GBPJPY
-    ("19:00", "signal", "btcusd"),   # 8:00 PM Lagos - Bitcoin
+    ("07:00", "signal", "xauusd"),   # 8:00 AM Lagos
+    ("13:00", "signal", "gbpjpy"),   # 2:00 PM Lagos
+    ("19:00", "signal", "btcusd"),   # 8:00 PM Lagos
 ]
 
 # ============================================
@@ -253,7 +253,7 @@ def get_price_twelvedata(symbol):
             return float(data["price"])
         return None
     except Exception as e:
-        print(f"[TWELVEDATA] Error for {symbol}: {e}")
+        print(f"[TWELVEDATA] Error: {e}")
         return None
 
 def get_price_alphavantage(config):
@@ -426,13 +426,21 @@ def format_breakdown(text):
         "Summary", "Outlook", "Key Levels", "Risk Warning",
         "Conclusion", "Price Action", "News Impact", "Market Overview",
     ]
-    emojis = ["📊", "📈", "💡", "🗞️", "📰", "🛢️", "⚡", "🔍", "📉", "🎯", "💰", "🔔"]
+    emojis = [
+        "📊", "📈", "💡", "🗞️", "📰",
+        "🛢️", "⚡", "🔍", "📉", "🎯", "💰", "🔔"
+    ]
     for header in headers:
         for e in emojis:
             text = text.replace(f"{e} {header}", f"{e} <b>{header}</b>")
         text = text.replace(f"\n{header}\n", f"\n<b>{header}</b>\n")
         text = text.replace(f"\n{header}:", f"\n<b>{header}:</b>")
     return text
+
+def clean_text(text):
+    text = text.replace("###", "").replace("##", "")
+    text = text.replace("**", "").replace("---", "").replace("__", "")
+    return text.strip()
 
 # ============================================
 # NEWS FETCHERS
@@ -494,11 +502,11 @@ def fetch_news_thenewsapi():
 def fetch_market_news():
     article = fetch_news_gnews()
     if article:
-        print("[NEWS] ✅ GNews article found")
+        print("[NEWS] ✅ GNews found")
         return article
     article = fetch_news_thenewsapi()
     if article:
-        print("[NEWS] ✅ TheNewsAPI article found")
+        print("[NEWS] ✅ TheNewsAPI found")
         return article
     print("[NEWS] Both APIs failed.")
     return None
@@ -604,11 +612,6 @@ async def ask_openrouter(prompt):
     except Exception as e:
         print(f"OpenRouter Error: {e}")
         return "⚠️ AI servers unavailable."
-
-def clean_text(text):
-    text = text.replace("###", "").replace("##", "")
-    text = text.replace("**", "").replace("---", "").replace("__", "")
-    return text.strip()
 
 # ============================================
 # NEWS SUMMARY
@@ -949,8 +952,8 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     "━━━━━━━━━━━━━━━━━━━━\n"
                     "✅ <b>HOW TO FIX THIS:</b>\n"
                     "━━━━━━━━━━━━━━━━━━━━\n\n"
-                    "Register a NEW Exness account using our official link "
-                    "below. It's completely <b>FREE</b> — takes 2 minutes.\n\n"
+                    "Register a NEW Exness account using our official "
+                    "link below. Completely <b>FREE</b> — takes 2 minutes.\n\n"
                     f"🔗 {EXNESS_LINK}\n\n"
                     "Once done, come back and type your new email. 🚀"
                 ),
@@ -1026,7 +1029,7 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 ])
             )
         except Exception as e:
-            print(f"[VERIFY] Failed to send to group: {e}")
+            print(f"[VERIFY] Failed: {e}")
 
         user_modes[user_id] = None
         return
@@ -1134,7 +1137,7 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
 
 # ============================================
-# POST NEWS
+# POST NEWS — CHANNEL 1 ONLY
 # ============================================
 
 async def post_news(context: ContextTypes.DEFAULT_TYPE):
@@ -1144,7 +1147,7 @@ async def post_news(context: ContextTypes.DEFAULT_TYPE):
 
     article = fetch_market_news()
     if article is None:
-        print("[NEWS] No article found. Skipping.")
+        print("[NEWS] No article. Skipping.")
         return
 
     headline = article.get("title", "financial market news")
@@ -1165,7 +1168,6 @@ async def post_news(context: ContextTypes.DEFAULT_TYPE):
     if calendar:
         summary += calendar
 
-    # News to Channel 1 ONLY
     try:
         await context.bot.send_photo(
             chat_id=CHANNEL_1_ID,
@@ -1187,7 +1189,7 @@ async def post_news(context: ContextTypes.DEFAULT_TYPE):
             print(f"[NEWS] ❌ Failed: {e2}")
 
 # ============================================
-# POST AUTO SIGNAL
+# POST AUTO SIGNAL — BOTH CHANNELS
 # ============================================
 
 async def post_auto_signal(context: ContextTypes.DEFAULT_TYPE):
@@ -1205,6 +1207,7 @@ async def post_auto_signal(context: ContextTypes.DEFAULT_TYPE):
 
     for channel_id in [CHANNEL_1_ID, CHANNEL_2_ID]:
         try:
+            # Button on Channel 1 only
             markup = (
                 get_channel_button()
                 if channel_id == CHANNEL_1_ID
@@ -1218,10 +1221,6 @@ async def post_auto_signal(context: ContextTypes.DEFAULT_TYPE):
                 reply_markup=markup
             )
             print(f"[AUTO SIGNAL] ✅ {pair_keyword.upper()} → {channel_id}")
-
-            # Place MT5 trade
-            asyncio.create_task(place_mt5_trade(signal_data))
-
         except Exception as e:
             print(f"[AUTO SIGNAL] ❌ Failed for {channel_id}: {e}")
 
@@ -1263,30 +1262,12 @@ async def place_mt5_trade(signal_data):
         print(f"[MT5] ❌ Exception: {e}")
 
 # ============================================
-# MAIN — CONFLICT FIX + JOB QUEUE FIX
+# MAIN — SIMPLE AND STABLE
 # ============================================
 
-async def run_bot():
+def main():
+    app = Application.builder().token(TELEGRAM_TOKEN).build()
 
-    print("[BOT] Building application...")
-
-    app = (
-        Application.builder()
-        .token(TELEGRAM_TOKEN)
-        .build()
-    )
-
-    # Check job queue
-    job_queue = app.job_queue
-    if job_queue is None:
-        print("[ERROR] ❌ JobQueue is None!")
-        print("[ERROR] Make sure requirements.txt has:")
-        print("[ERROR] python-telegram-bot[job-queue]")
-        return
-
-    print("[BOT] ✅ JobQueue available")
-
-    # Register handlers
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CallbackQueryHandler(handle_callback))
     app.add_handler(
@@ -1299,7 +1280,8 @@ async def run_bot():
         MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text)
     )
 
-    # Schedule jobs
+    job_queue = app.job_queue
+
     def parse_time(t):
         h, m = map(int, t.split(":"))
         return datetime.now().replace(
@@ -1314,7 +1296,6 @@ async def run_bot():
                 name=f"news_{i}_{data}",
                 data=data
             )
-            print(f"  📰 Scheduled news at {utc_time} UTC")
         elif post_type == "signal":
             job_queue.run_daily(
                 post_auto_signal,
@@ -1322,45 +1303,20 @@ async def run_bot():
                 name=f"signal_{i}_{data}",
                 data=data
             )
-            print(f"  📊 Scheduled {data.upper()} signal at {utc_time} UTC")
 
     print("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━")
-    print("Nexora AI Starting...")
-    print(f"Channel 1 (Public):   {CHANNEL_1_ID}")
+    print("Nexora AI Running!")
+    print("Daily schedule (UTC):")
+    for utc_time, post_type, data in DAILY_SCHEDULE:
+        emoji = "📰" if post_type == "news" else "📊"
+        print(f"  {emoji} {utc_time} UTC — {data.upper()}")
+    print(f"Channel 1 (Public):       {CHANNEL_1_ID}")
     print(f"Channel 2 (Inner Circle): {CHANNEL_2_ID}")
-    print(f"Verify Group:         {VERIFY_GROUP_ID}")
-    print(f"Bot:                  @{BOT_USERNAME}")
+    print(f"Verify Group:             {VERIFY_GROUP_ID}")
+    print(f"Bot:                      @{BOT_USERNAME}")
     print("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━")
 
-    # Initialize and clear webhook to prevent conflicts
-    await app.initialize()
-    await app.bot.delete_webhook(drop_pending_updates=True)
-    print("[BOT] ✅ Webhook cleared — conflicts prevented")
-
-    # Wait for old instance to fully stop
-    await asyncio.sleep(3)
-
-    # Start
-    await app.start()
-    await app.updater.start_polling(
-        drop_pending_updates=True,
-        allowed_updates=Update.ALL_TYPES
-    )
-    print("[BOT] ✅ Nexora AI is LIVE and polling!")
-
-    # Keep running
-    try:
-        await asyncio.Event().wait()
-    except (KeyboardInterrupt, SystemExit):
-        print("[BOT] Shutting down...")
-    finally:
-        await app.updater.stop()
-        await app.stop()
-        await app.shutdown()
-
-
-def main():
-    asyncio.run(run_bot())
+    app.run_polling(drop_pending_updates=True)
 
 
 if __name__ == "__main__":

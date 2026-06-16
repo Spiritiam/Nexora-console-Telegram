@@ -611,49 +611,50 @@ def fetch_market_news():
     return None
 
 # ============================================
-# ECONOMIC CALENDAR
+# ECONOMIC CALENDAR — FOREX FACTORY
 # ============================================
 
 def fetch_economic_calendar():
     try:
         today = datetime.utcnow()
-        date_from = today.strftime("%Y-%m-%dT00:00:00.000Z")
-        date_to = today.strftime("%Y-%m-%dT23:59:59.000Z")
         date_str = today.strftime("%d.%m.%Y")
+        today_str = today.strftime("%Y-%m-%d")
 
-        url = "https://economic-calendar.tradingview.com/events"
-        params = {
-            "from": date_from,
-            "to": date_to,
-            "countries": ["US", "EU", "GB", "CA", "JP", "AU", "CN"],
-            "importance": ["high"]
-        }
-        response = requests.get(url, params=params, timeout=10)
+        url = "https://nfs.faireconomy.media/ff_calendar_thisweek.json"
+        response = requests.get(url, timeout=10)
         data = response.json()
-        events = data.get("result", [])
 
-        if not events:
+        if not data:
             return None
 
         flag_map = {
-            "US": "🇺🇸", "EU": "🇪🇺", "GB": "🇬🇧",
-            "CA": "🇨🇦", "JP": "🇯🇵", "AU": "🇦🇺",
-            "CN": "🇨🇳", "NZ": "🇳🇿", "CH": "🇨🇭",
+            "USD": "🇺🇸", "EUR": "🇪🇺", "GBP": "🇬🇧",
+            "CAD": "🇨🇦", "JPY": "🇯🇵", "AUD": "🇦🇺",
+            "CNY": "🇨🇳", "NZD": "🇳🇿", "CHF": "🇨🇭",
         }
 
         calendar_text = f"\n\n📆 <b>CALENDAR TODAY — {date_str}</b>\n\n"
 
         count = 0
-        for event in events[:5]:
-            title = event.get("title", "")
-            country = event.get("country", "")
-            time_utc = event.get("date", "")
-            flag = flag_map.get(country, "🌍")
+        for event in data:
+            event_date = event.get("date", "")[:10]
+            if event_date != today_str:
+                continue
 
-            if time_utc:
+            impact = event.get("impact", "").lower()
+            if impact != "high":
+                continue
+
+            title = event.get("title", "")
+            currency = event.get("currency", "")
+            time_utc = event.get("date", "")
+            flag = flag_map.get(currency, "🌍")
+
+            if time_utc and "T" in time_utc:
                 try:
-                    dt = datetime.strptime(time_utc[:16], "%Y-%m-%dT%H:%M")
-                    # Convert UTC to Lagos (UTC+1)
+                    dt = datetime.strptime(
+                        time_utc[:16], "%Y-%m-%dT%H:%M"
+                    )
                     lagos_hour = (dt.hour + 1) % 24
                     time_str = f"{lagos_hour:02d}:{dt.minute:02d} GMT+1"
                 except:
@@ -661,11 +662,14 @@ def fetch_economic_calendar():
             else:
                 time_str = ""
 
-            calendar_text += f"{flag} {title}"
+            line = f"{flag} {title}"
             if time_str:
-                calendar_text += f" — {time_str}"
-            calendar_text += "\n"
+                line += f" — {time_str}"
+            calendar_text += line + "\n"
             count += 1
+
+            if count >= 5:
+                break
 
         if count == 0:
             return None
@@ -724,7 +728,7 @@ STRICT RULES:
     return await ask_gemini(prompt)
 
 # ============================================
-# POST NEWS TO CHANNELS
+# POST NEWS — CHANNEL 1 ONLY
 # ============================================
 
 async def post_news(context: ContextTypes.DEFAULT_TYPE):
@@ -738,7 +742,7 @@ async def post_news(context: ContextTypes.DEFAULT_TYPE):
         print("[NEWS] No article found from any source. Skipping.")
         return
 
-    # Generate AI image from headline using Pollinations.ai
+    # Generate AI image from Pollinations.ai
     headline = article.get("title", "financial market news trading")
     image_prompt = (
         f"professional financial news illustration: {headline}, "
@@ -759,26 +763,27 @@ async def post_news(context: ContextTypes.DEFAULT_TYPE):
     if calendar:
         summary += calendar
 
-    for channel_id in [CHANNEL_1_ID, CHANNEL_2_ID]:
+    # ── NEWS ONLY GOES TO CHANNEL 1 ──────────────
+    # Inner Circle (Channel 2) receives signals only
+    try:
+        await context.bot.send_photo(
+            chat_id=CHANNEL_1_ID,
+            photo=image_url,
+            caption=summary,
+            parse_mode=ParseMode.HTML
+        )
+        print(f"[NEWS] ✅ {session_type} posted to Channel 1")
+    except Exception as e:
+        print(f"[NEWS] AI image failed, posting text only: {e}")
         try:
-            await context.bot.send_photo(
-                chat_id=channel_id,
-                photo=image_url,
-                caption=summary,
+            await context.bot.send_message(
+                chat_id=CHANNEL_1_ID,
+                text=summary,
                 parse_mode=ParseMode.HTML
             )
-            print(f"[NEWS] ✅ {session_type} posted to {channel_id}")
-        except Exception as e:
-            print(f"[NEWS] AI image failed, posting without image: {e}")
-            try:
-                await context.bot.send_message(
-                    chat_id=channel_id,
-                    text=summary,
-                    parse_mode=ParseMode.HTML
-                )
-                print(f"[NEWS] ✅ {session_type} posted (text only) to {channel_id}")
-            except Exception as e2:
-                print(f"[NEWS] ❌ Failed for {channel_id}: {e2}")
+            print(f"[NEWS] ✅ {session_type} posted (text only) to Channel 1")
+        except Exception as e2:
+            print(f"[NEWS] ❌ Failed for Channel 1: {e2}")
 
 # ============================================
 # METAAPI — PLACE TRADE ON MT5
@@ -868,7 +873,10 @@ async def monitor_signal(bot, channel_id, message_id, signal_data):
             pips, pip_label = calculate_pips(
                 pair_name, entry_price, exit_price, direction, config
             )
-            print(f"[MONITOR] ✅ TP HIT {pair_name} at {exit_price} | +{pips} {pip_label}")
+            print(
+                f"[MONITOR] ✅ TP HIT {pair_name} "
+                f"at {exit_price} | +{pips} {pip_label}"
+            )
             await bot.send_photo(
                 chat_id=channel_id,
                 photo=TP_HIT_IMAGE_FILE_ID,
@@ -892,7 +900,10 @@ async def monitor_signal(bot, channel_id, message_id, signal_data):
                 pair_name, entry_price, exit_price, direction, config
             )
             pips_lost = abs(pips)
-            print(f"[MONITOR] ❌ SL HIT {pair_name} at {exit_price} | -{pips_lost} {pip_label}")
+            print(
+                f"[MONITOR] ❌ SL HIT {pair_name} "
+                f"at {exit_price} | -{pips_lost} {pip_label}"
+            )
             await bot.send_photo(
                 chat_id=channel_id,
                 photo=SL_HIT_IMAGE_FILE_ID,
@@ -1528,6 +1539,7 @@ async def post_auto_signal(context: ContextTypes.DEFAULT_TYPE):
         print(f"[AUTO SIGNAL] ❌ Could not fetch price for {pair_keyword}.")
         return
 
+    # Signals go to BOTH channels
     for channel_id in [CHANNEL_1_ID, CHANNEL_2_ID]:
         try:
             sent = await context.bot.send_photo(
@@ -1609,8 +1621,8 @@ def main():
     for utc_time, post_type, data in DAILY_SCHEDULE:
         emoji = "📰" if post_type == "news" else "📊"
         print(f"  {emoji} {utc_time} UTC — {data.upper()}")
-    print(f"Channel 1: {CHANNEL_1_ID}")
-    print(f"Channel 2 (Inner Circle): {CHANNEL_2_ID}")
+    print(f"Channel 1 (Public): {CHANNEL_1_ID}")
+    print(f"Channel 2 (Inner Circle — signals only): {CHANNEL_2_ID}")
     print(f"Verify Group: {VERIFY_GROUP_ID}")
     print(f"Bot: @{BOT_USERNAME}")
 

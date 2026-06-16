@@ -1,3 +1,5 @@
 python-telegram-bot[job-queue]
 httpx
 requests
+python-telegram-bot[job-queue]
+requests

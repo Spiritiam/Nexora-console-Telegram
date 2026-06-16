@@ -91,7 +91,6 @@ SL_HIT_IMAGE_FILE_ID = "AgACAgQAAxkBAAIBIWowI9Lxu93CIKFD5YSHFbJ8_MB-AAJBD2sbbT2B
 
 # ============================================
 # DAILY SCHEDULE (UTC)
-# CHANGE 1: usoil → gbpjpy
 # ============================================
 
 DAILY_SCHEDULE = [
@@ -124,10 +123,6 @@ main_keyboard = ReplyKeyboardMarkup(
     is_persistent=True,
     one_time_keyboard=False
 )
-
-# ============================================
-# CHANGE 2: Channel 1 button
-# ============================================
 
 def get_channel_button():
     return InlineKeyboardMarkup([
@@ -317,12 +312,14 @@ def calculate_pips(pair_name, entry_price, exit_price, direction, config):
         return 0, "pips"
 
 # ============================================
-# CHANGE 3: SILVER PRICE — METALS.DEV
+# SILVER PRICE — METALS.DEV
+# CHANGE 1: Try all possible key names
 # ============================================
 
 def get_silver_price():
     try:
         if not METALS_API_KEY:
+            print("[SILVER] No METALS_API_KEY set")
             return None
         url = "https://api.metals.dev/v1/latest"
         params = {
@@ -332,17 +329,26 @@ def get_silver_price():
         }
         response = requests.get(url, params=params, timeout=10)
         data = response.json()
-        price = data.get("metals", {}).get("silver")
+        print(f"[SILVER] Full response: {data}")
+        metals = data.get("metals", {})
+        # Try all possible key names metals.dev might use
+        price = (
+            metals.get("silver") or
+            metals.get("XAG") or
+            metals.get("xag") or
+            metals.get("SILVER")
+        )
         if price:
             print(f"[SILVER] metals.dev: {price}")
             return float(price)
+        print(f"[SILVER] Could not find silver in response: {metals}")
         return None
     except Exception as e:
         print(f"[SILVER] metals.dev error: {e}")
         return None
 
 # ============================================
-# CHANGE 4: OIL PRICE — API NINJAS
+# OIL PRICE — API NINJAS PRIMARY
 # ============================================
 
 def get_oil_price():
@@ -475,7 +481,10 @@ def get_live_price(symbol="XAU/USD", config=None):
     if price is not None:
         return price
     if config:
-        print(f"[PRICE] Twelvedata failed for {symbol}, trying Alpha Vantage...")
+        print(
+            f"[PRICE] Twelvedata failed for {symbol}, "
+            f"trying Alpha Vantage..."
+        )
         price = get_price_alphavantage(config)
         if price is not None:
             print(f"[PRICE] Alpha Vantage: {price} for {symbol}")
@@ -884,6 +893,7 @@ async def post_news(context: ContextTypes.DEFAULT_TYPE):
 
 # ============================================
 # METAAPI — PLACE TRADE ON MT5
+# CHANGE 2: volume 0.01 → 0.1
 # ============================================
 
 async def place_mt5_trade(signal_data):
@@ -903,7 +913,7 @@ async def place_mt5_trade(signal_data):
         )
         payload = {
             "symbol": mt5_symbol,
-            "volume": 0.01,
+            "volume": 0.1,
             "actionType": order_type,
             "stopLoss": signal_data["stop_loss"],
             "takeProfit": signal_data["take_profit"],
@@ -1523,7 +1533,7 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
 
 # ============================================
-# AUTO SIGNAL — CHANGE 2 & 3
+# AUTO SIGNAL — BOTH CHANNELS
 # Button on Channel 1 only, no TP/SL monitor
 # ============================================
 
@@ -1544,7 +1554,6 @@ async def post_auto_signal(context: ContextTypes.DEFAULT_TYPE):
 
     for channel_id in [CHANNEL_1_ID, CHANNEL_2_ID]:
         try:
-            # Button on Channel 1 only
             markup = (
                 get_channel_button()
                 if channel_id == CHANNEL_1_ID
@@ -1563,16 +1572,13 @@ async def post_auto_signal(context: ContextTypes.DEFAULT_TYPE):
                 f"posted to {channel_id}"
             )
 
-            # MT5 auto trade
             asyncio.create_task(place_mt5_trade(signal_data))
-
-            # TP/SL monitor removed — handled manually
 
         except Exception as e:
             print(f"[AUTO SIGNAL] ❌ Failed for {channel_id}: {e}")
 
 # ============================================
-# MAIN — UNCHANGED FROM WORKING VERSION
+# MAIN — UNCHANGED
 # ============================================
 
 def main():

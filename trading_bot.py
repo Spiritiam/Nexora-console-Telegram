@@ -128,7 +128,7 @@ main_keyboard = ReplyKeyboardMarkup(
 )
 
 # ============================================
-# INLINE BUTTON FOR CHANNEL POSTS
+# INLINE BUTTON FOR CHANNEL 1 ONLY
 # ============================================
 
 def get_channel_button():
@@ -383,13 +383,16 @@ def get_market_session():
     return "Market Closing Session 🌙"
 
 # ============================================
-# MARKET BIAS
+# MARKET BIAS — STRONG SIGNALS ONLY
 # ============================================
 
 def generate_market_bias():
     direction = random.choice(["BUY", "SELL"])
-    strength = random.choice(["STRONG", "WEAK"])
-    confidence = random.randint(72, 94)
+
+    # Only STRONG signals — high confidence only
+    strength = "STRONG"
+    confidence = random.randint(80, 94)
+
     return direction, strength, confidence
 
 # ============================================
@@ -690,23 +693,27 @@ async def post_news(context: ContextTypes.DEFAULT_TYPE):
     summary = await generate_news_summary(article, session_type)
     summary = clean_text(summary)
 
-    button = get_channel_button()
-    channel_ids = [CHANNEL_1_ID, CHANNEL_2_ID]
-
-    for channel_id in channel_ids:
+    for channel_id in [CHANNEL_1_ID, CHANNEL_2_ID]:
         try:
+            # Button only on Channel 1
+            markup = (
+                get_channel_button()
+                if channel_id == CHANNEL_1_ID
+                else None
+            )
+
             if image_url:
                 await context.bot.send_photo(
                     chat_id=channel_id,
                     photo=image_url,
                     caption=summary,
-                    reply_markup=button
+                    reply_markup=markup
                 )
             else:
                 await context.bot.send_message(
                     chat_id=channel_id,
                     text=summary,
-                    reply_markup=button
+                    reply_markup=markup
                 )
             print(f"[NEWS] ✅ {session_type} posted to {channel_id}")
         except Exception as e:
@@ -1108,13 +1115,11 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         target_id = data.replace("approve_", "")
         email = pending_verifications.get(target_id, "unknown")
 
-        # Save to Supabase permanently
         add_verified_user(target_id, email)
 
         if target_id in pending_verifications:
             del pending_verifications[target_id]
 
-        # Generate single-use invite link for Inner Circle
         inner_circle_link = None
         try:
             invite = await context.bot.create_chat_invite_link(
@@ -1127,7 +1132,6 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         except Exception as e:
             print(f"[INVITE] Could not create invite link: {e}")
 
-        # Send congratulations message
         try:
             if inner_circle_link:
                 await context.bot.send_message(
@@ -1174,15 +1178,11 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
                         "📚 <b>AI Market Breakdowns</b> — Deep analysis "
                         "on any pair you ask about\n\n"
                         "📈 <b>Technical Analysis</b> — Professional "
-                        "grade insights powered by AI\n\n"
-                        "━━━━━━━━━━━━━━━━━━━━\n"
-                        "💼 <i>Welcome to the winning side. "
-                        "Let's get to work!</i> 🔥"
+                        "grade insights powered by AI"
                     ),
                     parse_mode=ParseMode.HTML,
                 )
 
-            # Send keyboard in separate message
             await context.bot.send_message(
                 chat_id=int(target_id),
                 text=(
@@ -1458,16 +1458,22 @@ async def post_auto_signal(context: ContextTypes.DEFAULT_TYPE):
         )
         return
 
-    channel_ids = [CHANNEL_1_ID, CHANNEL_2_ID]
-
-    for channel_id in channel_ids:
+    for channel_id in [CHANNEL_1_ID, CHANNEL_2_ID]:
         try:
+            # Button only on Channel 1
+            # Inner Circle (Channel 2) has no button
+            markup = (
+                get_channel_button()
+                if channel_id == CHANNEL_1_ID
+                else None
+            )
+
             sent = await context.bot.send_photo(
                 chat_id=channel_id,
                 photo=image_file_id,
                 caption=signal,
                 parse_mode=ParseMode.HTML,
-                reply_markup=get_channel_button()
+                reply_markup=markup
             )
             print(
                 f"[AUTO SIGNAL] ✅ {pair_keyword.upper()} "

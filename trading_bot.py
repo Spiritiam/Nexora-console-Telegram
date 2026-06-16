@@ -2,6 +2,9 @@ import os
 import asyncio
 import random
 import requests
+import threading
+import schedule
+import time
 
 from datetime import datetime
 
@@ -63,17 +66,6 @@ BUY_IMAGE_FILE_ID = "AgACAgQAAxkBAAIBFWowFvKE9iJ2rPQK6iqENojXggvJAAIyD2sbbT2BUfF
 SELL_IMAGE_FILE_ID = "AgACAgQAAxkBAAIBH2owIQ4F4GQEnXyDhVLRoQZ3Vg06AAI_D2sbbT2BUechitI61wpvAQADAgADeQADPAQ"
 
 # ============================================
-# DAILY SCHEDULE (UTC)
-# ============================================
-
-DAILY_SCHEDULE = [
-    ("06:00", "news",   "morning"),  # 7:00 AM Lagos
-    ("07:00", "signal", "xauusd"),   # 8:00 AM Lagos
-    ("13:00", "signal", "gbpjpy"),   # 2:00 PM Lagos
-    ("19:00", "signal", "btcusd"),   # 8:00 PM Lagos
-]
-
-# ============================================
 # AI CONFIG
 # ============================================
 
@@ -109,6 +101,9 @@ def get_channel_button():
 
 user_modes = {}
 pending_verifications = {}
+
+# Global bot reference for scheduler
+bot_app = None
 
 # ============================================
 # SUPABASE
@@ -502,13 +497,10 @@ def fetch_news_thenewsapi():
 def fetch_market_news():
     article = fetch_news_gnews()
     if article:
-        print("[NEWS] ✅ GNews found")
         return article
     article = fetch_news_thenewsapi()
     if article:
-        print("[NEWS] ✅ TheNewsAPI found")
         return article
-    print("[NEWS] Both APIs failed.")
     return None
 
 # ============================================
@@ -581,7 +573,6 @@ async def ask_gemini(prompt):
     try:
         r = requests.post(GEMINI_URL, headers=headers, json=data, timeout=30)
         if r.status_code == 429:
-            print("[GEMINI] Rate limit, waiting 10s...")
             await asyncio.sleep(10)
             r = requests.post(GEMINI_URL, headers=headers, json=data, timeout=30)
             if r.status_code == 429:
@@ -652,7 +643,6 @@ STRICT RULES:
 - Each bullet point MAX 15 words
 - No markdown symbols like ** or ##
 - No hashtags
-- Focus on forex and gold traders
 """
     return await ask_gemini(prompt)
 
@@ -707,7 +697,6 @@ FORMAT EXACTLY LIKE THIS:
 
 RULES:
 - Use the LIVE PRICE
-- Beginner friendly but professional
 - Maximum 250 words
 - No markdown symbols like ** or ##
 - No hashtags
@@ -715,6 +704,151 @@ RULES:
 QUESTION: {question}
 """
     return await ask_gemini(prompt)
+
+# ============================================
+# SCHEDULED TASKS
+# ============================================
+
+async def scheduled_news():
+    global bot_app
+    if bot_app is None:
+        return
+
+    print(f"[SCHEDULER] Posting morning news")
+
+    article = fetch_market_news()
+    if article is None:
+        print("[NEWS] No article. Skipping.")
+        return
+
+    headline = article.get("title", "financial market news")
+    image_prompt = (
+        f"professional financial news illustration: {headline}, "
+        f"cinematic digital art, dramatic lighting, high quality"
+    )
+    image_url = (
+        f"https://image.pollinations.ai/prompt/"
+        f"{requests.utils.quote(image_prompt)}"
+        f"?width=800&height=450&nologo=true"
+    )
+
+    summary = await generate_news_summary(article, "morning")
+    summary = clean_text(summary)
+
+    calendar = fetch_economic_calendar()
+    if calendar:
+        summary += calendar
+
+    try:
+        await bot_app.bot.send_photo(
+            chat_id=CHANNEL_1_ID,
+            photo=image_url,
+            caption=summary,
+            parse_mode=ParseMode.HTML
+        )
+        print("[NEWS] ✅ Posted to Channel 1")
+    except Exception as e:
+        try:
+            await bot_app.bot.send_message(
+                chat_id=CHANNEL_1_ID,
+                text=summary,
+                parse_mode=ParseMode.HTML
+            )
+        except Exception as e2:
+            print(f"[NEWS] ❌ Failed: {e2}")
+
+
+async def scheduled_signal(pair_keyword):
+    global bot_app
+    if bot_app is None:
+        return
+
+    print(f"[SCHEDULER] Posting {pair_keyword.upper()} signal")
+
+    image_file_id, direction, signal, signal_data = (
+        build_signal_response(pair_keyword)
+    )
+
+    if signal_data is None:
+        print(f"[SCHEDULER] ❌ No price for {pair_keyword}")
+        return
+
+    for channel_id in [CHANNEL_1_ID, CHANNEL_2_ID]:
+        try:
+            markup = (
+                get_channel_button()
+                if channel_id == CHANNEL_1_ID
+                else None
+            )
+            await bot_app.bot.send_photo(
+                chat_id=channel_id,
+                photo=image_file_id,
+                caption=signal,
+                parse_mode=ParseMode.HTML,
+                reply_markup=markup
+            )
+            print(f"[SCHEDULER] ✅ {pair_keyword.upper()} → {channel_id}")
+        except Exception as e:
+            print(f"[SCHEDULER] ❌ Failed: {e}")
+
+
+def run_scheduled_task(coro):
+    """Run async task from sync scheduler thread."""
+    loop = asyncio.new_event_loop()
+    asyncio.set_event_loop(loop)
+    loop.run_until_complete(coro)
+    loop.close()
+
+
+def setup_scheduler():
+    """Set up all scheduled tasks using the schedule library."""
+
+    # 7:00 AM Lagos = 06:00 UTC — Morning News
+    schedule.every().day.at("06:00").do(
+        lambda: threading.Thread(
+            target=run_scheduled_task,
+            args=(scheduled_news(),)
+        ).start()
+    )
+
+    # 8:00 AM Lagos = 07:00 UTC — Gold Signal
+    schedule.every().day.at("07:00").do(
+        lambda: threading.Thread(
+            target=run_scheduled_task,
+            args=(scheduled_signal("xauusd"),)
+        ).start()
+    )
+
+    # 2:00 PM Lagos = 13:00 UTC — GBPJPY Signal
+    schedule.every().day.at("13:00").do(
+        lambda: threading.Thread(
+            target=run_scheduled_task,
+            args=(scheduled_signal("gbpjpy"),)
+        ).start()
+    )
+
+    # 8:00 PM Lagos = 19:00 UTC — Bitcoin Signal
+    schedule.every().day.at("19:00").do(
+        lambda: threading.Thread(
+            target=run_scheduled_task,
+            args=(scheduled_signal("btcusd"),)
+        ).start()
+    )
+
+    print("[SCHEDULER] ✅ All tasks scheduled")
+    print("  📰 06:00 UTC — Morning News (Channel 1)")
+    print("  📊 07:00 UTC — XAUUSD Gold (Both Channels)")
+    print("  📊 13:00 UTC — GBPJPY (Both Channels)")
+    print("  📊 19:00 UTC — BTCUSD Bitcoin (Both Channels)")
+
+    # Run scheduler in background thread
+    def run_forever():
+        while True:
+            schedule.run_pending()
+            time.sleep(30)
+
+    thread = threading.Thread(target=run_forever, daemon=True)
+    thread.start()
 
 # ============================================
 # VERIFICATION GATE
@@ -763,7 +897,6 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text(
             f"👋 <b>Welcome back, {username}!</b>\n\n"
             f"✅ You're a <b>verified Nexora AI trader.</b>\n\n"
-            f"━━━━━━━━━━━━━━━━━━━━\n"
             f"📊 <b>Signal</b> — Get a live trading signal\n\n"
             f"📚 <b>Breakdown</b> — Get a full AI market analysis\n\n"
             f"<i>Both buttons are at the bottom of your screen 👇</i>",
@@ -777,10 +910,8 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if remaining > 0:
         await update.message.reply_text(
             f"👋 <b>Hello {username}, welcome to Nexora AI! 🤖</b>\n\n"
-            f"Your personal AI trading assistant — delivering "
-            f"<b>professional trading signals</b> and AI-powered breakdowns.\n\n"
+            f"Your personal AI trading assistant.\n\n"
             f"🎁 <b>You have {remaining} FREE trial signal(s) to use!</b>\n\n"
-            f"━━━━━━━━━━━━━━━━━━━━\n"
             f"📊 <b>Signal</b> — Get a live trading signal\n\n"
             f"📚 <b>Breakdown</b> — Get a full AI market analysis\n\n"
             f"<i>Both buttons are at the bottom of your screen 👇</i>",
@@ -809,7 +940,7 @@ async def handle_buttons(update: Update, context: ContextTypes.DEFAULT_TYPE):
         user_modes[user_id] = "signal"
         await update.message.reply_text(
             "📊 <b>Signal Mode Activated</b>\n\n"
-            "Type the pair you want a signal for:\n\n"
+            "Type the pair you want:\n\n"
             "• XAUUSD — Gold\n"
             "• BTCUSD — Bitcoin\n"
             "• GBPJPY\n"
@@ -829,7 +960,7 @@ async def handle_buttons(update: Update, context: ContextTypes.DEFAULT_TYPE):
             "Type your market question:\n\n"
             "• Analyze gold market today\n"
             "• BTCUSD outlook\n"
-            "• GBPJPY market analysis",
+            "• GBPJPY analysis",
             parse_mode=ParseMode.HTML,
             reply_markup=main_keyboard
         )
@@ -860,7 +991,6 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 name=f"Verified: {email}"
             )
             inner_circle_link = invite.invite_link
-            print(f"[INVITE] ✅ Created for {target_id}")
         except Exception as e:
             print(f"[INVITE] Error: {e}")
 
@@ -872,16 +1002,13 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
                         "🎉 <b>Congratulations! You're now a verified "
                         "Nexora AI trader!</b>\n\n"
                         "✅ <b>Full access unlocked!</b>\n\n"
-                        "📊 <b>Live Trading Signals</b> — Gold, Bitcoin, "
-                        "Forex and more\n\n"
-                        "📚 <b>AI Market Breakdowns</b> — Any pair\n\n"
-                        "📈 <b>Professional Analysis</b> — Powered by AI\n\n"
+                        "📊 Live signals — Gold, Bitcoin, Forex and more\n\n"
+                        "📚 AI market breakdowns — any pair\n\n"
+                        "📈 Professional grade insights\n\n"
                         "━━━━━━━━━━━━━━━━━━━━\n"
-                        "🔐 <b>EXCLUSIVE — INNER CIRCLE ACCESS</b>\n"
+                        "🔐 <b>INNER CIRCLE ACCESS</b>\n"
                         "━━━━━━━━━━━━━━━━━━━━\n\n"
-                        "You now have access to our exclusive Inner Circle "
-                        "channel — premium signals for verified traders only.\n\n"
-                        "👇 <b>Your personal invite — works once, just for you:</b>"
+                        "👇 <b>Your personal invite — works once:</b>"
                     ),
                     parse_mode=ParseMode.HTML,
                     reply_markup=InlineKeyboardMarkup([
@@ -895,12 +1022,8 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 await context.bot.send_message(
                     chat_id=int(target_id),
                     text=(
-                        "🎉 <b>Congratulations! You're now a verified "
-                        "Nexora AI trader!</b>\n\n"
-                        "✅ <b>Full access unlocked!</b>\n\n"
-                        "📊 Live signals on Gold, Bitcoin, Forex and more\n"
-                        "📚 AI market breakdowns on any pair\n"
-                        "📈 Professional grade insights"
+                        "🎉 <b>Congratulations! You're now verified!</b>\n\n"
+                        "✅ Full access to all signals and breakdowns unlocked!"
                     ),
                     parse_mode=ParseMode.HTML,
                 )
@@ -908,10 +1031,8 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await context.bot.send_message(
                 chat_id=int(target_id),
                 text=(
-                    "━━━━━━━━━━━━━━━━━━━━\n"
                     "💼 <i>Welcome to the winning side. "
-                    "Let's get to work!</i> 🔥\n"
-                    "━━━━━━━━━━━━━━━━━━━━\n\n"
+                    "Let's get to work!</i> 🔥\n\n"
                     "📊 <b>Signal</b> — Get a live trading signal\n\n"
                     "📚 <b>Breakdown</b> — Get a full market analysis"
                 ),
@@ -925,9 +1046,8 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await query.edit_message_text(
             text=(
                 f"✅ <b>APPROVED</b>\n\n"
-                f"🆔 <b>User ID:</b> {target_id}\n"
-                f"📧 <b>Email:</b> {email}\n\n"
-                f"<i>Verified, saved to database, Inner Circle invite sent.</i>"
+                f"🆔 {target_id}\n📧 {email}\n\n"
+                f"<i>Verified and Inner Circle invite sent.</i>"
             ),
             parse_mode=ParseMode.HTML
         )
@@ -944,18 +1064,11 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 chat_id=int(target_id),
                 text=(
                     "❌ <b>Verification Failed</b>\n\n"
-                    "We could not find an Exness account linked to your "
-                    "email registered through our official link.\n\n"
-                    "<b>This could mean:</b>\n"
-                    "• You registered without using our link\n"
-                    "• You used a different email\n\n"
-                    "━━━━━━━━━━━━━━━━━━━━\n"
-                    "✅ <b>HOW TO FIX THIS:</b>\n"
-                    "━━━━━━━━━━━━━━━━━━━━\n\n"
-                    "Register a NEW Exness account using our official "
-                    "link below. Completely <b>FREE</b> — takes 2 minutes.\n\n"
+                    "We could not find your Exness account "
+                    "registered through our link.\n\n"
+                    "Register a NEW account using our link below:\n\n"
                     f"🔗 {EXNESS_LINK}\n\n"
-                    "Once done, come back and type your new email. 🚀"
+                    "Then come back and type your new email. 🚀"
                 ),
                 parse_mode=ParseMode.HTML
             )
@@ -963,12 +1076,7 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             print(f"[REJECT] Error: {e}")
 
         await query.edit_message_text(
-            text=(
-                f"❌ <b>REJECTED</b>\n\n"
-                f"🆔 <b>User ID:</b> {target_id}\n"
-                f"📧 <b>Email:</b> {email}\n\n"
-                f"<i>User notified to register via correct link.</i>"
-            ),
+            text=f"❌ <b>REJECTED</b>\n\n🆔 {target_id}\n📧 {email}",
             parse_mode=ParseMode.HTML
         )
 
@@ -981,14 +1089,12 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
     username = update.message.from_user.username or "Trader"
     message = update.message.text.strip()
 
-    # ── AWAITING EMAIL ──────────────────────────
     if user_modes.get(user_id) == "awaiting_email":
         email = message.strip().lower()
 
         if "@" not in email or "." not in email:
             await update.message.reply_text(
-                "⚠️ <b>That doesn't look like a valid email.</b>\n\n"
-                "Please enter the email you used to register on Exness 👇\n\n"
+                "⚠️ Please enter a valid email address 👇\n\n"
                 "<i>Example: yourname@gmail.com</i>",
                 parse_mode=ParseMode.HTML
             )
@@ -998,9 +1104,8 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
         await update.message.reply_text(
             "⏳ <b>Verification request submitted!</b>\n\n"
-            "Our team is reviewing your details. "
-            "You'll receive a confirmation shortly.\n\n"
-            "<i>Sit tight — greatness is loading! 🚀</i>",
+            "Our team is reviewing your details shortly.\n\n"
+            "<i>Sit tight! 🚀</i>",
             parse_mode=ParseMode.HTML
         )
 
@@ -1009,10 +1114,10 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 chat_id=VERIFY_GROUP_ID,
                 text=(
                     f"🔔 <b>NEW VERIFICATION REQUEST</b>\n\n"
-                    f"👤 <b>User:</b> @{username}\n"
-                    f"🆔 <b>ID:</b> {user_id}\n"
-                    f"📧 <b>Email:</b> {email}\n\n"
-                    f"<i>Tap a button to approve or reject:</i>"
+                    f"👤 @{username}\n"
+                    f"🆔 {user_id}\n"
+                    f"📧 {email}\n\n"
+                    f"<i>Tap to approve or reject:</i>"
                 ),
                 parse_mode=ParseMode.HTML,
                 reply_markup=InlineKeyboardMarkup([
@@ -1034,7 +1139,6 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
         user_modes[user_id] = None
         return
 
-    # ── TRIAL / VERIFIED CHECK ──────────────────
     if not is_verified(user_id) and get_trial_count(user_id) >= FREE_TRIAL_LIMIT:
         user_modes[user_id] = "awaiting_email"
         await send_verification_gate(update)
@@ -1042,7 +1146,6 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     mode = user_modes.get(user_id)
 
-    # ── SIGNAL MODE ─────────────────────────────
     if mode == "signal":
         if not is_verified(user_id):
             count = increment_trial(user_id)
@@ -1090,7 +1193,6 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
             )
         return
 
-    # ── BREAKDOWN MODE ──────────────────────────
     if mode == "breakdown":
         if not is_verified(user_id):
             count = increment_trial(user_id)
@@ -1126,7 +1228,6 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 await send_verification_gate(update)
         return
 
-    # ── DEFAULT ─────────────────────────────────
     await update.message.reply_text(
         "👇 <b>Here's what you can do:</b>\n\n"
         "📊 <b>Signal</b> — Get a live trading signal\n\n"
@@ -1137,186 +1238,41 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
 
 # ============================================
-# POST NEWS — CHANNEL 1 ONLY
-# ============================================
-
-async def post_news(context: ContextTypes.DEFAULT_TYPE):
-    session_type = context.job.data
-    now = datetime.utcnow().strftime('%H:%M UTC')
-    print(f"[NEWS] Posting {session_type} at {now}")
-
-    article = fetch_market_news()
-    if article is None:
-        print("[NEWS] No article. Skipping.")
-        return
-
-    headline = article.get("title", "financial market news")
-    image_prompt = (
-        f"professional financial news illustration: {headline}, "
-        f"cinematic digital art, dramatic lighting, high quality"
-    )
-    image_url = (
-        f"https://image.pollinations.ai/prompt/"
-        f"{requests.utils.quote(image_prompt)}"
-        f"?width=800&height=450&nologo=true"
-    )
-
-    summary = await generate_news_summary(article, session_type)
-    summary = clean_text(summary)
-
-    calendar = fetch_economic_calendar()
-    if calendar:
-        summary += calendar
-
-    try:
-        await context.bot.send_photo(
-            chat_id=CHANNEL_1_ID,
-            photo=image_url,
-            caption=summary,
-            parse_mode=ParseMode.HTML
-        )
-        print(f"[NEWS] ✅ Posted to Channel 1")
-    except Exception as e:
-        print(f"[NEWS] Image failed, trying text: {e}")
-        try:
-            await context.bot.send_message(
-                chat_id=CHANNEL_1_ID,
-                text=summary,
-                parse_mode=ParseMode.HTML
-            )
-            print(f"[NEWS] ✅ Text posted to Channel 1")
-        except Exception as e2:
-            print(f"[NEWS] ❌ Failed: {e2}")
-
-# ============================================
-# POST AUTO SIGNAL — BOTH CHANNELS
-# ============================================
-
-async def post_auto_signal(context: ContextTypes.DEFAULT_TYPE):
-    pair_keyword = context.job.data
-    now = datetime.utcnow().strftime('%H:%M UTC')
-    print(f"[AUTO SIGNAL] {pair_keyword.upper()} at {now}")
-
-    image_file_id, direction, signal, signal_data = (
-        build_signal_response(pair_keyword)
-    )
-
-    if signal_data is None:
-        print(f"[AUTO SIGNAL] ❌ No price for {pair_keyword}")
-        return
-
-    for channel_id in [CHANNEL_1_ID, CHANNEL_2_ID]:
-        try:
-            # Button on Channel 1 only
-            markup = (
-                get_channel_button()
-                if channel_id == CHANNEL_1_ID
-                else None
-            )
-            await context.bot.send_photo(
-                chat_id=channel_id,
-                photo=image_file_id,
-                caption=signal,
-                parse_mode=ParseMode.HTML,
-                reply_markup=markup
-            )
-            print(f"[AUTO SIGNAL] ✅ {pair_keyword.upper()} → {channel_id}")
-        except Exception as e:
-            print(f"[AUTO SIGNAL] ❌ Failed for {channel_id}: {e}")
-
-# ============================================
-# MT5 TRADE
-# ============================================
-
-async def place_mt5_trade(signal_data):
-    if not METAAPI_TOKEN or not METAAPI_ACCOUNT_ID:
-        return None
-    try:
-        headers = {
-            "auth-token": METAAPI_TOKEN,
-            "Content-Type": "application/json"
-        }
-        direction = signal_data["direction"]
-        order_type = (
-            "ORDER_TYPE_BUY" if direction == "BUY"
-            else "ORDER_TYPE_SELL"
-        )
-        payload = {
-            "symbol": signal_data["mt5_symbol"],
-            "volume": 0.01,
-            "actionType": order_type,
-            "stopLoss": signal_data["stop_loss"],
-            "takeProfit": signal_data["take_profit"],
-            "comment": "NexoraAI"
-        }
-        url = (
-            f"https://mt-client-api-v1.london.agiliumtrade.ai"
-            f"/users/current/accounts/{METAAPI_ACCOUNT_ID}/trade"
-        )
-        r = requests.post(url, headers=headers, json=payload, timeout=30)
-        if r.status_code in [200, 201]:
-            print(f"[MT5] ✅ Trade placed")
-        else:
-            print(f"[MT5] ❌ Failed: {r.status_code}")
-    except Exception as e:
-        print(f"[MT5] ❌ Exception: {e}")
-
-# ============================================
-# MAIN — SIMPLE AND STABLE
+# MAIN
 # ============================================
 
 def main():
-    app = Application.builder().token(TELEGRAM_TOKEN).build()
+    global bot_app
 
-    app.add_handler(CommandHandler("start", start))
-    app.add_handler(CallbackQueryHandler(handle_callback))
-    app.add_handler(
+    print("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━")
+    print("Nexora AI Starting...")
+    print("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━")
+
+    # Build app WITHOUT job queue dependency
+    bot_app = Application.builder().token(TELEGRAM_TOKEN).build()
+
+    bot_app.add_handler(CommandHandler("start", start))
+    bot_app.add_handler(CallbackQueryHandler(handle_callback))
+    bot_app.add_handler(
         MessageHandler(
             filters.Regex("^(📊 Signal|📚 Breakdown|signal|breakdown)$"),
             handle_buttons
         )
     )
-    app.add_handler(
+    bot_app.add_handler(
         MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text)
     )
 
-    job_queue = app.job_queue
+    # Start scheduler in background
+    setup_scheduler()
 
-    def parse_time(t):
-        h, m = map(int, t.split(":"))
-        return datetime.now().replace(
-            hour=h, minute=m, second=0, microsecond=0
-        ).time()
-
-    for i, (utc_time, post_type, data) in enumerate(DAILY_SCHEDULE):
-        if post_type == "news":
-            job_queue.run_daily(
-                post_news,
-                time=parse_time(utc_time),
-                name=f"news_{i}_{data}",
-                data=data
-            )
-        elif post_type == "signal":
-            job_queue.run_daily(
-                post_auto_signal,
-                time=parse_time(utc_time),
-                name=f"signal_{i}_{data}",
-                data=data
-            )
-
-    print("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━")
-    print("Nexora AI Running!")
-    print("Daily schedule (UTC):")
-    for utc_time, post_type, data in DAILY_SCHEDULE:
-        emoji = "📰" if post_type == "news" else "📊"
-        print(f"  {emoji} {utc_time} UTC — {data.upper()}")
     print(f"Channel 1 (Public):       {CHANNEL_1_ID}")
     print(f"Channel 2 (Inner Circle): {CHANNEL_2_ID}")
-    print(f"Verify Group:             {VERIFY_GROUP_ID}")
-    print(f"Bot:                      @{BOT_USERNAME}")
+    print(f"Bot: @{BOT_USERNAME}")
     print("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━")
+    print("[BOT] ✅ Nexora AI is LIVE!")
 
-    app.run_polling(drop_pending_updates=True)
+    bot_app.run_polling(drop_pending_updates=True)
 
 
 if __name__ == "__main__":

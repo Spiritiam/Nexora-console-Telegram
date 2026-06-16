@@ -90,19 +90,17 @@ SL_HIT_IMAGE_FILE_ID = "AgACAgQAAxkBAAIBIWowI9Lxu93CIKFD5YSHFbJ8_MB-AAJBD2sbbT2B
 # ============================================
 # DAILY SCHEDULE (UTC)
 # ============================================
-# XAGUSD removed — both price APIs fail for silver
-# News posts now use GNews + TheNewsAPI
 
 DAILY_SCHEDULE = [
-    ("06:00", "news",   "morning"),   # 7:00 AM Lagos
-    ("07:00", "signal", "xauusd"),    # 8:00 AM Lagos
-    ("09:00", "signal", "btcusd"),    # 10:00 AM Lagos
-    ("11:00", "news",   "midday"),    # 12:00 PM Lagos
-    ("13:00", "signal", "usoil"),     # 2:00 PM Lagos
-    ("15:00", "signal", "gbpusd"),    # 4:00 PM Lagos
-    ("17:00", "news",   "afternoon"), # 6:00 PM Lagos
-    ("19:00", "signal", "gbpjpy"),    # 8:00 PM Lagos
-    ("21:00", "signal", "xauusd"),    # 10:00 PM Lagos — second gold signal
+    ("06:00", "news",   "morning"),
+    ("07:00", "signal", "xauusd"),
+    ("09:00", "signal", "btcusd"),
+    ("11:00", "news",   "midday"),
+    ("13:00", "signal", "usoil"),
+    ("15:00", "signal", "gbpusd"),
+    ("17:00", "news",   "afternoon"),
+    ("19:00", "signal", "gbpjpy"),
+    ("21:00", "signal", "xauusd"),
 ]
 
 # ============================================
@@ -618,19 +616,15 @@ def fetch_news_thenewsapi():
 # ============================================
 
 def fetch_market_news():
-    # Try GNews first
     article = fetch_news_gnews()
     if article:
         print("[NEWS] ✅ GNews article found")
         return article
-
-    # Fallback to TheNewsAPI
     print("[NEWS] GNews failed, trying TheNewsAPI...")
     article = fetch_news_thenewsapi()
     if article:
         print("[NEWS] ✅ TheNewsAPI article found")
         return article
-
     print("[NEWS] Both news APIs failed.")
     return None
 
@@ -849,7 +843,6 @@ async def ask_gemini(prompt):
         if response.status_code == 429:
             print("[GEMINI] Rate limit hit, waiting 10 seconds...")
             await asyncio.sleep(10)
-            # Retry once after waiting
             response = requests.post(
                 GEMINI_URL, headers=headers, json=data, timeout=30
             )
@@ -1115,25 +1108,84 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         target_id = data.replace("approve_", "")
         email = pending_verifications.get(target_id, "unknown")
 
+        # Save to Supabase permanently
         add_verified_user(target_id, email)
 
         if target_id in pending_verifications:
             del pending_verifications[target_id]
 
+        # Generate single-use invite link for Inner Circle
+        inner_circle_link = None
         try:
+            invite = await context.bot.create_chat_invite_link(
+                chat_id=CHANNEL_2_ID,
+                member_limit=1,
+                name=f"Verified: {email}"
+            )
+            inner_circle_link = invite.invite_link
+            print(f"[INVITE] ✅ Created invite for {target_id}")
+        except Exception as e:
+            print(f"[INVITE] Could not create invite link: {e}")
+
+        # Send congratulations message
+        try:
+            if inner_circle_link:
+                await context.bot.send_message(
+                    chat_id=int(target_id),
+                    text=(
+                        "🎉 <b>Congratulations! You're now a verified "
+                        "Nexora AI trader!</b>\n\n"
+                        "✅ <b>Full access unlocked!</b>\n\n"
+                        "You now have <b>unlimited access</b> to:\n\n"
+                        "📊 <b>Live Trading Signals</b> — Real-time "
+                        "signals on Gold, Bitcoin, Oil, Forex and more\n\n"
+                        "📚 <b>AI Market Breakdowns</b> — Deep analysis "
+                        "on any pair you ask about\n\n"
+                        "📈 <b>Technical Analysis</b> — Professional "
+                        "grade insights powered by AI\n\n"
+                        "━━━━━━━━━━━━━━━━━━━━\n"
+                        "🔐 <b>EXCLUSIVE — INNER CIRCLE ACCESS</b>\n"
+                        "━━━━━━━━━━━━━━━━━━━━\n\n"
+                        "As a verified trader you now have access to our "
+                        "<b>exclusive Inner Circle channel</b> — premium "
+                        "signals and real-time alerts reserved only for "
+                        "verified Exness traders like you.\n\n"
+                        "👇 <b>Your personal invite link — "
+                        "works once, just for you:</b>"
+                    ),
+                    parse_mode=ParseMode.HTML,
+                    reply_markup=InlineKeyboardMarkup([
+                        [InlineKeyboardButton(
+                            "🔐 Join Inner Circle Now",
+                            url=inner_circle_link
+                        )]
+                    ])
+                )
+            else:
+                await context.bot.send_message(
+                    chat_id=int(target_id),
+                    text=(
+                        "🎉 <b>Congratulations! You're now a verified "
+                        "Nexora AI trader!</b>\n\n"
+                        "✅ <b>Full access unlocked!</b>\n\n"
+                        "You now have <b>unlimited access</b> to:\n\n"
+                        "📊 <b>Live Trading Signals</b> — Real-time "
+                        "signals on Gold, Bitcoin, Oil, Forex and more\n\n"
+                        "📚 <b>AI Market Breakdowns</b> — Deep analysis "
+                        "on any pair you ask about\n\n"
+                        "📈 <b>Technical Analysis</b> — Professional "
+                        "grade insights powered by AI\n\n"
+                        "━━━━━━━━━━━━━━━━━━━━\n"
+                        "💼 <i>Welcome to the winning side. "
+                        "Let's get to work!</i> 🔥"
+                    ),
+                    parse_mode=ParseMode.HTML,
+                )
+
+            # Send keyboard in separate message
             await context.bot.send_message(
                 chat_id=int(target_id),
                 text=(
-                    "🎉 <b>Congratulations! You're now a verified "
-                    "Nexora AI trader!</b>\n\n"
-                    "✅ <b>Full access unlocked!</b>\n\n"
-                    "You now have <b>unlimited access</b> to:\n\n"
-                    "📊 <b>Live Trading Signals</b> — Real-time signals "
-                    "on Gold, Bitcoin, Silver, Oil, Forex and more\n\n"
-                    "📚 <b>AI Market Breakdowns</b> — Deep analysis on "
-                    "any pair you ask about\n\n"
-                    "📈 <b>Technical Analysis</b> — Professional grade "
-                    "insights powered by AI\n\n"
                     "━━━━━━━━━━━━━━━━━━━━\n"
                     "💼 <i>Welcome to the winning side. "
                     "Let's get to work!</i> 🔥\n"
@@ -1145,6 +1197,7 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 parse_mode=ParseMode.HTML,
                 reply_markup=main_keyboard
             )
+
         except Exception as e:
             print(f"[APPROVE] Could not message user: {e}")
 
@@ -1153,7 +1206,8 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 f"✅ <b>APPROVED</b>\n\n"
                 f"🆔 <b>User ID:</b> {target_id}\n"
                 f"📧 <b>Email:</b> {email}\n\n"
-                f"<i>User verified and saved to database permanently.</i>"
+                f"<i>User verified, saved to database and "
+                f"sent Inner Circle invite.</i>"
             ),
             parse_mode=ParseMode.HTML
         )
@@ -1489,7 +1543,7 @@ def main():
         emoji = "📰" if post_type == "news" else "📊"
         print(f"  {emoji} {utc_time} UTC — {data.upper()}")
     print(f"Channel 1: {CHANNEL_1_ID}")
-    print(f"Channel 2: {CHANNEL_2_ID}")
+    print(f"Channel 2 (Inner Circle): {CHANNEL_2_ID}")
     print(f"Verify Group: {VERIFY_GROUP_ID}")
     print(f"Bot: @{BOT_USERNAME}")
 

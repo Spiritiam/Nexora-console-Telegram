@@ -288,15 +288,12 @@ def calculate_pips(pair_name, entry_price, exit_price, direction, config):
     try:
         pip_value = config.get("pip_value", 0.0001)
         pip_label = config.get("pip_label", "pips")
-
         if direction == "BUY":
             price_diff = exit_price - entry_price
         else:
             price_diff = entry_price - exit_price
-
         pips = round(price_diff / pip_value)
         return pips, pip_label
-
     except Exception as e:
         print(f"[PIPS] Calculation error: {e}")
         return 0, "pips"
@@ -329,10 +326,8 @@ def get_price_alphavantage(config):
     try:
         av_symbol = config.get("av_symbol")
         av_type = config.get("av_type")
-
         if not av_symbol or not ALPHA_VANTAGE_API_KEY:
             return None
-
         if av_type in ["crypto", "forex"]:
             url = (
                 f"https://www.alphavantage.co/query"
@@ -348,7 +343,6 @@ def get_price_alphavantage(config):
             ).get("5. Exchange Rate")
             if rate:
                 return float(rate)
-
         elif av_type == "commodity":
             url = (
                 f"https://www.alphavantage.co/query"
@@ -362,9 +356,7 @@ def get_price_alphavantage(config):
             value = latest.get("value")
             if value and value != ".":
                 return float(value)
-
         return None
-
     except Exception as e:
         print(f"[ALPHAVANTAGE] Error: {e}")
         return None
@@ -378,10 +370,7 @@ def get_live_price(symbol="XAU/USD", config=None):
     if price is not None:
         return price
     if config:
-        print(
-            f"[PRICE] Twelvedata failed for {symbol}, "
-            f"trying Alpha Vantage..."
-        )
+        print(f"[PRICE] Twelvedata failed for {symbol}, trying Alpha Vantage...")
         price = get_price_alphavantage(config)
         if price is not None:
             print(f"[PRICE] Alpha Vantage: {price} for {symbol}")
@@ -444,10 +433,8 @@ SELL_REASONS = [
 # ============================================
 
 def build_signal_response(question):
-
     q = question.lower()
     config = PAIR_CONFIG["xauusd"]
-
     for key in PAIR_CONFIG:
         if key in q:
             config = PAIR_CONFIG[key]
@@ -459,7 +446,6 @@ def build_signal_response(question):
     display = config["display"]
 
     live_price = get_live_price(symbol, config=config)
-
     if live_price is None:
         return None, None, None, None
 
@@ -481,7 +467,6 @@ def build_signal_response(question):
         image_file_id = SELL_IMAGE_FILE_ID
 
     session = get_market_session()
-
     timeframe_confirmation = random.choice([
         "M15 bullish structure confirmation",
         "H1 trend continuation active",
@@ -525,24 +510,14 @@ def build_signal_response(question):
 
 def format_breakdown(text):
     headers = [
-        "Technical Analysis",
-        "Fundamental Analysis",
-        "Market Sentiment",
-        "Sentiment",
-        "Trade Idea",
-        "Summary",
-        "Outlook",
-        "Key Levels",
-        "Risk Warning",
-        "Conclusion",
-        "Price Action",
-        "News Impact",
-        "Market Overview",
+        "Technical Analysis", "Fundamental Analysis",
+        "Market Sentiment", "Sentiment", "Trade Idea",
+        "Summary", "Outlook", "Key Levels", "Risk Warning",
+        "Conclusion", "Price Action", "News Impact", "Market Overview",
     ]
     emojis = [
         "📊", "📈", "💡", "🗞️", "📰",
-        "🛢️", "⚡", "🔍", "📉", "🎯",
-        "💰", "🔔"
+        "🛢️", "⚡", "🔍", "📉", "🎯", "💰", "🔔"
     ]
     for header in headers:
         for emoji in emojis:
@@ -550,14 +525,8 @@ def format_breakdown(text):
                 f"{emoji} {header}",
                 f"{emoji} <b>{header}</b>"
             )
-        text = text.replace(
-            f"\n{header}\n",
-            f"\n<b>{header}</b>\n"
-        )
-        text = text.replace(
-            f"\n{header}:",
-            f"\n<b>{header}:</b>"
-        )
+        text = text.replace(f"\n{header}\n", f"\n<b>{header}</b>\n")
+        text = text.replace(f"\n{header}:", f"\n<b>{header}:</b>")
     return text
 
 # ============================================
@@ -570,18 +539,14 @@ def fetch_news_gnews():
     try:
         url = (
             f"https://gnews.io/api/v4/top-headlines"
-            f"?category=business"
-            f"&lang=en"
-            f"&max=10"
+            f"?category=business&lang=en&max=10"
             f"&apikey={GNEWS_API_KEY}"
         )
         response = requests.get(url, timeout=10)
         data = response.json()
-        articles = data.get("articles", [])
         articles = [
-            a for a in articles
-            if a.get("image") and a.get("title")
-            and a.get("description")
+            a for a in data.get("articles", [])
+            if a.get("image") and a.get("title") and a.get("description")
         ]
         if not articles:
             return None
@@ -607,17 +572,13 @@ def fetch_news_thenewsapi():
         url = (
             f"https://api.thenewsapi.com/v1/news/top"
             f"?api_token={THENEWS_API_KEY}"
-            f"&categories=business,finance"
-            f"&language=en"
-            f"&limit=10"
+            f"&categories=business,finance&language=en&limit=10"
         )
         response = requests.get(url, timeout=10)
         data = response.json()
-        articles = data.get("data", [])
         articles = [
-            a for a in articles
-            if a.get("image_url") and a.get("title")
-            and a.get("description")
+            a for a in data.get("data", [])
+            if a.get("image_url") and a.get("title") and a.get("description")
         ]
         if not articles:
             return None
@@ -650,7 +611,73 @@ def fetch_market_news():
     return None
 
 # ============================================
-# NEWS SUMMARY GENERATOR
+# ECONOMIC CALENDAR
+# ============================================
+
+def fetch_economic_calendar():
+    try:
+        today = datetime.utcnow()
+        date_from = today.strftime("%Y-%m-%dT00:00:00.000Z")
+        date_to = today.strftime("%Y-%m-%dT23:59:59.000Z")
+        date_str = today.strftime("%d.%m.%Y")
+
+        url = "https://economic-calendar.tradingview.com/events"
+        params = {
+            "from": date_from,
+            "to": date_to,
+            "countries": ["US", "EU", "GB", "CA", "JP", "AU", "CN"],
+            "importance": ["high"]
+        }
+        response = requests.get(url, params=params, timeout=10)
+        data = response.json()
+        events = data.get("result", [])
+
+        if not events:
+            return None
+
+        flag_map = {
+            "US": "🇺🇸", "EU": "🇪🇺", "GB": "🇬🇧",
+            "CA": "🇨🇦", "JP": "🇯🇵", "AU": "🇦🇺",
+            "CN": "🇨🇳", "NZ": "🇳🇿", "CH": "🇨🇭",
+        }
+
+        calendar_text = f"\n\n📆 <b>CALENDAR TODAY — {date_str}</b>\n\n"
+
+        count = 0
+        for event in events[:5]:
+            title = event.get("title", "")
+            country = event.get("country", "")
+            time_utc = event.get("date", "")
+            flag = flag_map.get(country, "🌍")
+
+            if time_utc:
+                try:
+                    dt = datetime.strptime(time_utc[:16], "%Y-%m-%dT%H:%M")
+                    # Convert UTC to Lagos (UTC+1)
+                    lagos_hour = (dt.hour + 1) % 24
+                    time_str = f"{lagos_hour:02d}:{dt.minute:02d} GMT+1"
+                except:
+                    time_str = ""
+            else:
+                time_str = ""
+
+            calendar_text += f"{flag} {title}"
+            if time_str:
+                calendar_text += f" — {time_str}"
+            calendar_text += "\n"
+            count += 1
+
+        if count == 0:
+            return None
+
+        return calendar_text
+
+    except Exception as e:
+        print(f"[CALENDAR] Error: {e}")
+        return None
+
+# ============================================
+# NEWS SUMMARY GENERATOR — SHORT & PRECISE
 # ============================================
 
 async def generate_news_summary(article, session_type):
@@ -661,34 +688,38 @@ async def generate_news_summary(article, session_type):
 
     if session_type == "morning":
         session_label = "Morning Market Briefing 🌅"
-        prompt_context = "morning trading session opening"
     elif session_type == "midday":
         session_label = "Midday Market Update ☀️"
-        prompt_context = "midday trading activity"
     else:
         session_label = "Afternoon Market Briefing 🌆"
-        prompt_context = "afternoon and closing session"
 
     prompt = f"""
 You are Nexora AI, a professional financial news analyst.
-Write a SHORT, ENGAGING market news post for a Telegram trading channel.
+Write a VERY SHORT market news post for a Telegram trading channel.
 
 SESSION: {session_label}
-CONTEXT: {prompt_context}
 NEWS HEADLINE: {title}
 NEWS DETAILS: {description}
 SOURCE: {source}
 
-RULES:
-- Maximum 150 words
-- Start with a punchy opening line
-- Include what this means for traders
-- Mention impact on gold, forex, or crypto if relevant
-- End with a motivational trading line
-- No markdown symbols like ** or ## or ---
+FORMAT EXACTLY LIKE THIS — NO EXCEPTIONS:
+{session_label}
+
+🔹 [One line news item 1]
+
+🔹 [One line news item 2]
+
+🔹 [One line news item 3]
+
+STRICT RULES:
+- Maximum 3 bullet points ONLY
+- Each bullet point MAX 15 words
+- No long sentences
+- No paragraphs
+- No markdown symbols like ** or ##
 - No hashtags
-- Professional but exciting tone
-- Use emojis naturally to separate sections
+- Make each point punchy and impactful
+- Focus on what matters most to forex and gold traders
 """
     return await ask_gemini(prompt)
 
@@ -707,26 +738,47 @@ async def post_news(context: ContextTypes.DEFAULT_TYPE):
         print("[NEWS] No article found from any source. Skipping.")
         return
 
-    image_url = article.get("image")
+    # Generate AI image from headline using Pollinations.ai
+    headline = article.get("title", "financial market news trading")
+    image_prompt = (
+        f"professional financial news illustration: {headline}, "
+        f"cinematic digital art, dramatic lighting, high quality"
+    )
+    image_url = (
+        f"https://image.pollinations.ai/prompt/"
+        f"{requests.utils.quote(image_prompt)}"
+        f"?width=800&height=450&nologo=true"
+    )
+
+    # Generate short news summary
     summary = await generate_news_summary(article, session_type)
     summary = clean_text(summary)
 
+    # Fetch economic calendar and append
+    calendar = fetch_economic_calendar()
+    if calendar:
+        summary += calendar
+
     for channel_id in [CHANNEL_1_ID, CHANNEL_2_ID]:
         try:
-            if image_url:
-                await context.bot.send_photo(
-                    chat_id=channel_id,
-                    photo=image_url,
-                    caption=summary
-                )
-            else:
-                await context.bot.send_message(
-                    chat_id=channel_id,
-                    text=summary
-                )
+            await context.bot.send_photo(
+                chat_id=channel_id,
+                photo=image_url,
+                caption=summary,
+                parse_mode=ParseMode.HTML
+            )
             print(f"[NEWS] ✅ {session_type} posted to {channel_id}")
         except Exception as e:
-            print(f"[NEWS] ❌ Failed for {channel_id}: {e}")
+            print(f"[NEWS] AI image failed, posting without image: {e}")
+            try:
+                await context.bot.send_message(
+                    chat_id=channel_id,
+                    text=summary,
+                    parse_mode=ParseMode.HTML
+                )
+                print(f"[NEWS] ✅ {session_type} posted (text only) to {channel_id}")
+            except Exception as e2:
+                print(f"[NEWS] ❌ Failed for {channel_id}: {e2}")
 
 # ============================================
 # METAAPI — PLACE TRADE ON MT5
@@ -814,13 +866,9 @@ async def monitor_signal(bot, channel_id, message_id, signal_data):
         if tp_hit:
             exit_price = round(current_price, 2)
             pips, pip_label = calculate_pips(
-                pair_name, entry_price, exit_price,
-                direction, config
+                pair_name, entry_price, exit_price, direction, config
             )
-            print(
-                f"[MONITOR] ✅ TP HIT {pair_name} "
-                f"at {exit_price} | +{pips} {pip_label}"
-            )
+            print(f"[MONITOR] ✅ TP HIT {pair_name} at {exit_price} | +{pips} {pip_label}")
             await bot.send_photo(
                 chat_id=channel_id,
                 photo=TP_HIT_IMAGE_FILE_ID,
@@ -841,14 +889,10 @@ async def monitor_signal(bot, channel_id, message_id, signal_data):
         elif sl_hit:
             exit_price = round(current_price, 2)
             pips, pip_label = calculate_pips(
-                pair_name, entry_price, exit_price,
-                direction, config
+                pair_name, entry_price, exit_price, direction, config
             )
             pips_lost = abs(pips)
-            print(
-                f"[MONITOR] ❌ SL HIT {pair_name} "
-                f"at {exit_price} | -{pips_lost} {pip_label}"
-            )
+            print(f"[MONITOR] ❌ SL HIT {pair_name} at {exit_price} | -{pips_lost} {pip_label}")
             await bot.send_photo(
                 chat_id=channel_id,
                 photo=SL_HIT_IMAGE_FILE_ID,
@@ -1314,8 +1358,7 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
         pending_verifications[user_id] = email
 
         await update.message.reply_text(
-            "⏳ <b>Got it! Your verification request has been "
-            "submitted.</b>\n\n"
+            "⏳ <b>Got it! Your verification request has been submitted.</b>\n\n"
             "Our team is reviewing your details right now. "
             "You'll receive a confirmation message shortly.\n\n"
             "<i>Sit tight — greatness is loading! 🚀</i>",
@@ -1482,16 +1525,11 @@ async def post_auto_signal(context: ContextTypes.DEFAULT_TYPE):
     )
 
     if signal_data is None:
-        print(
-            f"[AUTO SIGNAL] ❌ Could not fetch price "
-            f"for {pair_keyword}."
-        )
+        print(f"[AUTO SIGNAL] ❌ Could not fetch price for {pair_keyword}.")
         return
 
     for channel_id in [CHANNEL_1_ID, CHANNEL_2_ID]:
         try:
-            # No button on either channel
-            # Comments section fully accessible on both
             sent = await context.bot.send_photo(
                 chat_id=channel_id,
                 photo=image_file_id,

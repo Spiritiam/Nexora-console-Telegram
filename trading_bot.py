@@ -128,18 +128,6 @@ main_keyboard = ReplyKeyboardMarkup(
 )
 
 # ============================================
-# INLINE BUTTON FOR CHANNEL 1 ONLY
-# ============================================
-
-def get_channel_button():
-    return InlineKeyboardMarkup([
-        [InlineKeyboardButton(
-            "🤖 Get Your Own Signal",
-            url=f"https://t.me/{BOT_USERNAME}"
-        )]
-    ])
-
-# ============================================
 # USER MODES
 # ============================================
 
@@ -228,6 +216,8 @@ PAIR_CONFIG = {
         "symbol": "XAU/USD",
         "pair_name": "XAUUSD",
         "pip_size": 10,
+        "pip_value": 0.01,
+        "pip_label": "pips",
         "mt5_symbol": "XAUUSDm",
         "display": "Gold (XAUUSD) 🥇",
         "av_symbol": "XAU",
@@ -237,6 +227,8 @@ PAIR_CONFIG = {
         "symbol": "BTC/USD",
         "pair_name": "BTCUSD",
         "pip_size": 300,
+        "pip_value": 1.0,
+        "pip_label": "points",
         "mt5_symbol": "BTCUSDm",
         "display": "Bitcoin (BTCUSD) ₿",
         "av_symbol": "BTC",
@@ -246,6 +238,8 @@ PAIR_CONFIG = {
         "symbol": "XAG/USD",
         "pair_name": "XAGUSD",
         "pip_size": 0.30,
+        "pip_value": 0.01,
+        "pip_label": "pips",
         "mt5_symbol": "XAGUSDm",
         "display": "Silver (XAGUSD) 🥈",
         "av_symbol": "XAG",
@@ -255,6 +249,8 @@ PAIR_CONFIG = {
         "symbol": "WTI/USD",
         "pair_name": "USOIL",
         "pip_size": 0.50,
+        "pip_value": 0.01,
+        "pip_label": "pips",
         "mt5_symbol": "USOILm",
         "display": "US Oil (WTI) 🛢️",
         "av_symbol": "WTI",
@@ -264,6 +260,8 @@ PAIR_CONFIG = {
         "symbol": "GBP/USD",
         "pair_name": "GBPUSD",
         "pip_size": 0.0025,
+        "pip_value": 0.0001,
+        "pip_label": "pips",
         "mt5_symbol": "GBPUSDm",
         "display": "GBP/USD 🇬🇧",
         "av_symbol": "GBP",
@@ -273,12 +271,35 @@ PAIR_CONFIG = {
         "symbol": "GBP/JPY",
         "pair_name": "GBPJPY",
         "pip_size": 0.30,
+        "pip_value": 0.01,
+        "pip_label": "pips",
         "mt5_symbol": "GBPJPYm",
         "display": "GBP/JPY 🇯🇵",
         "av_symbol": "GBPJPY",
         "av_type": "forex",
     },
 }
+
+# ============================================
+# PIPS CALCULATOR
+# ============================================
+
+def calculate_pips(pair_name, entry_price, exit_price, direction, config):
+    try:
+        pip_value = config.get("pip_value", 0.0001)
+        pip_label = config.get("pip_label", "pips")
+
+        if direction == "BUY":
+            price_diff = exit_price - entry_price
+        else:
+            price_diff = entry_price - exit_price
+
+        pips = round(price_diff / pip_value)
+        return pips, pip_label
+
+    except Exception as e:
+        print(f"[PIPS] Calculation error: {e}")
+        return 0, "pips"
 
 # ============================================
 # LIVE PRICE — TWELVEDATA PRIMARY
@@ -388,11 +409,8 @@ def get_market_session():
 
 def generate_market_bias():
     direction = random.choice(["BUY", "SELL"])
-
-    # Only STRONG signals — high confidence only
     strength = "STRONG"
     confidence = random.randint(80, 94)
-
     return direction, strength, confidence
 
 # ============================================
@@ -695,25 +713,16 @@ async def post_news(context: ContextTypes.DEFAULT_TYPE):
 
     for channel_id in [CHANNEL_1_ID, CHANNEL_2_ID]:
         try:
-            # Button only on Channel 1
-            markup = (
-                get_channel_button()
-                if channel_id == CHANNEL_1_ID
-                else None
-            )
-
             if image_url:
                 await context.bot.send_photo(
                     chat_id=channel_id,
                     photo=image_url,
-                    caption=summary,
-                    reply_markup=markup
+                    caption=summary
                 )
             else:
                 await context.bot.send_message(
                     chat_id=channel_id,
-                    text=summary,
-                    reply_markup=markup
+                    text=summary
                 )
             print(f"[NEWS] ✅ {session_type} posted to {channel_id}")
         except Exception as e:
@@ -803,7 +812,15 @@ async def monitor_signal(bot, channel_id, message_id, signal_data):
         )
 
         if tp_hit:
-            print(f"[MONITOR] ✅ TP HIT {pair_name} at {current_price}")
+            exit_price = round(current_price, 2)
+            pips, pip_label = calculate_pips(
+                pair_name, entry_price, exit_price,
+                direction, config
+            )
+            print(
+                f"[MONITOR] ✅ TP HIT {pair_name} "
+                f"at {exit_price} | +{pips} {pip_label}"
+            )
             await bot.send_photo(
                 chat_id=channel_id,
                 photo=TP_HIT_IMAGE_FILE_ID,
@@ -811,8 +828,10 @@ async def monitor_signal(bot, channel_id, message_id, signal_data):
                     f"✅ <b>TP HIT — {pair_name}</b>\n\n"
                     f"<b>Entry:</b> {entry_price}\n"
                     f"<b>Take Profit:</b> {take_profit}\n"
-                    f"<b>Exit Price:</b> {round(current_price, 2)}\n\n"
-                    f"<i>Well done to everyone who followed! 💰🔥</i>"
+                    f"<b>Exit Price:</b> {exit_price}\n\n"
+                    f"📈 <b>Result: +{pips} {pip_label} gained!</b>\n\n"
+                    f"<i>Well done to everyone who followed! 💰🔥\n"
+                    f"Consistency is the key to long term profits.</i>"
                 ),
                 parse_mode=ParseMode.HTML,
                 reply_to_message_id=message_id
@@ -820,7 +839,16 @@ async def monitor_signal(bot, channel_id, message_id, signal_data):
             break
 
         elif sl_hit:
-            print(f"[MONITOR] ❌ SL HIT {pair_name} at {current_price}")
+            exit_price = round(current_price, 2)
+            pips, pip_label = calculate_pips(
+                pair_name, entry_price, exit_price,
+                direction, config
+            )
+            pips_lost = abs(pips)
+            print(
+                f"[MONITOR] ❌ SL HIT {pair_name} "
+                f"at {exit_price} | -{pips_lost} {pip_label}"
+            )
             await bot.send_photo(
                 chat_id=channel_id,
                 photo=SL_HIT_IMAGE_FILE_ID,
@@ -828,8 +856,10 @@ async def monitor_signal(bot, channel_id, message_id, signal_data):
                     f"❌ <b>SL HIT — {pair_name}</b>\n\n"
                     f"<b>Entry:</b> {entry_price}\n"
                     f"<b>Stop Loss:</b> {stop_loss}\n"
-                    f"<b>Exit Price:</b> {round(current_price, 2)}\n\n"
-                    f"<i>Risk managed. Next signal coming. 💼</i>"
+                    f"<b>Exit Price:</b> {exit_price}\n\n"
+                    f"📉 <b>Result: -{pips_lost} {pip_label} lost.</b>\n\n"
+                    f"<i>Risk managed. Every loss is a lesson. 💼\n"
+                    f"Next signal coming — stay disciplined!</i>"
                 ),
                 parse_mode=ParseMode.HTML,
                 reply_to_message_id=message_id
@@ -1460,20 +1490,13 @@ async def post_auto_signal(context: ContextTypes.DEFAULT_TYPE):
 
     for channel_id in [CHANNEL_1_ID, CHANNEL_2_ID]:
         try:
-            # Button only on Channel 1
-            # Inner Circle (Channel 2) has no button
-            markup = (
-                get_channel_button()
-                if channel_id == CHANNEL_1_ID
-                else None
-            )
-
+            # No button on either channel
+            # Comments section fully accessible on both
             sent = await context.bot.send_photo(
                 chat_id=channel_id,
                 photo=image_file_id,
                 caption=signal,
-                parse_mode=ParseMode.HTML,
-                reply_markup=markup
+                parse_mode=ParseMode.HTML
             )
             print(
                 f"[AUTO SIGNAL] ✅ {pair_keyword.upper()} "

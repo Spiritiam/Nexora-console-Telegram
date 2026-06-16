@@ -4,6 +4,8 @@ import random
 import requests
 import json
 import time
+import signal as signal_module
+import sys
 
 from datetime import datetime
 from pathlib import Path
@@ -204,7 +206,7 @@ def trial_remaining(user_id):
     return max(0, FREE_TRIAL_LIMIT - get_trial_count(user_id))
 
 # ============================================
-# PAIR CONFIG — FIXED USOIL SYMBOL
+# PAIR CONFIG
 # ============================================
 
 PAIR_CONFIG = {
@@ -218,7 +220,6 @@ PAIR_CONFIG = {
         "display": "Gold (XAUUSD) 🥇",
         "av_symbol": "XAU",
         "av_type": "forex",
-        "td_symbol": "XAU/USD",
     },
     "btcusd": {
         "symbol": "BTC/USD",
@@ -230,7 +231,6 @@ PAIR_CONFIG = {
         "display": "Bitcoin (BTCUSD) ₿",
         "av_symbol": "BTC",
         "av_type": "crypto",
-        "td_symbol": "BTC/USD",
     },
     "xagusd": {
         "symbol": "XAG/USD",
@@ -242,10 +242,9 @@ PAIR_CONFIG = {
         "display": "Silver (XAGUSD) 🥈",
         "av_symbol": "XAG",
         "av_type": "forex",
-        "td_symbol": "XAG/USD",
     },
     "usoil": {
-        "symbol": "USO",
+        "symbol": "USOIL",
         "pair_name": "USOIL",
         "pip_size": 0.50,
         "pip_value": 0.01,
@@ -254,8 +253,6 @@ PAIR_CONFIG = {
         "display": "US Oil (WTI) 🛢️",
         "av_symbol": "WTI",
         "av_type": "commodity",
-        # Use direct crude oil price from multiple sources
-        "td_symbol": "CL1!",
         "use_oil_api": True,
     },
     "gbpusd": {
@@ -268,7 +265,6 @@ PAIR_CONFIG = {
         "display": "GBP/USD 🇬🇧",
         "av_symbol": "GBP",
         "av_type": "forex",
-        "td_symbol": "GBP/USD",
     },
     "gbpjpy": {
         "symbol": "GBP/JPY",
@@ -280,7 +276,6 @@ PAIR_CONFIG = {
         "display": "GBP/JPY 🇯🇵",
         "av_symbol": "GBPJPY",
         "av_type": "forex",
-        "td_symbol": "GBP/JPY",
     },
 }
 
@@ -303,33 +298,43 @@ def calculate_pips(pair_name, entry_price, exit_price, direction, config):
         return 0, "pips"
 
 # ============================================
-# LIVE PRICE — OIL SPECIFIC (FREE APIs)
+# OIL PRICE — DEDICATED FUNCTION
 # ============================================
 
 def get_oil_price():
-    """Get accurate WTI crude oil price from free sources."""
+    """Get accurate WTI crude oil price."""
 
-    # Try 1: Twelvedata with correct symbol
+    # Try 1: Yahoo Finance
     try:
-        symbols_to_try = ["CL1!", "USOIL", "WTI/USD"]
-        for sym in symbols_to_try:
-            url = (
-                f"https://api.twelvedata.com/price"
-                f"?symbol={sym}"
-                f"&apikey={TWELVEDATA_API_KEY}"
-            )
-            response = requests.get(url, timeout=10)
-            data = response.json()
-            if "price" in data:
-                price = float(data["price"])
-                # Validate oil price is realistic (between 50 and 150)
-                if 50 <= price <= 150:
-                    print(f"[OIL] Twelvedata {sym}: {price}")
-                    return price
+        url = "https://query1.finance.yahoo.com/v8/finance/chart/CL=F"
+        headers = {"User-Agent": "Mozilla/5.0"}
+        response = requests.get(url, headers=headers, timeout=10)
+        data = response.json()
+        price = data["chart"]["result"][0]["meta"]["regularMarketPrice"]
+        if price and 50 <= float(price) <= 150:
+            print(f"[OIL] Yahoo Finance: {price}")
+            return round(float(price), 2)
     except Exception as e:
-        print(f"[OIL] Twelvedata error: {e}")
+        print(f"[OIL] Yahoo Finance error: {e}")
 
-    # Try 2: Alpha Vantage WTI
+    # Try 2: Twelvedata with CL1!
+    try:
+        url = (
+            f"https://api.twelvedata.com/price"
+            f"?symbol=CL1!"
+            f"&apikey={TWELVEDATA_API_KEY}"
+        )
+        response = requests.get(url, timeout=10)
+        data = response.json()
+        if "price" in data:
+            price = float(data["price"])
+            if 50 <= price <= 150:
+                print(f"[OIL] Twelvedata CL1!: {price}")
+                return round(price, 2)
+    except Exception as e:
+        print(f"[OIL] Twelvedata CL1! error: {e}")
+
+    # Try 3: Alpha Vantage WTI
     try:
         if ALPHA_VANTAGE_API_KEY:
             url = (
@@ -346,22 +351,9 @@ def get_oil_price():
                 price = float(value)
                 if 50 <= price <= 150:
                     print(f"[OIL] Alpha Vantage WTI: {price}")
-                    return price
+                    return round(price, 2)
     except Exception as e:
         print(f"[OIL] Alpha Vantage error: {e}")
-
-    # Try 3: Free commodity price API
-    try:
-        url = "https://query1.finance.yahoo.com/v8/finance/chart/CL=F"
-        headers = {"User-Agent": "Mozilla/5.0"}
-        response = requests.get(url, headers=headers, timeout=10)
-        data = response.json()
-        price = data["chart"]["result"][0]["meta"]["regularMarketPrice"]
-        if price and 50 <= float(price) <= 150:
-            print(f"[OIL] Yahoo Finance: {price}")
-            return float(price)
-    except Exception as e:
-        print(f"[OIL] Yahoo Finance error: {e}")
 
     print("[OIL] All oil price APIs failed")
     return None
@@ -433,7 +425,10 @@ def get_live_price(symbol="XAU/USD", config=None):
     if price is not None:
         return price
     if config:
-        print(f"[PRICE] Twelvedata failed for {symbol}, trying Alpha Vantage...")
+        print(
+            f"[PRICE] Twelvedata failed for {symbol}, "
+            f"trying Alpha Vantage..."
+        )
         price = get_price_alphavantage(config)
         if price is not None:
             print(f"[PRICE] Alpha Vantage: {price} for {symbol}")
@@ -510,6 +505,7 @@ def build_signal_response(question):
 
     live_price = get_live_price(symbol, config=config)
     if live_price is None:
+        print(f"[SIGNAL] ❌ Could not get live price for {pair_name}")
         return None, None, None, None
 
     direction, strength, confidence = generate_market_bias()
@@ -564,6 +560,12 @@ def build_signal_response(question):
         "take_profit": take_profit,
         "config": config,
     }
+
+    print(
+        f"[SIGNAL] ✅ Built {pair_name} signal | "
+        f"{direction} @ {entry_price} | "
+        f"TP: {take_profit} | SL: {stop_loss}"
+    )
 
     return image_file_id, direction, response, signal_data
 
@@ -914,7 +916,6 @@ async def monitor_signal(bot, channel_id, message_id, signal_data):
     for _ in range(max_checks):
         await asyncio.sleep(60)
 
-        # Use oil-specific price fetch for oil signals
         if config and config.get("use_oil_api"):
             current_price = get_oil_price()
         else:
@@ -1623,10 +1624,11 @@ async def post_auto_signal(context: ContextTypes.DEFAULT_TYPE):
             print(f"[AUTO SIGNAL] ❌ Failed for {channel_id}: {e}")
 
 # ============================================
-# MAIN
+# MAIN — WITH CONFLICT FIX
 # ============================================
 
-def main():
+async def run_bot():
+    """Build and run the bot with proper startup to prevent conflicts."""
 
     app = Application.builder().token(TELEGRAM_TOKEN).build()
 
@@ -1683,7 +1685,43 @@ def main():
     print(f"Verify Group: {VERIFY_GROUP_ID}")
     print(f"Bot: @{BOT_USERNAME}")
 
-    app.run_polling(drop_pending_updates=True)
+    # ── CONFLICT FIX ─────────────────────────────
+    # Initialize the app
+    await app.initialize()
+
+    # Delete any existing webhook and clear pending updates
+    # This stops any other running instance from conflicting
+    await app.bot.delete_webhook(drop_pending_updates=True)
+    print("[BOT] ✅ Webhook cleared — no conflicts possible")
+
+    # Wait 3 seconds to ensure old instance has fully stopped
+    await asyncio.sleep(3)
+
+    # Start the app
+    await app.start()
+
+    # Start polling
+    await app.updater.start_polling(
+        drop_pending_updates=True,
+        allowed_updates=Update.ALL_TYPES
+    )
+
+    print("[BOT] ✅ Polling started successfully")
+
+    # Keep running until stopped
+    try:
+        await asyncio.Event().wait()
+    except (KeyboardInterrupt, SystemExit):
+        print("[BOT] Shutting down...")
+    finally:
+        await app.updater.stop()
+        await app.stop()
+        await app.shutdown()
+
+
+def main():
+    asyncio.run(run_bot())
+
 
 if __name__ == "__main__":
     main()

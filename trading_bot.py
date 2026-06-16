@@ -3,6 +3,7 @@ import asyncio
 import random
 import requests
 import json
+import time
 
 from datetime import datetime
 from pathlib import Path
@@ -34,7 +35,8 @@ GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
 OPENROUTER_API_KEY = os.getenv("OPENROUTER_API_KEY")
 TWELVEDATA_API_KEY = os.getenv("TWELVEDATA_API_KEY")
 ALPHA_VANTAGE_API_KEY = os.getenv("ALPHA_VANTAGE_API_KEY")
-NEWS_API_KEY = os.getenv("NEWS_API_KEY")
+GNEWS_API_KEY = os.getenv("GNEWS_API_KEY")
+THENEWS_API_KEY = os.getenv("THENEWS_API_KEY")
 SUPABASE_URL = os.getenv("SUPABASE_URL")
 SUPABASE_KEY = os.getenv("SUPABASE_KEY")
 
@@ -88,17 +90,19 @@ SL_HIT_IMAGE_FILE_ID = "AgACAgQAAxkBAAIBIWowI9Lxu93CIKFD5YSHFbJ8_MB-AAJBD2sbbT2B
 # ============================================
 # DAILY SCHEDULE (UTC)
 # ============================================
+# XAGUSD removed — both price APIs fail for silver
+# News posts now use GNews + TheNewsAPI
 
 DAILY_SCHEDULE = [
-    ("06:00", "news",   "morning"),
-    ("07:00", "signal", "xauusd"),
-    ("09:00", "signal", "btcusd"),
-    ("11:00", "news",   "midday"),
-    ("13:00", "signal", "xagusd"),
-    ("15:00", "signal", "usoil"),
-    ("17:00", "news",   "afternoon"),
-    ("19:00", "signal", "gbpusd"),
-    ("21:00", "signal", "gbpjpy"),
+    ("06:00", "news",   "morning"),   # 7:00 AM Lagos
+    ("07:00", "signal", "xauusd"),    # 8:00 AM Lagos
+    ("09:00", "signal", "btcusd"),    # 10:00 AM Lagos
+    ("11:00", "news",   "midday"),    # 12:00 PM Lagos
+    ("13:00", "signal", "usoil"),     # 2:00 PM Lagos
+    ("15:00", "signal", "gbpusd"),    # 4:00 PM Lagos
+    ("17:00", "news",   "afternoon"), # 6:00 PM Lagos
+    ("19:00", "signal", "gbpjpy"),    # 8:00 PM Lagos
+    ("21:00", "signal", "xauusd"),    # 10:00 PM Lagos — second gold signal
 ]
 
 # ============================================
@@ -208,6 +212,7 @@ def increment_trial(user_id):
         }
         headers = {**sb_headers(), "Prefer": "resolution=merge-duplicates"}
         requests.post(url, headers=headers, json=payload, timeout=10)
+        print(f"[DB] Trial count for {user_id}: {new_count}")
         return new_count
     except Exception as e:
         print(f"[DB] increment_trial error: {e}")
@@ -537,33 +542,97 @@ def format_breakdown(text):
     return text
 
 # ============================================
-# NEWS FETCHER
+# NEWS FETCHER — GNEWS PRIMARY
 # ============================================
 
-def fetch_market_news():
-    if not NEWS_API_KEY:
+def fetch_news_gnews():
+    if not GNEWS_API_KEY:
         return None
     try:
         url = (
-            f"https://newsapi.org/v2/top-headlines"
-            f"?category=business&language=en"
-            f"&pageSize=10&apiKey={NEWS_API_KEY}"
+            f"https://gnews.io/api/v4/top-headlines"
+            f"?category=business"
+            f"&lang=en"
+            f"&max=10"
+            f"&apikey={GNEWS_API_KEY}"
         )
         response = requests.get(url, timeout=10)
         data = response.json()
-        if data.get("status") != "ok":
-            return None
+        articles = data.get("articles", [])
         articles = [
-            a for a in data.get("articles", [])
-            if a.get("urlToImage") and a.get("title")
+            a for a in articles
+            if a.get("image") and a.get("title")
             and a.get("description")
         ]
         if not articles:
             return None
-        return random.choice(articles)
+        article = random.choice(articles)
+        return {
+            "title": article.get("title", ""),
+            "description": article.get("description", ""),
+            "image": article.get("image", ""),
+            "source": article.get("source", {}).get("name", "GNews"),
+        }
     except Exception as e:
-        print(f"[NEWS] Fetch error: {e}")
+        print(f"[GNEWS] Error: {e}")
         return None
+
+# ============================================
+# NEWS FETCHER — THENEWSAPI FALLBACK
+# ============================================
+
+def fetch_news_thenewsapi():
+    if not THENEWS_API_KEY:
+        return None
+    try:
+        url = (
+            f"https://api.thenewsapi.com/v1/news/top"
+            f"?api_token={THENEWS_API_KEY}"
+            f"&categories=business,finance"
+            f"&language=en"
+            f"&limit=10"
+        )
+        response = requests.get(url, timeout=10)
+        data = response.json()
+        articles = data.get("data", [])
+        articles = [
+            a for a in articles
+            if a.get("image_url") and a.get("title")
+            and a.get("description")
+        ]
+        if not articles:
+            return None
+        article = random.choice(articles)
+        return {
+            "title": article.get("title", ""),
+            "description": article.get("description", ""),
+            "image": article.get("image_url", ""),
+            "source": article.get("source", "TheNewsAPI"),
+        }
+    except Exception as e:
+        print(f"[THENEWSAPI] Error: {e}")
+        return None
+
+# ============================================
+# NEWS FETCHER — COMBINED
+# ============================================
+
+def fetch_market_news():
+    # Try GNews first
+    article = fetch_news_gnews()
+    if article:
+        print("[NEWS] ✅ GNews article found")
+        return article
+
+    # Fallback to TheNewsAPI
+    print("[NEWS] GNews failed, trying TheNewsAPI...")
+    article = fetch_news_thenewsapi()
+    if article:
+        print("[NEWS] ✅ TheNewsAPI article found")
+        return article
+
+    print("[NEWS] Both news APIs failed.")
+    return None
 
 # ============================================
 # NEWS SUMMARY GENERATOR
@@ -573,7 +642,7 @@ async def generate_news_summary(article, session_type):
 
     title = article.get("title", "")
     description = article.get("description", "")
-    source = article.get("source", {}).get("name", "")
+    source = article.get("source", "")
 
     if session_type == "morning":
         session_label = "Morning Market Briefing 🌅"
@@ -620,10 +689,10 @@ async def post_news(context: ContextTypes.DEFAULT_TYPE):
 
     article = fetch_market_news()
     if article is None:
-        print("[NEWS] No article found. Skipping.")
+        print("[NEWS] No article found from any source. Skipping.")
         return
 
-    image_url = article.get("urlToImage")
+    image_url = article.get("image")
     summary = await generate_news_summary(article, session_type)
     summary = clean_text(summary)
 
@@ -767,7 +836,7 @@ async def monitor_signal(bot, channel_id, message_id, signal_data):
             break
 
 # ============================================
-# GEMINI AI
+# GEMINI AI — WITH RATE LIMIT HANDLING
 # ============================================
 
 async def ask_gemini(prompt):
@@ -778,13 +847,20 @@ async def ask_gemini(prompt):
             GEMINI_URL, headers=headers, json=data, timeout=30
         )
         if response.status_code == 429:
-            raise Exception("RATE_LIMIT")
+            print("[GEMINI] Rate limit hit, waiting 10 seconds...")
+            await asyncio.sleep(10)
+            # Retry once after waiting
+            response = requests.post(
+                GEMINI_URL, headers=headers, json=data, timeout=30
+            )
+            if response.status_code == 429:
+                raise Exception("RATE_LIMIT")
         if response.status_code != 200:
             raise Exception("GEMINI_ERROR")
         result = response.json()
         return result["candidates"][0]["content"]["parts"][0]["text"]
     except Exception as e:
-        print("Gemini Error:", e)
+        print(f"Gemini Error: {e}")
         return await ask_openrouter(prompt)
 
 # ============================================
@@ -811,7 +887,7 @@ async def ask_openrouter(prompt):
         result = response.json()
         return result["choices"][0]["message"]["content"]
     except Exception as e:
-        print("OpenRouter Error:", e)
+        print(f"OpenRouter Error: {e}")
         return "⚠️ AI servers unavailable."
 
 # ============================================
@@ -1039,7 +1115,6 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         target_id = data.replace("approve_", "")
         email = pending_verifications.get(target_id, "unknown")
 
-        # Save to Supabase permanently
         add_verified_user(target_id, email)
 
         if target_id in pending_verifications:
@@ -1231,7 +1306,6 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 parse_mode=ParseMode.HTML
             )
 
-            # Only show trial counter if NOT verified
             if not is_verified(user_id):
                 remaining = trial_remaining(user_id)
                 if remaining > 0:
@@ -1280,7 +1354,6 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
             parse_mode=ParseMode.HTML
         )
 
-        # Only show trial counter if NOT verified
         if not is_verified(user_id):
             remaining = trial_remaining(user_id)
             if remaining > 0:

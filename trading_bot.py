@@ -2,13 +2,8 @@ import os
 import asyncio
 import random
 import requests
-import json
-import time
-import signal as signal_module
-import sys
 
 from datetime import datetime
-from pathlib import Path
 
 from telegram import (
     Update,
@@ -91,14 +86,13 @@ SL_HIT_IMAGE_FILE_ID = "AgACAgQAAxkBAAIBIWowI9Lxu93CIKFD5YSHFbJ8_MB-AAJBD2sbbT2B
 
 # ============================================
 # DAILY SCHEDULE (UTC)
-# 3 signals + 1 news per day
 # ============================================
 
 DAILY_SCHEDULE = [
     ("06:00", "news",   "morning"),   # 7:00 AM Lagos
-    ("07:00", "signal", "xauusd"),    # 8:00 AM Lagos
-    ("13:00", "signal", "btcusd"),    # 2:00 PM Lagos
-    ("19:00", "signal", "usoil"),     # 8:00 PM Lagos
+    ("07:00", "signal", "xauusd"),    # 8:00 AM Lagos  — Gold morning
+    ("13:00", "signal", "gbpjpy"),    # 2:00 PM Lagos  — GBPJPY afternoon
+    ("19:00", "signal", "btcusd"),    # 8:00 PM Lagos  — BTC evening
 ]
 
 # ============================================
@@ -124,6 +118,18 @@ main_keyboard = ReplyKeyboardMarkup(
     is_persistent=True,
     one_time_keyboard=False
 )
+
+# ============================================
+# CHANNEL 1 BUTTON
+# ============================================
+
+def get_channel_button():
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton(
+            "🤖 Get Your Own Signal",
+            url=f"https://t.me/{BOT_USERNAME}"
+        )]
+    ])
 
 # ============================================
 # USER MODES
@@ -253,7 +259,6 @@ PAIR_CONFIG = {
         "display": "US Oil (WTI) 🛢️",
         "av_symbol": "WTI",
         "av_type": "commodity",
-        "use_oil_api": True,
     },
     "gbpusd": {
         "symbol": "GBP/USD",
@@ -278,85 +283,6 @@ PAIR_CONFIG = {
         "av_type": "forex",
     },
 }
-
-# ============================================
-# PIPS CALCULATOR
-# ============================================
-
-def calculate_pips(pair_name, entry_price, exit_price, direction, config):
-    try:
-        pip_value = config.get("pip_value", 0.0001)
-        pip_label = config.get("pip_label", "pips")
-        if direction == "BUY":
-            price_diff = exit_price - entry_price
-        else:
-            price_diff = entry_price - exit_price
-        pips = round(price_diff / pip_value)
-        return pips, pip_label
-    except Exception as e:
-        print(f"[PIPS] Calculation error: {e}")
-        return 0, "pips"
-
-# ============================================
-# OIL PRICE — DEDICATED FUNCTION
-# ============================================
-
-def get_oil_price():
-    """Get accurate WTI crude oil price."""
-
-    # Try 1: Yahoo Finance
-    try:
-        url = "https://query1.finance.yahoo.com/v8/finance/chart/CL=F"
-        headers = {"User-Agent": "Mozilla/5.0"}
-        response = requests.get(url, headers=headers, timeout=10)
-        data = response.json()
-        price = data["chart"]["result"][0]["meta"]["regularMarketPrice"]
-        if price and 50 <= float(price) <= 150:
-            print(f"[OIL] Yahoo Finance: {price}")
-            return round(float(price), 2)
-    except Exception as e:
-        print(f"[OIL] Yahoo Finance error: {e}")
-
-    # Try 2: Twelvedata with CL1!
-    try:
-        url = (
-            f"https://api.twelvedata.com/price"
-            f"?symbol=CL1!"
-            f"&apikey={TWELVEDATA_API_KEY}"
-        )
-        response = requests.get(url, timeout=10)
-        data = response.json()
-        if "price" in data:
-            price = float(data["price"])
-            if 50 <= price <= 150:
-                print(f"[OIL] Twelvedata CL1!: {price}")
-                return round(price, 2)
-    except Exception as e:
-        print(f"[OIL] Twelvedata CL1! error: {e}")
-
-    # Try 3: Alpha Vantage WTI
-    try:
-        if ALPHA_VANTAGE_API_KEY:
-            url = (
-                f"https://www.alphavantage.co/query"
-                f"?function=WTI"
-                f"&interval=daily"
-                f"&apikey={ALPHA_VANTAGE_API_KEY}"
-            )
-            response = requests.get(url, timeout=10)
-            data = response.json()
-            latest = data.get("data", [{}])[0]
-            value = latest.get("value")
-            if value and value != ".":
-                price = float(value)
-                if 50 <= price <= 150:
-                    print(f"[OIL] Alpha Vantage WTI: {price}")
-                    return round(price, 2)
-    except Exception as e:
-        print(f"[OIL] Alpha Vantage error: {e}")
-
-    print("[OIL] All oil price APIs failed")
-    return None
 
 # ============================================
 # LIVE PRICE — TWELVEDATA PRIMARY
@@ -413,14 +339,6 @@ def get_price_alphavantage(config):
 # ============================================
 
 def get_live_price(symbol="XAU/USD", config=None):
-    # Special handling for oil
-    if config and config.get("use_oil_api"):
-        price = get_oil_price()
-        if price:
-            return price
-        print("[PRICE] All oil APIs failed")
-        return None
-
     price = get_price_twelvedata(symbol)
     if price is not None:
         return price
@@ -562,7 +480,7 @@ def build_signal_response(question):
     }
 
     print(
-        f"[SIGNAL] ✅ Built {pair_name} signal | "
+        f"[SIGNAL] ✅ {pair_name} | "
         f"{direction} @ {entry_price} | "
         f"TP: {take_profit} | SL: {stop_loss}"
     )
@@ -705,11 +623,9 @@ def fetch_economic_calendar():
             event_date = event.get("date", "")[:10]
             if event_date != today_str:
                 continue
-
             impact = event.get("impact", "").lower()
             if impact != "high":
                 continue
-
             title = event.get("title", "")
             currency = event.get("currency", "")
             time_utc = event.get("date", "")
@@ -732,7 +648,6 @@ def fetch_economic_calendar():
                 line += f" — {time_str}"
             calendar_text += line + "\n"
             count += 1
-
             if count >= 5:
                 break
 
@@ -746,7 +661,7 @@ def fetch_economic_calendar():
         return None
 
 # ============================================
-# NEWS SUMMARY GENERATOR — SHORT & PRECISE
+# NEWS SUMMARY GENERATOR
 # ============================================
 
 async def generate_news_summary(article, session_type):
@@ -804,7 +719,7 @@ async def post_news(context: ContextTypes.DEFAULT_TYPE):
 
     article = fetch_market_news()
     if article is None:
-        print("[NEWS] No article found from any source. Skipping.")
+        print("[NEWS] No article found. Skipping.")
         return
 
     headline = article.get("title", "financial market news trading")
@@ -835,14 +750,14 @@ async def post_news(context: ContextTypes.DEFAULT_TYPE):
         )
         print(f"[NEWS] ✅ {session_type} posted to Channel 1")
     except Exception as e:
-        print(f"[NEWS] AI image failed, posting text only: {e}")
+        print(f"[NEWS] Image failed, posting text only: {e}")
         try:
             await context.bot.send_message(
                 chat_id=CHANNEL_1_ID,
                 text=summary,
                 parse_mode=ParseMode.HTML
             )
-            print(f"[NEWS] ✅ {session_type} posted (text only) to Channel 1")
+            print(f"[NEWS] ✅ {session_type} text posted to Channel 1")
         except Exception as e2:
             print(f"[NEWS] ❌ Failed: {e2}")
 
@@ -893,95 +808,7 @@ async def place_mt5_trade(signal_data):
         return None
 
 # ============================================
-# MONITOR SIGNAL FOR TP/SL
-# ============================================
-
-async def monitor_signal(bot, channel_id, message_id, signal_data):
-
-    symbol = signal_data["symbol"]
-    direction = signal_data["direction"]
-    take_profit = signal_data["take_profit"]
-    stop_loss = signal_data["stop_loss"]
-    pair_name = signal_data["pair_name"]
-    entry_price = signal_data["entry_price"]
-    config = signal_data.get("config")
-
-    print(
-        f"[MONITOR] Watching {pair_name} | "
-        f"TP: {take_profit} | SL: {stop_loss}"
-    )
-
-    max_checks = 1440
-
-    for _ in range(max_checks):
-        await asyncio.sleep(60)
-
-        if config and config.get("use_oil_api"):
-            current_price = get_oil_price()
-        else:
-            current_price = get_live_price(symbol, config=config)
-
-        if current_price is None:
-            continue
-
-        tp_hit = (
-            (direction == "BUY" and current_price >= take_profit) or
-            (direction == "SELL" and current_price <= take_profit)
-        )
-        sl_hit = (
-            (direction == "BUY" and current_price <= stop_loss) or
-            (direction == "SELL" and current_price >= stop_loss)
-        )
-
-        if tp_hit:
-            exit_price = round(current_price, 2)
-            pips, pip_label = calculate_pips(
-                pair_name, entry_price, exit_price, direction, config
-            )
-            print(f"[MONITOR] ✅ TP HIT {pair_name} at {exit_price}")
-            await bot.send_photo(
-                chat_id=channel_id,
-                photo=TP_HIT_IMAGE_FILE_ID,
-                caption=(
-                    f"✅ <b>TP HIT — {pair_name}</b>\n\n"
-                    f"<b>Entry:</b> {entry_price}\n"
-                    f"<b>Take Profit:</b> {take_profit}\n"
-                    f"<b>Exit Price:</b> {exit_price}\n\n"
-                    f"📈 <b>Result: +{pips} {pip_label} gained!</b>\n\n"
-                    f"<i>Well done to everyone who followed! 💰🔥\n"
-                    f"Consistency is the key to long term profits.</i>"
-                ),
-                parse_mode=ParseMode.HTML,
-                reply_to_message_id=message_id
-            )
-            break
-
-        elif sl_hit:
-            exit_price = round(current_price, 2)
-            pips, pip_label = calculate_pips(
-                pair_name, entry_price, exit_price, direction, config
-            )
-            pips_lost = abs(pips)
-            print(f"[MONITOR] ❌ SL HIT {pair_name} at {exit_price}")
-            await bot.send_photo(
-                chat_id=channel_id,
-                photo=SL_HIT_IMAGE_FILE_ID,
-                caption=(
-                    f"❌ <b>SL HIT — {pair_name}</b>\n\n"
-                    f"<b>Entry:</b> {entry_price}\n"
-                    f"<b>Stop Loss:</b> {stop_loss}\n"
-                    f"<b>Exit Price:</b> {exit_price}\n\n"
-                    f"📉 <b>Result: -{pips_lost} {pip_label} lost.</b>\n\n"
-                    f"<i>Risk managed. Every loss is a lesson. 💼\n"
-                    f"Next signal coming — stay disciplined!</i>"
-                ),
-                parse_mode=ParseMode.HTML,
-                reply_to_message_id=message_id
-            )
-            break
-
-# ============================================
-# GEMINI AI — WITH RATE LIMIT HANDLING
+# GEMINI AI
 # ============================================
 
 async def ask_gemini(prompt):
@@ -1580,7 +1407,7 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
 
 # ============================================
-# AUTO SIGNAL — POSTED TO BOTH CHANNELS
+# AUTO SIGNAL — BOTH CHANNELS
 # ============================================
 
 async def post_auto_signal(context: ContextTypes.DEFAULT_TYPE):
@@ -1600,11 +1427,19 @@ async def post_auto_signal(context: ContextTypes.DEFAULT_TYPE):
 
     for channel_id in [CHANNEL_1_ID, CHANNEL_2_ID]:
         try:
-            sent = await context.bot.send_photo(
+            # Button on Channel 1 only
+            markup = (
+                get_channel_button()
+                if channel_id == CHANNEL_1_ID
+                else None
+            )
+
+            await context.bot.send_photo(
                 chat_id=channel_id,
                 photo=image_file_id,
                 caption=signal,
-                parse_mode=ParseMode.HTML
+                parse_mode=ParseMode.HTML,
+                reply_markup=markup
             )
             print(
                 f"[AUTO SIGNAL] ✅ {pair_keyword.upper()} "
@@ -1612,14 +1447,7 @@ async def post_auto_signal(context: ContextTypes.DEFAULT_TYPE):
             )
 
             asyncio.create_task(place_mt5_trade(signal_data))
-            asyncio.create_task(
-                monitor_signal(
-                    context.bot,
-                    channel_id,
-                    sent.message_id,
-                    signal_data
-                )
-            )
+
         except Exception as e:
             print(f"[AUTO SIGNAL] ❌ Failed for {channel_id}: {e}")
 
@@ -1628,7 +1456,6 @@ async def post_auto_signal(context: ContextTypes.DEFAULT_TYPE):
 # ============================================
 
 async def run_bot():
-    """Build and run the bot with proper startup to prevent conflicts."""
 
     app = Application.builder().token(TELEGRAM_TOKEN).build()
 
@@ -1686,29 +1513,17 @@ async def run_bot():
     print(f"Bot: @{BOT_USERNAME}")
 
     # ── CONFLICT FIX ─────────────────────────────
-    # Initialize the app
     await app.initialize()
-
-    # Delete any existing webhook and clear pending updates
-    # This stops any other running instance from conflicting
     await app.bot.delete_webhook(drop_pending_updates=True)
-    print("[BOT] ✅ Webhook cleared — no conflicts possible")
-
-    # Wait 3 seconds to ensure old instance has fully stopped
+    print("[BOT] ✅ Webhook cleared")
     await asyncio.sleep(3)
-
-    # Start the app
     await app.start()
-
-    # Start polling
     await app.updater.start_polling(
         drop_pending_updates=True,
         allowed_updates=Update.ALL_TYPES
     )
-
     print("[BOT] ✅ Polling started successfully")
 
-    # Keep running until stopped
     try:
         await asyncio.Event().wait()
     except (KeyboardInterrupt, SystemExit):

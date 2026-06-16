@@ -33,6 +33,7 @@ TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
 OPENROUTER_API_KEY = os.getenv("OPENROUTER_API_KEY")
 TWELVEDATA_API_KEY = os.getenv("TWELVEDATA_API_KEY")
+ALPHA_VANTAGE_API_KEY = os.getenv("ALPHA_VANTAGE_API_KEY")
 NEWS_API_KEY = os.getenv("NEWS_API_KEY")
 
 # ============================================
@@ -112,12 +113,14 @@ GEMINI_URL = (
 OPENROUTER_URL = "https://openrouter.ai/api/v1/chat/completions"
 
 # ============================================
-# KEYBOARDS
+# KEYBOARDS — PERSISTENT SO THEY NEVER HIDE
 # ============================================
 
 main_keyboard = ReplyKeyboardMarkup(
     [["📊 Signal", "📚 Breakdown"]],
-    resize_keyboard=True
+    resize_keyboard=True,
+    is_persistent=True,
+    one_time_keyboard=False
 )
 
 # ============================================
@@ -166,6 +169,8 @@ PAIR_CONFIG = {
         "pip_size": 10,
         "mt5_symbol": "XAUUSDm",
         "display": "Gold (XAUUSD) 🥇",
+        "av_symbol": "XAU",
+        "av_type": "forex",
     },
     "btcusd": {
         "symbol": "BTC/USD",
@@ -173,6 +178,8 @@ PAIR_CONFIG = {
         "pip_size": 300,
         "mt5_symbol": "BTCUSDm",
         "display": "Bitcoin (BTCUSD) ₿",
+        "av_symbol": "BTC",
+        "av_type": "crypto",
     },
     "xagusd": {
         "symbol": "XAG/USD",
@@ -180,6 +187,8 @@ PAIR_CONFIG = {
         "pip_size": 0.30,
         "mt5_symbol": "XAGUSDm",
         "display": "Silver (XAGUSD) 🥈",
+        "av_symbol": "XAG",
+        "av_type": "forex",
     },
     "usoil": {
         "symbol": "WTI/USD",
@@ -187,6 +196,8 @@ PAIR_CONFIG = {
         "pip_size": 0.50,
         "mt5_symbol": "USOILm",
         "display": "US Oil (WTI) 🛢️",
+        "av_symbol": "WTI",
+        "av_type": "commodity",
     },
     "gbpusd": {
         "symbol": "GBP/USD",
@@ -194,6 +205,8 @@ PAIR_CONFIG = {
         "pip_size": 0.0025,
         "mt5_symbol": "GBPUSDm",
         "display": "GBP/USD 🇬🇧",
+        "av_symbol": "GBP",
+        "av_type": "forex",
     },
     "gbpjpy": {
         "symbol": "GBP/JPY",
@@ -201,6 +214,8 @@ PAIR_CONFIG = {
         "pip_size": 0.30,
         "mt5_symbol": "GBPJPYm",
         "display": "GBP/JPY 🇯🇵",
+        "av_symbol": "GBPJPY",
+        "av_type": "forex",
     },
 }
 
@@ -226,111 +241,10 @@ def trial_remaining(user_id):
     return max(0, FREE_TRIAL_LIMIT - get_trial_count(user_id))
 
 # ============================================
-# VERIFICATION GATE MESSAGE
+# LIVE PRICE — TWELVEDATA PRIMARY
 # ============================================
 
-async def send_verification_gate(update):
-    await update.message.reply_text(
-        "🔐 <b>You've used your 3 FREE trial signals!</b>\n\n"
-        "Hope you loved what you saw! 🔥\n\n"
-        "To continue enjoying <b>UNLIMITED FREE signals</b>, "
-        "live market analysis and AI breakdowns — "
-        "you just need <b>ONE simple step:</b>\n\n"
-        "━━━━━━━━━━━━━━━━━━━━\n"
-        "🔓 <b>HOW TO UNLOCK FULL ACCESS</b>\n"
-        "━━━━━━━━━━━━━━━━━━━━\n\n"
-        "📌 Register a <b>FREE</b> trading account with our official "
-        "broker partner — <b>Exness</b> — using our unique link.\n\n"
-        "<b>No payment. No subscription. Completely FREE.</b>\n\n"
-        "━━━━━━━━━━━━━━━━━━━━\n"
-        "👇 <b>CHOOSE YOUR SITUATION:</b>\n"
-        "━━━━━━━━━━━━━━━━━━━━\n\n"
-        "✅ <b>SITUATION 1</b> — I have already registered on Exness "
-        "using the Nexora AI link in the past:\n"
-        "👉 Simply type the email address you used to register "
-        "on Exness below and we will verify you instantly.\n\n"
-        "📝 <b>SITUATION 2</b> — I have NOT registered on Exness yet "
-        "or I registered without using our link:\n"
-        "👉 Click the button below to create your FREE Exness "
-        "account using our official link. Once done, come back "
-        "here and type the email you registered with.\n\n"
-        "━━━━━━━━━━━━━━━━━━━━\n"
-        "📧 <b>Already registered? Type your Exness email now 👇</b>",
-        parse_mode=ParseMode.HTML,
-        reply_markup=InlineKeyboardMarkup([
-            [InlineKeyboardButton(
-                "📝 I'm New — Register on Exness FREE 👆",
-                url=EXNESS_LINK
-            )]
-        ])
-    )
-
-# ============================================
-# START COMMAND
-# ============================================
-
-async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-
-    user_id = str(update.message.from_user.id)
-    username = update.message.from_user.username or "Trader"
-
-    if is_verified(user_id):
-        await update.message.reply_text(
-            f"👋 <b>Welcome back, {username}!</b>\n\n"
-            f"✅ You're a <b>verified Nexora AI trader.</b>\n\n"
-            f"━━━━━━━━━━━━━━━━━━━━\n"
-            f"👇 <b>What would you like to do today?</b>\n"
-            f"━━━━━━━━━━━━━━━━━━━━\n\n"
-            f"📊 <b>Signal</b> — Get a live trading signal right now\n\n"
-            f"📚 <b>Breakdown</b> — Get a full AI market analysis\n\n"
-            f"<i>Both buttons are at the bottom of your screen 👇</i>",
-            parse_mode=ParseMode.HTML,
-            reply_markup=main_keyboard
-        )
-        return
-
-    remaining = trial_remaining(user_id)
-
-    if remaining > 0:
-        await update.message.reply_text(
-            f"👋 <b>Hello {username}, welcome to Nexora AI! 🤖</b>\n\n"
-            f"I am your personal AI trading assistant — delivering "
-            f"<b>professional trading signals</b>, live market analysis "
-            f"and AI-powered breakdowns.\n\n"
-            f"🎁 <b>You have {remaining} FREE trial signal(s) to use!</b>\n\n"
-            f"━━━━━━━━━━━━━━━━━━━━\n"
-            f"👇 <b>TAP ONE OF THE OPTIONS BELOW TO START:</b>\n"
-            f"━━━━━━━━━━━━━━━━━━━━\n\n"
-            f"📊 <b>Signal</b> — Get a live trading signal right now\n\n"
-            f"📚 <b>Breakdown</b> — Get a full AI market analysis\n\n"
-            f"<i>Both buttons are at the bottom of your screen 👇</i>",
-            parse_mode=ParseMode.HTML,
-            reply_markup=main_keyboard
-        )
-        return
-
-    user_modes[user_id] = "awaiting_email"
-    await send_verification_gate(update)
-
-# ============================================
-# SESSION DETECTION
-# ============================================
-
-def get_market_session():
-    hour = datetime.utcnow().hour
-    if 0 <= hour < 7:
-        return "Asian Session 🌏"
-    elif 7 <= hour < 13:
-        return "London Session 🇬🇧"
-    elif 13 <= hour < 21:
-        return "New York Session 🇺🇸"
-    return "Market Closing Session 🌙"
-
-# ============================================
-# LIVE PRICE
-# ============================================
-
-def get_live_price(symbol="XAU/USD"):
+def get_price_twelvedata(symbol):
     try:
         url = (
             f"https://api.twelvedata.com/price"
@@ -343,8 +257,97 @@ def get_live_price(symbol="XAU/USD"):
             return float(data["price"])
         return None
     except Exception as e:
-        print("PRICE ERROR:", e)
+        print(f"[TWELVEDATA] Error for {symbol}: {e}")
         return None
+
+# ============================================
+# LIVE PRICE — ALPHA VANTAGE FALLBACK
+# ============================================
+
+def get_price_alphavantage(config):
+    try:
+        av_symbol = config.get("av_symbol")
+        av_type = config.get("av_type")
+
+        if not av_symbol or not ALPHA_VANTAGE_API_KEY:
+            return None
+
+        if av_type == "crypto":
+            url = (
+                f"https://www.alphavantage.co/query"
+                f"?function=CURRENCY_EXCHANGE_RATE"
+                f"&from_currency={av_symbol}"
+                f"&to_currency=USD"
+                f"&apikey={ALPHA_VANTAGE_API_KEY}"
+            )
+            response = requests.get(url, timeout=10)
+            data = response.json()
+            rate = data.get(
+                "Realtime Currency Exchange Rate", {}
+            ).get("5. Exchange Rate")
+            if rate:
+                return float(rate)
+
+        elif av_type == "forex":
+            url = (
+                f"https://www.alphavantage.co/query"
+                f"?function=CURRENCY_EXCHANGE_RATE"
+                f"&from_currency={av_symbol}"
+                f"&to_currency=USD"
+                f"&apikey={ALPHA_VANTAGE_API_KEY}"
+            )
+            response = requests.get(url, timeout=10)
+            data = response.json()
+            rate = data.get(
+                "Realtime Currency Exchange Rate", {}
+            ).get("5. Exchange Rate")
+            if rate:
+                return float(rate)
+
+        elif av_type == "commodity":
+            # WTI Oil — use global quote
+            url = (
+                f"https://www.alphavantage.co/query"
+                f"?function=WTI"
+                f"&interval=daily"
+                f"&apikey={ALPHA_VANTAGE_API_KEY}"
+            )
+            response = requests.get(url, timeout=10)
+            data = response.json()
+            latest = data.get("data", [{}])[0]
+            value = latest.get("value")
+            if value and value != ".":
+                return float(value)
+
+        return None
+
+    except Exception as e:
+        print(f"[ALPHAVANTAGE] Error: {e}")
+        return None
+
+# ============================================
+# LIVE PRICE — COMBINED WITH FALLBACK
+# ============================================
+
+def get_live_price(symbol="XAU/USD", config=None):
+
+    # Try Twelvedata first
+    price = get_price_twelvedata(symbol)
+
+    if price is not None:
+        return price
+
+    # Fallback to Alpha Vantage
+    if config:
+        print(f"[PRICE] Twelvedata failed for {symbol}, trying Alpha Vantage...")
+        price = get_price_alphavantage(config)
+
+        if price is not None:
+            print(f"[PRICE] Alpha Vantage returned {price} for {symbol}")
+            return price
+
+    print(f"[PRICE] Both APIs failed for {symbol}")
+    return None
 
 # ============================================
 # MARKET BIAS
@@ -383,6 +386,20 @@ SELL_REASONS = [
 ]
 
 # ============================================
+# SESSION DETECTION
+# ============================================
+
+def get_market_session():
+    hour = datetime.utcnow().hour
+    if 0 <= hour < 7:
+        return "Asian Session 🌏"
+    elif 7 <= hour < 13:
+        return "London Session 🇬🇧"
+    elif 13 <= hour < 21:
+        return "New York Session 🇺🇸"
+    return "Market Closing Session 🌙"
+
+# ============================================
 # SIGNAL BUILDER
 # ============================================
 
@@ -401,7 +418,8 @@ def build_signal_response(question):
     pip_size = config["pip_size"]
     display = config["display"]
 
-    live_price = get_live_price(symbol)
+    # Pass config for Alpha Vantage fallback
+    live_price = get_live_price(symbol, config=config)
 
     if live_price is None:
         return None, None, None, None
@@ -457,9 +475,51 @@ def build_signal_response(question):
         "entry_price": entry_price,
         "stop_loss": stop_loss,
         "take_profit": take_profit,
+        "config": config,
     }
 
     return image_file_id, direction, response, signal_data
+
+# ============================================
+# FORMAT BREAKDOWN — ADD BOLD HEADERS
+# ============================================
+
+def format_breakdown(text):
+    headers = [
+        "Technical Analysis",
+        "Fundamental Analysis",
+        "Market Sentiment",
+        "Sentiment",
+        "Trade Idea",
+        "Summary",
+        "Outlook",
+        "Key Levels",
+        "Risk Warning",
+        "Conclusion",
+        "Price Action",
+        "News Impact",
+        "Market Overview",
+    ]
+    emojis = ["📊", "📈", "💡", "🗞️", "📰", "🛢️",
+              "⚡", "🔍", "📉", "🎯", "💰", "🔔"]
+
+    for header in headers:
+        for emoji in emojis:
+            text = text.replace(
+                f"{emoji} {header}",
+                f"{emoji} <b>{header}</b>"
+            )
+        # Bold without emoji
+        text = text.replace(
+            f"\n{header}\n",
+            f"\n<b>{header}</b>\n"
+        )
+        text = text.replace(
+            f"\n{header}:",
+            f"\n<b>{header}:</b>"
+        )
+
+    return text
 
 # ============================================
 # NEWS FETCHER
@@ -480,7 +540,8 @@ def fetch_market_news():
             return None
         articles = [
             a for a in data.get("articles", [])
-            if a.get("urlToImage") and a.get("title") and a.get("description")
+            if a.get("urlToImage") and a.get("title")
+            and a.get("description")
         ]
         if not articles:
             return None
@@ -525,10 +586,10 @@ RULES:
 - Include what this means for traders
 - Mention impact on gold, forex, or crypto if relevant
 - End with a motivational trading line
-- No markdown symbols like ** or ##
+- No markdown symbols like ** or ## or ---
 - No hashtags
 - Professional but exciting tone
-- Use emojis naturally
+- Use emojis naturally to separate sections
 """
 
     return await ask_gemini(prompt)
@@ -634,14 +695,18 @@ async def monitor_signal(bot, channel_id, message_id, signal_data):
     stop_loss = signal_data["stop_loss"]
     pair_name = signal_data["pair_name"]
     entry_price = signal_data["entry_price"]
+    config = signal_data.get("config")
 
-    print(f"[MONITOR] Watching {pair_name} | TP: {take_profit} | SL: {stop_loss}")
+    print(
+        f"[MONITOR] Watching {pair_name} | "
+        f"TP: {take_profit} | SL: {stop_loss}"
+    )
 
     max_checks = 1440
 
     for _ in range(max_checks):
         await asyncio.sleep(60)
-        current_price = get_live_price(symbol)
+        current_price = get_live_price(symbol, config=config)
 
         if current_price is None:
             continue
@@ -751,14 +816,16 @@ async def generate_breakdown(question):
     q = question.lower()
     symbol = "XAU/USD"
     pair_name = "Gold (XAUUSD)"
+    config = PAIR_CONFIG["xauusd"]
 
-    for key, config in PAIR_CONFIG.items():
+    for key, cfg in PAIR_CONFIG.items():
         if key in q:
-            symbol = config["symbol"]
-            pair_name = config["display"]
+            symbol = cfg["symbol"]
+            pair_name = cfg["display"]
+            config = cfg
             break
 
-    live_price = get_live_price(symbol)
+    live_price = get_live_price(symbol, config=config)
     live_price_text = (
         str(round(live_price, 4)) if live_price
         else "Live price unavailable"
@@ -782,19 +849,26 @@ PAIR: {pair_name}
 LIVE PRICE: {live_price_text}
 SESSION: {session}
 
+FORMAT YOUR RESPONSE EXACTLY LIKE THIS:
+📊 Technical Analysis
+[Your technical analysis here]
+
+📰 Fundamental Analysis
+[Your fundamental analysis here]
+
+💡 Market Sentiment
+[Your sentiment here]
+
+🎯 Trade Idea
+[Your trade idea with entry, TP, SL levels]
+
 RULES:
-- Clean professional formatting
+- Use the LIVE PRICE in your analysis
+- Beginner friendly but professional tone
+- Maximum 250 words total
 - No markdown symbols like ** or ## or ---
 - No hashtags
-- Beginner friendly but professional tone
-- Include technical analysis
-- Include fundamental analysis
-- Include market sentiment
-- Include a trade idea
-- Use the live price in your analysis
-- Maximum 250 words
-- Use emojis naturally to separate sections
-
+- Use emojis as shown in the format above
 QUESTION: {question}
 """
 
@@ -808,6 +882,93 @@ def clean_text(text):
     text = text.replace("###", "").replace("##", "")
     text = text.replace("**", "").replace("---", "").replace("__", "")
     return text.strip()
+
+# ============================================
+# VERIFICATION GATE MESSAGE
+# ============================================
+
+async def send_verification_gate(update):
+    await update.message.reply_text(
+        "🔐 <b>You've used your 3 FREE trial signals!</b>\n\n"
+        "Hope you loved what you saw! 🔥\n\n"
+        "To continue enjoying <b>UNLIMITED FREE signals</b>, "
+        "live market analysis and AI breakdowns — "
+        "you just need <b>ONE simple step:</b>\n\n"
+        "━━━━━━━━━━━━━━━━━━━━\n"
+        "🔓 <b>HOW TO UNLOCK FULL ACCESS</b>\n"
+        "━━━━━━━━━━━━━━━━━━━━\n\n"
+        "📌 Register a <b>FREE</b> trading account with our official "
+        "broker partner — <b>Exness</b> — using our unique link.\n\n"
+        "<b>No payment. No subscription. Completely FREE.</b>\n\n"
+        "━━━━━━━━━━━━━━━━━━━━\n"
+        "👇 <b>CHOOSE YOUR SITUATION:</b>\n"
+        "━━━━━━━━━━━━━━━━━━━━\n\n"
+        "✅ <b>SITUATION 1</b> — Already registered on Exness "
+        "using our link before:\n"
+        "👉 Simply type the email address you used to register "
+        "on Exness below and we will verify you instantly.\n\n"
+        "📝 <b>SITUATION 2</b> — Not yet registered or registered "
+        "without our link:\n"
+        "👉 Click the button below to create your FREE Exness "
+        "account using our official link. Once done, come back "
+        "here and type the email you registered with.\n\n"
+        "━━━━━━━━━━━━━━━━━━━━\n"
+        "📧 <b>Already registered? Type your Exness email now 👇</b>",
+        parse_mode=ParseMode.HTML,
+        reply_markup=InlineKeyboardMarkup([
+            [InlineKeyboardButton(
+                "📝 I'm New — Register on Exness FREE 👆",
+                url=EXNESS_LINK
+            )]
+        ])
+    )
+
+# ============================================
+# START COMMAND
+# ============================================
+
+async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+
+    user_id = str(update.message.from_user.id)
+    username = update.message.from_user.username or "Trader"
+
+    if is_verified(user_id):
+        await update.message.reply_text(
+            f"👋 <b>Welcome back, {username}!</b>\n\n"
+            f"✅ You're a <b>verified Nexora AI trader.</b>\n\n"
+            f"━━━━━━━━━━━━━━━━━━━━\n"
+            f"👇 <b>What would you like to do today?</b>\n"
+            f"━━━━━━━━━━━━━━━━━━━━\n\n"
+            f"📊 <b>Signal</b> — Get a live trading signal right now\n\n"
+            f"📚 <b>Breakdown</b> — Get a full AI market analysis\n\n"
+            f"<i>Both buttons are at the bottom of your screen 👇</i>",
+            parse_mode=ParseMode.HTML,
+            reply_markup=main_keyboard
+        )
+        return
+
+    remaining = trial_remaining(user_id)
+
+    if remaining > 0:
+        await update.message.reply_text(
+            f"👋 <b>Hello {username}, welcome to Nexora AI! 🤖</b>\n\n"
+            f"I am your personal AI trading assistant — delivering "
+            f"<b>professional trading signals</b>, live market analysis "
+            f"and AI-powered breakdowns.\n\n"
+            f"🎁 <b>You have {remaining} FREE trial signal(s) to use!</b>\n\n"
+            f"━━━━━━━━━━━━━━━━━━━━\n"
+            f"👇 <b>TAP ONE OF THE OPTIONS BELOW TO START:</b>\n"
+            f"━━━━━━━━━━━━━━━━━━━━\n\n"
+            f"📊 <b>Signal</b> — Get a live trading signal right now\n\n"
+            f"📚 <b>Breakdown</b> — Get a full AI market analysis\n\n"
+            f"<i>Both buttons are at the bottom of your screen 👇</i>",
+            parse_mode=ParseMode.HTML,
+            reply_markup=main_keyboard
+        )
+        return
+
+    user_modes[user_id] = "awaiting_email"
+    await send_verification_gate(update)
 
 # ============================================
 # HANDLE BUTTONS
@@ -836,7 +997,8 @@ async def handle_buttons(update: Update, context: ContextTypes.DEFAULT_TYPE):
             "• GBPUSD\n"
             "• GBPJPY\n\n"
             "<i>Example: Type <b>XAUUSD</b> to get a Gold signal</i>",
-            parse_mode=ParseMode.HTML
+            parse_mode=ParseMode.HTML,
+            reply_markup=main_keyboard
         )
         return
 
@@ -850,7 +1012,8 @@ async def handle_buttons(update: Update, context: ContextTypes.DEFAULT_TYPE):
             "• BTCUSD outlook\n"
             "• GBPJPY market analysis\n"
             "• What is happening with oil today?",
-            parse_mode=ParseMode.HTML
+            parse_mode=ParseMode.HTML,
+            reply_markup=main_keyboard
         )
         return
 
@@ -862,7 +1025,6 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     query = update.callback_query
     await query.answer()
-
     data = query.data
 
     if data.startswith("approve_"):
@@ -956,7 +1118,8 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 f"❌ <b>REJECTED</b>\n\n"
                 f"🆔 <b>User ID:</b> {target_id}\n"
                 f"📧 <b>Email:</b> {email}\n\n"
-                f"<i>User has been notified to register via the correct link.</i>"
+                f"<i>User has been notified to register "
+                f"via the correct link.</i>"
             ),
             parse_mode=ParseMode.HTML
         )
@@ -989,7 +1152,8 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
         pending_verifications[user_id] = email
 
         await update.message.reply_text(
-            "⏳ <b>Got it! Your verification request has been submitted.</b>\n\n"
+            "⏳ <b>Got it! Your verification request has been "
+            "submitted.</b>\n\n"
             "Our team is reviewing your details right now. "
             "You'll receive a confirmation message shortly.\n\n"
             "<i>Sit tight — greatness is loading! 🚀</i>",
@@ -1064,6 +1228,7 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 parse_mode=ParseMode.HTML
             )
 
+            # Only show trial counter if NOT verified
             if not is_verified(user_id):
                 remaining = trial_remaining(user_id)
                 if remaining > 0:
@@ -1105,12 +1270,14 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
         response = await generate_breakdown(message)
         response = clean_text(response)
+        response = format_breakdown(response)
 
         await wait_message.edit_text(
             response,
             parse_mode=ParseMode.HTML
         )
 
+        # Only show trial counter if NOT verified
         if not is_verified(user_id):
             remaining = trial_remaining(user_id)
             if remaining > 0:
@@ -1155,7 +1322,10 @@ async def post_auto_signal(context: ContextTypes.DEFAULT_TYPE):
     )
 
     if signal_data is None:
-        print(f"[AUTO SIGNAL] ❌ Could not fetch price for {pair_keyword}.")
+        print(
+            f"[AUTO SIGNAL] ❌ Could not fetch price "
+            f"for {pair_keyword}."
+        )
         return
 
     channel_ids = [CHANNEL_1_ID, CHANNEL_2_ID]
@@ -1199,7 +1369,9 @@ def main():
 
     app.add_handler(
         MessageHandler(
-            filters.Regex("^(📊 Signal|📚 Breakdown|signal|breakdown)$"),
+            filters.Regex(
+                "^(📊 Signal|📚 Breakdown|signal|breakdown)$"
+            ),
             handle_buttons
         )
     )

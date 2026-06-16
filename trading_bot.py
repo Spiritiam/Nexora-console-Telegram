@@ -23,6 +23,8 @@ from telegram.ext import (
     filters,
 )
 
+from telegram.constants import ParseMode
+
 # ============================================
 # ENV VARIABLES
 # ============================================
@@ -229,30 +231,32 @@ def trial_remaining(user_id):
 
 async def send_verification_gate(update):
     await update.message.reply_text(
-        "🔐 You've used your 3 FREE trial signals!\n\n"
+        "🔐 <b>You've used your 3 FREE trial signals!</b>\n\n"
         "Hope you loved what you saw! 🔥\n\n"
-        "To continue enjoying UNLIMITED FREE signals, "
+        "To continue enjoying <b>UNLIMITED FREE signals</b>, "
         "live market analysis and AI breakdowns — "
-        "you just need ONE simple step:\n\n"
+        "you just need <b>ONE simple step:</b>\n\n"
         "━━━━━━━━━━━━━━━━━━━━\n"
-        "🔓 HOW TO UNLOCK FULL ACCESS\n"
+        "🔓 <b>HOW TO UNLOCK FULL ACCESS</b>\n"
         "━━━━━━━━━━━━━━━━━━━━\n\n"
-        "📌 Register a FREE trading account with our official "
-        "broker partner — Exness — using our unique link.\n\n"
-        "No payment. No subscription. Completely FREE.\n\n"
+        "📌 Register a <b>FREE</b> trading account with our official "
+        "broker partner — <b>Exness</b> — using our unique link.\n\n"
+        "<b>No payment. No subscription. Completely FREE.</b>\n\n"
         "━━━━━━━━━━━━━━━━━━━━\n"
-        "👇 CHOOSE YOUR SITUATION:\n"
+        "👇 <b>CHOOSE YOUR SITUATION:</b>\n"
         "━━━━━━━━━━━━━━━━━━━━\n\n"
-        "✅ SITUATION 1 — Already registered on Exness "
-        "using our link before:\n"
-        "👉 Type the email you used to register on Exness "
-        "and we will verify you instantly.\n\n"
-        "📝 SITUATION 2 — Not yet registered or registered "
-        "without our link:\n"
+        "✅ <b>SITUATION 1</b> — I have already registered on Exness "
+        "using the Nexora AI link in the past:\n"
+        "👉 Simply type the email address you used to register "
+        "on Exness below and we will verify you instantly.\n\n"
+        "📝 <b>SITUATION 2</b> — I have NOT registered on Exness yet "
+        "or I registered without using our link:\n"
         "👉 Click the button below to create your FREE Exness "
-        "account. Once done, come back and type your email.\n\n"
+        "account using our official link. Once done, come back "
+        "here and type the email you registered with.\n\n"
         "━━━━━━━━━━━━━━━━━━━━\n"
-        "📧 Already registered? Type your Exness email now 👇",
+        "📧 <b>Already registered? Type your Exness email now 👇</b>",
+        parse_mode=ParseMode.HTML,
         reply_markup=InlineKeyboardMarkup([
             [InlineKeyboardButton(
                 "📝 I'm New — Register on Exness FREE 👆",
@@ -272,9 +276,15 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     if is_verified(user_id):
         await update.message.reply_text(
-            f"👋 Welcome back, {username}!\n\n"
-            f"✅ You're a verified Nexora AI trader.\n\n"
-            f"Choose an option below to get started.",
+            f"👋 <b>Welcome back, {username}!</b>\n\n"
+            f"✅ You're a <b>verified Nexora AI trader.</b>\n\n"
+            f"━━━━━━━━━━━━━━━━━━━━\n"
+            f"👇 <b>What would you like to do today?</b>\n"
+            f"━━━━━━━━━━━━━━━━━━━━\n\n"
+            f"📊 <b>Signal</b> — Get a live trading signal right now\n\n"
+            f"📚 <b>Breakdown</b> — Get a full AI market analysis\n\n"
+            f"<i>Both buttons are at the bottom of your screen 👇</i>",
+            parse_mode=ParseMode.HTML,
             reply_markup=main_keyboard
         )
         return
@@ -283,12 +293,18 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     if remaining > 0:
         await update.message.reply_text(
-            f"👋 Hello {username}, welcome to Nexora AI! 🤖\n\n"
+            f"👋 <b>Hello {username}, welcome to Nexora AI! 🤖</b>\n\n"
             f"I am your personal AI trading assistant — delivering "
-            f"professional trading signals, live market analysis "
+            f"<b>professional trading signals</b>, live market analysis "
             f"and AI-powered breakdowns.\n\n"
-            f"🎁 You have {remaining} FREE trial signal(s) to use!\n\n"
-            f"Choose an option below to get started 👇",
+            f"🎁 <b>You have {remaining} FREE trial signal(s) to use!</b>\n\n"
+            f"━━━━━━━━━━━━━━━━━━━━\n"
+            f"👇 <b>TAP ONE OF THE OPTIONS BELOW TO START:</b>\n"
+            f"━━━━━━━━━━━━━━━━━━━━\n\n"
+            f"📊 <b>Signal</b> — Get a live trading signal right now\n\n"
+            f"📚 <b>Breakdown</b> — Get a full AI market analysis\n\n"
+            f"<i>Both buttons are at the bottom of your screen 👇</i>",
+            parse_mode=ParseMode.HTML,
             reply_markup=main_keyboard
         )
         return
@@ -419,25 +435,19 @@ def build_signal_response(question):
         "New York volatility expansion detected",
     ])
 
-    response = f"""{signal_emoji} {strength} {direction} {display}
-
-Entry Price: {entry_price}
-
-Stop Loss: {stop_loss}
-
-Take Profit: {take_profit}
-
-Confidence: {confidence}%
-
-Session: {session}
-
-Timeframe Confirmation:
-{timeframe_confirmation}
-
-Reason:
-{reason}
-
-Trade safe 💼🔥"""
+    response = (
+        f"{signal_emoji} <b>{strength} {direction} {display}</b>\n\n"
+        f"<b>Entry Price:</b> {entry_price}\n\n"
+        f"<b>Stop Loss:</b> {stop_loss}\n\n"
+        f"<b>Take Profit:</b> {take_profit}\n\n"
+        f"<b>Confidence:</b> {confidence}%\n\n"
+        f"<b>Session:</b> {session}\n\n"
+        f"<b>Timeframe Confirmation:</b>\n"
+        f"{timeframe_confirmation}\n\n"
+        f"<b>Reason:</b>\n"
+        f"{reason}\n\n"
+        f"<i>Trade safe 💼🔥</i>"
+    )
 
     signal_data = {
         "symbol": symbol,
@@ -651,12 +661,13 @@ async def monitor_signal(bot, channel_id, message_id, signal_data):
                 chat_id=channel_id,
                 photo=TP_HIT_IMAGE_FILE_ID,
                 caption=(
-                    f"✅ TP HIT — {pair_name}\n\n"
-                    f"Entry: {entry_price}\n"
-                    f"Take Profit: {take_profit}\n"
-                    f"Exit Price: {round(current_price, 2)}\n\n"
-                    f"Well done to everyone who followed! 💰🔥"
+                    f"✅ <b>TP HIT — {pair_name}</b>\n\n"
+                    f"<b>Entry:</b> {entry_price}\n"
+                    f"<b>Take Profit:</b> {take_profit}\n"
+                    f"<b>Exit Price:</b> {round(current_price, 2)}\n\n"
+                    f"<i>Well done to everyone who followed! 💰🔥</i>"
                 ),
+                parse_mode=ParseMode.HTML,
                 reply_to_message_id=message_id
             )
             break
@@ -667,12 +678,13 @@ async def monitor_signal(bot, channel_id, message_id, signal_data):
                 chat_id=channel_id,
                 photo=SL_HIT_IMAGE_FILE_ID,
                 caption=(
-                    f"❌ SL HIT — {pair_name}\n\n"
-                    f"Entry: {entry_price}\n"
-                    f"Stop Loss: {stop_loss}\n"
-                    f"Exit Price: {round(current_price, 2)}\n\n"
-                    f"Risk managed. Next signal coming. 💼"
+                    f"❌ <b>SL HIT — {pair_name}</b>\n\n"
+                    f"<b>Entry:</b> {entry_price}\n"
+                    f"<b>Stop Loss:</b> {stop_loss}\n"
+                    f"<b>Exit Price:</b> {round(current_price, 2)}\n\n"
+                    f"<i>Risk managed. Next signal coming. 💼</i>"
                 ),
+                parse_mode=ParseMode.HTML,
                 reply_to_message_id=message_id
             )
             break
@@ -761,8 +773,9 @@ async def generate_breakdown(question):
         session = "Asian Session 🇯🇵"
 
     prompt = f"""
-You are Nexora AI.
-Generate a PROFESSIONAL market breakdown.
+You are Nexora AI, a professional market analyst.
+Generate a PROFESSIONAL market breakdown for a Telegram trading channel.
+
 IMPORTANT: Use the REAL LIVE PRICE. Do NOT invent fake prices.
 
 PAIR: {pair_name}
@@ -770,11 +783,17 @@ LIVE PRICE: {live_price_text}
 SESSION: {session}
 
 RULES:
-- Clean formatting, no markdown, no hashtags, no stars
-- Beginner friendly, professional tone
-- Include technical and fundamental analysis
-- Include sentiment and trade idea
-- Modern clean formatting
+- Clean professional formatting
+- No markdown symbols like ** or ## or ---
+- No hashtags
+- Beginner friendly but professional tone
+- Include technical analysis
+- Include fundamental analysis
+- Include market sentiment
+- Include a trade idea
+- Use the live price in your analysis
+- Maximum 250 words
+- Use emojis naturally to separate sections
 
 QUESTION: {question}
 """
@@ -807,22 +826,31 @@ async def handle_buttons(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if "signal" in text:
         user_modes[user_id] = "signal"
         await update.message.reply_text(
-            "📊 Signal Mode Activated\n\n"
-            "Now ask for a signal.\n\n"
-            "Examples:\n"
-            "• XAUUSD\n• BTCUSD\n• XAGUSD\n• USOIL\n• GBPUSD\n• GBPJPY"
+            "📊 <b>Signal Mode Activated</b>\n\n"
+            "Now type the pair you want a signal for.\n\n"
+            "<b>Available pairs:</b>\n"
+            "• XAUUSD — Gold\n"
+            "• BTCUSD — Bitcoin\n"
+            "• XAGUSD — Silver\n"
+            "• USOIL — US Oil\n"
+            "• GBPUSD\n"
+            "• GBPJPY\n\n"
+            "<i>Example: Type <b>XAUUSD</b> to get a Gold signal</i>",
+            parse_mode=ParseMode.HTML
         )
         return
 
     if "breakdown" in text:
         user_modes[user_id] = "breakdown"
         await update.message.reply_text(
-            "📚 Breakdown Mode Activated\n\n"
-            "Now ask your market question.\n\n"
-            "Examples:\n"
+            "📚 <b>Breakdown Mode Activated</b>\n\n"
+            "Now type your market question below.\n\n"
+            "<b>Examples:</b>\n"
             "• Analyze gold market today\n"
             "• BTCUSD outlook\n"
-            "• GBPJPY market analysis"
+            "• GBPJPY market analysis\n"
+            "• What is happening with oil today?",
+            parse_mode=ParseMode.HTML
         )
         return
 
@@ -837,7 +865,6 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     data = query.data
 
-    # ── APPROVE ───────────────────────────────────
     if data.startswith("approve_"):
 
         target_id = data.replace("approve_", "")
@@ -852,35 +879,44 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if target_id in pending_verifications:
             del pending_verifications[target_id]
 
-        # Notify the user
         try:
             await context.bot.send_message(
                 chat_id=int(target_id),
                 text=(
-                    "🎉 Congratulations! You're now a verified "
-                    "Nexora AI trader!\n\n"
-                    "✅ Full access unlocked — unlimited signals, "
-                    "live market breakdowns and AI analysis "
-                    "are all yours.\n\n"
-                    "Welcome to the winning side. "
-                    "Let's get to work! 💼🔥"
+                    "🎉 <b>Congratulations! You're now a verified "
+                    "Nexora AI trader!</b>\n\n"
+                    "✅ <b>Full access unlocked!</b>\n\n"
+                    "You now have <b>unlimited access</b> to:\n\n"
+                    "📊 <b>Live Trading Signals</b> — Real-time signals "
+                    "on Gold, Bitcoin, Silver, Oil, Forex and more\n\n"
+                    "📚 <b>AI Market Breakdowns</b> — Deep analysis on "
+                    "any pair you ask about\n\n"
+                    "📈 <b>Technical Analysis</b> — Professional grade "
+                    "insights powered by AI\n\n"
+                    "━━━━━━━━━━━━━━━━━━━━\n"
+                    "💼 <i>Welcome to the winning side. "
+                    "Let's get to work!</i> 🔥\n"
+                    "━━━━━━━━━━━━━━━━━━━━\n\n"
+                    "👇 <b>TAP AN OPTION BELOW TO GET STARTED:</b>\n\n"
+                    "📊 <b>Signal</b> — Get a live trading signal\n\n"
+                    "📚 <b>Breakdown</b> — Get a full market analysis"
                 ),
+                parse_mode=ParseMode.HTML,
                 reply_markup=main_keyboard
             )
         except Exception as e:
             print(f"[APPROVE] Could not message user: {e}")
 
-        # Update the group message
         await query.edit_message_text(
             text=(
-                f"✅ APPROVED\n\n"
-                f"🆔 User ID: {target_id}\n"
-                f"📧 Email: {email}\n\n"
-                f"User has been notified and granted full access."
-            )
+                f"✅ <b>APPROVED</b>\n\n"
+                f"🆔 <b>User ID:</b> {target_id}\n"
+                f"📧 <b>Email:</b> {email}\n\n"
+                f"<i>User has been notified and granted full access.</i>"
+            ),
+            parse_mode=ParseMode.HTML
         )
 
-    # ── REJECT ────────────────────────────────────
     elif data.startswith("reject_"):
 
         target_id = data.replace("reject_", "")
@@ -889,40 +925,40 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if target_id in pending_verifications:
             del pending_verifications[target_id]
 
-        # Notify the user
         try:
             await context.bot.send_message(
                 chat_id=int(target_id),
                 text=(
-                    "❌ Verification Failed.\n\n"
+                    "❌ <b>Verification Failed</b>\n\n"
                     "Unfortunately, we could not find an Exness account "
                     "linked to your email that was registered through "
                     "our official link.\n\n"
-                    "This could mean:\n"
+                    "<b>This could mean:</b>\n"
                     "• You registered on Exness without using our link\n"
                     "• You used a different email address\n\n"
                     "━━━━━━━━━━━━━━━━━━━━\n"
-                    "✅ HOW TO FIX THIS:\n"
+                    "✅ <b>HOW TO FIX THIS:</b>\n"
                     "━━━━━━━━━━━━━━━━━━━━\n\n"
-                    "Click the link below to create a NEW Exness account "
-                    "using our official link. It's completely FREE and "
-                    "takes less than 2 minutes.\n\n"
+                    "Click the link below to create a <b>NEW Exness "
+                    "account</b> using our official link. It's completely "
+                    "<b>FREE</b> and takes less than 2 minutes.\n\n"
                     f"🔗 {EXNESS_LINK}\n\n"
                     "Once done, come back here and type your new "
                     "email address to get verified instantly. 🚀"
-                )
+                ),
+                parse_mode=ParseMode.HTML
             )
         except Exception as e:
             print(f"[REJECT] Could not message user: {e}")
 
-        # Update the group message
         await query.edit_message_text(
             text=(
-                f"❌ REJECTED\n\n"
-                f"🆔 User ID: {target_id}\n"
-                f"📧 Email: {email}\n\n"
-                f"User has been notified to register via the correct link."
-            )
+                f"❌ <b>REJECTED</b>\n\n"
+                f"🆔 <b>User ID:</b> {target_id}\n"
+                f"📧 <b>Email:</b> {email}\n\n"
+                f"<i>User has been notified to register via the correct link.</i>"
+            ),
+            parse_mode=ParseMode.HTML
         )
 
 # ============================================
@@ -942,32 +978,35 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
         if "@" not in email or "." not in email:
             await update.message.reply_text(
-                "⚠️ That doesn't look like a valid email address.\n\n"
-                "Please enter the email you used to "
-                "register on Exness 👇"
+                "⚠️ <b>That doesn't look like a valid email address.</b>\n\n"
+                "Please enter the email address you used to "
+                "register on Exness 👇\n\n"
+                "<i>Example: yourname@gmail.com</i>",
+                parse_mode=ParseMode.HTML
             )
             return
 
         pending_verifications[user_id] = email
 
         await update.message.reply_text(
-            "⏳ Got it! Your verification request has been submitted.\n\n"
+            "⏳ <b>Got it! Your verification request has been submitted.</b>\n\n"
             "Our team is reviewing your details right now. "
             "You'll receive a confirmation message shortly.\n\n"
-            "Sit tight — greatness is loading! 🚀"
+            "<i>Sit tight — greatness is loading! 🚀</i>",
+            parse_mode=ParseMode.HTML
         )
 
-        # Send to verification group with tap buttons
         try:
             await context.bot.send_message(
                 chat_id=VERIFY_GROUP_ID,
                 text=(
-                    f"🔔 NEW VERIFICATION REQUEST\n\n"
-                    f"👤 User: @{username}\n"
-                    f"🆔 ID: {user_id}\n"
-                    f"📧 Email: {email}\n\n"
-                    f"Tap a button below to approve or reject:"
+                    f"🔔 <b>NEW VERIFICATION REQUEST</b>\n\n"
+                    f"👤 <b>User:</b> @{username}\n"
+                    f"🆔 <b>ID:</b> {user_id}\n"
+                    f"📧 <b>Email:</b> {email}\n\n"
+                    f"<i>Tap a button below to approve or reject:</i>"
                 ),
+                parse_mode=ParseMode.HTML,
                 reply_markup=InlineKeyboardMarkup([
                     [
                         InlineKeyboardButton(
@@ -1006,7 +1045,8 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 return
 
         wait_message = await update.message.reply_text(
-            "🧠 Nexora AI analyzing live market..."
+            "🧠 <b>Nexora AI analyzing live market...</b>",
+            parse_mode=ParseMode.HTML
         )
 
         await asyncio.sleep(1)
@@ -1020,25 +1060,31 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if image_file_id:
             await update.message.reply_photo(
                 photo=image_file_id,
-                caption=signal
+                caption=signal,
+                parse_mode=ParseMode.HTML
             )
 
             if not is_verified(user_id):
                 remaining = trial_remaining(user_id)
                 if remaining > 0:
                     await update.message.reply_text(
-                        f"⚡ You have {remaining} free trial "
-                        f"signal(s) remaining.\n"
+                        f"⚡ <b>You have {remaining} free trial "
+                        f"signal(s) remaining.</b>\n\n"
                         f"Verify your Exness account for "
-                        f"unlimited access!"
+                        f"<b>unlimited access!</b>\n\n"
+                        f"📊 <b>Signal</b> — Get another signal\n"
+                        f"📚 <b>Breakdown</b> — Get a market analysis",
+                        parse_mode=ParseMode.HTML,
+                        reply_markup=main_keyboard
                     )
                 else:
                     user_modes[user_id] = "awaiting_email"
                     await send_verification_gate(update)
         else:
             await update.message.reply_text(
-                "⚠️ Unable to fetch live market data.\n"
-                "Please try again shortly."
+                "⚠️ <b>Unable to fetch live market data.</b>\n"
+                "Please try again shortly.",
+                parse_mode=ParseMode.HTML
             )
         return
 
@@ -1053,22 +1099,30 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 return
 
         wait_message = await update.message.reply_text(
-            "🧠 Nexora AI preparing market breakdown..."
+            "🧠 <b>Nexora AI preparing market breakdown...</b>",
+            parse_mode=ParseMode.HTML
         )
 
         response = await generate_breakdown(message)
         response = clean_text(response)
 
-        await wait_message.edit_text(response)
+        await wait_message.edit_text(
+            response,
+            parse_mode=ParseMode.HTML
+        )
 
         if not is_verified(user_id):
             remaining = trial_remaining(user_id)
             if remaining > 0:
                 await update.message.reply_text(
-                    f"⚡ You have {remaining} free trial "
-                    f"signal(s) remaining.\n"
+                    f"⚡ <b>You have {remaining} free trial "
+                    f"signal(s) remaining.</b>\n\n"
                     f"Verify your Exness account for "
-                    f"unlimited access!"
+                    f"<b>unlimited access!</b>\n\n"
+                    f"📊 <b>Signal</b> — Get a live trading signal\n"
+                    f"📚 <b>Breakdown</b> — Get a market analysis",
+                    parse_mode=ParseMode.HTML,
+                    reply_markup=main_keyboard
                 )
             else:
                 user_modes[user_id] = "awaiting_email"
@@ -1077,7 +1131,11 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     # ── DEFAULT ───────────────────────────────────
     await update.message.reply_text(
-        "Choose an option below:",
+        "👇 <b>Here's what you can do:</b>\n\n"
+        "📊 <b>Signal</b> — Get a live trading signal right now\n\n"
+        "📚 <b>Breakdown</b> — Get a full AI market analysis\n\n"
+        "<i>Both buttons are right at the bottom of your screen!</i>",
+        parse_mode=ParseMode.HTML,
         reply_markup=main_keyboard
     )
 
@@ -1108,6 +1166,7 @@ async def post_auto_signal(context: ContextTypes.DEFAULT_TYPE):
                 chat_id=channel_id,
                 photo=image_file_id,
                 caption=signal,
+                parse_mode=ParseMode.HTML,
                 reply_markup=get_channel_button()
             )
             print(
@@ -1135,13 +1194,9 @@ def main():
 
     app = Application.builder().token(TELEGRAM_TOKEN).build()
 
-    # Handlers
     app.add_handler(CommandHandler("start", start))
-
-    # Inline button callback — approve/reject
     app.add_handler(CallbackQueryHandler(handle_callback))
 
-    # Button handler
     app.add_handler(
         MessageHandler(
             filters.Regex("^(📊 Signal|📚 Breakdown|signal|breakdown)$"),
@@ -1149,7 +1204,6 @@ def main():
         )
     )
 
-    # Text handler
     app.add_handler(
         MessageHandler(
             filters.TEXT & ~filters.COMMAND,
@@ -1157,7 +1211,6 @@ def main():
         )
     )
 
-    # Schedule
     job_queue = app.job_queue
 
     def parse_time(t):

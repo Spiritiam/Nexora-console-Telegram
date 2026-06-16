@@ -35,6 +35,8 @@ OPENROUTER_API_KEY = os.getenv("OPENROUTER_API_KEY")
 TWELVEDATA_API_KEY = os.getenv("TWELVEDATA_API_KEY")
 ALPHA_VANTAGE_API_KEY = os.getenv("ALPHA_VANTAGE_API_KEY")
 NEWS_API_KEY = os.getenv("NEWS_API_KEY")
+SUPABASE_URL = os.getenv("SUPABASE_URL")
+SUPABASE_KEY = os.getenv("SUPABASE_KEY")
 
 # ============================================
 # METAAPI CONFIG
@@ -113,7 +115,7 @@ GEMINI_URL = (
 OPENROUTER_URL = "https://openrouter.ai/api/v1/chat/completions"
 
 # ============================================
-# KEYBOARDS — PERSISTENT SO THEY NEVER HIDE
+# KEYBOARDS
 # ============================================
 
 main_keyboard = ReplyKeyboardMarkup(
@@ -136,27 +138,83 @@ def get_channel_button():
     ])
 
 # ============================================
-# USER DATA STORAGE
+# USER MODES
 # ============================================
 
 user_modes = {}
-
-VERIFIED_FILE = "verified_users.json"
-TRIAL_FILE = "trial_users.json"
-
-def load_json(filename):
-    if Path(filename).exists():
-        with open(filename, "r") as f:
-            return json.load(f)
-    return {}
-
-def save_json(filename, data):
-    with open(filename, "w") as f:
-        json.dump(data, f)
-
-verified_users = load_json(VERIFIED_FILE)
-trial_users = load_json(TRIAL_FILE)
 pending_verifications = {}
+
+# ============================================
+# SUPABASE DATABASE FUNCTIONS
+# ============================================
+
+def sb_headers():
+    return {
+        "apikey": SUPABASE_KEY,
+        "Authorization": f"Bearer {SUPABASE_KEY}",
+        "Content-Type": "application/json"
+    }
+
+def is_verified(user_id):
+    try:
+        url = (
+            f"{SUPABASE_URL}/rest/v1/verified_users"
+            f"?user_id=eq.{user_id}&select=user_id"
+        )
+        response = requests.get(url, headers=sb_headers(), timeout=10)
+        data = response.json()
+        return len(data) > 0
+    except Exception as e:
+        print(f"[DB] is_verified error: {e}")
+        return False
+
+def add_verified_user(user_id, email):
+    try:
+        url = f"{SUPABASE_URL}/rest/v1/verified_users"
+        payload = {
+            "user_id": str(user_id),
+            "email": email,
+            "verified_at": datetime.utcnow().isoformat()
+        }
+        headers = {**sb_headers(), "Prefer": "resolution=merge-duplicates"}
+        requests.post(url, headers=headers, json=payload, timeout=10)
+        print(f"[DB] ✅ Verified user saved: {user_id}")
+    except Exception as e:
+        print(f"[DB] add_verified_user error: {e}")
+
+def get_trial_count(user_id):
+    try:
+        url = (
+            f"{SUPABASE_URL}/rest/v1/trial_users"
+            f"?user_id=eq.{user_id}&select=count"
+        )
+        response = requests.get(url, headers=sb_headers(), timeout=10)
+        data = response.json()
+        if data:
+            return data[0].get("count", 0)
+        return 0
+    except Exception as e:
+        print(f"[DB] get_trial_count error: {e}")
+        return 0
+
+def increment_trial(user_id):
+    try:
+        current = get_trial_count(user_id)
+        new_count = current + 1
+        url = f"{SUPABASE_URL}/rest/v1/trial_users"
+        payload = {
+            "user_id": str(user_id),
+            "count": new_count
+        }
+        headers = {**sb_headers(), "Prefer": "resolution=merge-duplicates"}
+        requests.post(url, headers=headers, json=payload, timeout=10)
+        return new_count
+    except Exception as e:
+        print(f"[DB] increment_trial error: {e}")
+        return 1
+
+def trial_remaining(user_id):
+    return max(0, FREE_TRIAL_LIMIT - get_trial_count(user_id))
 
 # ============================================
 # PAIR CONFIG
@@ -220,27 +278,6 @@ PAIR_CONFIG = {
 }
 
 # ============================================
-# TRIAL HELPERS
-# ============================================
-
-def get_trial_count(user_id):
-    return trial_users.get(str(user_id), {}).get("count", 0)
-
-def increment_trial(user_id):
-    uid = str(user_id)
-    if uid not in trial_users:
-        trial_users[uid] = {"count": 0}
-    trial_users[uid]["count"] += 1
-    save_json(TRIAL_FILE, trial_users)
-    return trial_users[uid]["count"]
-
-def is_verified(user_id):
-    return str(user_id) in verified_users
-
-def trial_remaining(user_id):
-    return max(0, FREE_TRIAL_LIMIT - get_trial_count(user_id))
-
-# ============================================
 # LIVE PRICE — TWELVEDATA PRIMARY
 # ============================================
 
@@ -272,23 +309,7 @@ def get_price_alphavantage(config):
         if not av_symbol or not ALPHA_VANTAGE_API_KEY:
             return None
 
-        if av_type == "crypto":
-            url = (
-                f"https://www.alphavantage.co/query"
-                f"?function=CURRENCY_EXCHANGE_RATE"
-                f"&from_currency={av_symbol}"
-                f"&to_currency=USD"
-                f"&apikey={ALPHA_VANTAGE_API_KEY}"
-            )
-            response = requests.get(url, timeout=10)
-            data = response.json()
-            rate = data.get(
-                "Realtime Currency Exchange Rate", {}
-            ).get("5. Exchange Rate")
-            if rate:
-                return float(rate)
-
-        elif av_type == "forex":
+        if av_type in ["crypto", "forex"]:
             url = (
                 f"https://www.alphavantage.co/query"
                 f"?function=CURRENCY_EXCHANGE_RATE"
@@ -305,7 +326,6 @@ def get_price_alphavantage(config):
                 return float(rate)
 
         elif av_type == "commodity":
-            # WTI Oil — use global quote
             url = (
                 f"https://www.alphavantage.co/query"
                 f"?function=WTI"
@@ -326,28 +346,38 @@ def get_price_alphavantage(config):
         return None
 
 # ============================================
-# LIVE PRICE — COMBINED WITH FALLBACK
+# LIVE PRICE — COMBINED
 # ============================================
 
 def get_live_price(symbol="XAU/USD", config=None):
-
-    # Try Twelvedata first
     price = get_price_twelvedata(symbol)
-
     if price is not None:
         return price
-
-    # Fallback to Alpha Vantage
     if config:
-        print(f"[PRICE] Twelvedata failed for {symbol}, trying Alpha Vantage...")
+        print(
+            f"[PRICE] Twelvedata failed for {symbol}, "
+            f"trying Alpha Vantage..."
+        )
         price = get_price_alphavantage(config)
-
         if price is not None:
-            print(f"[PRICE] Alpha Vantage returned {price} for {symbol}")
+            print(f"[PRICE] Alpha Vantage: {price} for {symbol}")
             return price
-
     print(f"[PRICE] Both APIs failed for {symbol}")
     return None
+
+# ============================================
+# SESSION DETECTION
+# ============================================
+
+def get_market_session():
+    hour = datetime.utcnow().hour
+    if 0 <= hour < 7:
+        return "Asian Session 🌏"
+    elif 7 <= hour < 13:
+        return "London Session 🇬🇧"
+    elif 13 <= hour < 21:
+        return "New York Session 🇺🇸"
+    return "Market Closing Session 🌙"
 
 # ============================================
 # MARKET BIAS
@@ -386,20 +416,6 @@ SELL_REASONS = [
 ]
 
 # ============================================
-# SESSION DETECTION
-# ============================================
-
-def get_market_session():
-    hour = datetime.utcnow().hour
-    if 0 <= hour < 7:
-        return "Asian Session 🌏"
-    elif 7 <= hour < 13:
-        return "London Session 🇬🇧"
-    elif 13 <= hour < 21:
-        return "New York Session 🇺🇸"
-    return "Market Closing Session 🌙"
-
-# ============================================
 # SIGNAL BUILDER
 # ============================================
 
@@ -418,7 +434,6 @@ def build_signal_response(question):
     pip_size = config["pip_size"]
     display = config["display"]
 
-    # Pass config for Alpha Vantage fallback
     live_price = get_live_price(symbol, config=config)
 
     if live_price is None:
@@ -481,7 +496,7 @@ def build_signal_response(question):
     return image_file_id, direction, response, signal_data
 
 # ============================================
-# FORMAT BREAKDOWN — ADD BOLD HEADERS
+# FORMAT BREAKDOWN — BOLD HEADERS
 # ============================================
 
 def format_breakdown(text):
@@ -500,16 +515,17 @@ def format_breakdown(text):
         "News Impact",
         "Market Overview",
     ]
-    emojis = ["📊", "📈", "💡", "🗞️", "📰", "🛢️",
-              "⚡", "🔍", "📉", "🎯", "💰", "🔔"]
-
+    emojis = [
+        "📊", "📈", "💡", "🗞️", "📰",
+        "🛢️", "⚡", "🔍", "📉", "🎯",
+        "💰", "🔔"
+    ]
     for header in headers:
         for emoji in emojis:
             text = text.replace(
                 f"{emoji} {header}",
                 f"{emoji} <b>{header}</b>"
             )
-        # Bold without emoji
         text = text.replace(
             f"\n{header}\n",
             f"\n<b>{header}</b>\n"
@@ -518,7 +534,6 @@ def format_breakdown(text):
             f"\n{header}:",
             f"\n<b>{header}:</b>"
         )
-
     return text
 
 # ============================================
@@ -591,7 +606,6 @@ RULES:
 - Professional but exciting tone
 - Use emojis naturally to separate sections
 """
-
     return await ask_gemini(prompt)
 
 # ============================================
@@ -640,11 +654,9 @@ async def post_news(context: ContextTypes.DEFAULT_TYPE):
 # ============================================
 
 async def place_mt5_trade(signal_data):
-
     if not METAAPI_TOKEN or not METAAPI_ACCOUNT_ID:
         print("[MT5] MetaAPI credentials not set.")
         return None
-
     try:
         headers = {
             "auth-token": METAAPI_TOKEN,
@@ -759,10 +771,8 @@ async def monitor_signal(bot, channel_id, message_id, signal_data):
 # ============================================
 
 async def ask_gemini(prompt):
-
     headers = {"Content-Type": "application/json"}
     data = {"contents": [{"parts": [{"text": prompt}]}]}
-
     try:
         response = requests.post(
             GEMINI_URL, headers=headers, json=data, timeout=30
@@ -782,10 +792,8 @@ async def ask_gemini(prompt):
 # ============================================
 
 async def ask_openrouter(prompt):
-
     if not OPENROUTER_API_KEY:
         return "⚠️ AI service unavailable."
-
     headers = {
         "Authorization": f"Bearer {OPENROUTER_API_KEY}",
         "Content-Type": "application/json"
@@ -794,7 +802,6 @@ async def ask_openrouter(prompt):
         "model": "deepseek/deepseek-chat",
         "messages": [{"role": "user", "content": prompt}]
     }
-
     try:
         response = requests.post(
             OPENROUTER_URL, headers=headers, json=data, timeout=30
@@ -869,9 +876,9 @@ RULES:
 - No markdown symbols like ** or ## or ---
 - No hashtags
 - Use emojis as shown in the format above
+
 QUESTION: {question}
 """
-
     return await ask_gemini(prompt)
 
 # ============================================
@@ -1018,7 +1025,7 @@ async def handle_buttons(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
 # ============================================
-# CALLBACK HANDLER — APPROVE / REJECT BUTTONS
+# CALLBACK HANDLER — APPROVE / REJECT
 # ============================================
 
 async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -1032,11 +1039,8 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         target_id = data.replace("approve_", "")
         email = pending_verifications.get(target_id, "unknown")
 
-        verified_users[target_id] = {
-            "email": email,
-            "verified_at": str(datetime.utcnow())
-        }
-        save_json(VERIFIED_FILE, verified_users)
+        # Save to Supabase permanently
+        add_verified_user(target_id, email)
 
         if target_id in pending_verifications:
             del pending_verifications[target_id]
@@ -1074,7 +1078,7 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 f"✅ <b>APPROVED</b>\n\n"
                 f"🆔 <b>User ID:</b> {target_id}\n"
                 f"📧 <b>Email:</b> {email}\n\n"
-                f"<i>User has been notified and granted full access.</i>"
+                f"<i>User verified and saved to database permanently.</i>"
             ),
             parse_mode=ParseMode.HTML
         )
@@ -1118,8 +1122,7 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 f"❌ <b>REJECTED</b>\n\n"
                 f"🆔 <b>User ID:</b> {target_id}\n"
                 f"📧 <b>Email:</b> {email}\n\n"
-                f"<i>User has been notified to register "
-                f"via the correct link.</i>"
+                f"<i>User notified to register via the correct link.</i>"
             ),
             parse_mode=ParseMode.HTML
         )

@@ -220,8 +220,8 @@ PAIR_CONFIG = {
     "xauusd": {
         "symbol": "XAU/USD",
         "pair_name": "XAUUSD",
-        "pip_size": 10,
-        "pip_value": 0.01,
+        "pip_size": 50,
+        "pip_value": 1.0,
         "pip_label": "pips",
         "mt5_symbol": "XAUUSDm",
         "display": "Gold (XAUUSD) 🥇",
@@ -232,7 +232,7 @@ PAIR_CONFIG = {
     "btcusd": {
         "symbol": "BTC/USD",
         "pair_name": "BTCUSD",
-        "pip_size": 300,
+        "pip_size": 16.67,
         "pip_value": 1.0,
         "pip_label": "points",
         "mt5_symbol": "BTCUSDm",
@@ -244,7 +244,7 @@ PAIR_CONFIG = {
     "xagusd": {
         "symbol": "XAG/USD",
         "pair_name": "XAGUSD",
-        "pip_size": 0.30,
+        "pip_size": 0.1667,
         "pip_value": 0.01,
         "pip_label": "pips",
         "mt5_symbol": "XAGUSDm",
@@ -257,7 +257,7 @@ PAIR_CONFIG = {
     "usoil": {
         "symbol": "USO",
         "pair_name": "USOIL",
-        "pip_size": 0.50,
+        "pip_size": 0.1667,
         "pip_value": 0.01,
         "pip_label": "pips",
         "mt5_symbol": "USOILm",
@@ -270,7 +270,7 @@ PAIR_CONFIG = {
     "gbpusd": {
         "symbol": "GBP/USD",
         "pair_name": "GBPUSD",
-        "pip_size": 0.0025,
+        "pip_size": 0.001667,
         "pip_value": 0.0001,
         "pip_label": "pips",
         "mt5_symbol": "GBPUSDm",
@@ -282,7 +282,7 @@ PAIR_CONFIG = {
     "gbpjpy": {
         "symbol": "GBP/JPY",
         "pair_name": "GBPJPY",
-        "pip_size": 0.30,
+        "pip_size": 0.1667,
         "pip_value": 0.01,
         "pip_label": "pips",
         "mt5_symbol": "GBPJPYm",

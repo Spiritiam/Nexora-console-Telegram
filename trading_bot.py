@@ -246,7 +246,7 @@ PAIR_CONFIG = {
     "btcusd": {
         "symbol": "BTC/USD",
         "pair_name": "BTCUSD",
-        "pip_size": 41.68,
+        "pip_size": 165.3,
         "pip_value": 1.0,
         "pip_label": "points",
         "decimals": 2,

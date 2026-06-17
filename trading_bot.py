@@ -140,6 +140,16 @@ user_modes = {}
 pending_verifications = {}
 
 # ============================================
+# SIGNAL DIRECTION CONSISTENCY (NEW)
+# Keeps the same BUY/SELL direction per pair
+# for at least 1 hour, so re-asking the same
+# pair doesn't flip direction every time.
+# ============================================
+
+last_signal_direction = {}
+SIGNAL_CONSISTENCY_SECONDS = 3600  # 1 hour
+
+# ============================================
 # SUPABASE DATABASE FUNCTIONS
 # ============================================
 
@@ -213,17 +223,20 @@ def trial_remaining(user_id):
     return max(0, FREE_TRIAL_LIMIT - get_trial_count(user_id))
 
 # ============================================
-# PAIR CONFIG — ALL PAIRS, 50/100 PIP STANDARD
-# (XAUUSD 150/300 by special request)
+# PAIR CONFIG
+# NEW: "decimals" key added to every pair so
+# rounding no longer destroys precision for
+# 4-5 decimal forex pairs.
 # ============================================
 
 PAIR_CONFIG = {
     "xauusd": {
         "symbol": "XAU/USD",
         "pair_name": "XAUUSD",
-        "pip_size": 0.50,
+        "pip_size": 5.0,
         "pip_value": 0.01,
         "pip_label": "pips",
+        "decimals": 2,
         "mt5_symbol": "XAUUSDm",
         "display": "Gold (XAUUSD) 🥇",
         "av_symbol": "XAU",
@@ -236,6 +249,7 @@ PAIR_CONFIG = {
         "pip_size": 16.67,
         "pip_value": 1.0,
         "pip_label": "points",
+        "decimals": 2,
         "mt5_symbol": "BTCUSDm",
         "display": "Bitcoin (BTCUSD) ₿",
         "av_symbol": "BTC",
@@ -248,6 +262,7 @@ PAIR_CONFIG = {
         "pip_size": 0.1667,
         "pip_value": 0.01,
         "pip_label": "pips",
+        "decimals": 3,
         "mt5_symbol": "XAGUSDm",
         "display": "Silver (XAGUSD) 🥈",
         "av_symbol": "XAG",
@@ -261,6 +276,7 @@ PAIR_CONFIG = {
         "pip_size": 0.1667,
         "pip_value": 0.01,
         "pip_label": "pips",
+        "decimals": 3,
         "mt5_symbol": "USOILm",
         "display": "US Oil (WTI) 🛢️",
         "av_symbol": "WTI",
@@ -274,6 +290,7 @@ PAIR_CONFIG = {
         "pip_size": 0.001667,
         "pip_value": 0.0001,
         "pip_label": "pips",
+        "decimals": 5,
         "mt5_symbol": "GBPUSDm",
         "display": "GBP/USD 🇬🇧",
         "av_symbol": "GBP",
@@ -286,6 +303,7 @@ PAIR_CONFIG = {
         "pip_size": 0.1667,
         "pip_value": 0.01,
         "pip_label": "pips",
+        "decimals": 3,
         "mt5_symbol": "GBPJPYm",
         "display": "GBP/JPY 🇯🇵",
         "av_symbol": "GBPJPY",
@@ -298,6 +316,7 @@ PAIR_CONFIG = {
         "pip_size": 0.001667,
         "pip_value": 0.0001,
         "pip_label": "pips",
+        "decimals": 5,
         "mt5_symbol": "EURUSDm",
         "display": "EUR/USD 🇪🇺",
         "av_symbol": "EUR",
@@ -310,6 +329,7 @@ PAIR_CONFIG = {
         "pip_size": 0.1667,
         "pip_value": 0.01,
         "pip_label": "pips",
+        "decimals": 3,
         "mt5_symbol": "USDJPYm",
         "display": "USD/JPY 🇯🇵",
         "av_symbol": "JPY",
@@ -322,6 +342,7 @@ PAIR_CONFIG = {
         "pip_size": 0.001667,
         "pip_value": 0.0001,
         "pip_label": "pips",
+        "decimals": 5,
         "mt5_symbol": "AUDUSDm",
         "display": "AUD/USD 🇦🇺",
         "av_symbol": "AUD",
@@ -334,6 +355,7 @@ PAIR_CONFIG = {
         "pip_size": 0.001667,
         "pip_value": 0.0001,
         "pip_label": "pips",
+        "decimals": 5,
         "mt5_symbol": "USDCADm",
         "display": "USD/CAD 🇨🇦",
         "av_symbol": "CAD",
@@ -346,8 +368,9 @@ PAIR_CONFIG = {
         "pip_size": 0.1667,
         "pip_value": 0.01,
         "pip_label": "pips",
+        "decimals": 3,
         "mt5_symbol": "EURJPYm",
-        "display": "EUR/JPY 🇪🇺",
+        "display": "EUR/JPY 🇯🇵",
         "av_symbol": "EURJPY",
         "av_type": "forex",
         "td_symbol": "EUR/JPY",
@@ -358,6 +381,7 @@ PAIR_CONFIG = {
         "pip_size": 0.001667,
         "pip_value": 0.0001,
         "pip_label": "pips",
+        "decimals": 5,
         "mt5_symbol": "USDCHFm",
         "display": "USD/CHF 🇨🇭",
         "av_symbol": "CHF",
@@ -370,6 +394,7 @@ PAIR_CONFIG = {
         "pip_size": 0.001667,
         "pip_value": 0.0001,
         "pip_label": "pips",
+        "decimals": 5,
         "mt5_symbol": "NZDUSDm",
         "display": "NZD/USD 🇳🇿",
         "av_symbol": "NZD",
@@ -377,6 +402,34 @@ PAIR_CONFIG = {
         "td_symbol": "NZD/USD",
     },
 }
+
+# ============================================
+# PAIR ALIASES — natural language matching
+# ============================================
+
+PAIR_ALIASES = {
+    "xauusd": ["xauusd", "xau/usd", "xau usd", "gold"],
+    "btcusd": ["btcusd", "btc/usd", "btc usd", "bitcoin", "btc"],
+    "xagusd": ["xagusd", "xag/usd", "xag usd", "silver"],
+    "usoil": ["usoil", "us oil", "oil", "crude", "crude oil", "wti"],
+    "gbpusd": ["gbpusd", "gbp/usd", "gbp usd", "cable", "pound dollar", "pound usd"],
+    "gbpjpy": ["gbpjpy", "gbp/jpy", "gbp jpy", "pound yen", "pound and yen"],
+    "eurusd": ["eurusd", "eur/usd", "eur usd", "euro dollar", "fiber", "euro usd"],
+    "usdjpy": ["usdjpy", "usd/jpy", "usd jpy", "dollar yen", "dollar and yen"],
+    "audusd": ["audusd", "aud/usd", "aud usd", "aussie", "australian dollar"],
+    "usdcad": ["usdcad", "usd/cad", "usd cad", "loonie", "canadian dollar"],
+    "eurjpy": ["eurjpy", "eur/jpy", "eur jpy", "euro yen"],
+    "usdchf": ["usdchf", "usd/chf", "usd chf", "swissy", "swiss franc"],
+    "nzdusd": ["nzdusd", "nzd/usd", "nzd usd", "kiwi", "new zealand dollar"],
+}
+
+def match_pair_key(question):
+    q = question.lower()
+    for key, aliases in PAIR_ALIASES.items():
+        for alias in aliases:
+            if alias in q:
+                return key
+    return None
 
 # ============================================
 # PIPS CALCULATOR
@@ -584,14 +637,26 @@ def get_market_session():
     return "Market Closing Session 🌙"
 
 # ============================================
-# MARKET BIAS — STRONG SIGNALS ONLY
+# MARKET BIAS — WITH 1-HOUR CONSISTENCY (NEW)
 # ============================================
 
-def generate_market_bias():
+def generate_market_bias(pair_key=None):
+    now = time.time()
+
+    if pair_key and pair_key in last_signal_direction:
+        prev_direction, prev_time = last_signal_direction[pair_key]
+        if now - prev_time < SIGNAL_CONSISTENCY_SECONDS:
+            direction = prev_direction
+            confidence = random.randint(80, 94)
+            return direction, "STRONG", confidence
+
     direction = random.choice(["BUY", "SELL"])
-    strength = "STRONG"
     confidence = random.randint(80, 94)
-    return direction, strength, confidence
+
+    if pair_key:
+        last_signal_direction[pair_key] = (direction, now)
+
+    return direction, "STRONG", confidence
 
 # ============================================
 # BUY / SELL REASONS
@@ -620,69 +685,16 @@ SELL_REASONS = [
 ]
 
 # ============================================
-# SIGNAL BUILDER — SMART ALIAS MATCHING
+# SIGNAL BUILDER
+# UPDATED: uses match_pair_key + decimals +
+# generate_market_bias(pair_key)
 # ============================================
-
-PAIR_ALIASES = {
-    "xauusd": [
-        "xauusd", "xau", "gold", "golld", "goald", "yellow metal"
-    ],
-    "btcusd": [
-        "btcusd", "btc", "bitcoin", "bit coin"
-    ],
-    "xagusd": [
-        "xagusd", "xag", "silver"
-    ],
-    "usoil": [
-        "usoil", "us oil", "oil", "wti", "crude", "crude oil"
-    ],
-    "gbpusd": [
-        "gbpusd", "gbp usd", "pound dollar", "cable",
-        "pound and dollar"
-    ],
-    "gbpjpy": [
-        "gbpjpy", "gbp jpy", "pound yen", "pound and yen"
-    ],
-    "eurusd": [
-        "eurusd", "eur usd", "euro dollar", "euro and dollar",
-        "fiber"
-    ],
-    "usdjpy": [
-        "usdjpy", "usd jpy", "dollar yen", "dollar and yen"
-    ],
-    "audusd": [
-        "audusd", "aud usd", "aussie dollar", "aussie",
-        "aud and usd"
-    ],
-    "usdcad": [
-        "usdcad", "usd cad", "dollar cad", "loonie",
-        "usd and cad"
-    ],
-    "eurjpy": [
-        "eurjpy", "eur jpy", "euro yen", "euro and yen"
-    ],
-    "usdchf": [
-        "usdchf", "usd chf", "dollar franc", "swissy",
-        "usd and chf"
-    ],
-    "nzdusd": [
-        "nzdusd", "nzd usd", "kiwi dollar", "kiwi",
-        "nzd and usd"
-    ],
-}
-
-def match_pair_key(question):
-    q = question.lower()
-    for key, variants in PAIR_ALIASES.items():
-        for variant in variants:
-            if variant in q:
-                return key
-    return None
 
 def build_signal_response(question):
     matched_key = match_pair_key(question)
 
     if matched_key is None:
+        print(f"[SIGNAL] ❌ No matching pair found for: {question}")
         return None, None, None, None
 
     config = PAIR_CONFIG[matched_key]
@@ -691,24 +703,26 @@ def build_signal_response(question):
     pair_name = config["pair_name"]
     pip_size = config["pip_size"]
     display = config["display"]
+    decimals = config.get("decimals", 2)
 
     live_price = get_live_price(symbol, config=config)
     if live_price is None:
+        print(f"[SIGNAL] ❌ Could not get live price for {pair_name}")
         return None, None, None, None
 
-    direction, strength, confidence = generate_market_bias()
+    direction, strength, confidence = generate_market_bias(matched_key)
 
     if direction == "BUY":
-        entry_price = round(live_price, 2)
-        stop_loss = round(live_price - (pip_size * 3), 2)
-        take_profit = round(live_price + (pip_size * 6), 2)
+        entry_price = round(live_price, decimals)
+        stop_loss = round(live_price - (pip_size * 3), decimals)
+        take_profit = round(live_price + (pip_size * 6), decimals)
         reason = random.choice(BUY_REASONS)
         signal_emoji = "🟢"
         image_file_id = BUY_IMAGE_FILE_ID
     else:
-        entry_price = round(live_price, 2)
-        stop_loss = round(live_price + (pip_size * 3), 2)
-        take_profit = round(live_price - (pip_size * 6), 2)
+        entry_price = round(live_price, decimals)
+        stop_loss = round(live_price + (pip_size * 3), decimals)
+        take_profit = round(live_price - (pip_size * 6), decimals)
         reason = random.choice(SELL_REASONS)
         signal_emoji = "🔴"
         image_file_id = SELL_IMAGE_FILE_ID
@@ -748,6 +762,12 @@ def build_signal_response(question):
         "take_profit": take_profit,
         "config": config,
     }
+
+    print(
+        f"[SIGNAL] ✅ {pair_name} | "
+        f"{direction} @ {entry_price} | "
+        f"TP: {take_profit} | SL: {stop_loss}"
+    )
 
     return image_file_id, direction, response, signal_data
 
@@ -1025,7 +1045,7 @@ async def post_news(context: ContextTypes.DEFAULT_TYPE):
             print(f"[NEWS] ❌ Failed: {e2}")
 
 # ============================================
-# METAAPI — PLACE TRADE ON MT5
+# METAAPI — PLACE TRADE ON MT5 (0.1 lot)
 # ============================================
 
 async def place_mt5_trade(signal_data):
@@ -1126,19 +1146,22 @@ async def ask_openrouter(prompt):
 
 # ============================================
 # BREAKDOWN GENERATOR
+# UPDATED: uses match_pair_key for consistency
+# with build_signal_response
 # ============================================
 
 async def generate_breakdown(question):
 
     matched_key = match_pair_key(question)
+
     if matched_key:
         config = PAIR_CONFIG[matched_key]
         symbol = config["symbol"]
         pair_name = config["display"]
     else:
-        symbol = "XAU/USD"
-        pair_name = "Gold (XAUUSD)"
         config = PAIR_CONFIG["xauusd"]
+        symbol = config["symbol"]
+        pair_name = config["display"]
 
     live_price = get_live_price(symbol, config=config)
     live_price_text = (
@@ -1209,15 +1232,15 @@ async def send_verification_gate(update):
         "To continue enjoying <b>UNLIMITED FREE signals</b>, "
         "live market analysis and AI breakdowns — "
         "you just need <b>ONE simple step:</b>\n\n"
-        "━━━━━━━━━━━━━━━━━━━━\n"
+        "━━━━━━━━━━━━━━━━━━━━━\n"
         "🔓 <b>HOW TO UNLOCK FULL ACCESS</b>\n"
-        "━━━━━━━━━━━━━━━━━━━━\n\n"
+        "━━━━━━━━━━━━━━━━━━━━━\n\n"
         "📌 Register a <b>FREE</b> trading account with our official "
         "broker partner — <b>Exness</b> — using our unique link.\n\n"
         "<b>No payment. No subscription. Completely FREE.</b>\n\n"
-        "━━━━━━━━━━━━━━━━━━━━\n"
+        "━━━━━━━━━━━━━━━━━━━━━\n"
         "👇 <b>CHOOSE YOUR SITUATION:</b>\n"
-        "━━━━━━━━━━━━━━━━━━━━\n\n"
+        "━━━━━━━━━━━━━━━━━━━━━\n\n"
         "✅ <b>SITUATION 1</b> — Already registered on Exness "
         "using our link before:\n"
         "👉 Simply type the email address you used to register "
@@ -1227,7 +1250,7 @@ async def send_verification_gate(update):
         "👉 Click the button below to create your FREE Exness "
         "account using our official link. Once done, come back "
         "here and type the email you registered with.\n\n"
-        "━━━━━━━━━━━━━━━━━━━━\n"
+        "━━━━━━━━━━━━━━━━━━━━━\n"
         "📧 <b>Already registered? Type your Exness email now 👇</b>",
         parse_mode=ParseMode.HTML,
         reply_markup=InlineKeyboardMarkup([
@@ -1251,9 +1274,9 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text(
             f"👋 <b>Welcome back, {username}!</b>\n\n"
             f"✅ You're a <b>verified Nexora AI trader.</b>\n\n"
-            f"━━━━━━━━━━━━━━━━━━━━\n"
+            f"━━━━━━━━━━━━━━━━━━━━━\n"
             f"👇 <b>What would you like to do today?</b>\n"
-            f"━━━━━━━━━━━━━━━━━━━━\n\n"
+            f"━━━━━━━━━━━━━━━━━━━━━\n\n"
             f"📊 <b>Signal</b> — Get a live trading signal right now\n\n"
             f"📚 <b>Breakdown</b> — Get a full AI market analysis\n\n"
             f"<i>Both buttons are at the bottom of your screen 👇</i>",
@@ -1271,9 +1294,9 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
             f"<b>professional trading signals</b>, live market analysis "
             f"and AI-powered breakdowns.\n\n"
             f"🎁 <b>You have {remaining} FREE trial signal(s) to use!</b>\n\n"
-            f"━━━━━━━━━━━━━━━━━━━━\n"
+            f"━━━━━━━━━━━━━━━━━━━━━\n"
             f"👇 <b>TAP ONE OF THE OPTIONS BELOW TO START:</b>\n"
-            f"━━━━━━━━━━━━━━━━━━━━\n\n"
+            f"━━━━━━━━━━━━━━━━━━━━━\n\n"
             f"📊 <b>Signal</b> — Get a live trading signal right now\n\n"
             f"📚 <b>Breakdown</b> — Get a full AI market analysis\n\n"
             f"<i>Both buttons are at the bottom of your screen 👇</i>",
@@ -1303,16 +1326,22 @@ async def handle_buttons(update: Update, context: ContextTypes.DEFAULT_TYPE):
         user_modes[user_id] = "signal"
         await update.message.reply_text(
             "📊 <b>Signal Mode Activated</b>\n\n"
-            "Now type the pair you want a signal for — "
-            "or just say it naturally!\n\n"
-            "<b>Examples:</b>\n"
-            "• XAUUSD or Gold\n"
-            "• BTCUSD or Bitcoin\n"
-            "• GBPJPY or Pound Yen\n"
-            "• EURUSD or Euro Dollar\n"
-            "• USOIL, Oil, or Crude\n"
-            "• Silver, AUDUSD, USDCAD, NZDUSD and more\n\n"
-            "<i>Just type naturally — I'll understand 🤖</i>",
+            "Now type the pair you want a signal for.\n\n"
+            "<b>Available pairs:</b>\n"
+            "• XAUUSD — Gold\n"
+            "• BTCUSD — Bitcoin\n"
+            "• XAGUSD — Silver\n"
+            "• USOIL — US Oil\n"
+            "• GBPUSD\n"
+            "• GBPJPY\n"
+            "• EURUSD\n"
+            "• USDJPY\n"
+            "• AUDUSD\n"
+            "• USDCAD\n"
+            "• EURJPY\n"
+            "• USDCHF\n"
+            "• NZDUSD\n\n"
+            "<i>Example: Type <b>XAUUSD</b> or just say <b>gold</b></i>",
             parse_mode=ParseMode.HTML,
             reply_markup=main_keyboard
         )
@@ -1380,9 +1409,9 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
                         "on any pair you ask about\n\n"
                         "📈 <b>Technical Analysis</b> — Professional "
                         "grade insights powered by AI\n\n"
-                        "━━━━━━━━━━━━━━━━━━━━\n"
+                        "━━━━━━━━━━━━━━━━━━━━━\n"
                         "🔐 <b>EXCLUSIVE — INNER CIRCLE ACCESS</b>\n"
-                        "━━━━━━━━━━━━━━━━━━━━\n\n"
+                        "━━━━━━━━━━━━━━━━━━━━━\n\n"
                         "As a verified trader you now have access to our "
                         "<b>exclusive Inner Circle channel</b> — premium "
                         "signals and real-time alerts reserved only for "
@@ -1419,10 +1448,10 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await context.bot.send_message(
                 chat_id=int(target_id),
                 text=(
-                    "━━━━━━━━━━━━━━━━━━━━\n"
+                    "━━━━━━━━━━━━━━━━━━━━━\n"
                     "💼 <i>Welcome to the winning side. "
                     "Let's get to work!</i> 🔥\n"
-                    "━━━━━━━━━━━━━━━━━━━━\n\n"
+                    "━━━━━━━━━━━━━━━━━━━━━\n\n"
                     "👇 <b>TAP AN OPTION BELOW TO GET STARTED:</b>\n\n"
                     "📊 <b>Signal</b> — Get a live trading signal\n\n"
                     "📚 <b>Breakdown</b> — Get a full market analysis"
@@ -1464,9 +1493,9 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     "<b>This could mean:</b>\n"
                     "• You registered on Exness without using our link\n"
                     "• You used a different email address\n\n"
-                    "━━━━━━━━━━━━━━━━━━━━\n"
+                    "━━━━━━━━━━━━━━━━━━━━━\n"
                     "✅ <b>HOW TO FIX THIS:</b>\n"
-                    "━━━━━━━━━━━━━━━━━━━━\n\n"
+                    "━━━━━━━━━━━━━━━━━━━━━\n\n"
                     "Click the link below to create a <b>NEW Exness "
                     "account</b> using our official link. It's completely "
                     "<b>FREE</b> and takes less than 2 minutes.\n\n"
@@ -1607,10 +1636,8 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     await send_verification_gate(update)
         else:
             await update.message.reply_text(
-                "⚠️ <b>Sorry, I couldn't recognize that pair "
-                "or fetch its live price.</b>\n\n"
-                "Try something like <b>XAUUSD</b>, <b>Gold</b>, "
-                "<b>Bitcoin</b>, <b>GBPJPY</b>, or <b>EURUSD</b>.",
+                "⚠️ <b>Unable to fetch live market data.</b>\n"
+                "Please try again shortly.",
                 parse_mode=ParseMode.HTML
             )
         return
@@ -1666,7 +1693,8 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
 
 # ============================================
-# AUTO SIGNAL — BOTH CHANNELS
+# AUTO SIGNAL — Button on Channel 1 only,
+# no TP/SL monitor
 # ============================================
 
 async def post_auto_signal(context: ContextTypes.DEFAULT_TYPE):
@@ -1710,7 +1738,7 @@ async def post_auto_signal(context: ContextTypes.DEFAULT_TYPE):
             print(f"[AUTO SIGNAL] ❌ Failed for {channel_id}: {e}")
 
 # ============================================
-# MAIN
+# MAIN — UNCHANGED FROM WORKING VERSION
 # ============================================
 
 def main():

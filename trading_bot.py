@@ -213,15 +213,16 @@ def trial_remaining(user_id):
     return max(0, FREE_TRIAL_LIMIT - get_trial_count(user_id))
 
 # ============================================
-# PAIR CONFIG
+# PAIR CONFIG — ALL PAIRS, 50/100 PIP STANDARD
+# (XAUUSD 150/300 by special request)
 # ============================================
 
 PAIR_CONFIG = {
     "xauusd": {
         "symbol": "XAU/USD",
         "pair_name": "XAUUSD",
-        "pip_size": 50,
-        "pip_value": 1.0,
+        "pip_size": 0.50,
+        "pip_value": 0.01,
         "pip_label": "pips",
         "mt5_symbol": "XAUUSDm",
         "display": "Gold (XAUUSD) 🥇",
@@ -291,6 +292,90 @@ PAIR_CONFIG = {
         "av_type": "forex",
         "td_symbol": "GBP/JPY",
     },
+    "eurusd": {
+        "symbol": "EUR/USD",
+        "pair_name": "EURUSD",
+        "pip_size": 0.001667,
+        "pip_value": 0.0001,
+        "pip_label": "pips",
+        "mt5_symbol": "EURUSDm",
+        "display": "EUR/USD 🇪🇺",
+        "av_symbol": "EUR",
+        "av_type": "forex",
+        "td_symbol": "EUR/USD",
+    },
+    "usdjpy": {
+        "symbol": "USD/JPY",
+        "pair_name": "USDJPY",
+        "pip_size": 0.1667,
+        "pip_value": 0.01,
+        "pip_label": "pips",
+        "mt5_symbol": "USDJPYm",
+        "display": "USD/JPY 🇯🇵",
+        "av_symbol": "JPY",
+        "av_type": "forex",
+        "td_symbol": "USD/JPY",
+    },
+    "audusd": {
+        "symbol": "AUD/USD",
+        "pair_name": "AUDUSD",
+        "pip_size": 0.001667,
+        "pip_value": 0.0001,
+        "pip_label": "pips",
+        "mt5_symbol": "AUDUSDm",
+        "display": "AUD/USD 🇦🇺",
+        "av_symbol": "AUD",
+        "av_type": "forex",
+        "td_symbol": "AUD/USD",
+    },
+    "usdcad": {
+        "symbol": "USD/CAD",
+        "pair_name": "USDCAD",
+        "pip_size": 0.001667,
+        "pip_value": 0.0001,
+        "pip_label": "pips",
+        "mt5_symbol": "USDCADm",
+        "display": "USD/CAD 🇨🇦",
+        "av_symbol": "CAD",
+        "av_type": "forex",
+        "td_symbol": "USD/CAD",
+    },
+    "eurjpy": {
+        "symbol": "EUR/JPY",
+        "pair_name": "EURJPY",
+        "pip_size": 0.1667,
+        "pip_value": 0.01,
+        "pip_label": "pips",
+        "mt5_symbol": "EURJPYm",
+        "display": "EUR/JPY 🇪🇺",
+        "av_symbol": "EURJPY",
+        "av_type": "forex",
+        "td_symbol": "EUR/JPY",
+    },
+    "usdchf": {
+        "symbol": "USD/CHF",
+        "pair_name": "USDCHF",
+        "pip_size": 0.001667,
+        "pip_value": 0.0001,
+        "pip_label": "pips",
+        "mt5_symbol": "USDCHFm",
+        "display": "USD/CHF 🇨🇭",
+        "av_symbol": "CHF",
+        "av_type": "forex",
+        "td_symbol": "USD/CHF",
+    },
+    "nzdusd": {
+        "symbol": "NZD/USD",
+        "pair_name": "NZDUSD",
+        "pip_size": 0.001667,
+        "pip_value": 0.0001,
+        "pip_label": "pips",
+        "mt5_symbol": "NZDUSDm",
+        "display": "NZD/USD 🇳🇿",
+        "av_symbol": "NZD",
+        "av_type": "forex",
+        "td_symbol": "NZD/USD",
+    },
 }
 
 # ============================================
@@ -313,7 +398,6 @@ def calculate_pips(pair_name, entry_price, exit_price, direction, config):
 
 # ============================================
 # SILVER PRICE — METALS.DEV
-# CHANGE 1: Try all possible key names
 # ============================================
 
 def get_silver_price():
@@ -329,9 +413,7 @@ def get_silver_price():
         }
         response = requests.get(url, params=params, timeout=10)
         data = response.json()
-        print(f"[SILVER] Full response: {data}")
         metals = data.get("metals", {})
-        # Try all possible key names metals.dev might use
         price = (
             metals.get("silver") or
             metals.get("XAG") or
@@ -352,7 +434,6 @@ def get_silver_price():
 # ============================================
 
 def get_oil_price():
-    # Try 1: API Ninjas
     try:
         if API_NINJAS_KEY:
             url = "https://api.api-ninjas.com/v1/commodityprice?name=crude_oil"
@@ -366,7 +447,6 @@ def get_oil_price():
     except Exception as e:
         print(f"[OIL] API Ninjas error: {e}")
 
-    # Try 2: Twelvedata
     try:
         for sym in ["CL1!", "USOIL"]:
             url = (
@@ -383,7 +463,6 @@ def get_oil_price():
     except Exception as e:
         print(f"[OIL] Twelvedata error: {e}")
 
-    # Try 3: Alpha Vantage
     try:
         if ALPHA_VANTAGE_API_KEY:
             url = (
@@ -461,7 +540,6 @@ def get_price_alphavantage(config):
 # ============================================
 
 def get_live_price(symbol="XAU/USD", config=None):
-    # Silver — metals.dev
     if config and config.get("use_metals_api"):
         price = get_silver_price()
         if price:
@@ -469,7 +547,6 @@ def get_live_price(symbol="XAU/USD", config=None):
         print("[PRICE] metals.dev failed for silver")
         return None
 
-    # Oil — API Ninjas
     if config and config.get("use_oil_api"):
         price = get_oil_price()
         if price:
@@ -543,16 +620,72 @@ SELL_REASONS = [
 ]
 
 # ============================================
-# SIGNAL BUILDER
+# SIGNAL BUILDER — SMART ALIAS MATCHING
 # ============================================
 
-def build_signal_response(question):
+PAIR_ALIASES = {
+    "xauusd": [
+        "xauusd", "xau", "gold", "golld", "goald", "yellow metal"
+    ],
+    "btcusd": [
+        "btcusd", "btc", "bitcoin", "bit coin"
+    ],
+    "xagusd": [
+        "xagusd", "xag", "silver"
+    ],
+    "usoil": [
+        "usoil", "us oil", "oil", "wti", "crude", "crude oil"
+    ],
+    "gbpusd": [
+        "gbpusd", "gbp usd", "pound dollar", "cable",
+        "pound and dollar"
+    ],
+    "gbpjpy": [
+        "gbpjpy", "gbp jpy", "pound yen", "pound and yen"
+    ],
+    "eurusd": [
+        "eurusd", "eur usd", "euro dollar", "euro and dollar",
+        "fiber"
+    ],
+    "usdjpy": [
+        "usdjpy", "usd jpy", "dollar yen", "dollar and yen"
+    ],
+    "audusd": [
+        "audusd", "aud usd", "aussie dollar", "aussie",
+        "aud and usd"
+    ],
+    "usdcad": [
+        "usdcad", "usd cad", "dollar cad", "loonie",
+        "usd and cad"
+    ],
+    "eurjpy": [
+        "eurjpy", "eur jpy", "euro yen", "euro and yen"
+    ],
+    "usdchf": [
+        "usdchf", "usd chf", "dollar franc", "swissy",
+        "usd and chf"
+    ],
+    "nzdusd": [
+        "nzdusd", "nzd usd", "kiwi dollar", "kiwi",
+        "nzd and usd"
+    ],
+}
+
+def match_pair_key(question):
     q = question.lower()
-    config = PAIR_CONFIG["xauusd"]
-    for key in PAIR_CONFIG:
-        if key in q:
-            config = PAIR_CONFIG[key]
-            break
+    for key, variants in PAIR_ALIASES.items():
+        for variant in variants:
+            if variant in q:
+                return key
+    return None
+
+def build_signal_response(question):
+    matched_key = match_pair_key(question)
+
+    if matched_key is None:
+        return None, None, None, None
+
+    config = PAIR_CONFIG[matched_key]
 
     symbol = config["symbol"]
     pair_name = config["pair_name"]
@@ -893,7 +1026,6 @@ async def post_news(context: ContextTypes.DEFAULT_TYPE):
 
 # ============================================
 # METAAPI — PLACE TRADE ON MT5
-# CHANGE 2: volume 0.01 → 0.1
 # ============================================
 
 async def place_mt5_trade(signal_data):
@@ -998,17 +1130,15 @@ async def ask_openrouter(prompt):
 
 async def generate_breakdown(question):
 
-    q = question.lower()
-    symbol = "XAU/USD"
-    pair_name = "Gold (XAUUSD)"
-    config = PAIR_CONFIG["xauusd"]
-
-    for key, cfg in PAIR_CONFIG.items():
-        if key in q:
-            symbol = cfg["symbol"]
-            pair_name = cfg["display"]
-            config = cfg
-            break
+    matched_key = match_pair_key(question)
+    if matched_key:
+        config = PAIR_CONFIG[matched_key]
+        symbol = config["symbol"]
+        pair_name = config["display"]
+    else:
+        symbol = "XAU/USD"
+        pair_name = "Gold (XAUUSD)"
+        config = PAIR_CONFIG["xauusd"]
 
     live_price = get_live_price(symbol, config=config)
     live_price_text = (
@@ -1173,15 +1303,16 @@ async def handle_buttons(update: Update, context: ContextTypes.DEFAULT_TYPE):
         user_modes[user_id] = "signal"
         await update.message.reply_text(
             "📊 <b>Signal Mode Activated</b>\n\n"
-            "Now type the pair you want a signal for.\n\n"
-            "<b>Available pairs:</b>\n"
-            "• XAUUSD — Gold\n"
-            "• BTCUSD — Bitcoin\n"
-            "• XAGUSD — Silver\n"
-            "• USOIL — US Oil\n"
-            "• GBPUSD\n"
-            "• GBPJPY\n\n"
-            "<i>Example: Type <b>XAUUSD</b> to get a Gold signal</i>",
+            "Now type the pair you want a signal for — "
+            "or just say it naturally!\n\n"
+            "<b>Examples:</b>\n"
+            "• XAUUSD or Gold\n"
+            "• BTCUSD or Bitcoin\n"
+            "• GBPJPY or Pound Yen\n"
+            "• EURUSD or Euro Dollar\n"
+            "• USOIL, Oil, or Crude\n"
+            "• Silver, AUDUSD, USDCAD, NZDUSD and more\n\n"
+            "<i>Just type naturally — I'll understand 🤖</i>",
             parse_mode=ParseMode.HTML,
             reply_markup=main_keyboard
         )
@@ -1476,8 +1607,10 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     await send_verification_gate(update)
         else:
             await update.message.reply_text(
-                "⚠️ <b>Unable to fetch live market data.</b>\n"
-                "Please try again shortly.",
+                "⚠️ <b>Sorry, I couldn't recognize that pair "
+                "or fetch its live price.</b>\n\n"
+                "Try something like <b>XAUUSD</b>, <b>Gold</b>, "
+                "<b>Bitcoin</b>, <b>GBPJPY</b>, or <b>EURUSD</b>.",
                 parse_mode=ParseMode.HTML
             )
         return
@@ -1534,7 +1667,6 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 # ============================================
 # AUTO SIGNAL — BOTH CHANNELS
-# Button on Channel 1 only, no TP/SL monitor
 # ============================================
 
 async def post_auto_signal(context: ContextTypes.DEFAULT_TYPE):
@@ -1578,7 +1710,7 @@ async def post_auto_signal(context: ContextTypes.DEFAULT_TYPE):
             print(f"[AUTO SIGNAL] ❌ Failed for {channel_id}: {e}")
 
 # ============================================
-# MAIN — UNCHANGED
+# MAIN
 # ============================================
 
 def main():

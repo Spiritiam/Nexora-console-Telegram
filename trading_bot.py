@@ -456,7 +456,7 @@ PAIR_CONFIG = {
         "pip_label": "pips",
         "decimals": 2,
         "mt5_symbol": "XAUUSDm",
-        "display": "Gold (XAUUSD) 🥇",
+        "display": "XAU/USD 🥇",
         "av_symbol": "XAU",
         "av_type": "forex",
         "td_symbol": "XAU/USD",
@@ -469,7 +469,7 @@ PAIR_CONFIG = {
         "pip_label": "points",
         "decimals": 2,
         "mt5_symbol": "BTCUSDm",
-        "display": "Bitcoin (BTCUSD) ₿",
+        "display": "BTC/USD ₿",
         "av_symbol": "BTC",
         "av_type": "crypto",
         "td_symbol": "BTC/USD",
@@ -1524,10 +1524,9 @@ async def build_signal_response(question, user_id=None):
 
     response = (
         f"{signal_emoji} <b>{strength} {direction} {display}</b>\n\n"
-        f"<b>Entry Price:</b> {entry_price}\n\n"
-        f"<b>Stop Loss:</b> {stop_loss}\n\n"
-        f"<b>Take Profit:</b> {take_profit}\n\n"
-        f"<b>Confidence:</b> {confidence}%\n\n"
+        f"<b>Entry Price:</b> {entry_price}\n"
+        f"<b>SL:</b> {stop_loss} | <b>TP:</b> {take_profit}\n\n"
+        f"<b>Confidence:</b> {confidence}%\n"
         f"<b>Session:</b> {session}\n\n"
         f"<b>Timeframe Confirmation:</b>\n"
         f"{timeframe_confirmation}\n\n"

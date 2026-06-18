@@ -302,7 +302,10 @@ def increment_ai_bias_count(user_id):
         today_str = datetime.utcnow().strftime("%Y-%m-%d")
         current = get_ai_bias_count_today(user_id)
         new_count = current + 1
-        url = f"{SUPABASE_URL}/rest/v1/ai_bias_usage"
+        url = (
+            f"{SUPABASE_URL}/rest/v1/ai_bias_usage"
+            f"?on_conflict=user_id,usage_date"
+        )
         payload = {
             "user_id": str(user_id),
             "usage_date": today_str,
@@ -336,7 +339,10 @@ def increment_ai_bias_global_count():
         today_str = datetime.utcnow().strftime("%Y-%m-%d")
         current = get_ai_bias_global_count_today()
         new_count = current + 1
-        url = f"{SUPABASE_URL}/rest/v1/ai_bias_global"
+        url = (
+            f"{SUPABASE_URL}/rest/v1/ai_bias_global"
+            f"?on_conflict=usage_date"
+        )
         payload = {
             "usage_date": today_str,
             "count": new_count,

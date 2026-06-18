@@ -140,7 +140,7 @@ user_modes = {}
 pending_verifications = {}
 
 # ============================================
-# SIGNAL DIRECTION CONSISTENCY (NEW)
+# SIGNAL DIRECTION CONSISTENCY
 # Keeps the same BUY/SELL direction per pair
 # for at least 1 hour, so re-asking the same
 # pair doesn't flip direction every time.
@@ -148,6 +148,25 @@ pending_verifications = {}
 
 last_signal_direction = {}
 SIGNAL_CONSISTENCY_SECONDS = 3600  # 1 hour
+
+# ============================================
+# NEWS RELEVANCE FILTER (NEW)
+# Only forex / major currency / Bitcoin news
+# is allowed through, no general business news.
+# ============================================
+
+NEWS_RELEVANT_KEYWORDS = [
+    "forex", "currency", "currencies", "dollar", "euro", "pound",
+    "sterling", "yen", "usd", "eur", "gbp", "jpy", "fed", "federal reserve",
+    "ecb", "european central bank", "bank of england", "boe",
+    "bank of japan", "boj", "interest rate", "rate hike", "rate cut",
+    "inflation", "cpi", "nonfarm payroll", "nfp", "gdp", "central bank",
+    "bitcoin", "btc", "crypto", "cryptocurrency",
+]
+
+def is_news_relevant(title, description):
+    text = f"{title} {description}".lower()
+    return any(keyword in text for keyword in NEWS_RELEVANT_KEYWORDS)
 
 # ============================================
 # SUPABASE DATABASE FUNCTIONS
@@ -224,9 +243,6 @@ def trial_remaining(user_id):
 
 # ============================================
 # PAIR CONFIG
-# NEW: "decimals" key added to every pair so
-# rounding no longer destroys precision for
-# 4-5 decimal forex pairs.
 # ============================================
 
 PAIR_CONFIG = {
@@ -637,7 +653,7 @@ def get_market_session():
     return "Market Closing Session 🌙"
 
 # ============================================
-# MARKET BIAS — WITH 1-HOUR CONSISTENCY (NEW)
+# MARKET BIAS — WITH 1-HOUR CONSISTENCY
 # ============================================
 
 def generate_market_bias(pair_key=None):
@@ -686,8 +702,6 @@ SELL_REASONS = [
 
 # ============================================
 # SIGNAL BUILDER
-# UPDATED: uses match_pair_key + decimals +
-# generate_market_bias(pair_key)
 # ============================================
 
 def build_signal_response(question):
@@ -798,6 +812,7 @@ def format_breakdown(text):
 
 # ============================================
 # NEWS FETCHER — GNEWS PRIMARY
+# UPDATED: relevance filter applied
 # ============================================
 
 def fetch_news_gnews():
@@ -814,6 +829,7 @@ def fetch_news_gnews():
         articles = [
             a for a in data.get("articles", [])
             if a.get("image") and a.get("title") and a.get("description")
+            and is_news_relevant(a.get("title", ""), a.get("description", ""))
         ]
         if not articles:
             return None
@@ -830,6 +846,7 @@ def fetch_news_gnews():
 
 # ============================================
 # NEWS FETCHER — THENEWSAPI FALLBACK
+# UPDATED: relevance filter applied
 # ============================================
 
 def fetch_news_thenewsapi():
@@ -846,6 +863,7 @@ def fetch_news_thenewsapi():
         articles = [
             a for a in data.get("data", [])
             if a.get("image_url") and a.get("title") and a.get("description")
+            and is_news_relevant(a.get("title", ""), a.get("description", ""))
         ]
         if not articles:
             return None
@@ -861,7 +879,44 @@ def fetch_news_thenewsapi():
         return None
 
 # ============================================
+# NEWS FETCHER — ALPHA VANTAGE (NEW)
+# Third fallback, forex/macro/crypto topics
+# ============================================
+
+def fetch_news_alphavantage():
+    if not ALPHA_VANTAGE_API_KEY:
+        return None
+    try:
+        url = (
+            f"https://www.alphavantage.co/query"
+            f"?function=NEWS_SENTIMENT"
+            f"&topics=forex,economy_macro,blockchain"
+            f"&apikey={ALPHA_VANTAGE_API_KEY}"
+        )
+        response = requests.get(url, timeout=10)
+        data = response.json()
+        feed = data.get("feed", [])
+        articles = [
+            a for a in feed
+            if a.get("banner_image") and a.get("title") and a.get("summary")
+            and is_news_relevant(a.get("title", ""), a.get("summary", ""))
+        ]
+        if not articles:
+            return None
+        article = random.choice(articles)
+        return {
+            "title": article.get("title", ""),
+            "description": article.get("summary", ""),
+            "image": article.get("banner_image", ""),
+            "source": article.get("source", "Alpha Vantage"),
+        }
+    except Exception as e:
+        print(f"[ALPHAVANTAGE NEWS] Error: {e}")
+        return None
+
+# ============================================
 # NEWS FETCHER — COMBINED
+# UPDATED: Alpha Vantage added as 3rd fallback
 # ============================================
 
 def fetch_market_news():
@@ -874,11 +929,18 @@ def fetch_market_news():
     if article:
         print("[NEWS] ✅ TheNewsAPI article found")
         return article
-    print("[NEWS] Both news APIs failed.")
+    print("[NEWS] TheNewsAPI failed, trying Alpha Vantage...")
+    article = fetch_news_alphavantage()
+    if article:
+        print("[NEWS] ✅ Alpha Vantage article found")
+        return article
+    print("[NEWS] All news APIs failed or no relevant forex/BTC news today.")
     return None
 
 # ============================================
 # ECONOMIC CALENDAR — FOREX FACTORY
+# UPDATED: currency filter (USD/EUR/GBP/JPY)
+# and trimmed to 3 events instead of 5
 # ============================================
 
 def fetch_economic_calendar():
@@ -910,8 +972,10 @@ def fetch_economic_calendar():
             impact = event.get("impact", "").lower()
             if impact != "high":
                 continue
-            title = event.get("title", "")
             currency = event.get("currency", "")
+            if currency not in ["USD", "EUR", "GBP", "JPY"]:
+                continue
+            title = event.get("title", "")
             time_utc = event.get("date", "")
             flag = flag_map.get(currency, "🌍")
 
@@ -932,7 +996,7 @@ def fetch_economic_calendar():
                 line += f" — {time_str}"
             calendar_text += line + "\n"
             count += 1
-            if count >= 5:
+            if count >= 3:
                 break
 
         if count == 0:
@@ -946,6 +1010,7 @@ def fetch_economic_calendar():
 
 # ============================================
 # NEWS SUMMARY GENERATOR
+# UPDATED: 2 bullet points instead of 3
 # ============================================
 
 async def generate_news_summary(article, session_type):
@@ -977,10 +1042,8 @@ FORMAT EXACTLY LIKE THIS — NO EXCEPTIONS:
 
 🔹 [One line news item 2]
 
-🔹 [One line news item 3]
-
 STRICT RULES:
-- Maximum 3 bullet points ONLY
+- Maximum 2 bullet points ONLY
 - Each bullet point MAX 15 words
 - No long sentences
 - No paragraphs
@@ -1146,8 +1209,6 @@ async def ask_openrouter(prompt):
 
 # ============================================
 # BREAKDOWN GENERATOR
-# UPDATED: uses match_pair_key for consistency
-# with build_signal_response
 # ============================================
 
 async def generate_breakdown(question):
@@ -1738,7 +1799,7 @@ async def post_auto_signal(context: ContextTypes.DEFAULT_TYPE):
             print(f"[AUTO SIGNAL] ❌ Failed for {channel_id}: {e}")
 
 # ============================================
-# MAIN — UNCHANGED FROM WORKING VERSION
+# MAIN
 # ============================================
 
 def main():

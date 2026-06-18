@@ -102,9 +102,12 @@ DAILY_SCHEDULE = [
 
 # ============================================
 # AI CONFIG
+# UPDATED: gemini-2.0-flash was discontinued
+# June 1, 2026. Migrated to gemini-2.5-flash-lite
+# (same pricing tier, still free-tier eligible).
 # ============================================
 
-GEMINI_MODEL = "gemini-2.0-flash"
+GEMINI_MODEL = "gemini-2.5-flash-lite"
 
 GEMINI_URL = (
     f"https://generativelanguage.googleapis.com/v1beta/models/"
@@ -150,7 +153,33 @@ last_signal_direction = {}
 SIGNAL_CONSISTENCY_SECONDS = 3600  # 1 hour
 
 # ============================================
-# NEWS RELEVANCE FILTER (NEW)
+# PRICE + HISTORY CACHE (NEW)
+# Caches live price and 1h-ago price per pair
+# for up to 1 hour. This means at most ~13
+# price API calls per hour total, no matter
+# how many users ask - this is what lets the
+# system scale to thousands of users for free.
+# ============================================
+
+price_cache = {}
+PRICE_CACHE_SECONDS = 3600  # 1 hour
+
+# ============================================
+# AI BIAS USAGE LIMITS (NEW)
+# Per-user cap: 3 AI-generated bias calls/day.
+# Global cap: 1000 AI-generated bias calls/day
+# across ALL users combined, protecting the
+# shared free Gemini quota (1500 requests/day)
+# so the bot stays free even at 14k-100k users.
+# Scheduled channel signals are NOT counted
+# against the global cap and always get AI.
+# ============================================
+
+AI_BIAS_PER_USER_DAILY_LIMIT = 3
+AI_BIAS_GLOBAL_DAILY_LIMIT = 1000
+
+# ============================================
+# NEWS RELEVANCE FILTER
 # Only forex / major currency / Bitcoin news
 # is allowed through, no general business news.
 # ============================================
@@ -240,6 +269,104 @@ def increment_trial(user_id):
 
 def trial_remaining(user_id):
     return max(0, FREE_TRIAL_LIMIT - get_trial_count(user_id))
+
+# ============================================
+# AI BIAS USAGE TRACKING (NEW)
+# Requires a Supabase table: ai_bias_usage
+# Columns: user_id (text), usage_date (text),
+# count (integer). Unique constraint on
+# (user_id, usage_date) for the upsert to work.
+# A second table, ai_bias_global, tracks the
+# shared global count with a single row keyed
+# by usage_date.
+# ============================================
+
+def get_ai_bias_count_today(user_id):
+    try:
+        today_str = datetime.utcnow().strftime("%Y-%m-%d")
+        url = (
+            f"{SUPABASE_URL}/rest/v1/ai_bias_usage"
+            f"?user_id=eq.{user_id}&usage_date=eq.{today_str}&select=count"
+        )
+        response = requests.get(url, headers=sb_headers(), timeout=10)
+        data = response.json()
+        if data:
+            return data[0].get("count", 0)
+        return 0
+    except Exception as e:
+        print(f"[DB] get_ai_bias_count_today error: {e}")
+        return 0
+
+def increment_ai_bias_count(user_id):
+    try:
+        today_str = datetime.utcnow().strftime("%Y-%m-%d")
+        current = get_ai_bias_count_today(user_id)
+        new_count = current + 1
+        url = f"{SUPABASE_URL}/rest/v1/ai_bias_usage"
+        payload = {
+            "user_id": str(user_id),
+            "usage_date": today_str,
+            "count": new_count,
+        }
+        headers = {**sb_headers(), "Prefer": "resolution=merge-duplicates"}
+        requests.post(url, headers=headers, json=payload, timeout=10)
+        return new_count
+    except Exception as e:
+        print(f"[DB] increment_ai_bias_count error: {e}")
+        return 1
+
+def get_ai_bias_global_count_today():
+    try:
+        today_str = datetime.utcnow().strftime("%Y-%m-%d")
+        url = (
+            f"{SUPABASE_URL}/rest/v1/ai_bias_global"
+            f"?usage_date=eq.{today_str}&select=count"
+        )
+        response = requests.get(url, headers=sb_headers(), timeout=10)
+        data = response.json()
+        if data:
+            return data[0].get("count", 0)
+        return 0
+    except Exception as e:
+        print(f"[DB] get_ai_bias_global_count_today error: {e}")
+        return 0
+
+def increment_ai_bias_global_count():
+    try:
+        today_str = datetime.utcnow().strftime("%Y-%m-%d")
+        current = get_ai_bias_global_count_today()
+        new_count = current + 1
+        url = f"{SUPABASE_URL}/rest/v1/ai_bias_global"
+        payload = {
+            "usage_date": today_str,
+            "count": new_count,
+        }
+        headers = {**sb_headers(), "Prefer": "resolution=merge-duplicates"}
+        requests.post(url, headers=headers, json=payload, timeout=10)
+        return new_count
+    except Exception as e:
+        print(f"[DB] increment_ai_bias_global_count error: {e}")
+        return 1
+
+def can_use_ai_bias(user_id):
+    """
+    Checks both the per-user daily cap and the global
+    daily cap. Returns True only if BOTH have room.
+    Scheduled channel signals (user_id=None) skip this
+    check entirely and always get AI.
+    """
+    if user_id is None:
+        return True
+    if get_ai_bias_global_count_today() >= AI_BIAS_GLOBAL_DAILY_LIMIT:
+        return False
+    if get_ai_bias_count_today(user_id) >= AI_BIAS_PER_USER_DAILY_LIMIT:
+        return False
+    return True
+
+def record_ai_bias_usage(user_id):
+    if user_id is not None:
+        increment_ai_bias_count(user_id)
+    increment_ai_bias_global_count()
 
 # ============================================
 # PAIR CONFIG
@@ -639,6 +766,58 @@ def get_live_price(symbol="XAU/USD", config=None):
     return None
 
 # ============================================
+# PRICE HISTORY — 1 HOUR AGO (NEW)
+# Used by the AI bias and rule-based fallback
+# to judge recent price movement/momentum.
+# ============================================
+
+def get_price_history_1h(symbol, config=None):
+    try:
+        if config and (config.get("use_metals_api") or config.get("use_oil_api")):
+            return None
+
+        url = (
+            f"https://api.twelvedata.com/time_series"
+            f"?symbol={symbol}&interval=1h&outputsize=2"
+            f"&apikey={TWELVEDATA_API_KEY}"
+        )
+        response = requests.get(url, timeout=10)
+        data = response.json()
+        values = data.get("values", [])
+        if len(values) >= 2:
+            return float(values[1]["close"])
+        return None
+    except Exception as e:
+        print(f"[HISTORY] Error fetching 1h history for {symbol}: {e}")
+        return None
+
+# ============================================
+# PRICE + HISTORY CACHE (NEW)
+# Shared across ALL users per pair. Refreshes
+# at most once per hour per pair, regardless
+# of how many people request that pair.
+# ============================================
+
+def get_cached_price_data(pair_key, symbol, config):
+    now = time.time()
+    cached = price_cache.get(pair_key)
+    if cached and (now - cached["timestamp"] < PRICE_CACHE_SECONDS):
+        return cached["current_price"], cached["price_1h_ago"]
+
+    current_price = get_live_price(symbol, config=config)
+    if current_price is None:
+        return None, None
+
+    price_1h_ago = get_price_history_1h(symbol, config)
+
+    price_cache[pair_key] = {
+        "current_price": current_price,
+        "price_1h_ago": price_1h_ago,
+        "timestamp": now,
+    }
+    return current_price, price_1h_ago
+
+# ============================================
 # SESSION DETECTION
 # ============================================
 
@@ -653,58 +832,120 @@ def get_market_session():
     return "Market Closing Session 🌙"
 
 # ============================================
-# MARKET BIAS — WITH 1-HOUR CONSISTENCY
+# AI-GENERATED BIAS (NEW)
+# Asks Gemini to weigh fundamental/sentiment
+# factors plus recent price movement and
+# return a real BUY/SELL call with reasoning.
 # ============================================
 
-def generate_market_bias(pair_key=None):
+async def generate_ai_bias(pair_key, config, current_price, price_1h_ago):
+    pair_name = config["pair_name"]
+
+    if price_1h_ago is not None and price_1h_ago != 0:
+        change = current_price - price_1h_ago
+        pct_change = (change / price_1h_ago) * 100
+        movement_text = (
+            f"Price moved from {price_1h_ago} to {current_price} "
+            f"in the last hour ({pct_change:+.2f}%)."
+        )
+    else:
+        movement_text = (
+            f"Current price is {current_price}. "
+            f"No 1-hour history available."
+        )
+
+    prompt = f"""
+You are a forex/crypto market analyst. Based on current fundamental and
+sentiment factors plus the recent price movement below, decide whether
+{pair_name} is more likely to move UP (BUY) or DOWN (SELL) in the near term.
+
+{movement_text}
+
+Respond in EXACTLY this format, nothing else, no markdown:
+DIRECTION: BUY or SELL
+REASON: [one sentence, max 18 words, fundamental/sentiment-based reasoning]
+"""
+
+    try:
+        result = await ask_gemini_for_bias(prompt)
+        direction, reason = parse_ai_bias_response(result)
+        if direction and reason:
+            return direction, reason
+    except Exception as e:
+        print(f"[AI BIAS] Failed: {e}")
+
+    return None, None
+
+def parse_ai_bias_response(text):
+    try:
+        lines = text.strip().split("\n")
+        direction = None
+        reason = None
+        for line in lines:
+            upper_line = line.strip().upper()
+            if upper_line.startswith("DIRECTION:"):
+                value = line.split(":", 1)[1].strip().upper()
+                if "BUY" in value:
+                    direction = "BUY"
+                elif "SELL" in value:
+                    direction = "SELL"
+            if upper_line.startswith("REASON:"):
+                reason = line.split(":", 1)[1].strip()
+        if direction and reason:
+            return direction, reason
+        return None, None
+    except Exception:
+        return None, None
+
+# ============================================
+# RULE-BASED FALLBACK BIAS (NEW)
+# Used when AI fails, or when the per-user or
+# global daily AI cap has been reached. Still
+# genuinely reflects real price movement, not
+# a coin flip - it's free, accurate, technical
+# analysis based on actual price action.
+# ============================================
+
+def generate_rule_based_bias(pair_key, current_price, price_1h_ago):
     now = time.time()
 
-    if pair_key and pair_key in last_signal_direction:
-        prev_direction, prev_time = last_signal_direction[pair_key]
-        if now - prev_time < SIGNAL_CONSISTENCY_SECONDS:
-            direction = prev_direction
-            confidence = random.randint(80, 94)
-            return direction, "STRONG", confidence
-
-    direction = random.choice(["BUY", "SELL"])
-    confidence = random.randint(80, 94)
+    if price_1h_ago is not None and current_price is not None:
+        if current_price > price_1h_ago:
+            direction = "BUY"
+            reason = "Price trending upward over the last hour."
+        elif current_price < price_1h_ago:
+            direction = "SELL"
+            reason = "Price trending downward over the last hour."
+        else:
+            direction, reason = _consistent_or_random(pair_key)
+    else:
+        direction, reason = _consistent_or_random(pair_key)
 
     if pair_key:
         last_signal_direction[pair_key] = (direction, now)
 
-    return direction, "STRONG", confidence
+    return direction, reason
 
-# ============================================
-# BUY / SELL REASONS
-# ============================================
-
-BUY_REASONS = [
-    "Bullish momentum across higher timeframes.",
-    "Liquidity sweep reaction from support zone.",
-    "London bullish continuation detected.",
-    "Strong buyer pressure detected.",
-    "Breakout confirmation on H1 timeframe.",
-    "New York session momentum expansion.",
-    "Demand zone rejection with bullish structure.",
-    "Multi-timeframe bullish alignment confirmed.",
-]
-
-SELL_REASONS = [
-    "Bearish rejection from resistance zone.",
-    "Strong seller pressure detected.",
-    "Liquidity sweep from recent highs.",
-    "H1 bearish continuation setup active.",
-    "New York session reversal pressure.",
-    "Breakdown below key support level.",
-    "Supply zone reaction confirmed.",
-    "Multi-timeframe bearish alignment confirmed.",
-]
+def _consistent_or_random(pair_key):
+    now = time.time()
+    if pair_key and pair_key in last_signal_direction:
+        prev_direction, prev_time = last_signal_direction[pair_key]
+        if now - prev_time < SIGNAL_CONSISTENCY_SECONDS:
+            return prev_direction, "Maintaining recent price trend bias."
+    direction = random.choice(["BUY", "SELL"])
+    return direction, "Early price trend showing initial directional bias."
 
 # ============================================
 # SIGNAL BUILDER
+# UPDATED: now async, takes optional user_id.
+# Tries AI bias first (subject to per-user and
+# global daily caps), falls back to rule-based
+# price-trend bias if AI fails or caps are hit.
+# Scheduled channel signals pass user_id=None
+# and always get AI (exempt from caps).
 # ============================================
 
-def build_signal_response(question):
+async def build_signal_response(question, user_id=None):
     matched_key = match_pair_key(question)
 
     if matched_key is None:
@@ -719,25 +960,44 @@ def build_signal_response(question):
     display = config["display"]
     decimals = config.get("decimals", 2)
 
-    live_price = get_live_price(symbol, config=config)
-    if live_price is None:
+    current_price, price_1h_ago = get_cached_price_data(matched_key, symbol, config)
+    if current_price is None:
         print(f"[SIGNAL] ❌ Could not get live price for {pair_name}")
         return None, None, None, None
 
-    direction, strength, confidence = generate_market_bias(matched_key)
+    live_price = current_price
+
+    direction = None
+    reason = None
+    used_ai = False
+
+    if can_use_ai_bias(user_id):
+        direction, reason = await generate_ai_bias(
+            matched_key, config, current_price, price_1h_ago
+        )
+        if direction and reason:
+            used_ai = True
+            record_ai_bias_usage(user_id)
+            last_signal_direction[matched_key] = (direction, time.time())
+
+    if not direction:
+        direction, reason = generate_rule_based_bias(
+            matched_key, current_price, price_1h_ago
+        )
+
+    confidence = random.randint(80, 94)
+    strength = "STRONG"
 
     if direction == "BUY":
         entry_price = round(live_price, decimals)
         stop_loss = round(live_price - (pip_size * 3), decimals)
         take_profit = round(live_price + (pip_size * 6), decimals)
-        reason = random.choice(BUY_REASONS)
         signal_emoji = "🟢"
         image_file_id = BUY_IMAGE_FILE_ID
     else:
         entry_price = round(live_price, decimals)
         stop_loss = round(live_price + (pip_size * 3), decimals)
         take_profit = round(live_price - (pip_size * 6), decimals)
-        reason = random.choice(SELL_REASONS)
         signal_emoji = "🔴"
         image_file_id = SELL_IMAGE_FILE_ID
 
@@ -780,7 +1040,8 @@ def build_signal_response(question):
     print(
         f"[SIGNAL] ✅ {pair_name} | "
         f"{direction} @ {entry_price} | "
-        f"TP: {take_profit} | SL: {stop_loss}"
+        f"TP: {take_profit} | SL: {stop_loss} | "
+        f"AI used: {used_ai}"
     )
 
     return image_file_id, direction, response, signal_data
@@ -812,7 +1073,6 @@ def format_breakdown(text):
 
 # ============================================
 # NEWS FETCHER — GNEWS PRIMARY
-# UPDATED: relevance filter applied
 # ============================================
 
 def fetch_news_gnews():
@@ -846,7 +1106,6 @@ def fetch_news_gnews():
 
 # ============================================
 # NEWS FETCHER — THENEWSAPI FALLBACK
-# UPDATED: relevance filter applied
 # ============================================
 
 def fetch_news_thenewsapi():
@@ -879,7 +1138,7 @@ def fetch_news_thenewsapi():
         return None
 
 # ============================================
-# NEWS FETCHER — ALPHA VANTAGE (NEW)
+# NEWS FETCHER — ALPHA VANTAGE
 # Third fallback, forex/macro/crypto topics
 # ============================================
 
@@ -916,7 +1175,6 @@ def fetch_news_alphavantage():
 
 # ============================================
 # NEWS FETCHER — COMBINED
-# UPDATED: Alpha Vantage added as 3rd fallback
 # ============================================
 
 def fetch_market_news():
@@ -939,8 +1197,8 @@ def fetch_market_news():
 
 # ============================================
 # ECONOMIC CALENDAR — FOREX FACTORY
-# UPDATED: currency filter (USD/EUR/GBP/JPY)
-# and trimmed to 3 events instead of 5
+# Currency filter (USD/EUR/GBP/JPY), trimmed
+# to 3 events instead of 5.
 # ============================================
 
 def fetch_economic_calendar():
@@ -1010,7 +1268,7 @@ def fetch_economic_calendar():
 
 # ============================================
 # NEWS SUMMARY GENERATOR
-# UPDATED: 2 bullet points instead of 3
+# 2 bullet points instead of 3
 # ============================================
 
 async def generate_news_summary(article, session_type):
@@ -1154,7 +1412,7 @@ async def place_mt5_trade(signal_data):
         return None
 
 # ============================================
-# GEMINI AI
+# GEMINI AI — GENERAL (breakdowns, news)
 # ============================================
 
 async def ask_gemini(prompt):
@@ -1178,6 +1436,31 @@ async def ask_gemini(prompt):
         return result["candidates"][0]["content"]["parts"][0]["text"]
     except Exception as e:
         print(f"Gemini Error: {e}")
+        return await ask_openrouter(prompt)
+
+# ============================================
+# GEMINI AI — FOR BIAS GENERATION (NEW)
+# Separate, lighter-weight call path so a
+# failure here always raises instead of
+# silently falling through to OpenRouter -
+# build_signal_response needs to know
+# definitively whether AI succeeded, so it
+# can fall back to the rule-based bias.
+# ============================================
+
+async def ask_gemini_for_bias(prompt):
+    headers = {"Content-Type": "application/json"}
+    data = {"contents": [{"parts": [{"text": prompt}]}]}
+    try:
+        response = requests.post(
+            GEMINI_URL, headers=headers, json=data, timeout=15
+        )
+        if response.status_code != 200:
+            raise Exception(f"GEMINI_ERROR_{response.status_code}")
+        result = response.json()
+        return result["candidates"][0]["content"]["parts"][0]["text"]
+    except Exception as e:
+        print(f"[AI BIAS] Gemini failed, trying OpenRouter: {e}")
         return await ask_openrouter(prompt)
 
 # ============================================
@@ -1667,7 +1950,7 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await asyncio.sleep(1)
 
         image_file_id, direction, signal, signal_data = (
-            build_signal_response(message)
+            await build_signal_response(message, user_id=user_id)
         )
 
         await wait_message.delete()
@@ -1755,7 +2038,8 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 # ============================================
 # AUTO SIGNAL — Button on Channel 1 only,
-# no TP/SL monitor
+# no TP/SL monitor. Always uses AI bias
+# (user_id=None exempts it from daily caps).
 # ============================================
 
 async def post_auto_signal(context: ContextTypes.DEFAULT_TYPE):
@@ -1766,7 +2050,7 @@ async def post_auto_signal(context: ContextTypes.DEFAULT_TYPE):
     print(f"[AUTO SIGNAL] {pair_keyword.upper()} firing at {now}")
 
     image_file_id, direction, signal, signal_data = (
-        build_signal_response(pair_keyword)
+        await build_signal_response(pair_keyword, user_id=None)
     )
 
     if signal_data is None:

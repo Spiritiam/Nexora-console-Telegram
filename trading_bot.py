@@ -5,7 +5,7 @@ import requests
 import json
 import time
 
-from datetime import datetime
+from datetime import datetime, timedelta
 from pathlib import Path
 
 from telegram import (
@@ -269,6 +269,75 @@ def increment_trial(user_id):
 
 def trial_remaining(user_id):
     return max(0, FREE_TRIAL_LIMIT - get_trial_count(user_id))
+
+# ============================================
+# SIGNAL LOG (NEW)
+# Requires a Supabase table: signal_log
+# Columns: id (bigint identity), pair_name (text),
+# direction (text), entry_price (float8),
+# stop_loss (float8), take_profit (float8),
+# posted_at (text, ISO format), status (text,
+# default 'OPEN'), closed_at (text, nullable).
+# Only scheduled CHANNEL signals are logged here
+# (post_auto_signal) - these are the official
+# trade calls the brand stands behind, not every
+# personal DM lookup a user makes. Backs both the
+# TP/SL monitor and the weekly performance report.
+# ============================================
+
+def log_signal(signal_data):
+    try:
+        url = f"{SUPABASE_URL}/rest/v1/signal_log"
+        payload = {
+            "pair_name": signal_data["pair_name"],
+            "direction": signal_data["direction"],
+            "entry_price": signal_data["entry_price"],
+            "stop_loss": signal_data["stop_loss"],
+            "take_profit": signal_data["take_profit"],
+            "posted_at": datetime.utcnow().isoformat(),
+            "status": "OPEN",
+        }
+        requests.post(url, headers=sb_headers(), json=payload, timeout=10)
+        print(
+            f"[SIGNAL LOG] ✅ Logged {signal_data['pair_name']} "
+            f"{signal_data['direction']}"
+        )
+    except Exception as e:
+        print(f"[SIGNAL LOG] log_signal error: {e}")
+
+def get_open_signals():
+    try:
+        url = f"{SUPABASE_URL}/rest/v1/signal_log?status=eq.OPEN&select=*"
+        response = requests.get(url, headers=sb_headers(), timeout=10)
+        return response.json()
+    except Exception as e:
+        print(f"[SIGNAL LOG] get_open_signals error: {e}")
+        return []
+
+def update_signal_status(signal_id, status):
+    try:
+        url = f"{SUPABASE_URL}/rest/v1/signal_log?id=eq.{signal_id}"
+        payload = {
+            "status": status,
+            "closed_at": datetime.utcnow().isoformat(),
+        }
+        requests.patch(url, headers=sb_headers(), json=payload, timeout=10)
+        print(f"[SIGNAL LOG] Signal {signal_id} -> {status}")
+    except Exception as e:
+        print(f"[SIGNAL LOG] update_signal_status error: {e}")
+
+def get_signals_since(start_dt):
+    try:
+        start_str = start_dt.isoformat()
+        url = (
+            f"{SUPABASE_URL}/rest/v1/signal_log"
+            f"?posted_at=gte.{start_str}&select=*"
+        )
+        response = requests.get(url, headers=sb_headers(), timeout=10)
+        return response.json()
+    except Exception as e:
+        print(f"[SIGNAL LOG] get_signals_since error: {e}")
+        return []
 
 # ============================================
 # AI BIAS USAGE TRACKING (NEW)
@@ -1188,6 +1257,21 @@ def get_market_session():
     return "Market Closing Session 🌙"
 
 # ============================================
+# WEEKEND MARKET GATE (NEW)
+# Forex, gold, silver and oil are all closed
+# Saturday/Sunday. Mirrors the same Sat/Sun
+# window already used for WEEKDAYS_ONLY in
+# main()'s scheduler, kept as one shared check
+# so the manual signal flow and the channel
+# scheduler never disagree about market hours.
+# BTCUSD trades 24/7 and is exempt everywhere
+# this is checked.
+# ============================================
+
+def is_forex_market_closed():
+    return datetime.utcnow().weekday() in (5, 6)  # Saturday=5, Sunday=6
+
+# ============================================
 # AI-GENERATED BIAS (NEW)
 # Asks Gemini to weigh fundamental/sentiment
 # factors plus recent price movement and
@@ -1350,6 +1434,10 @@ async def build_signal_response(question, user_id=None):
     if matched_key is None:
         print(f"[SIGNAL] ❌ No matching pair found for: {question}")
         return None, None, None, None
+
+    if matched_key != "btcusd" and is_forex_market_closed():
+        print(f"[SIGNAL] ⏸️ {matched_key} blocked — forex market closed for the week")
+        return None, None, "MARKET_CLOSED", None
 
     config = PAIR_CONFIG[matched_key]
 
@@ -2357,6 +2445,23 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     if mode == "signal":
 
+        requested_key = match_pair_key(message)
+        if (
+            requested_key
+            and requested_key != "btcusd"
+            and is_forex_market_closed()
+        ):
+            await update.message.reply_text(
+                "🌙 <b>Forex Market Closed for the Week</b>\n\n"
+                "Gold, Silver, Oil and all Forex pairs are closed "
+                "until the market reopens Sunday.\n\n"
+                "₿ <b>Crypto (BTCUSD)</b> trades 24/7 — try that "
+                "pair instead!",
+                parse_mode=ParseMode.HTML,
+                reply_markup=main_keyboard
+            )
+            return
+
         if not is_verified(user_id):
             count = increment_trial(user_id)
             if count > FREE_TRIAL_LIMIT:
@@ -2400,6 +2505,16 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 else:
                     user_modes[user_id] = "awaiting_email"
                     await send_verification_gate(update)
+        elif signal == "MARKET_CLOSED":
+            await update.message.reply_text(
+                "🌙 <b>Forex Market Closed for the Week</b>\n\n"
+                "Gold, Silver, Oil and all Forex pairs are closed "
+                "until the market reopens Sunday.\n\n"
+                "₿ <b>Crypto (BTCUSD)</b> trades 24/7 — try that "
+                "pair instead!",
+                parse_mode=ParseMode.HTML,
+                reply_markup=main_keyboard
+            )
         else:
             await update.message.reply_text(
                 "⚠️ <b>Unable to fetch live market data.</b>\n"
@@ -2459,9 +2574,11 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
 
 # ============================================
-# AUTO SIGNAL — Button on Channel 1 only,
-# no TP/SL monitor. Always uses AI bias
-# (user_id=None exempts it from daily caps).
+# AUTO SIGNAL — Button on Channel 1 only.
+# Logs every posted signal to signal_log so the
+# TP/SL monitor and weekly report can track it.
+# Always uses AI bias (user_id=None exempts it
+# from daily caps).
 # ============================================
 
 async def post_auto_signal(context: ContextTypes.DEFAULT_TYPE):
@@ -2476,8 +2593,13 @@ async def post_auto_signal(context: ContextTypes.DEFAULT_TYPE):
     )
 
     if signal_data is None:
-        print(f"[AUTO SIGNAL] ❌ Could not fetch price for {pair_keyword}.")
+        if signal == "MARKET_CLOSED":
+            print(f"[AUTO SIGNAL] ⏸️ {pair_keyword.upper()} skipped — forex market closed.")
+        else:
+            print(f"[AUTO SIGNAL] ❌ Could not fetch price for {pair_keyword}.")
         return
+
+    log_signal(signal_data)
 
     for channel_id in [CHANNEL_1_ID, CHANNEL_2_ID]:
         try:
@@ -2503,6 +2625,109 @@ async def post_auto_signal(context: ContextTypes.DEFAULT_TYPE):
 
         except Exception as e:
             print(f"[AUTO SIGNAL] ❌ Failed for {channel_id}: {e}")
+
+# ============================================
+# TP/SL MONITOR (NEW)
+# Runs every 15 minutes. Checks every OPEN
+# signal in signal_log against current price
+# (via the same shared price_cache everything
+# else already uses, so this adds no extra API
+# load beyond what's already happening) and
+# marks it TP_HIT or SL_HIT the moment price
+# reaches either level.
+# ============================================
+
+async def check_open_signals(context: ContextTypes.DEFAULT_TYPE):
+    open_signals = get_open_signals()
+    if not open_signals:
+        return
+
+    for sig in open_signals:
+        pair_name = sig.get("pair_name")
+        pair_key = next(
+            (k for k, c in PAIR_CONFIG.items() if c["pair_name"] == pair_name),
+            None
+        )
+        if not pair_key:
+            continue
+
+        config = PAIR_CONFIG[pair_key]
+        current_price, _ = get_cached_price_data(
+            pair_key, config["symbol"], config
+        )
+        if current_price is None:
+            continue
+
+        direction = sig.get("direction")
+        take_profit = sig.get("take_profit")
+        stop_loss = sig.get("stop_loss")
+
+        if direction == "BUY":
+            if current_price >= take_profit:
+                update_signal_status(sig["id"], "TP_HIT")
+            elif current_price <= stop_loss:
+                update_signal_status(sig["id"], "SL_HIT")
+        else:
+            if current_price <= take_profit:
+                update_signal_status(sig["id"], "TP_HIT")
+            elif current_price >= stop_loss:
+                update_signal_status(sig["id"], "SL_HIT")
+
+# ============================================
+# WEEKLY PERFORMANCE REPORT (NEW)
+# Runs every Sunday at 23:00 UTC, covering the
+# full Monday 00:00 UTC -> Sunday 23:00 UTC week
+# (including weekend BTCUSD activity). Posted to
+# both channels, no comments needed since it's a
+# self-contained summary - total signals issued,
+# TP hits, SL hits, still-open count, and an
+# overall win rate.
+# ============================================
+
+def get_week_start():
+    now = datetime.utcnow()
+    monday = now - timedelta(days=now.weekday())
+    return monday.replace(hour=0, minute=0, second=0, microsecond=0)
+
+async def post_weekly_report(context: ContextTypes.DEFAULT_TYPE):
+    week_start = get_week_start()
+    now = datetime.utcnow()
+
+    signals = get_signals_since(week_start)
+
+    total = len(signals)
+    tp_hit = sum(1 for s in signals if s.get("status") == "TP_HIT")
+    sl_hit = sum(1 for s in signals if s.get("status") == "SL_HIT")
+    still_open = sum(1 for s in signals if s.get("status") == "OPEN")
+    closed = tp_hit + sl_hit
+    win_rate = round((tp_hit / closed) * 100) if closed > 0 else 0
+
+    date_range = f"{week_start.strftime('%d %b')} – {now.strftime('%d %b %Y')}"
+
+    report = (
+        f"📊 <b>WEEKLY PERFORMANCE REPORT</b>\n"
+        f"<i>#SpiritFX — {date_range}</i>\n\n"
+        f"━━━━━━━━━━━━━━━━━━━━━\n\n"
+        f"<b>Total Signals Issued:</b> {total}\n\n"
+        f"✅ <b>Take Profit Hit:</b> {tp_hit}\n"
+        f"❌ <b>Stop Loss Hit:</b> {sl_hit}\n"
+        f"⏳ <b>Still Running:</b> {still_open}\n\n"
+        f"🎯 <b>Win Rate:</b> {win_rate}% "
+        f"({tp_hit}/{closed} closed signals)\n\n"
+        f"━━━━━━━━━━━━━━━━━━━━━\n\n"
+        f"<i>Trade safe 💼🔥</i>"
+    )
+
+    for channel_id in [CHANNEL_1_ID, CHANNEL_2_ID]:
+        try:
+            await context.bot.send_message(
+                chat_id=channel_id,
+                text=report,
+                parse_mode=ParseMode.HTML
+            )
+            print(f"[WEEKLY REPORT] ✅ Posted to {channel_id}")
+        except Exception as e:
+            print(f"[WEEKLY REPORT] ❌ Failed for {channel_id}: {e}")
 
 # ============================================
 # MAIN
@@ -2539,6 +2764,13 @@ def main():
             hour=h, minute=m, second=0, microsecond=0
         ).time()
 
+    # BTCUSD trades 24/7 so it runs every day. Every other scheduled
+    # pair (gold, forex) has its market closed Sat/Sun - posting then
+    # would use stale Friday-close prices, so those are restricted to
+    # weekdays only (0=Monday ... 6=Sunday).
+    WEEKDAYS_ONLY = (0, 1, 2, 3, 4)
+    EVERY_DAY = (0, 1, 2, 3, 4, 5, 6)
+
     for i, (utc_time, post_type, data) in enumerate(DAILY_SCHEDULE):
         if post_type == "news":
             job_queue.run_daily(
@@ -2548,18 +2780,39 @@ def main():
                 data=data
             )
         elif post_type == "signal":
+            days = EVERY_DAY if data == "btcusd" else WEEKDAYS_ONLY
             job_queue.run_daily(
                 post_auto_signal,
                 time=parse_time(utc_time),
                 name=f"signal_{i}_{data}",
-                data=data
+                data=data,
+                days=days
             )
+
+    # TP/SL monitor - checks every OPEN logged signal every 15 minutes
+    job_queue.run_repeating(
+        check_open_signals,
+        interval=900,
+        first=60,
+        name="tp_sl_monitor"
+    )
+
+    # Weekly performance report - every Sunday at 23:00 UTC
+    job_queue.run_daily(
+        post_weekly_report,
+        time=parse_time("23:00"),
+        name="weekly_report",
+        days=(6,)
+    )
 
     print("Nexora AI Running...")
     print("Daily schedule (UTC):")
     for utc_time, post_type, data in DAILY_SCHEDULE:
         emoji = "📰" if post_type == "news" else "📊"
-        print(f"  {emoji} {utc_time} UTC — {data.upper()}")
+        weekend_note = "" if data == "btcusd" else " (weekdays only)"
+        print(f"  {emoji} {utc_time} UTC — {data.upper()}{weekend_note}")
+    print("  🔁 TP/SL monitor — every 15 minutes")
+    print("  📊 23:00 UTC Sunday — WEEKLY REPORT")
     print(f"Channel 1 (Public): {CHANNEL_1_ID}")
     print(f"Channel 2 (Inner Circle): {CHANNEL_2_ID}")
     print(f"Verify Group: {VERIFY_GROUP_ID}")

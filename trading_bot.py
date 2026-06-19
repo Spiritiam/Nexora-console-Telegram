@@ -1396,7 +1396,10 @@ def parse_fundamental_response(text):
     try:
         for line in text.strip().split("\n"):
             if line.strip().upper().startswith("FUNDAMENTAL:"):
-                return line.split(":", 1)[1].strip()
+                value = line.split(":", 1)[1].strip()
+                if value.upper() == "NONE":
+                    return None
+                return value
         return None
     except Exception:
         return None
@@ -1426,25 +1429,34 @@ information below - do not invent any other news, data or events.
 {context_block}
 
 The technical analysis for {pair_name} already calls a {direction}.
-Write ONE sentence explaining how the fundamentals above relate to
-this {direction} call. If they support it, say so plainly. If they
-point the other way, frame it as a brief risk/caveat to be aware of -
-do NOT state a competing directional recommendation of your own.
+If the information above has a genuine, meaningful connection to
+{pair_name}, write ONE sentence explaining how it relates to this
+{direction} call. If they support it, say so plainly. If they point
+the other way, frame it as a brief risk/caveat to be aware of - do
+NOT state a competing directional recommendation of your own.
+
+If the information above has NO real connection to {pair_name} -
+respond with exactly: FUNDAMENTAL: NONE
+Do not force a connection that isn't genuinely there.
 
 Respond in EXACTLY this format, nothing else, no markdown:
-FUNDAMENTAL: [one sentence, max 18 words]
+FUNDAMENTAL: [one sentence, max 18 words] OR FUNDAMENTAL: NONE
 """
     else:
         prompt = f"""
 You are a forex/macro analyst. No specific real-time news or
 calendar data is available right now. The technical analysis for
-{pair_name} already calls a {direction}. Write ONE sentence giving
-general macro context relevant to this pair and direction, making
-clear it's a general pattern rather than a specific current event.
-Do not state a competing directional recommendation of your own.
+{pair_name} already calls a {direction}. If you can give genuinely
+useful general macro context relevant to this pair and direction,
+write ONE sentence, making clear it's a general pattern rather than
+a specific current event. Do not state a competing directional
+recommendation of your own.
+
+If you have nothing genuinely useful to add, respond with exactly:
+FUNDAMENTAL: NONE
 
 Respond in EXACTLY this format, nothing else, no markdown:
-FUNDAMENTAL: [one sentence, max 18 words]
+FUNDAMENTAL: [one sentence, max 18 words] OR FUNDAMENTAL: NONE
 """
 
     try:

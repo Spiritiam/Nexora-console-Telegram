@@ -1188,6 +1188,10 @@ def analyze_smc_structure(pair_key, config):
     timeframe_confirmation) built entirely from real detected
     factors, or None if there's no usable edge / no candle data -
     in which case the caller falls back to the old trend logic.
+    Reason and Timeframe Confirmation are always built to complement
+    each other - if the top H1 and H4 factors are the same detector
+    type, Reason surfaces the next-best H1 factor instead of
+    repeating the same detail in both fields.
     """
     h1_candles = get_cached_candles(pair_key, config, "1h", outputsize=60)
     h4_candles = get_cached_candles(pair_key, config, "4h", outputsize=60)
@@ -1218,15 +1222,7 @@ def analyze_smc_structure(pair_key, config):
 
     confidence = min(95, 76 + confluence_count * 4)
 
-    if matching_h1:
-        primary = max(matching_h1, key=lambda f: f["weight"])
-        reason = f"{primary['detail'].capitalize()} on H1."
-    elif matching_h4:
-        primary = max(matching_h4, key=lambda f: f["weight"])
-        reason = f"{primary['detail'].capitalize()} on H4."
-    else:
-        reason = "Multi-timeframe structure favors this direction."
-
+    # Build Timeframe Confirmation from the strongest H4 factor first
     if matching_h4:
         h4_primary = max(matching_h4, key=lambda f: f["weight"])
         timeframe_confirmation = f"H4 bias confirms: {h4_primary['detail']}"
@@ -1234,6 +1230,33 @@ def analyze_smc_structure(pair_key, config):
         timeframe_confirmation = (
             f"{confluence_count} confluent SMC factor(s) aligned on H1"
         )
+
+    # Build Reason from H1, but if the top H1 factor is the same
+    # detector type as the H4 primary, try to surface a different
+    # H1 factor so the two fields complement rather than repeat.
+    reason = None
+    if matching_h1:
+        h1_sorted = sorted(matching_h1, key=lambda f: f["weight"], reverse=True)
+        h4_primary_detail = (
+            h4_primary["detail"] if matching_h4 else ""
+        )
+        # Try to find an H1 factor whose detail differs from H4's primary
+        for candidate in h1_sorted:
+            if candidate["detail"] != h4_primary_detail:
+                reason = f"{candidate['detail'].capitalize()} on H1."
+                break
+        # All H1 factors match H4 primary — use the strongest but
+        # describe it at a more specific level rather than just repeating
+        if not reason:
+            primary = h1_sorted[0]
+            reason = (
+                f"{primary['detail'].capitalize()} confirmed on both "
+                f"H1 and H4, high-confluence setup."
+            )
+    elif matching_h4:
+        reason = f"{h4_primary['detail'].capitalize()} on H4."
+    else:
+        reason = "Multi-timeframe structure favors this direction."
 
     print(
         f"[SMC] {pair_key} -> {direction} | confluence={confluence_count} "

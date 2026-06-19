@@ -1188,10 +1188,16 @@ def analyze_smc_structure(pair_key, config):
     timeframe_confirmation) built entirely from real detected
     factors, or None if there's no usable edge / no candle data -
     in which case the caller falls back to the old trend logic.
-    Reason now folds in the H4 confirmation detail directly when it
-    differs from H1's (e.g. "X on H1, confirmed by Y on H4.") so a
-    single line carries both timeframes' information without a
-    separate Timeframe Confirmation row repeating part of it.
+    Reason surfaces up to 2 distinct genuine factors per timeframe
+    (capped to keep it readable) instead of always collapsing to
+    the single strongest one - a setup with multiple real
+    confluences reads as more specific, and naturally varies from
+    signal to signal based on whatever was actually detected, rather
+    than repeatedly boiling down to whichever single factor happens
+    to carry the highest weight. H4's detail(s) are folded directly
+    into the same sentence (e.g. "X and Y on H1, confirmed by Z on
+    H4.") so there's no separate Timeframe Confirmation row
+    repeating part of it.
     """
     h1_candles = get_cached_candles(pair_key, config, "1h", outputsize=60)
     h4_candles = get_cached_candles(pair_key, config, "4h", outputsize=60)
@@ -1222,13 +1228,19 @@ def analyze_smc_structure(pair_key, config):
 
     confidence = min(95, 76 + confluence_count * 4)
 
-    h4_primary = max(matching_h4, key=lambda f: f["weight"]) if matching_h4 else None
-    h4_detail = h4_primary["detail"] if h4_primary else None
+    # Up to 2 distinct H4 factor descriptions, strongest first
+    h4_sorted = sorted(matching_h4, key=lambda f: f["weight"], reverse=True)
+    h4_details = []
+    for f in h4_sorted:
+        if f["detail"] not in h4_details:
+            h4_details.append(f["detail"])
+        if len(h4_details) == 2:
+            break
 
     # Kept for internal logging/back-compat only - no longer shown
     # in the message itself (folded into reason below instead).
     timeframe_confirmation = (
-        f"H4 bias confirms: {h4_detail}" if h4_detail
+        f"H4 bias confirms: {h4_details[0]}" if h4_details
         else f"{confluence_count} confluent SMC factor(s) aligned on H1"
     )
 
@@ -1236,28 +1248,35 @@ def analyze_smc_structure(pair_key, config):
     if matching_h1:
         h1_sorted = sorted(matching_h1, key=lambda f: f["weight"], reverse=True)
 
-        # Find an H1 factor whose detail differs from H4's primary
-        distinct_h1 = None
-        for candidate in h1_sorted:
-            if candidate["detail"] != h4_detail:
-                distinct_h1 = candidate
+        # Up to 2 distinct H1 factors not already covered by H4
+        h1_details = []
+        for f in h1_sorted:
+            if f["detail"] in h4_details:
+                continue
+            if f["detail"] in h1_details:
+                continue
+            h1_details.append(f["detail"])
+            if len(h1_details) == 2:
                 break
 
-        if distinct_h1 and h4_detail:
-            reason = (
-                f"{distinct_h1['detail'].capitalize()} on H1, "
-                f"confirmed by {h4_detail} on H4."
-            )
-        elif distinct_h1:
-            reason = f"{distinct_h1['detail'].capitalize()} on H1."
+        if h1_details:
+            h1_text = " and ".join(h1_details)
+            if h4_details:
+                h4_text = " and ".join(h4_details)
+                reason = f"{h1_text.capitalize()} on H1, confirmed by {h4_text} on H4."
+            else:
+                reason = f"{h1_text.capitalize()} on H1."
         else:
+            # All H1 factors are also present on H4 — use the
+            # strongest shared one rather than just repeating it
             primary = h1_sorted[0]
             reason = (
                 f"{primary['detail'].capitalize()} confirmed on both "
                 f"H1 and H4, high-confluence setup."
             )
-    elif h4_primary:
-        reason = f"{h4_primary['detail'].capitalize()} on H4."
+    elif h4_details:
+        h4_text = " and ".join(h4_details)
+        reason = f"{h4_text.capitalize()} on H4."
     else:
         reason = "Multi-timeframe structure favors this direction."
 

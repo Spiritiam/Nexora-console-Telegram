@@ -1188,10 +1188,10 @@ def analyze_smc_structure(pair_key, config):
     timeframe_confirmation) built entirely from real detected
     factors, or None if there's no usable edge / no candle data -
     in which case the caller falls back to the old trend logic.
-    Reason and Timeframe Confirmation are always built to complement
-    each other - if the top H1 and H4 factors are the same detector
-    type, Reason surfaces the next-best H1 factor instead of
-    repeating the same detail in both fields.
+    Reason now folds in the H4 confirmation detail directly when it
+    differs from H1's (e.g. "X on H1, confirmed by Y on H4.") so a
+    single line carries both timeframes' information without a
+    separate Timeframe Confirmation row repeating part of it.
     """
     h1_candles = get_cached_candles(pair_key, config, "1h", outputsize=60)
     h4_candles = get_cached_candles(pair_key, config, "4h", outputsize=60)
@@ -1222,38 +1222,41 @@ def analyze_smc_structure(pair_key, config):
 
     confidence = min(95, 76 + confluence_count * 4)
 
-    # Build Timeframe Confirmation from the strongest H4 factor first
-    if matching_h4:
-        h4_primary = max(matching_h4, key=lambda f: f["weight"])
-        timeframe_confirmation = f"H4 bias confirms: {h4_primary['detail']}"
-    else:
-        timeframe_confirmation = (
-            f"{confluence_count} confluent SMC factor(s) aligned on H1"
-        )
+    h4_primary = max(matching_h4, key=lambda f: f["weight"]) if matching_h4 else None
+    h4_detail = h4_primary["detail"] if h4_primary else None
 
-    # Build Reason from H1, but if the top H1 factor is the same
-    # detector type as the H4 primary, try to surface a different
-    # H1 factor so the two fields complement rather than repeat.
+    # Kept for internal logging/back-compat only - no longer shown
+    # in the message itself (folded into reason below instead).
+    timeframe_confirmation = (
+        f"H4 bias confirms: {h4_detail}" if h4_detail
+        else f"{confluence_count} confluent SMC factor(s) aligned on H1"
+    )
+
     reason = None
     if matching_h1:
         h1_sorted = sorted(matching_h1, key=lambda f: f["weight"], reverse=True)
-        h4_primary_detail = (
-            h4_primary["detail"] if matching_h4 else ""
-        )
-        # Try to find an H1 factor whose detail differs from H4's primary
+
+        # Find an H1 factor whose detail differs from H4's primary
+        distinct_h1 = None
         for candidate in h1_sorted:
-            if candidate["detail"] != h4_primary_detail:
-                reason = f"{candidate['detail'].capitalize()} on H1."
+            if candidate["detail"] != h4_detail:
+                distinct_h1 = candidate
                 break
-        # All H1 factors match H4 primary — use the strongest but
-        # describe it at a more specific level rather than just repeating
-        if not reason:
+
+        if distinct_h1 and h4_detail:
+            reason = (
+                f"{distinct_h1['detail'].capitalize()} on H1, "
+                f"confirmed by {h4_detail} on H4."
+            )
+        elif distinct_h1:
+            reason = f"{distinct_h1['detail'].capitalize()} on H1."
+        else:
             primary = h1_sorted[0]
             reason = (
                 f"{primary['detail'].capitalize()} confirmed on both "
                 f"H1 and H4, high-confluence setup."
             )
-    elif matching_h4:
+    elif h4_primary:
         reason = f"{h4_primary['detail'].capitalize()} on H4."
     else:
         reason = "Multi-timeframe structure favors this direction."
@@ -1367,15 +1370,18 @@ def parse_ai_bias_response(text):
 
 # ============================================
 # AI FUNDAMENTAL CONTEXT LAYER (NEW)
-# Asks Gemini for its own honest, independent
-# fundamental/macro read on a pair - WITHOUT
-# telling it the technical direction, so it
-# can't just rubber-stamp whatever the SMC
-# engine already decided. build_signal_response
-# compares this against the technical call and
-# adds it as supporting context (or flags a
-# disagreement transparently); it never
-# overrides the technical direction itself.
+# Now told the technical direction up front and
+# asked to write ONE sentence explaining how
+# fundamentals relate to it - either supporting
+# it plainly, or framing a disagreement as a
+# brief risk caveat. It never states a competing
+# directional call, so the channel message can
+# show Technical Analysis and Fundamental
+# Analysis as two clearly labeled rows without
+# them ever reading as two votes pointing
+# opposite ways. Direction is still decided
+# 100% by the SMC engine - this layer only adds
+# context to it, never overrides it.
 # Grounded in real fetched news + real calendar
 # events (see get_cached_news_context /
 # get_relevant_calendar_events below) rather than
@@ -1386,7 +1392,16 @@ def parse_ai_bias_response(text):
 # real-time data, rather than failing outright.
 # ============================================
 
-async def generate_fundamental_context(pair_name):
+def parse_fundamental_response(text):
+    try:
+        for line in text.strip().split("\n"):
+            if line.strip().upper().startswith("FUNDAMENTAL:"):
+                return line.split(":", 1)[1].strip()
+        return None
+    except Exception:
+        return None
+
+async def generate_fundamental_context(pair_name, direction):
     article = get_cached_news_context()
     calendar_events = get_relevant_calendar_events(pair_name)
 
@@ -1410,35 +1425,36 @@ information below - do not invent any other news, data or events.
 
 {context_block}
 
-Based ONLY on the above, give your honest near-term directional lean
-for {pair_name}.
+The technical analysis for {pair_name} already calls a {direction}.
+Write ONE sentence explaining how the fundamentals above relate to
+this {direction} call. If they support it, say so plainly. If they
+point the other way, frame it as a brief risk/caveat to be aware of -
+do NOT state a competing directional recommendation of your own.
 
 Respond in EXACTLY this format, nothing else, no markdown:
-DIRECTION: BUY or SELL
-REASON: [one sentence, max 16 words, referencing the specific real factor above]
+FUNDAMENTAL: [one sentence, max 18 words]
 """
     else:
         prompt = f"""
 You are a forex/macro analyst. No specific real-time news or
-calendar data is available right now. Based on general, well-known
-macro relationships for {pair_name} (typical safe haven flows,
-interest rate differential effects, etc), give your best near-term
-directional lean, and make clear in your reasoning that it's a
-general pattern rather than a specific current event.
+calendar data is available right now. The technical analysis for
+{pair_name} already calls a {direction}. Write ONE sentence giving
+general macro context relevant to this pair and direction, making
+clear it's a general pattern rather than a specific current event.
+Do not state a competing directional recommendation of your own.
 
 Respond in EXACTLY this format, nothing else, no markdown:
-DIRECTION: BUY or SELL
-REASON: [one sentence, max 16 words]
+FUNDAMENTAL: [one sentence, max 18 words]
 """
 
     try:
         result = await ask_gemini_for_bias(prompt)
-        direction, reason = parse_ai_bias_response(result)
-        if direction and reason:
-            return direction, reason
+        fundamental_reason = parse_fundamental_response(result)
+        if fundamental_reason:
+            return fundamental_reason
     except Exception as e:
         print(f"[FUNDAMENTAL] Failed: {e}")
-    return None, None
+    return None
 
 # ============================================
 # RULE-BASED FALLBACK BIAS (NEW)
@@ -1538,37 +1554,20 @@ async def build_signal_response(question, user_id=None):
         )
         confidence = random.randint(80, 94)
 
-    if timeframe_confirmation is None:
-        timeframe_confirmation = random.choice([
-            "M15 bullish structure confirmation",
-            "H1 trend continuation active",
-            "H4 momentum alignment confirmed",
-            "Multi-timeframe confirmation detected",
-            "Liquidity sweep confirmation on M15",
-            "London session continuation setup",
-            "New York volatility expansion detected",
-        ])
-
     # AI fundamental layer (capped). Scheduled channel signals pass
     # user_id=None and are always allowed - negligible cost, only 3
     # cron slots/day. DM signals are capped by the exact same
     # per-user/global limits used elsewhere in this file, so the
     # shared Gemini quota stays protected at 100k users. AI NEVER
-    # overrides the technical direction - it only adds an honest,
-    # independently-generated fundamental sentence, and flags it
-    # transparently if it actually disagrees with the technical call.
+    # decides or contradicts the direction - it's told the technical
+    # call up front and only writes a supporting/caveat sentence for
+    # the separate Fundamental Analysis row below.
+    fundamental_reason = None
     if can_use_ai_bias(user_id):
-        ai_direction, ai_reason = await generate_fundamental_context(pair_name)
-        if ai_direction and ai_reason:
+        fundamental_reason = await generate_fundamental_context(pair_name, direction)
+        if fundamental_reason:
             record_ai_bias_usage(user_id)
             used_ai_layer = True
-            if ai_direction == direction:
-                reason = f"{reason} Fundamentally: {ai_reason}"
-            else:
-                reason = (
-                    f"{reason} (Note: fundamentals currently lean "
-                    f"{ai_direction.lower()} — {ai_reason})"
-                )
 
     strength = "STRONG"
 
@@ -1593,12 +1592,12 @@ async def build_signal_response(question, user_id=None):
         f"<b>SL:</b> {stop_loss} | <b>TP:</b> {take_profit}\n\n"
         f"<b>Confidence:</b> {confidence}%\n"
         f"<b>Session:</b> {session}\n\n"
-        f"<b>Timeframe Confirmation:</b>\n"
-        f"{timeframe_confirmation}\n\n"
         f"<b>Reason:</b>\n"
-        f"{reason}\n\n"
-        f"<i>Trade safe 💼🔥</i>"
+        f"<b>Technical Analysis:</b> {reason}\n\n"
     )
+    if fundamental_reason:
+        response += f"<b>Fundamental Analysis:</b> {fundamental_reason}\n\n"
+    response += f"<i>Trade safe 💼🔥</i>"
 
     signal_data = {
         "symbol": symbol,

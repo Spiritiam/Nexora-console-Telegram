@@ -1376,19 +1376,61 @@ def parse_ai_bias_response(text):
 # adds it as supporting context (or flags a
 # disagreement transparently); it never
 # overrides the technical direction itself.
+# Grounded in real fetched news + real calendar
+# events (see get_cached_news_context /
+# get_relevant_calendar_events below) rather than
+# letting Gemini invent "current" factors from
+# training-data patterns - if neither is
+# available right now, falls back to a generic
+# prompt that's explicit about not having
+# real-time data, rather than failing outright.
 # ============================================
 
 async def generate_fundamental_context(pair_name):
-    prompt = f"""
-You are a forex/macro analyst. Based on current fundamental and
-sentiment factors (interest rate policy, safe haven flows,
-geopolitical risk, recent central bank commentary, etc), give your
-honest near-term directional lean for {pair_name}.
+    article = get_cached_news_context()
+    calendar_events = get_relevant_calendar_events(pair_name)
+
+    context_lines = []
+    if article and article.get("title"):
+        context_lines.append(
+            f"Recent headline ({article.get('source', 'news')}): "
+            f"{article['title']}. {article.get('description', '')}"
+        )
+    if calendar_events:
+        context_lines.append(
+            "Today's high-impact calendar events: "
+            + "; ".join(calendar_events)
+        )
+
+    if context_lines:
+        context_block = "\n".join(context_lines)
+        prompt = f"""
+You are a forex/macro analyst. Base your answer ONLY on the real
+information below - do not invent any other news, data or events.
+
+{context_block}
+
+Based ONLY on the above, give your honest near-term directional lean
+for {pair_name}.
 
 Respond in EXACTLY this format, nothing else, no markdown:
 DIRECTION: BUY or SELL
-REASON: [one sentence, max 16 words, the specific fundamental factor]
+REASON: [one sentence, max 16 words, referencing the specific real factor above]
 """
+    else:
+        prompt = f"""
+You are a forex/macro analyst. No specific real-time news or
+calendar data is available right now. Based on general, well-known
+macro relationships for {pair_name} (typical safe haven flows,
+interest rate differential effects, etc), give your best near-term
+directional lean, and make clear in your reasoning that it's a
+general pattern rather than a specific current event.
+
+Respond in EXACTLY this format, nothing else, no markdown:
+DIRECTION: BUY or SELL
+REASON: [one sentence, max 16 words]
+"""
+
     try:
         result = await ask_gemini_for_bias(prompt)
         direction, reason = parse_ai_bias_response(result)
@@ -1797,6 +1839,88 @@ def fetch_economic_calendar():
     except Exception as e:
         print(f"[CALENDAR] Error: {e}")
         return None
+
+# ============================================
+# FUNDAMENTAL GROUNDING DATA (NEW)
+# Real news + real calendar data for the AI
+# fundamental layer to reason from, instead of
+# letting Gemini guess at "current" factors from
+# training-data patterns. Both cached globally
+# (same scaling pattern as price_cache/
+# candle_cache) so repeated signal requests don't
+# multiply calls to the news/calendar APIs -
+# cost stays flat regardless of user count.
+# ============================================
+
+NEWS_CONTEXT_CACHE_SECONDS = 1800  # 30 minutes
+news_context_cache = {"article": None, "timestamp": 0}
+
+def get_cached_news_context():
+    now = time.time()
+    if now - news_context_cache["timestamp"] < NEWS_CONTEXT_CACHE_SECONDS:
+        return news_context_cache["article"]
+    article = fetch_market_news()
+    news_context_cache["article"] = article
+    news_context_cache["timestamp"] = now
+    return article
+
+CALENDAR_CACHE_SECONDS = 3600  # 1 hour
+calendar_data_cache = {"data": None, "timestamp": 0}
+
+def get_cached_calendar_data():
+    now = time.time()
+    if (
+        calendar_data_cache["data"] is not None
+        and now - calendar_data_cache["timestamp"] < CALENDAR_CACHE_SECONDS
+    ):
+        return calendar_data_cache["data"]
+    try:
+        url = "https://nfs.faireconomy.media/ff_calendar_thisweek.json"
+        response = requests.get(url, timeout=10)
+        data = response.json()
+        calendar_data_cache["data"] = data
+        calendar_data_cache["timestamp"] = now
+        return data
+    except Exception as e:
+        print(f"[FUNDAMENTAL] Calendar fetch error: {e}")
+        return calendar_data_cache["data"] or []
+
+def get_relevant_calendar_events(pair_name, limit=2):
+    """
+    Plain-text, real high-impact calendar events today for whichever
+    of USD/EUR/GBP/JPY appear in this pair's name. Returns [] if
+    none found or no calendar data available.
+    """
+    try:
+        data = get_cached_calendar_data()
+        if not data:
+            return []
+
+        today_str = datetime.utcnow().strftime("%Y-%m-%d")
+        relevant_currencies = [
+            c for c in ["USD", "EUR", "GBP", "JPY"] if c in pair_name
+        ]
+        if not relevant_currencies:
+            return []
+
+        events = []
+        for event in data:
+            if event.get("date", "")[:10] != today_str:
+                continue
+            if event.get("impact", "").lower() != "high":
+                continue
+            currency = event.get("currency", "")
+            if currency not in relevant_currencies:
+                continue
+            title = event.get("title", "")
+            if title:
+                events.append(f"{currency}: {title}")
+            if len(events) >= limit:
+                break
+        return events
+    except Exception as e:
+        print(f"[FUNDAMENTAL] get_relevant_calendar_events error: {e}")
+        return []
 
 # ============================================
 # NEWS SUMMARY GENERATOR
@@ -2603,9 +2727,18 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
 # from daily caps).
 # ============================================
 
-async def post_auto_signal(context: ContextTypes.DEFAULT_TYPE):
+# ============================================
+# AUTO SIGNAL — Button on Channel 1 only.
+# Logs every posted signal to signal_log so the
+# TP/SL monitor and weekly report can track it.
+# Always uses AI bias (user_id=None exempts it
+# from daily caps). Core logic lives in
+# _post_signal_for_pair so the startup catch-up
+# routine below can reuse the exact same code
+# path instead of a second copy that could drift.
+# ============================================
 
-    pair_keyword = context.job.data
+async def _post_signal_for_pair(bot, pair_keyword):
     now = datetime.utcnow().strftime('%H:%M UTC')
 
     print(f"[AUTO SIGNAL] {pair_keyword.upper()} firing at {now}")
@@ -2631,7 +2764,7 @@ async def post_auto_signal(context: ContextTypes.DEFAULT_TYPE):
                 else None
             )
 
-            await context.bot.send_photo(
+            await bot.send_photo(
                 chat_id=channel_id,
                 photo=image_file_id,
                 caption=signal,
@@ -2647,6 +2780,110 @@ async def post_auto_signal(context: ContextTypes.DEFAULT_TYPE):
 
         except Exception as e:
             print(f"[AUTO SIGNAL] ❌ Failed for {channel_id}: {e}")
+
+async def post_auto_signal(context: ContextTypes.DEFAULT_TYPE):
+    pair_keyword = context.job.data
+    await _post_signal_for_pair(context.bot, pair_keyword)
+
+# ============================================
+# STARTUP CATCH-UP (NEW)
+# JobQueue schedules live only in memory and
+# fire only at their exact scheduled time - if
+# Railway restarts the bot near a scheduled slot
+# (e.g. a transient Telegram 502 forcing a
+# crash/restart right around 07:00 UTC), that
+# slot is silently lost for the day with no
+# retry. This runs once at startup: for each
+# signal slot whose time has already passed
+# today, checks signal_log (which only logs
+# official channel signals) to see if it was
+# actually posted - if not, posts it immediately.
+# Safe to run on every restart: if a slot already
+# posted normally, has_signal_posted_today returns
+# True and nothing happens, so a routine mid-day
+# deploy never causes a duplicate post.
+# ============================================
+
+def has_signal_posted_today(pair_name):
+    try:
+        today_str = datetime.utcnow().strftime("%Y-%m-%d")
+        url = (
+            f"{SUPABASE_URL}/rest/v1/signal_log"
+            f"?pair_name=eq.{pair_name}"
+            f"&posted_at=gte.{today_str}T00:00:00"
+            f"&select=id&limit=1"
+        )
+        response = requests.get(url, headers=sb_headers(), timeout=10)
+        data = response.json()
+        return len(data) > 0
+    except Exception as e:
+        print(f"[CATCHUP] has_signal_posted_today error: {e}")
+        return True  # fail safe — assume posted, never double-post on a DB hiccup
+
+def try_claim_catchup_lock(pair_name):
+    """
+    Atomically claims the right to post today's catch-up signal for
+    this pair. has_signal_posted_today alone can't fully prevent a
+    duplicate if two bot instances briefly overlap during a Railway
+    deploy - both could check it as "not posted yet" before either
+    one's signal_log row is actually written. This closes that gap:
+    it tries to insert a row into signal_catchup_lock, which has a
+    primary key on (pair_name, lock_date). Only the first instance's
+    insert succeeds; Supabase rejects the second with a 409 conflict,
+    so only one instance ever proceeds to post.
+    Requires a Supabase table: signal_catchup_lock with columns
+    pair_name (text), lock_date (text), claimed_at (text), and a
+    primary key on (pair_name, lock_date).
+    """
+    try:
+        today_str = datetime.utcnow().strftime("%Y-%m-%d")
+        url = f"{SUPABASE_URL}/rest/v1/signal_catchup_lock"
+        payload = {
+            "pair_name": pair_name,
+            "lock_date": today_str,
+            "claimed_at": datetime.utcnow().isoformat(),
+        }
+        response = requests.post(url, headers=sb_headers(), json=payload, timeout=10)
+        if response.status_code in (200, 201):
+            return True
+        if response.status_code == 409:
+            print(f"[CATCHUP] Lock already claimed for {pair_name} today — skipping")
+            return False
+        print(f"[CATCHUP] Unexpected lock response {response.status_code} for {pair_name}")
+        return False
+    except Exception as e:
+        print(f"[CATCHUP] try_claim_catchup_lock error: {e}")
+        return False  # fail safe — if the lock can't be confirmed, don't risk a duplicate
+
+async def catch_up_missed_signals(app):
+    now = datetime.utcnow()
+    today_weekday = now.weekday()
+
+    for utc_time, post_type, data in DAILY_SCHEDULE:
+        if post_type != "signal":
+            continue
+
+        if data != "btcusd" and today_weekday in (5, 6):
+            continue  # forex/gold market closed, this slot wasn't supposed to fire anyway
+
+        h, m = map(int, utc_time.split(":"))
+        scheduled_dt = now.replace(hour=h, minute=m, second=0, microsecond=0)
+
+        if now < scheduled_dt:
+            continue  # today's slot hasn't happened yet, nothing to catch up
+
+        pair_name = PAIR_CONFIG[data]["pair_name"]
+        if has_signal_posted_today(pair_name):
+            continue  # already posted today, nothing missed
+
+        if not try_claim_catchup_lock(pair_name):
+            continue  # another instance already claimed this catch-up
+
+        print(
+            f"[CATCHUP] {pair_name} missed its {utc_time} UTC slot "
+            f"today — posting now"
+        )
+        await _post_signal_for_pair(app.bot, data)
 
 # ============================================
 # TP/SL MONITOR (NEW)
@@ -2757,7 +2994,12 @@ async def post_weekly_report(context: ContextTypes.DEFAULT_TYPE):
 
 def main():
 
-    app = Application.builder().token(TELEGRAM_TOKEN).build()
+    app = (
+        Application.builder()
+        .token(TELEGRAM_TOKEN)
+        .post_init(catch_up_missed_signals)
+        .build()
+    )
 
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CallbackQueryHandler(handle_callback))

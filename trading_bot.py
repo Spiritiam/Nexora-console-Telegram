@@ -104,6 +104,16 @@ DAILY_SCHEDULE = [
     ("19:00", "signal", "btcusd"),    # 8:00 PM Lagos
 ]
 
+# Synthetic index channel posts (NEW) - rotates through all 5
+# indices, one post on weekdays, two on weekends (slot 0/1 picks a
+# different index for each of the two weekend posts on the same
+# day - see get_rotation_key below).
+SYNTHETIC_SCHEDULE = [
+    ("11:00", "weekday", 0),
+    ("11:00", "weekend", 0),
+    ("17:00", "weekend", 1),
+]
+
 # ============================================
 # AI CONFIG
 # UPDATED: gemini-2.0-flash was discontinued
@@ -585,10 +595,20 @@ def get_deriv_account(user_id):
 # ============================================
 
 SYNTHETIC_CONFIG = {
-    "r10": {"symbol": "R_10", "display": "Volatility 10 Index", "default_multiplier": 1000},
-    "r25": {"symbol": "R_25", "display": "Volatility 25 Index", "default_multiplier": 400},
-    "r50": {"symbol": "R_50", "display": "Volatility 50 Index", "default_multiplier": 200},
-    "r75": {"symbol": "R_75", "display": "Volatility 75 Index", "default_multiplier": 150},
+    # Multiplier 100 is doubly confirmed safe: tested directly on
+    # R_100 (real trade executed successfully), and present in R_75's
+    # confirmed valid set (50/100/200/300/500, returned directly by
+    # Deriv after a rejected guess). Standardizing all five on 100
+    # for now rather than leaving the old per-index guesses, which
+    # turned out unreliable - R_75's original guess of 150 wasn't
+    # even in the valid set. R_10/R_25/R_50 still haven't been
+    # individually tested, so their true max multiplier (possibly
+    # higher, since lower-volatility indices often allow more) is
+    # still unknown - worth testing each the same way R_75 just was.
+    "r10": {"symbol": "R_10", "display": "Volatility 10 Index", "default_multiplier": 100},
+    "r25": {"symbol": "R_25", "display": "Volatility 25 Index", "default_multiplier": 100},
+    "r50": {"symbol": "R_50", "display": "Volatility 50 Index", "default_multiplier": 100},
+    "r75": {"symbol": "R_75", "display": "Volatility 75 Index", "default_multiplier": 100},
     "r100": {"symbol": "R_100", "display": "Volatility 100 Index", "default_multiplier": 100},
 }
 
@@ -618,6 +638,28 @@ STAKE_TIERS = [
 ]
 
 pending_trades = {}  # user_id -> trade context dict, one pending trade at a time
+
+SYNTHETIC_ROTATION_ORDER = ["r10", "r25", "r50", "r75", "r100"]
+
+# index_key -> most recent channel-posted trade context. Channel
+# posts aren't generated for any one user (unlike DM signals), so
+# when ANY member taps "Trade This Signal" on a channel post, this
+# is copied into pending_trades for that specific tapper - each
+# tapper gets their own independent trade context from the same
+# underlying signal.
+channel_signal_context = {}
+
+def get_rotation_key(slot_number=0):
+    """
+    Deterministic day-of-year based rotation through the 5 indices -
+    stateless on purpose, so a Railway restart never causes a repeat
+    or a skipped index. slot_number lets the two weekend posts (same
+    day, different times) land on two different indices instead of
+    the same one twice.
+    """
+    day_of_year = datetime.utcnow().timetuple().tm_yday
+    idx = (day_of_year + slot_number) % len(SYNTHETIC_ROTATION_ORDER)
+    return SYNTHETIC_ROTATION_ORDER[idx]
 
 def match_synthetic_key(question):
     """
@@ -782,10 +824,10 @@ async def analyze_synthetic_structure(index_key, config):
 
 async def build_synthetic_signal_response(index_key):
     """
-    Builds the signal message and the trade context that gets
-    stored for if/when the user taps "Trade This Signal". Returns
-    (message_html, trade_context) or None if no signal could be
-    generated.
+    Builds the signal message, image, and the trade context that
+    gets stored for if/when the user taps "Trade This Signal".
+    Returns (image_file_id, message_html, trade_context), or None
+    if no signal could be generated.
     """
     config = SYNTHETIC_CONFIG.get(index_key)
     if not config:
@@ -797,7 +839,13 @@ async def build_synthetic_signal_response(index_key):
 
     direction, confidence, reason = result
     contract_type = "MULTUP" if direction == "BUY" else "MULTDOWN"
-    emoji = "🟢" if direction == "BUY" else "🔴"
+
+    if direction == "BUY":
+        emoji = "🟢"
+        image_file_id = BUY_IMAGE_FILE_ID
+    else:
+        emoji = "🔴"
+        image_file_id = SELL_IMAGE_FILE_ID
 
     message = (
         f"{emoji} <b>STRONG {direction} {config['display']}</b> ⚡\n\n"
@@ -821,7 +869,63 @@ async def build_synthetic_signal_response(index_key):
         "win": DEFAULT_WIN,
     }
 
-    return message, trade_context
+    return image_file_id, message, trade_context
+
+async def send_tier_selection(bot, user_id, trade_context):
+    """
+    Shows the stake-tier buttons for a pending trade already stored
+    in pending_trades for this user. Shared by both the DM signal
+    flow (synthtrade_/edittrade_) and the channel-tap flow
+    (chantrade_), so this exists in exactly one place.
+    """
+    account = get_deriv_account(user_id)
+    if not account:
+        await bot.send_message(
+            chat_id=int(user_id),
+            text=(
+                "⚠️ <b>No linked Deriv account found.</b>\n\n"
+                "Tap 🔗 Connect Deriv first to link your real account "
+                "before trading."
+            ),
+            parse_mode=ParseMode.HTML
+        )
+        return
+
+    tier_buttons = [
+        [InlineKeyboardButton(
+            f"${t['stake']} | Risk ${t['risk']} → Win ${t['win']}",
+            callback_data=f"tier_{user_id}_{t['stake']}"
+        )]
+        for t in STAKE_TIERS
+    ]
+    tier_buttons.append([InlineKeyboardButton(
+        "✏️ Custom Amount", callback_data=f"customtier_{user_id}"
+    )])
+
+    await bot.send_message(
+        chat_id=int(user_id),
+        text=(
+            f"🎯 <b>{trade_context['direction']} {trade_context['display']}</b>\n\n"
+            f"Choose a stake, or enter a custom amount:"
+        ),
+        parse_mode=ParseMode.HTML,
+        reply_markup=InlineKeyboardMarkup(tier_buttons)
+    )
+
+def friendly_trade_error(raw_error):
+    """
+    Translates a raw Deriv API error into plain English for display
+    to the end user - retail/beginner audience, so raw API jargon
+    like "Multiplier is not in acceptable range" should never reach
+    them directly. The raw error is always still logged in full by
+    the caller for diagnosis - this only changes what gets shown.
+    """
+    lowered = raw_error.lower()
+    if "multiplier" in lowered:
+        return "This stake amount isn't supported for this index right now. Try a different stake, or use 🎯 Trade This Signal again."
+    if "insufficient" in lowered or "not enough" in lowered or "balance" in lowered:
+        return "Your account balance is too low for this stake. Try a smaller amount, or top up your Deriv account."
+    return "We couldn't place this trade right now. Try again in a moment, or try a different stake."
 
 async def deriv_execute_multiplier_trade(token, symbol, contract_type, multiplier, stake, risk, win):
     """
@@ -3005,15 +3109,18 @@ async def handle_buttons(update: Update, context: ContextTypes.DEFAULT_TYPE):
             "Nexora can show your real Deriv <b>Options account</b> "
             "balance and open positions right here in Telegram. "
             "(MT5 and cTrader accounts aren't supported yet.)\n\n"
+            "Don't have a Deriv account yet? "
+            "<a href=\"https://track.deriv.com/_eBizfEiAKzC6tyDIijdDK2Nd7ZgqdRLk/1/\">"
+            "Sign up here first</a>, then come back to this step.\n\n"
             "<b>How to connect:</b>\n"
             "1️⃣ Go to <b>developers.deriv.com</b> and log in\n"
             "2️⃣ Tap the menu (☰) in the top right, then tap "
             "<b>API tokens</b>\n"
-            "3️⃣ Tap <b>Create new token</b>, with the <b>Read</b> and "
-            "<b>Trading information</b> scopes only\n"
+            "3️⃣ Tap <b>Create new token</b>, and check <b>Trade</b> and "
+            "<b>Account management</b>\n"
             "4️⃣ Copy the token and paste it here\n\n"
             "⚠️ <b>Real accounts only</b> — demo/virtual tokens will be "
-            "rejected. Never select the Trade or Payments scopes for this.",
+            "rejected.",
             parse_mode=ParseMode.HTML,
             reply_markup=main_keyboard
         )
@@ -3192,39 +3299,35 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             )
             return
 
-        account = get_deriv_account(user_id)
-        if not account:
-            await context.bot.send_message(
-                chat_id=int(user_id),
-                text=(
-                    "⚠️ <b>No linked Deriv account found.</b>\n\n"
-                    "Tap 🔗 Connect Deriv first to link your real account "
-                    "before trading."
-                ),
-                parse_mode=ParseMode.HTML
-            )
+        await send_tier_selection(context.bot, user_id, trade_context)
+
+    elif data.startswith("chantrade_"):
+
+        index_key = data.replace("chantrade_", "")
+        tapping_user_id = str(query.from_user.id)
+
+        shared_context = channel_signal_context.get(index_key)
+        if not shared_context:
+            try:
+                await context.bot.send_message(
+                    chat_id=int(tapping_user_id),
+                    text=(
+                        "⚠️ <b>This signal has expired.</b>\n\n"
+                        "Request a fresh one by typing the index name "
+                        "(e.g. R_100) in Signal mode."
+                    ),
+                    parse_mode=ParseMode.HTML
+                )
+            except Exception as e:
+                print(f"[SYNTH] Couldn't notify {tapping_user_id} (likely hasn't started the bot in DM): {e}")
             return
 
-        tier_buttons = [
-            [InlineKeyboardButton(
-                f"${t['stake']} | Risk ${t['risk']} → Win ${t['win']}",
-                callback_data=f"tier_{user_id}_{t['stake']}"
-            )]
-            for t in STAKE_TIERS
-        ]
-        tier_buttons.append([InlineKeyboardButton(
-            "✏️ Custom Amount", callback_data=f"customtier_{user_id}"
-        )])
+        pending_trades[tapping_user_id] = dict(shared_context)  # copy - each tapper gets their own independent trade
 
-        await context.bot.send_message(
-            chat_id=int(user_id),
-            text=(
-                f"🎯 <b>{trade_context['direction']} {trade_context['display']}</b>\n\n"
-                f"Choose a stake, or enter a custom amount:"
-            ),
-            parse_mode=ParseMode.HTML,
-            reply_markup=InlineKeyboardMarkup(tier_buttons)
-        )
+        try:
+            await send_tier_selection(context.bot, tapping_user_id, pending_trades[tapping_user_id])
+        except Exception as e:
+            print(f"[SYNTH] Couldn't message {tapping_user_id} (likely hasn't started the bot in DM): {e}")
 
     elif data.startswith("tier_"):
 
@@ -3328,7 +3431,29 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
         wait_message = await context.bot.send_message(
             chat_id=int(user_id),
-            text="⏳ <b>Placing your trade...</b>",
+            text="⏳ <b>Checking your balance...</b>",
+            parse_mode=ParseMode.HTML
+        )
+
+        snapshot = await deriv_fetch_account_snapshot(account["api_token"])
+        if snapshot and snapshot.get("balance") is not None:
+            if snapshot["balance"] < trade_context["stake"]:
+                await wait_message.delete()
+                await context.bot.send_message(
+                    chat_id=int(user_id),
+                    text=(
+                        f"⚠️ <b>Not enough balance for this stake.</b>\n\n"
+                        f"Your balance: ${snapshot['balance']} | "
+                        f"Stake needed: ${trade_context['stake']}\n\n"
+                        f"Try a smaller amount, or top up your Deriv account."
+                    ),
+                    parse_mode=ParseMode.HTML,
+                    reply_markup=main_keyboard
+                )
+                return
+
+        await wait_message.edit_text(
+            "⏳ <b>Placing your trade...</b>",
             parse_mode=ParseMode.HTML
         )
 
@@ -3347,7 +3472,7 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if error:
             await context.bot.send_message(
                 chat_id=int(user_id),
-                text=f"❌ <b>Trade not placed.</b>\n\n{error}",
+                text=f"❌ <b>Trade not placed.</b>\n\n{friendly_trade_error(error)}",
                 parse_mode=ParseMode.HTML,
                 reply_markup=main_keyboard
             )
@@ -3451,7 +3576,7 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await update.message.reply_text(
                 "❌ <b>That token didn't work.</b>\n\n"
                 "Double-check you copied the full token and that it has "
-                "the <b>Read</b> and <b>Trading information</b> scopes "
+                "the <b>Trade</b> and <b>Account management</b> scopes "
                 "enabled, then paste it again.",
                 parse_mode=ParseMode.HTML,
                 reply_markup=main_keyboard
@@ -3580,11 +3705,12 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 )
                 return
 
-            signal_message, trade_context = result
+            signal_image_id, signal_message, trade_context = result
             pending_trades[user_id] = trade_context
 
-            await update.message.reply_text(
-                signal_message,
+            await update.message.reply_photo(
+                photo=signal_image_id,
+                caption=signal_message,
                 parse_mode=ParseMode.HTML,
                 reply_markup=InlineKeyboardMarkup([
                     [InlineKeyboardButton(
@@ -3788,6 +3914,51 @@ async def _post_signal_for_pair(bot, pair_keyword):
 async def post_auto_signal(context: ContextTypes.DEFAULT_TYPE):
     pair_keyword = context.job.data
     await _post_signal_for_pair(context.bot, pair_keyword)
+
+# ============================================
+# SYNTHETIC INDEX CHANNEL POSTING (NEW)
+# Mirrors _post_signal_for_pair above, but posts
+# a plain text message (no chart image exists for
+# synthetics) with a chantrade_ button instead of
+# a per-user synthtrade_ one, since this signal
+# isn't generated on behalf of any single person -
+# whoever taps it gets their own independent trade
+# context, copied fresh from channel_signal_context.
+# ============================================
+
+async def _post_synthetic_signal_for_index(bot, index_key):
+    print(f"[AUTO SYNTH] {index_key.upper()} firing")
+
+    result = await build_synthetic_signal_response(index_key)
+    if not result:
+        print(f"[AUTO SYNTH] ❌ No signal generated for {index_key}, skipping post")
+        return
+
+    signal_image_id, signal_message, trade_context = result
+    channel_signal_context[index_key] = trade_context
+
+    for channel_id in [CHANNEL_1_ID, CHANNEL_2_ID]:
+        try:
+            await bot.send_photo(
+                chat_id=channel_id,
+                photo=signal_image_id,
+                caption=signal_message,
+                parse_mode=ParseMode.HTML,
+                reply_markup=InlineKeyboardMarkup([[
+                    InlineKeyboardButton(
+                        "🎯 Trade This Signal",
+                        callback_data=f"chantrade_{index_key}"
+                    )
+                ]])
+            )
+            print(f"[AUTO SYNTH] ✅ {index_key.upper()} posted to {channel_id}")
+        except Exception as e:
+            print(f"[AUTO SYNTH] ❌ Failed for {channel_id}: {e}")
+
+async def post_auto_synthetic_signal(context: ContextTypes.DEFAULT_TYPE):
+    slot_number = context.job.data
+    index_key = get_rotation_key(slot_number)
+    await _post_synthetic_signal_for_index(context.bot, index_key)
 
 # ============================================
 # STARTUP CATCH-UP (NEW)
@@ -4057,6 +4228,18 @@ def main():
                 days=days
             )
 
+    WEEKEND_ONLY = (5, 6)
+
+    for i, (utc_time, schedule_type, slot_number) in enumerate(SYNTHETIC_SCHEDULE):
+        days = WEEKDAYS_ONLY if schedule_type == "weekday" else WEEKEND_ONLY
+        job_queue.run_daily(
+            post_auto_synthetic_signal,
+            time=parse_time(utc_time),
+            name=f"synth_{i}_{schedule_type}_{slot_number}",
+            data=slot_number,
+            days=days
+        )
+
     # TP/SL monitor - checks every OPEN logged signal every 15 minutes
     job_queue.run_repeating(
         check_open_signals,
@@ -4079,6 +4262,9 @@ def main():
         emoji = "📰" if post_type == "news" else "📊"
         weekend_note = "" if data == "btcusd" else " (weekdays only)"
         print(f"  {emoji} {utc_time} UTC — {data.upper()}{weekend_note}")
+    for utc_time, schedule_type, slot_number in SYNTHETIC_SCHEDULE:
+        note = "weekdays only" if schedule_type == "weekday" else "weekends only"
+        print(f"  ⚡ {utc_time} UTC — SYNTHETIC ROTATION ({note}, slot {slot_number})")
     print("  🔁 TP/SL monitor — every 15 minutes")
     print("  📊 23:00 UTC Sunday — WEEKLY REPORT")
     print(f"Channel 1 (Public): {CHANNEL_1_ID}")

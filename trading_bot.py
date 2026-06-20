@@ -593,11 +593,11 @@ SYNTHETIC_CONFIG = {
 }
 
 SYNTHETIC_ALIASES = {
-    "r10": ["r10", "r_10", "volatility 10", "vol 10", "v10"],
-    "r25": ["r25", "r_25", "volatility 25", "vol 25", "v25"],
-    "r50": ["r50", "r_50", "volatility 50", "vol 50", "v50"],
-    "r75": ["r75", "r_75", "volatility 75", "vol 75", "v75"],
-    "r100": ["r100", "r_100", "volatility 100", "vol 100", "v100"],
+    "r10": ["r10", "r_10", "r 10", "volatility 10", "volatility10", "vol 10", "vol10", "v10"],
+    "r25": ["r25", "r_25", "r 25", "volatility 25", "volatility25", "vol 25", "vol25", "v25"],
+    "r50": ["r50", "r_50", "r 50", "volatility 50", "volatility50", "vol 50", "vol50", "v50"],
+    "r75": ["r75", "r_75", "r 75", "volatility 75", "volatility75", "vol 75", "vol75", "v75"],
+    "r100": ["r100", "r_100", "r 100", "volatility 100", "volatility100", "vol 100", "vol100", "v100"],
 }
 
 DEFAULT_SYNTHETIC_STAKE = 10
@@ -607,10 +607,17 @@ DEFAULT_WIN = 6
 pending_trades = {}  # user_id -> trade context dict, one pending trade at a time
 
 def match_synthetic_key(question):
+    """
+    Word-boundary matching, not plain substring - "r10" is a literal
+    substring of "r100" (r-1-0-0 contains r-1-0), so a naive `in`
+    check would silently match Volatility 10 when someone types
+    R100 without the underscore. \\b ensures each alias only matches
+    as a whole token, never embedded inside a longer one.
+    """
     q = question.lower()
     for key, aliases in SYNTHETIC_ALIASES.items():
         for alias in aliases:
-            if alias in q:
+            if re.search(r"\b" + re.escape(alias) + r"\b", q):
                 return key
     return None
 

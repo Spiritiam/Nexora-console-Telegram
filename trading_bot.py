@@ -45,6 +45,7 @@ METALS_API_KEY = os.getenv("METALS_API_KEY")
 API_NINJAS_KEY = os.getenv("API_NINJAS_KEY")
 DERIV_APP_ID = os.getenv("DERIV_APP_ID")
 DERIV_SERVICE_TOKEN = os.getenv("DERIV_SERVICE_TOKEN")
+ADMIN_USER_ID = os.getenv("ADMIN_USER_ID")  # restricts /broadcast to this Telegram user ID only
 
 # ============================================
 # METAAPI CONFIG
@@ -3961,6 +3962,113 @@ async def post_auto_synthetic_signal(context: ContextTypes.DEFAULT_TYPE):
     await _post_synthetic_signal_for_index(context.bot, index_key)
 
 # ============================================
+# BROADCAST (NEW)
+# Telegram's reply keyboard (the row of buttons
+# at the bottom) only refreshes on a person's
+# screen when a NEW message arrives carrying the
+# updated layout - anyone who hasn't gotten a
+# fresh message since a button was added is still
+# looking at their old keyboard. /broadcast solves
+# both at once: announces something AND refreshes
+# every recipient's keyboard, since main_keyboard
+# is attached to the same message.
+# Runs as a background task (not awaited directly
+# in the command handler) so a multi-minute send
+# to thousands of users never blocks the bot from
+# handling everyone else's messages in the meantime.
+# ============================================
+
+async def get_all_known_user_ids():
+    """
+    Unions every user_id from trial_users and verified_users -
+    together these cover everyone who's ever interacted with the
+    bot, which is the full broadcast audience.
+    """
+    user_ids = set()
+    try:
+        url = f"{SUPABASE_URL}/rest/v1/trial_users?select=user_id"
+        response = requests.get(url, headers=sb_headers(), timeout=15)
+        for row in response.json():
+            user_ids.add(str(row["user_id"]))
+    except Exception as e:
+        print(f"[BROADCAST] Failed to fetch trial_users: {e}")
+
+    try:
+        url = f"{SUPABASE_URL}/rest/v1/verified_users?select=user_id"
+        response = requests.get(url, headers=sb_headers(), timeout=15)
+        for row in response.json():
+            user_ids.add(str(row["user_id"]))
+    except Exception as e:
+        print(f"[BROADCAST] Failed to fetch verified_users: {e}")
+
+    return user_ids
+
+async def _run_broadcast(bot, message_text, admin_chat_id):
+    user_ids = await get_all_known_user_ids()
+    total = len(user_ids)
+    print(f"[BROADCAST] Starting send to {total} users")
+
+    sent = 0
+    failed = 0
+
+    for uid in user_ids:
+        try:
+            await bot.send_message(
+                chat_id=int(uid),
+                text=message_text,
+                parse_mode=ParseMode.HTML,
+                reply_markup=main_keyboard
+            )
+            sent += 1
+        except Exception as e:
+            failed += 1
+            print(f"[BROADCAST] Failed for {uid}: {e}")
+
+        await asyncio.sleep(0.05)  # ~20/sec, safely under Telegram's ~30/sec global limit
+
+    print(f"[BROADCAST] Done — sent {sent}, failed {failed}")
+    try:
+        await bot.send_message(
+            chat_id=admin_chat_id,
+            text=(
+                f"✅ <b>Broadcast complete.</b>\n\n"
+                f"Sent: {sent}\n"
+                f"Failed: {failed} (likely blocked the bot or deleted "
+                f"their account)"
+            ),
+            parse_mode=ParseMode.HTML
+        )
+    except Exception as e:
+        print(f"[BROADCAST] Couldn't report completion to admin: {e}")
+
+async def broadcast_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = str(update.message.from_user.id)
+
+    if not ADMIN_USER_ID or user_id != str(ADMIN_USER_ID):
+        return  # silently ignore - don't reveal this command to anyone else
+
+    message_text = update.message.text.replace("/broadcast", "", 1).strip()
+    if not message_text:
+        await update.message.reply_text(
+            "Usage: /broadcast <message>\n\n"
+            "Sends to every known user, with the current keyboard "
+            "attached so everyone's buttons refresh too. HTML "
+            "formatting tags (<b>, <i>, etc.) are supported."
+        )
+        return
+
+    user_count = len(await get_all_known_user_ids())
+    await update.message.reply_text(
+        f"📡 <b>Broadcasting to {user_count} users in the background...</b>\n"
+        f"I'll message you here when it's done.",
+        parse_mode=ParseMode.HTML
+    )
+
+    asyncio.create_task(
+        _run_broadcast(context.bot, message_text, update.message.chat_id)
+    )
+
+# ============================================
 # STARTUP CATCH-UP (NEW)
 # JobQueue schedules live only in memory and
 # fire only at their exact scheduled time - if
@@ -4177,6 +4285,7 @@ def main():
     )
 
     app.add_handler(CommandHandler("start", start))
+    app.add_handler(CommandHandler("broadcast", broadcast_command))
     app.add_handler(CallbackQueryHandler(handle_callback))
 
     app.add_handler(

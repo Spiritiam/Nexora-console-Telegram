@@ -872,6 +872,39 @@ async def build_synthetic_signal_response(index_key):
 
     return image_file_id, message, trade_context
 
+async def send_connect_instructions(bot, user_id):
+    """
+    Shared connect-account instructions (affiliate link included) -
+    used by both the Connect Deriv button (handle_buttons) and the
+    Trade This Signal flow (send_tier_selection) when no account is
+    linked yet, so a brand-new user goes straight from intent to
+    sign-up to linking without needing to find a separate button.
+    """
+    user_modes[user_id] = "awaiting_deriv_token"
+    await bot.send_message(
+        chat_id=int(user_id),
+        text=(
+            "🔗 <b>Connect Your Deriv Account</b>\n\n"
+            "Nexora can show your real Deriv <b>Options account</b> "
+            "balance and open positions right here in Telegram. "
+            "(MT5 and cTrader accounts aren't supported yet.)\n\n"
+            "Don't have a Deriv account yet? "
+            "<a href=\"https://track.deriv.com/_eBizfEiAKzC6tyDIijdDK2Nd7ZgqdRLk/1/\">"
+            "Sign up here first</a>, then come back to this step.\n\n"
+            "<b>How to connect:</b>\n"
+            "1️⃣ Go to <b>developers.deriv.com</b> and log in\n"
+            "2️⃣ Tap the menu (☰) in the top right, then tap "
+            "<b>API tokens</b>\n"
+            "3️⃣ Tap <b>Create new token</b>, and check <b>Trade</b> and "
+            "<b>Account management</b>\n"
+            "4️⃣ Copy the token and paste it here\n\n"
+            "⚠️ <b>Real accounts only</b> — demo/virtual tokens will be "
+            "rejected."
+        ),
+        parse_mode=ParseMode.HTML,
+        reply_markup=main_keyboard
+    )
+
 async def send_tier_selection(bot, user_id, trade_context):
     """
     Shows the stake-tier buttons for a pending trade already stored
@@ -881,15 +914,7 @@ async def send_tier_selection(bot, user_id, trade_context):
     """
     account = get_deriv_account(user_id)
     if not account:
-        await bot.send_message(
-            chat_id=int(user_id),
-            text=(
-                "⚠️ <b>No linked Deriv account found.</b>\n\n"
-                "Tap 🔗 Connect Deriv first to link your real account "
-                "before trading."
-            ),
-            parse_mode=ParseMode.HTML
-        )
+        await send_connect_instructions(bot, user_id)
         return
 
     tier_buttons = [
@@ -3026,6 +3051,44 @@ async def handle_buttons(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = str(update.message.from_user.id)
     text = update.message.text.lower()
 
+    # Connect Deriv is checked before the trial gate on purpose -
+    # linking a Deriv account costs nothing and has nothing to do
+    # with the Exness-trial-limited forex signals, so it should
+    # never be blocked by that wall.
+    if "deriv" in text:
+        existing = get_deriv_account(user_id)
+        if existing:
+            await update.message.reply_text(
+                "🔄 <b>Checking your linked Deriv account...</b>",
+                parse_mode=ParseMode.HTML
+            )
+            snapshot = await deriv_fetch_account_snapshot(existing["api_token"])
+            if snapshot:
+                open_count = len(snapshot["open_contracts"])
+                await update.message.reply_text(
+                    f"🔗 <b>Linked Deriv Options Account</b>\n\n"
+                    f"<b>Account:</b> {snapshot['loginid']}\n"
+                    f"<b>Balance:</b> {snapshot['balance']} {snapshot['currency']}\n"
+                    f"<b>Open Positions:</b> {open_count}\n\n"
+                    f"ℹ️ <i>This shows your Options account only. Your MT5 "
+                    f"and cTrader balances aren't connected yet.</i>",
+                    parse_mode=ParseMode.HTML,
+                    reply_markup=main_keyboard
+                )
+            else:
+                await update.message.reply_text(
+                    "⚠️ <b>Couldn't reach your linked Deriv account.</b>\n\n"
+                    "Your saved token may have expired or been revoked. "
+                    "Paste a new real-account API token below to relink.",
+                    parse_mode=ParseMode.HTML,
+                    reply_markup=main_keyboard
+                )
+            user_modes[user_id] = "awaiting_deriv_token"
+            return
+
+        await send_connect_instructions(context.bot, user_id)
+        return
+
     if not is_verified(user_id) and get_trial_count(user_id) >= FREE_TRIAL_LIMIT:
         user_modes[user_id] = "awaiting_email"
         await send_verification_gate(update)
@@ -3068,60 +3131,6 @@ async def handle_buttons(update: Update, context: ContextTypes.DEFAULT_TYPE):
             "• BTCUSD outlook\n"
             "• GBPJPY market analysis\n"
             "• What is happening with oil today?",
-            parse_mode=ParseMode.HTML,
-            reply_markup=main_keyboard
-        )
-        return
-
-    if "deriv" in text:
-        existing = get_deriv_account(user_id)
-        if existing:
-            await update.message.reply_text(
-                "🔄 <b>Checking your linked Deriv account...</b>",
-                parse_mode=ParseMode.HTML
-            )
-            snapshot = await deriv_fetch_account_snapshot(existing["api_token"])
-            if snapshot:
-                open_count = len(snapshot["open_contracts"])
-                await update.message.reply_text(
-                    f"🔗 <b>Linked Deriv Options Account</b>\n\n"
-                    f"<b>Account:</b> {snapshot['loginid']}\n"
-                    f"<b>Balance:</b> {snapshot['balance']} {snapshot['currency']}\n"
-                    f"<b>Open Positions:</b> {open_count}\n\n"
-                    f"ℹ️ <i>This shows your Options account only. Your MT5 "
-                    f"and cTrader balances aren't connected yet.</i>",
-                    parse_mode=ParseMode.HTML,
-                    reply_markup=main_keyboard
-                )
-            else:
-                await update.message.reply_text(
-                    "⚠️ <b>Couldn't reach your linked Deriv account.</b>\n\n"
-                    "Your saved token may have expired or been revoked. "
-                    "Paste a new real-account API token below to relink.",
-                    parse_mode=ParseMode.HTML,
-                    reply_markup=main_keyboard
-                )
-            user_modes[user_id] = "awaiting_deriv_token"
-            return
-
-        user_modes[user_id] = "awaiting_deriv_token"
-        await update.message.reply_text(
-            "🔗 <b>Connect Your Deriv Account</b>\n\n"
-            "Nexora can show your real Deriv <b>Options account</b> "
-            "balance and open positions right here in Telegram. "
-            "(MT5 and cTrader accounts aren't supported yet.)\n\n"
-            "Don't have a Deriv account yet? "
-            "<a href=\"https://track.deriv.com/_eBizfEiAKzC6tyDIijdDK2Nd7ZgqdRLk/1/\">"
-            "Sign up here first</a>, then come back to this step.\n\n"
-            "<b>How to connect:</b>\n"
-            "1️⃣ Go to <b>developers.deriv.com</b> and log in\n"
-            "2️⃣ Tap the menu (☰) in the top right, then tap "
-            "<b>API tokens</b>\n"
-            "3️⃣ Tap <b>Create new token</b>, and check <b>Trade</b> and "
-            "<b>Account management</b>\n"
-            "4️⃣ Copy the token and paste it here\n\n"
-            "⚠️ <b>Real accounts only</b> — demo/virtual tokens will be "
-            "rejected.",
             parse_mode=ParseMode.HTML,
             reply_markup=main_keyboard
         )
@@ -3618,11 +3627,24 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
             f"<b>Balance:</b> {snapshot['balance']} {snapshot['currency']}\n"
             f"<b>Open Positions:</b> {open_count}\n\n"
             f"ℹ️ <i>This is your Options account specifically. MT5 and "
-            f"cTrader balances aren't connected yet.</i>\n\n"
-            f"<i>Tap 🔗 Connect Deriv anytime to check your balance again.</i>",
+            f"cTrader balances aren't connected yet.</i>",
             parse_mode=ParseMode.HTML,
             reply_markup=main_keyboard
         )
+
+        # Arrived here via Trade This Signal (no account was linked
+        # yet) - resume straight into stake selection instead of
+        # stopping at the link confirmation, so the whole signal ->
+        # connect -> trade flow stays one continuous motion.
+        pending_trade = pending_trades.get(user_id)
+        if pending_trade:
+            await send_tier_selection(context.bot, user_id, pending_trade)
+        else:
+            await update.message.reply_text(
+                "<i>Tap 🔗 Connect Deriv anytime to check your balance "
+                "again.</i>",
+                parse_mode=ParseMode.HTML
+            )
         return
 
     if user_modes.get(user_id) == "awaiting_trade_confirm":
@@ -3677,15 +3699,14 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         return
 
-    if not is_verified(user_id) and get_trial_count(user_id) >= FREE_TRIAL_LIMIT:
-        user_modes[user_id] = "awaiting_email"
-        await send_verification_gate(update)
-        return
-
     mode = user_modes.get(user_id)
 
+    # Synthetic (Deriv) signal requests bypass the Exness trial gate
+    # entirely - same reasoning as the Connect Deriv fix above, that
+    # gate exists specifically to push forex-signal users toward
+    # Exness registration and has nothing to do with Deriv. Forex
+    # pairs and Breakdown mode remain gated normally below.
     if mode == "signal":
-
         synthetic_key = match_synthetic_key(message)
         if synthetic_key:
             wait_message = await update.message.reply_text(
@@ -3721,6 +3742,13 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 ])
             )
             return
+
+    if not is_verified(user_id) and get_trial_count(user_id) >= FREE_TRIAL_LIMIT:
+        user_modes[user_id] = "awaiting_email"
+        await send_verification_gate(update)
+        return
+
+    if mode == "signal":
 
         requested_key = match_pair_key(message)
         if (

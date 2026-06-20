@@ -2,6 +2,7 @@ import os
 import asyncio
 import random
 import requests
+import re
 import json
 import time
 import websockets
@@ -43,6 +44,7 @@ SUPABASE_KEY = os.getenv("SUPABASE_KEY")
 METALS_API_KEY = os.getenv("METALS_API_KEY")
 API_NINJAS_KEY = os.getenv("API_NINJAS_KEY")
 DERIV_APP_ID = os.getenv("DERIV_APP_ID")
+DERIV_SERVICE_TOKEN = os.getenv("DERIV_SERVICE_TOKEN")
 
 # ============================================
 # METAAPI CONFIG
@@ -545,6 +547,351 @@ def get_deriv_account(user_id):
     except Exception as e:
         print(f"[DERIV] get_deriv_account error: {e}")
         return None
+
+# ============================================
+# DERIV SYNTHETIC SIGNALS + MULTIPLIER TRADING
+# (NEW) — PHASE 2
+# Real signals on Deriv's synthetic indices,
+# reusing the exact same SMC/ICT detector suite
+# already proven on forex/gold/crypto (analyze_
+# timeframe and every detect_* function below
+# are used completely unchanged - only the
+# candle SOURCE is new, since no outside data
+# provider carries Deriv's synthetic feeds).
+#
+# Candle data is fetched directly from Deriv
+# using a separate SERVICE token (read-only,
+# market-data purposes only - never used to
+# trade), via the exact same OTP connection flow
+# confirmed in Phase 1. Trading itself always
+# uses the requesting user's OWN linked token.
+#
+# Stop loss / take profit are real dollar
+# amounts on the stake (confirmed live, NOT
+# price levels) - every signal suggests a
+# default $10 stake / $3 risk / $6 target
+# (matching the same 1:2 risk:reward convention
+# already used elsewhere), always adjustable by
+# the user before they confirm a trade. Every
+# trade requires an explicit confirm - nothing
+# executes automatically.
+#
+# Multiplier values below are confirmed for
+# R_100 only (tested live). The other four are
+# reasonable starting defaults, NOT yet verified
+# - same caution as everything else in this file
+# that touches unconfirmed Deriv API behavior:
+# log clearly, fail safely, verify before trusting.
+# ============================================
+
+SYNTHETIC_CONFIG = {
+    "r10": {"symbol": "R_10", "display": "Volatility 10 Index", "default_multiplier": 1000},
+    "r25": {"symbol": "R_25", "display": "Volatility 25 Index", "default_multiplier": 400},
+    "r50": {"symbol": "R_50", "display": "Volatility 50 Index", "default_multiplier": 200},
+    "r75": {"symbol": "R_75", "display": "Volatility 75 Index", "default_multiplier": 150},
+    "r100": {"symbol": "R_100", "display": "Volatility 100 Index", "default_multiplier": 100},
+}
+
+SYNTHETIC_ALIASES = {
+    "r10": ["r10", "r_10", "volatility 10", "vol 10", "v10"],
+    "r25": ["r25", "r_25", "volatility 25", "vol 25", "v25"],
+    "r50": ["r50", "r_50", "volatility 50", "vol 50", "v50"],
+    "r75": ["r75", "r_75", "volatility 75", "vol 75", "v75"],
+    "r100": ["r100", "r_100", "volatility 100", "vol 100", "v100"],
+}
+
+DEFAULT_SYNTHETIC_STAKE = 10
+DEFAULT_RISK = 3
+DEFAULT_WIN = 6
+
+pending_trades = {}  # user_id -> trade context dict, one pending trade at a time
+
+def match_synthetic_key(question):
+    q = question.lower()
+    for key, aliases in SYNTHETIC_ALIASES.items():
+        for alias in aliases:
+            if alias in q:
+                return key
+    return None
+
+SYNTHETIC_CANDLE_CACHE_SECONDS = {"1h": 3600, "4h": 14400}
+synthetic_candle_cache = {}
+
+async def deriv_get_candles(symbol, granularity, count=60):
+    """
+    Fetches real candle history directly from Deriv using the
+    service token, via the exact same OTP connection flow already
+    confirmed in Phase 1. Returns a list of {open, high, low, close}
+    dicts already oldest-to-newest (confirmed live - no reversal
+    needed, unlike TwelveData), or None on any failure.
+    """
+    if not DERIV_SERVICE_TOKEN:
+        print("[SYNTH] No DERIV_SERVICE_TOKEN set")
+        return None
+
+    accounts_data = await deriv_get_options_accounts(DERIV_SERVICE_TOKEN)
+    if not accounts_data:
+        return None
+
+    accounts_list = accounts_data.get("data")
+    if not isinstance(accounts_list, list):
+        accounts_list = accounts_data.get("accounts")
+    if not accounts_list:
+        print(f"[SYNTH] Unexpected accounts response shape: {accounts_data}")
+        return None
+
+    account_id = (
+        accounts_list[0].get("account_id")
+        or accounts_list[0].get("loginid")
+        or accounts_list[0].get("id")
+    )
+    if not account_id:
+        print(f"[SYNTH] Could not find account_id in: {accounts_list[0]}")
+        return None
+
+    ws_url = await deriv_get_otp_url(DERIV_SERVICE_TOKEN, account_id)
+    if not ws_url:
+        return None
+
+    try:
+        async with websockets.connect(ws_url, open_timeout=10, close_timeout=5) as ws:
+            await ws.send(json.dumps({
+                "ticks_history": symbol,
+                "style": "candles",
+                "granularity": granularity,
+                "count": count,
+                "end": "latest",
+            }))
+            response = json.loads(await ws.recv())
+            if "error" in response:
+                print(f"[SYNTH] ticks_history error: {response['error'].get('message')}")
+                return None
+            candles = response.get("candles", [])
+            return candles if candles else None
+    except Exception as e:
+        print(f"[SYNTH] Connection error: {e}")
+        return None
+
+async def get_cached_synthetic_candles(index_key, symbol, granularity_label, granularity_seconds, count=60):
+    cache_key = f"{index_key}_{granularity_label}"
+    now = time.time()
+    ttl = SYNTHETIC_CANDLE_CACHE_SECONDS.get(granularity_label, 3600)
+    cached = synthetic_candle_cache.get(cache_key)
+    if cached and (now - cached["timestamp"] < ttl):
+        return cached["candles"]
+    candles = await deriv_get_candles(symbol, granularity_seconds, count)
+    if candles:
+        synthetic_candle_cache[cache_key] = {"candles": candles, "timestamp": now}
+    return candles
+
+async def analyze_synthetic_structure(index_key, config):
+    """
+    Same SMC/ICT logic already proven on forex/gold/crypto signals
+    (analyze_timeframe and every detect_* function reused completely
+    unchanged), applied to a Deriv synthetic index. Returns
+    (direction, confidence, reason) or None if there's no usable
+    edge / no candle data.
+    """
+    symbol = config["symbol"]
+    h1_candles = await get_cached_synthetic_candles(index_key, symbol, "1h", 3600, 60)
+    h4_candles = await get_cached_synthetic_candles(index_key, symbol, "4h", 14400, 60)
+
+    h1_factors = analyze_timeframe(h1_candles)
+    h4_factors = analyze_timeframe(h4_candles)
+
+    if not h1_factors and not h4_factors:
+        print(f"[SYNTH] No structure detected for {index_key}, skipping")
+        return None
+
+    h1_buy, h1_sell = score_factors(h1_factors)
+    h4_buy, h4_sell = score_factors(h4_factors)
+    total_buy = (h4_buy * 1.5) + h1_buy
+    total_sell = (h4_sell * 1.5) + h1_sell
+
+    if total_buy == total_sell:
+        print(f"[SYNTH] No clear edge for {index_key} (tied), skipping")
+        return None
+
+    direction = "BUY" if total_buy > total_sell else "SELL"
+    matching_h1 = [f for f in h1_factors if f["direction"] == direction]
+    matching_h4 = [f for f in h4_factors if f["direction"] == direction]
+    confluence_count = len(matching_h1) + len(matching_h4)
+    confidence = min(95, 76 + confluence_count * 4)
+
+    h4_sorted = sorted(matching_h4, key=lambda f: f["weight"], reverse=True)
+    h4_details = []
+    for f in h4_sorted:
+        if f["detail"] not in h4_details:
+            h4_details.append(f["detail"])
+        if len(h4_details) == 2:
+            break
+
+    reason = None
+    if matching_h1:
+        h1_sorted = sorted(matching_h1, key=lambda f: f["weight"], reverse=True)
+        h1_details = []
+        for f in h1_sorted:
+            if f["detail"] in h4_details or f["detail"] in h1_details:
+                continue
+            h1_details.append(f["detail"])
+            if len(h1_details) == 2:
+                break
+        if h1_details:
+            h1_text = " and ".join(h1_details)
+            reason = (
+                f"{h1_text.capitalize()} on H1, confirmed by "
+                f"{' and '.join(h4_details)} on H4."
+                if h4_details else f"{h1_text.capitalize()} on H1."
+            )
+        else:
+            primary = h1_sorted[0]
+            reason = (
+                f"{primary['detail'].capitalize()} confirmed on both "
+                f"H1 and H4, high-confluence setup."
+            )
+    elif h4_details:
+        reason = f"{' and '.join(h4_details).capitalize()} on H4."
+    else:
+        reason = "Multi-timeframe structure favors this direction."
+
+    print(
+        f"[SYNTH] {index_key} -> {direction} | confluence={confluence_count} "
+        f"| confidence={confidence}"
+    )
+    return direction, confidence, reason
+
+async def build_synthetic_signal_response(index_key):
+    """
+    Builds the signal message and the trade context that gets
+    stored for if/when the user taps "Trade This Signal". Returns
+    (message_html, trade_context) or None if no signal could be
+    generated.
+    """
+    config = SYNTHETIC_CONFIG.get(index_key)
+    if not config:
+        return None
+
+    result = await analyze_synthetic_structure(index_key, config)
+    if not result:
+        return None
+
+    direction, confidence, reason = result
+    contract_type = "MULTUP" if direction == "BUY" else "MULTDOWN"
+    emoji = "🟢" if direction == "BUY" else "🔴"
+
+    message = (
+        f"{emoji} <b>STRONG {direction} {config['display']}</b> ⚡\n\n"
+        f"<b>Confidence:</b> {confidence}%\n\n"
+        f"<b>Reason:</b> {reason}\n\n"
+        f"<b>Suggested:</b> ${DEFAULT_SYNTHETIC_STAKE} stake | "
+        f"Risk ${DEFAULT_RISK} → Target ${DEFAULT_WIN}\n"
+        f"<i>(Stake and risk/target are adjustable before you confirm)</i>\n\n"
+        f"<i>Trade safe 💼🔥</i>"
+    )
+
+    trade_context = {
+        "index_key": index_key,
+        "symbol": config["symbol"],
+        "display": config["display"],
+        "direction": direction,
+        "contract_type": contract_type,
+        "multiplier": config["default_multiplier"],
+        "stake": DEFAULT_SYNTHETIC_STAKE,
+        "risk": DEFAULT_RISK,
+        "win": DEFAULT_WIN,
+    }
+
+    return message, trade_context
+
+async def deriv_execute_multiplier_trade(token, symbol, contract_type, multiplier, stake, risk, win):
+    """
+    Confirmed Proposal -> Buy flow for Multiplier contracts (live
+    tested). A fresh quote is required every time - a stale or
+    fabricated proposal ID is rejected, confirmed via live testing -
+    so this always gets a new quote immediately before buying it.
+    stop_loss/take_profit are real dollar amounts on the stake,
+    confirmed live - not price levels.
+    Returns (buy_data, None) on success, or (None, error_message).
+    """
+    accounts_data = await deriv_get_options_accounts(token)
+    if not accounts_data:
+        return None, "Couldn't verify your Deriv account."
+
+    accounts_list = accounts_data.get("data")
+    if not isinstance(accounts_list, list):
+        accounts_list = accounts_data.get("accounts")
+    if not accounts_list:
+        return None, "Couldn't read your account list."
+
+    real_account = None
+    for acct in accounts_list:
+        is_virtual = bool(
+            acct.get("is_virtual")
+            or str(acct.get("account_type", "")).lower() in ("demo", "virtual")
+        )
+        if not is_virtual:
+            real_account = acct
+            break
+
+    if not real_account:
+        return None, "No real account found on this token."
+
+    account_id = (
+        real_account.get("account_id")
+        or real_account.get("loginid")
+        or real_account.get("id")
+    )
+    currency = real_account.get("currency", "USD")
+
+    ws_url = await deriv_get_otp_url(token, account_id)
+    if not ws_url:
+        return None, "Couldn't establish a trading connection."
+
+    try:
+        async with websockets.connect(ws_url, open_timeout=10, close_timeout=10) as ws:
+            proposal_request = {
+                "proposal": 1,
+                "amount": stake,
+                "basis": "stake",
+                "contract_type": contract_type,
+                "currency": currency,
+                "multiplier": multiplier,
+                "underlying_symbol": symbol,
+                "limit_order": {
+                    "stop_loss": risk,
+                    "take_profit": win,
+                },
+            }
+            await ws.send(json.dumps(proposal_request))
+            proposal_response = json.loads(await ws.recv())
+
+            if "error" in proposal_response:
+                err = proposal_response["error"].get("message", "Unknown error")
+                print(f"[SYNTH TRADE] Proposal error: {err}")
+                return None, f"Couldn't get a quote: {err}"
+
+            proposal = proposal_response.get("proposal", {})
+            proposal_id = proposal.get("id")
+            ask_price = proposal.get("ask_price")
+
+            if not proposal_id or ask_price is None:
+                print(f"[SYNTH TRADE] Unexpected proposal shape: {proposal_response}")
+                return None, "Got an unexpected response while pricing the trade."
+
+            await ws.send(json.dumps({"buy": proposal_id, "price": ask_price}))
+            buy_response = json.loads(await ws.recv())
+
+            if "error" in buy_response:
+                err = buy_response["error"].get("message", "Unknown error")
+                print(f"[SYNTH TRADE] Buy error: {err}")
+                return None, f"Trade failed: {err}"
+
+            buy_data = buy_response.get("buy", {})
+            print(f"[SYNTH TRADE] ✅ Bought {symbol} {contract_type} | raw response: {buy_data}")
+            return buy_data, None
+    except Exception as e:
+        print(f"[SYNTH TRADE] Connection error: {e}")
+        return None, "Connection error while placing the trade."
 
 # ============================================
 # AI BIAS USAGE TRACKING (NEW)
@@ -2578,6 +2925,8 @@ async def handle_buttons(update: Update, context: ContextTypes.DEFAULT_TYPE):
             "• EURJPY\n"
             "• USDCHF\n"
             "• NZDUSD\n\n"
+            "<b>Deriv Synthetics (tradeable):</b>\n"
+            "• R_10, R_25, R_50, R_75, R_100\n\n"
             "<i>Example: Type <b>XAUUSD</b> or just say <b>gold</b></i>",
             parse_mode=ParseMode.HTML,
             reply_markup=main_keyboard
@@ -2610,10 +2959,12 @@ async def handle_buttons(update: Update, context: ContextTypes.DEFAULT_TYPE):
             if snapshot:
                 open_count = len(snapshot["open_contracts"])
                 await update.message.reply_text(
-                    f"🔗 <b>Linked Deriv Account</b>\n\n"
+                    f"🔗 <b>Linked Deriv Options Account</b>\n\n"
                     f"<b>Account:</b> {snapshot['loginid']}\n"
                     f"<b>Balance:</b> {snapshot['balance']} {snapshot['currency']}\n"
                     f"<b>Open Positions:</b> {open_count}\n\n"
+                    f"ℹ️ <i>This shows your Options account only. Your MT5 "
+                    f"and cTrader balances aren't connected yet.</i>\n\n"
                     f"<i>Want to link a different real account instead? "
                     f"Just paste a new API token below.</i>",
                     parse_mode=ParseMode.HTML,
@@ -2633,12 +2984,14 @@ async def handle_buttons(update: Update, context: ContextTypes.DEFAULT_TYPE):
         user_modes[user_id] = "awaiting_deriv_token"
         await update.message.reply_text(
             "🔗 <b>Connect Your Deriv Account</b>\n\n"
-            "Nexora can show your real Deriv balance and open positions "
-            "right here in Telegram.\n\n"
+            "Nexora can show your real Deriv <b>Options account</b> "
+            "balance and open positions right here in Telegram. "
+            "(MT5 and cTrader accounts aren't supported yet.)\n\n"
             "<b>How to connect:</b>\n"
-            "1️⃣ Log in to your Deriv account\n"
-            "2️⃣ Go to <b>Settings → API Token</b>\n"
-            "3️⃣ Create a new token with the <b>Read</b> and "
+            "1️⃣ Go to <b>developers.deriv.com</b> and log in\n"
+            "2️⃣ Tap the menu (☰) in the top right, then tap "
+            "<b>API tokens</b>\n"
+            "3️⃣ Tap <b>Create new token</b>, with the <b>Read</b> and "
             "<b>Trading information</b> scopes only\n"
             "4️⃣ Copy the token and paste it here\n\n"
             "⚠️ <b>Real accounts only</b> — demo/virtual tokens will be "
@@ -2804,6 +3157,52 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             parse_mode=ParseMode.HTML
         )
 
+    elif data.startswith("synthtrade_"):
+
+        user_id = data.replace("synthtrade_", "")
+        trade_context = pending_trades.get(user_id)
+
+        if not trade_context:
+            await context.bot.send_message(
+                chat_id=int(user_id),
+                text=(
+                    "⚠️ <b>That trade has expired.</b>\n\n"
+                    "Please request a new signal and tap 🎯 Trade This "
+                    "Signal again."
+                ),
+                parse_mode=ParseMode.HTML
+            )
+            return
+
+        account = get_deriv_account(user_id)
+        if not account:
+            await context.bot.send_message(
+                chat_id=int(user_id),
+                text=(
+                    "⚠️ <b>No linked Deriv account found.</b>\n\n"
+                    "Tap 🔗 Connect Deriv first to link your real account "
+                    "before trading."
+                ),
+                parse_mode=ParseMode.HTML
+            )
+            return
+
+        user_modes[user_id] = "awaiting_trade_confirm"
+
+        await context.bot.send_message(
+            chat_id=int(user_id),
+            text=(
+                f"🎯 <b>Confirm this trade:</b>\n\n"
+                f"<b>{trade_context['direction']} {trade_context['display']}</b>\n"
+                f"Stake: ${trade_context['stake']} | "
+                f"Risk ${trade_context['risk']} → Target ${trade_context['win']}\n\n"
+                f"Reply <b>confirm</b> to execute as-is, or send custom "
+                f"values like:\n"
+                f"<code>stake=20 risk=5 win=10</code>"
+            ),
+            parse_mode=ParseMode.HTML
+        )
+
 # ============================================
 # HANDLE TEXT
 # ============================================
@@ -2921,11 +3320,120 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
         user_modes[user_id] = None
 
         await update.message.reply_text(
-            f"✅ <b>Deriv account linked!</b>\n\n"
+            f"✅ <b>Deriv Options account linked!</b>\n\n"
             f"<b>Account:</b> {snapshot['loginid']}\n"
             f"<b>Balance:</b> {snapshot['balance']} {snapshot['currency']}\n"
             f"<b>Open Positions:</b> {open_count}\n\n"
+            f"ℹ️ <i>This is your Options account specifically. MT5 and "
+            f"cTrader balances aren't connected yet.</i>\n\n"
             f"<i>Tap 🔗 Connect Deriv anytime to check your balance again.</i>",
+            parse_mode=ParseMode.HTML,
+            reply_markup=main_keyboard
+        )
+        return
+
+    if user_modes.get(user_id) == "awaiting_trade_confirm":
+
+        trade_context = pending_trades.get(user_id)
+        if not trade_context:
+            user_modes[user_id] = None
+            await update.message.reply_text(
+                "⚠️ <b>That trade has expired.</b>\n\n"
+                "Please request a new signal and tap 🎯 Trade This Signal "
+                "again.",
+                parse_mode=ParseMode.HTML,
+                reply_markup=main_keyboard
+            )
+            return
+
+        reply = message.strip().lower()
+
+        if reply != "confirm":
+            stake_match = re.search(r"stake\s*=\s*([\d.]+)", reply)
+            risk_match = re.search(r"risk\s*=\s*([\d.]+)", reply)
+            win_match = re.search(r"win\s*=\s*([\d.]+)", reply)
+
+            if not (stake_match or risk_match or win_match):
+                await update.message.reply_text(
+                    "⚠️ <b>I didn't understand that.</b>\n\n"
+                    "Reply <b>confirm</b> to execute with the suggested "
+                    "values, or send custom values like:\n"
+                    "<code>stake=20 risk=5 win=10</code>",
+                    parse_mode=ParseMode.HTML
+                )
+                return
+
+            if stake_match:
+                trade_context["stake"] = float(stake_match.group(1))
+            if risk_match:
+                trade_context["risk"] = float(risk_match.group(1))
+            if win_match:
+                trade_context["win"] = float(win_match.group(1))
+
+            pending_trades[user_id] = trade_context
+
+            await update.message.reply_text(
+                f"🎯 <b>Updated trade:</b>\n\n"
+                f"<b>{trade_context['direction']} {trade_context['display']}</b>\n"
+                f"Stake: ${trade_context['stake']} | "
+                f"Risk ${trade_context['risk']} → Target ${trade_context['win']}\n\n"
+                f"Reply <b>confirm</b> to execute, or send new values again "
+                f"to adjust further.",
+                parse_mode=ParseMode.HTML
+            )
+            return
+
+        account = get_deriv_account(user_id)
+        if not account:
+            user_modes[user_id] = None
+            pending_trades.pop(user_id, None)
+            await update.message.reply_text(
+                "⚠️ <b>No linked Deriv account found.</b>\n\n"
+                "Tap 🔗 Connect Deriv first to link your real account "
+                "before trading.",
+                parse_mode=ParseMode.HTML,
+                reply_markup=main_keyboard
+            )
+            return
+
+        wait_message = await update.message.reply_text(
+            "⏳ <b>Placing your trade...</b>",
+            parse_mode=ParseMode.HTML
+        )
+
+        buy_data, error = await deriv_execute_multiplier_trade(
+            account["api_token"],
+            trade_context["symbol"],
+            trade_context["contract_type"],
+            trade_context["multiplier"],
+            trade_context["stake"],
+            trade_context["risk"],
+            trade_context["win"],
+        )
+
+        await wait_message.delete()
+
+        user_modes[user_id] = None
+        pending_trades.pop(user_id, None)
+
+        if error:
+            await update.message.reply_text(
+                f"❌ <b>Trade not placed.</b>\n\n{error}",
+                parse_mode=ParseMode.HTML,
+                reply_markup=main_keyboard
+            )
+            return
+
+        contract_id = buy_data.get("contract_id", "—")
+        buy_price = buy_data.get("buy_price", trade_context["stake"])
+
+        await update.message.reply_text(
+            f"✅ <b>Trade placed!</b>\n\n"
+            f"<b>{trade_context['direction']} {trade_context['display']}</b>\n"
+            f"Stake: ${buy_price}\n"
+            f"Contract ID: {contract_id}\n\n"
+            f"<i>Deriv will automatically close this at your stop loss, "
+            f"take profit, or stop-out level.</i>",
             parse_mode=ParseMode.HTML,
             reply_markup=main_keyboard
         )
@@ -2939,6 +3447,41 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
     mode = user_modes.get(user_id)
 
     if mode == "signal":
+
+        synthetic_key = match_synthetic_key(message)
+        if synthetic_key:
+            wait_message = await update.message.reply_text(
+                "🧠 <b>Nexora AI analyzing live market...</b>",
+                parse_mode=ParseMode.HTML
+            )
+
+            result = await build_synthetic_signal_response(synthetic_key)
+
+            await wait_message.delete()
+
+            if not result:
+                await update.message.reply_text(
+                    "⚠️ <b>Unable to generate a signal right now.</b>\n"
+                    "Please try again shortly.",
+                    parse_mode=ParseMode.HTML,
+                    reply_markup=main_keyboard
+                )
+                return
+
+            signal_message, trade_context = result
+            pending_trades[user_id] = trade_context
+
+            await update.message.reply_text(
+                signal_message,
+                parse_mode=ParseMode.HTML,
+                reply_markup=InlineKeyboardMarkup([
+                    [InlineKeyboardButton(
+                        "🎯 Trade This Signal",
+                        callback_data=f"synthtrade_{user_id}"
+                    )]
+                ])
+            )
+            return
 
         requested_key = match_pair_key(message)
         if (

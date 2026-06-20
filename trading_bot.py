@@ -604,6 +604,19 @@ DEFAULT_SYNTHETIC_STAKE = 10
 DEFAULT_RISK = 3
 DEFAULT_WIN = 6
 
+# Preset stake tiers shown as tap-to-pick buttons before a trade is
+# confirmed. All keep the same 1:2 risk:reward ratio as the default
+# above ($10/$3/$6 is kept as one of the tiers for consistency).
+# "Custom Amount" is always offered alongside these for anything
+# that doesn't fit a preset.
+STAKE_TIERS = [
+    {"stake": 5, "risk": 2, "win": 4},
+    {"stake": 10, "risk": 3, "win": 6},
+    {"stake": 20, "risk": 6, "win": 12},
+    {"stake": 50, "risk": 15, "win": 30},
+    {"stake": 100, "risk": 30, "win": 60},
+]
+
 pending_trades = {}  # user_id -> trade context dict, one pending trade at a time
 
 def match_synthetic_key(question):
@@ -2971,9 +2984,7 @@ async def handle_buttons(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     f"<b>Balance:</b> {snapshot['balance']} {snapshot['currency']}\n"
                     f"<b>Open Positions:</b> {open_count}\n\n"
                     f"ℹ️ <i>This shows your Options account only. Your MT5 "
-                    f"and cTrader balances aren't connected yet.</i>\n\n"
-                    f"<i>Want to link a different real account instead? "
-                    f"Just paste a new API token below.</i>",
+                    f"and cTrader balances aren't connected yet.</i>",
                     parse_mode=ParseMode.HTML,
                     reply_markup=main_keyboard
                 )
@@ -3164,9 +3175,9 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             parse_mode=ParseMode.HTML
         )
 
-    elif data.startswith("synthtrade_"):
+    elif data.startswith("synthtrade_") or data.startswith("edittrade_"):
 
-        user_id = data.replace("synthtrade_", "")
+        user_id = data.replace("synthtrade_", "").replace("edittrade_", "")
         trade_context = pending_trades.get(user_id)
 
         if not trade_context:
@@ -3194,7 +3205,52 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             )
             return
 
-        user_modes[user_id] = "awaiting_trade_confirm"
+        tier_buttons = [
+            [InlineKeyboardButton(
+                f"${t['stake']} | Risk ${t['risk']} → Win ${t['win']}",
+                callback_data=f"tier_{user_id}_{t['stake']}"
+            )]
+            for t in STAKE_TIERS
+        ]
+        tier_buttons.append([InlineKeyboardButton(
+            "✏️ Custom Amount", callback_data=f"customtier_{user_id}"
+        )])
+
+        await context.bot.send_message(
+            chat_id=int(user_id),
+            text=(
+                f"🎯 <b>{trade_context['direction']} {trade_context['display']}</b>\n\n"
+                f"Choose a stake, or enter a custom amount:"
+            ),
+            parse_mode=ParseMode.HTML,
+            reply_markup=InlineKeyboardMarkup(tier_buttons)
+        )
+
+    elif data.startswith("tier_"):
+
+        body = data.replace("tier_", "")
+        user_id, stake_str = body.rsplit("_", 1)
+        stake = float(stake_str)
+
+        trade_context = pending_trades.get(user_id)
+        tier = next((t for t in STAKE_TIERS if t["stake"] == stake), None)
+
+        if not trade_context or not tier:
+            await context.bot.send_message(
+                chat_id=int(user_id),
+                text=(
+                    "⚠️ <b>That trade has expired.</b>\n\n"
+                    "Please request a new signal and tap 🎯 Trade This "
+                    "Signal again."
+                ),
+                parse_mode=ParseMode.HTML
+            )
+            return
+
+        trade_context["stake"] = tier["stake"]
+        trade_context["risk"] = tier["risk"]
+        trade_context["win"] = tier["win"]
+        pending_trades[user_id] = trade_context
 
         await context.bot.send_message(
             chat_id=int(user_id),
@@ -3202,12 +3258,116 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 f"🎯 <b>Confirm this trade:</b>\n\n"
                 f"<b>{trade_context['direction']} {trade_context['display']}</b>\n"
                 f"Stake: ${trade_context['stake']} | "
-                f"Risk ${trade_context['risk']} → Target ${trade_context['win']}\n\n"
-                f"Reply <b>confirm</b> to execute as-is, or send custom "
-                f"values like:\n"
-                f"<code>stake=20 risk=5 win=10</code>"
+                f"Risk ${trade_context['risk']} → Target ${trade_context['win']}"
+            ),
+            parse_mode=ParseMode.HTML,
+            reply_markup=InlineKeyboardMarkup([[
+                InlineKeyboardButton("✅ Confirm", callback_data=f"execconfirm_{user_id}"),
+                InlineKeyboardButton("✏️ Edit", callback_data=f"edittrade_{user_id}"),
+            ]])
+        )
+
+    elif data.startswith("customtier_"):
+
+        user_id = data.replace("customtier_", "")
+        trade_context = pending_trades.get(user_id)
+
+        if not trade_context:
+            await context.bot.send_message(
+                chat_id=int(user_id),
+                text=(
+                    "⚠️ <b>That trade has expired.</b>\n\n"
+                    "Please request a new signal and tap 🎯 Trade This "
+                    "Signal again."
+                ),
+                parse_mode=ParseMode.HTML
+            )
+            return
+
+        user_modes[user_id] = "awaiting_trade_confirm"
+
+        await context.bot.send_message(
+            chat_id=int(user_id),
+            text=(
+                "✏️ <b>Enter your custom amounts:</b>\n\n"
+                "Send something like:\n"
+                "<code>stake=20 risk=5 win=10</code>"
             ),
             parse_mode=ParseMode.HTML
+        )
+
+    elif data.startswith("execconfirm_"):
+
+        user_id = data.replace("execconfirm_", "")
+        trade_context = pending_trades.pop(user_id, None)  # pop immediately, prevents a double-tap re-executing
+
+        if not trade_context:
+            await context.bot.send_message(
+                chat_id=int(user_id),
+                text=(
+                    "⚠️ <b>That trade has expired.</b>\n\n"
+                    "Please request a new signal and tap 🎯 Trade This "
+                    "Signal again."
+                ),
+                parse_mode=ParseMode.HTML
+            )
+            return
+
+        account = get_deriv_account(user_id)
+        if not account:
+            await context.bot.send_message(
+                chat_id=int(user_id),
+                text=(
+                    "⚠️ <b>No linked Deriv account found.</b>\n\n"
+                    "Tap 🔗 Connect Deriv first to link your real account "
+                    "before trading."
+                ),
+                parse_mode=ParseMode.HTML
+            )
+            return
+
+        wait_message = await context.bot.send_message(
+            chat_id=int(user_id),
+            text="⏳ <b>Placing your trade...</b>",
+            parse_mode=ParseMode.HTML
+        )
+
+        buy_data, error = await deriv_execute_multiplier_trade(
+            account["api_token"],
+            trade_context["symbol"],
+            trade_context["contract_type"],
+            trade_context["multiplier"],
+            trade_context["stake"],
+            trade_context["risk"],
+            trade_context["win"],
+        )
+
+        await wait_message.delete()
+
+        if error:
+            await context.bot.send_message(
+                chat_id=int(user_id),
+                text=f"❌ <b>Trade not placed.</b>\n\n{error}",
+                parse_mode=ParseMode.HTML,
+                reply_markup=main_keyboard
+            )
+            return
+
+        contract_id = buy_data.get("contract_id", "—")
+        buy_price = buy_data.get("buy_price", trade_context["stake"])
+
+        await context.bot.send_message(
+            chat_id=int(user_id),
+            text=(
+                f"✅ <b>Trade placed!</b>\n\n"
+                f"<b>{trade_context['direction']} {trade_context['display']}</b>\n"
+                f"Stake: ${buy_price}\n"
+                f"Contract ID: {contract_id}\n\n"
+                f"<i>Deriv will automatically close this at your stop loss, "
+                f"take profit, or stop-out level.</i>"
+            ),
+            parse_mode=ParseMode.HTML,
+            reply_markup=main_keyboard
         )
 
 # ============================================
@@ -3355,94 +3515,39 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
         reply = message.strip().lower()
 
-        if reply != "confirm":
-            stake_match = re.search(r"stake\s*=\s*([\d.]+)", reply)
-            risk_match = re.search(r"risk\s*=\s*([\d.]+)", reply)
-            win_match = re.search(r"win\s*=\s*([\d.]+)", reply)
+        stake_match = re.search(r"stake\s*=\s*([\d.]+)", reply)
+        risk_match = re.search(r"risk\s*=\s*([\d.]+)", reply)
+        win_match = re.search(r"win\s*=\s*([\d.]+)", reply)
 
-            if not (stake_match or risk_match or win_match):
-                await update.message.reply_text(
-                    "⚠️ <b>I didn't understand that.</b>\n\n"
-                    "Reply <b>confirm</b> to execute with the suggested "
-                    "values, or send custom values like:\n"
-                    "<code>stake=20 risk=5 win=10</code>",
-                    parse_mode=ParseMode.HTML
-                )
-                return
-
-            if stake_match:
-                trade_context["stake"] = float(stake_match.group(1))
-            if risk_match:
-                trade_context["risk"] = float(risk_match.group(1))
-            if win_match:
-                trade_context["win"] = float(win_match.group(1))
-
-            pending_trades[user_id] = trade_context
-
+        if not (stake_match or risk_match or win_match):
             await update.message.reply_text(
-                f"🎯 <b>Updated trade:</b>\n\n"
-                f"<b>{trade_context['direction']} {trade_context['display']}</b>\n"
-                f"Stake: ${trade_context['stake']} | "
-                f"Risk ${trade_context['risk']} → Target ${trade_context['win']}\n\n"
-                f"Reply <b>confirm</b> to execute, or send new values again "
-                f"to adjust further.",
+                "⚠️ <b>I didn't understand that.</b>\n\n"
+                "Send custom values like:\n"
+                "<code>stake=20 risk=5 win=10</code>",
                 parse_mode=ParseMode.HTML
             )
             return
 
-        account = get_deriv_account(user_id)
-        if not account:
-            user_modes[user_id] = None
-            pending_trades.pop(user_id, None)
-            await update.message.reply_text(
-                "⚠️ <b>No linked Deriv account found.</b>\n\n"
-                "Tap 🔗 Connect Deriv first to link your real account "
-                "before trading.",
-                parse_mode=ParseMode.HTML,
-                reply_markup=main_keyboard
-            )
-            return
+        if stake_match:
+            trade_context["stake"] = float(stake_match.group(1))
+        if risk_match:
+            trade_context["risk"] = float(risk_match.group(1))
+        if win_match:
+            trade_context["win"] = float(win_match.group(1))
 
-        wait_message = await update.message.reply_text(
-            "⏳ <b>Placing your trade...</b>",
-            parse_mode=ParseMode.HTML
-        )
-
-        buy_data, error = await deriv_execute_multiplier_trade(
-            account["api_token"],
-            trade_context["symbol"],
-            trade_context["contract_type"],
-            trade_context["multiplier"],
-            trade_context["stake"],
-            trade_context["risk"],
-            trade_context["win"],
-        )
-
-        await wait_message.delete()
-
+        pending_trades[user_id] = trade_context
         user_modes[user_id] = None
-        pending_trades.pop(user_id, None)
-
-        if error:
-            await update.message.reply_text(
-                f"❌ <b>Trade not placed.</b>\n\n{error}",
-                parse_mode=ParseMode.HTML,
-                reply_markup=main_keyboard
-            )
-            return
-
-        contract_id = buy_data.get("contract_id", "—")
-        buy_price = buy_data.get("buy_price", trade_context["stake"])
 
         await update.message.reply_text(
-            f"✅ <b>Trade placed!</b>\n\n"
+            f"🎯 <b>Confirm this trade:</b>\n\n"
             f"<b>{trade_context['direction']} {trade_context['display']}</b>\n"
-            f"Stake: ${buy_price}\n"
-            f"Contract ID: {contract_id}\n\n"
-            f"<i>Deriv will automatically close this at your stop loss, "
-            f"take profit, or stop-out level.</i>",
+            f"Stake: ${trade_context['stake']} | "
+            f"Risk ${trade_context['risk']} → Target ${trade_context['win']}",
             parse_mode=ParseMode.HTML,
-            reply_markup=main_keyboard
+            reply_markup=InlineKeyboardMarkup([[
+                InlineKeyboardButton("✅ Confirm", callback_data=f"execconfirm_{user_id}"),
+                InlineKeyboardButton("✏️ Edit", callback_data=f"edittrade_{user_id}"),
+            ]])
         )
         return
 

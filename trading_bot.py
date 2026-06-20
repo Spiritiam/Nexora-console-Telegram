@@ -4,6 +4,7 @@ import random
 import requests
 import json
 import time
+import websockets
 
 from datetime import datetime, timedelta
 from pathlib import Path
@@ -41,6 +42,7 @@ SUPABASE_URL = os.getenv("SUPABASE_URL")
 SUPABASE_KEY = os.getenv("SUPABASE_KEY")
 METALS_API_KEY = os.getenv("METALS_API_KEY")
 API_NINJAS_KEY = os.getenv("API_NINJAS_KEY")
+DERIV_APP_ID = os.getenv("DERIV_APP_ID")
 
 # ============================================
 # METAAPI CONFIG
@@ -121,7 +123,7 @@ OPENROUTER_URL = "https://openrouter.ai/api/v1/chat/completions"
 # ============================================
 
 main_keyboard = ReplyKeyboardMarkup(
-    [["📊 Signal", "📚 Breakdown"]],
+    [["📊 Signal", "📚 Breakdown", "🔗 Connect Deriv"]],
     resize_keyboard=True,
     is_persistent=True,
     one_time_keyboard=False
@@ -338,6 +340,112 @@ def get_signals_since(start_dt):
     except Exception as e:
         print(f"[SIGNAL LOG] get_signals_since error: {e}")
         return []
+
+# ============================================
+# DERIV ACCOUNT LINKING (NEW) — PHASE 1
+# Read-only: connect a user's real Deriv account
+# and show balance/open positions. No trading.
+# Real accounts only - demo (virtual) accounts
+# are detected via Deriv's own "is_virtual" flag
+# in the authorize response and rejected, never
+# guessed from the loginid prefix alone.
+# Uses a Personal Access Token the user generates
+# themselves in their own Deriv account settings
+# (scoped to read + trading info only) and pastes
+# into the bot - no OAuth web server needed for
+# this phase. Each check opens one short-lived
+# WebSocket connection, asks everything needed,
+# then closes - never a persistent connection per
+# user, which wouldn't scale.
+# Requires a Supabase table: deriv_accounts.
+# Columns: user_id (text, unique), deriv_loginid
+# (text), api_token (text), currency (text),
+# linked_at (text), last_synced (text).
+# ============================================
+
+async def deriv_fetch_account_snapshot(token):
+    """
+    Opens one short-lived WebSocket connection to Deriv, authorizes
+    with the user's token, and fetches both balance and open
+    positions before closing. Returns None if authorization fails
+    (invalid/expired token) or on any connection error.
+    """
+    if not DERIV_APP_ID:
+        print("[DERIV] No DERIV_APP_ID set")
+        return None
+
+    url = f"wss://ws.derivws.com/websockets/v3?app_id={DERIV_APP_ID}"
+
+    try:
+        async with websockets.connect(url, open_timeout=10, close_timeout=5) as ws:
+            await ws.send(json.dumps({"authorize": token}))
+            auth_response = json.loads(await ws.recv())
+
+            if "error" in auth_response:
+                print(f"[DERIV] Authorize failed: {auth_response['error'].get('message')}")
+                return None
+
+            authorize_data = auth_response.get("authorize", {})
+            loginid = authorize_data.get("loginid", "")
+            is_virtual = authorize_data.get("is_virtual", 0) == 1
+            currency = authorize_data.get("currency", "")
+
+            await ws.send(json.dumps({"balance": 1}))
+            balance_response = json.loads(await ws.recv())
+            balance = balance_response.get("balance", {}).get("balance")
+
+            await ws.send(json.dumps({"portfolio": 1}))
+            portfolio_response = json.loads(await ws.recv())
+            open_contracts = portfolio_response.get("portfolio", {}).get("contracts", [])
+
+            return {
+                "loginid": loginid,
+                "is_virtual": is_virtual,
+                "currency": currency,
+                "balance": balance,
+                "open_contracts": open_contracts,
+            }
+    except Exception as e:
+        print(f"[DERIV] Connection error: {e}")
+        return None
+
+def save_deriv_account(user_id, loginid, token, currency):
+    try:
+        url = f"{SUPABASE_URL}/rest/v1/deriv_accounts"
+        payload = {
+            "user_id": str(user_id),
+            "deriv_loginid": loginid,
+            "api_token": token,
+            "currency": currency,
+            "linked_at": datetime.utcnow().isoformat(),
+        }
+        headers = {**sb_headers(), "Prefer": "resolution=merge-duplicates"}
+        response = requests.post(
+            url, headers=headers, json=payload, timeout=10
+        )
+        if response.status_code not in (200, 201):
+            print(f"[DERIV] save_deriv_account unexpected status {response.status_code}: {response.text}")
+            return False
+        print(f"[DERIV] ✅ Linked account for user {user_id}: {loginid}")
+        return True
+    except Exception as e:
+        print(f"[DERIV] save_deriv_account error: {e}")
+        return False
+
+def get_deriv_account(user_id):
+    try:
+        url = (
+            f"{SUPABASE_URL}/rest/v1/deriv_accounts"
+            f"?user_id=eq.{user_id}&select=*"
+        )
+        response = requests.get(url, headers=sb_headers(), timeout=10)
+        data = response.json()
+        if data:
+            return data[0]
+        return None
+    except Exception as e:
+        print(f"[DERIV] get_deriv_account error: {e}")
+        return None
 
 # ============================================
 # AI BIAS USAGE TRACKING (NEW)
@@ -2392,6 +2500,55 @@ async def handle_buttons(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         return
 
+    if "deriv" in text:
+        existing = get_deriv_account(user_id)
+        if existing:
+            await update.message.reply_text(
+                "🔄 <b>Checking your linked Deriv account...</b>",
+                parse_mode=ParseMode.HTML
+            )
+            snapshot = await deriv_fetch_account_snapshot(existing["api_token"])
+            if snapshot:
+                open_count = len(snapshot["open_contracts"])
+                await update.message.reply_text(
+                    f"🔗 <b>Linked Deriv Account</b>\n\n"
+                    f"<b>Account:</b> {snapshot['loginid']}\n"
+                    f"<b>Balance:</b> {snapshot['balance']} {snapshot['currency']}\n"
+                    f"<b>Open Positions:</b> {open_count}\n\n"
+                    f"<i>Want to link a different real account instead? "
+                    f"Just paste a new API token below.</i>",
+                    parse_mode=ParseMode.HTML,
+                    reply_markup=main_keyboard
+                )
+            else:
+                await update.message.reply_text(
+                    "⚠️ <b>Couldn't reach your linked Deriv account.</b>\n\n"
+                    "Your saved token may have expired or been revoked. "
+                    "Paste a new real-account API token below to relink.",
+                    parse_mode=ParseMode.HTML,
+                    reply_markup=main_keyboard
+                )
+            user_modes[user_id] = "awaiting_deriv_token"
+            return
+
+        user_modes[user_id] = "awaiting_deriv_token"
+        await update.message.reply_text(
+            "🔗 <b>Connect Your Deriv Account</b>\n\n"
+            "Nexora can show your real Deriv balance and open positions "
+            "right here in Telegram.\n\n"
+            "<b>How to connect:</b>\n"
+            "1️⃣ Log in to your Deriv account\n"
+            "2️⃣ Go to <b>Settings → API Token</b>\n"
+            "3️⃣ Create a new token with the <b>Read</b> and "
+            "<b>Trading information</b> scopes only\n"
+            "4️⃣ Copy the token and paste it here\n\n"
+            "⚠️ <b>Real accounts only</b> — demo/virtual tokens will be "
+            "rejected. Never select the Trade or Payments scopes for this.",
+            parse_mode=ParseMode.HTML,
+            reply_markup=main_keyboard
+        )
+        return
+
 # ============================================
 # CALLBACK HANDLER — APPROVE / REJECT
 # ============================================
@@ -2610,6 +2767,69 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
             print(f"[VERIFY] Failed to send to group: {e}")
 
         user_modes[user_id] = None
+        return
+
+    if user_modes.get(user_id) == "awaiting_deriv_token":
+
+        token = message.strip()
+
+        wait_message = await update.message.reply_text(
+            "🔄 <b>Verifying your Deriv account...</b>",
+            parse_mode=ParseMode.HTML
+        )
+
+        snapshot = await deriv_fetch_account_snapshot(token)
+
+        await wait_message.delete()
+
+        if not snapshot:
+            await update.message.reply_text(
+                "❌ <b>That token didn't work.</b>\n\n"
+                "Double-check you copied the full token and that it has "
+                "the <b>Read</b> and <b>Trading information</b> scopes "
+                "enabled, then paste it again.",
+                parse_mode=ParseMode.HTML,
+                reply_markup=main_keyboard
+            )
+            return
+
+        if snapshot["is_virtual"]:
+            await update.message.reply_text(
+                "🚫 <b>That's a demo account.</b>\n\n"
+                "Nexora account linking is for verified real-money "
+                "traders only. Please generate a token from your "
+                "<b>real</b> Deriv account and paste it again.",
+                parse_mode=ParseMode.HTML,
+                reply_markup=main_keyboard
+            )
+            return
+
+        saved = save_deriv_account(
+            user_id, snapshot["loginid"], token, snapshot["currency"]
+        )
+
+        if not saved:
+            await update.message.reply_text(
+                "⚠️ <b>Your account was verified but couldn't be saved "
+                "right now.</b>\n\nPlease try pasting the token again "
+                "in a moment.",
+                parse_mode=ParseMode.HTML,
+                reply_markup=main_keyboard
+            )
+            return
+
+        open_count = len(snapshot["open_contracts"])
+        user_modes[user_id] = None
+
+        await update.message.reply_text(
+            f"✅ <b>Deriv account linked!</b>\n\n"
+            f"<b>Account:</b> {snapshot['loginid']}\n"
+            f"<b>Balance:</b> {snapshot['balance']} {snapshot['currency']}\n"
+            f"<b>Open Positions:</b> {open_count}\n\n"
+            f"<i>Tap 🔗 Connect Deriv anytime to check your balance again.</i>",
+            parse_mode=ParseMode.HTML,
+            reply_markup=main_keyboard
+        )
         return
 
     if not is_verified(user_id) and get_trial_count(user_id) >= FREE_TRIAL_LIMIT:
@@ -3037,7 +3257,7 @@ def main():
     app.add_handler(
         MessageHandler(
             filters.Regex(
-                "^(📊 Signal|📚 Breakdown|signal|breakdown)$"
+                "^(📊 Signal|📚 Breakdown|🔗 Connect Deriv|signal|breakdown|connect deriv)$"
             ),
             handle_buttons
         )

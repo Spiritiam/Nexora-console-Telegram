@@ -345,68 +345,167 @@ def get_signals_since(start_dt):
 # DERIV ACCOUNT LINKING (NEW) — PHASE 1
 # Read-only: connect a user's real Deriv account
 # and show balance/open positions. No trading.
-# Real accounts only - demo (virtual) accounts
-# are detected via Deriv's own "is_virtual" flag
-# in the authorize response and rejected, never
-# guessed from the loginid prefix alone.
+# Real accounts only - virtual/demo accounts are
+# detected via Deriv's own account-type flag and
+# rejected, never guessed from the loginid prefix.
 # Uses a Personal Access Token the user generates
 # themselves in their own Deriv account settings
 # (scoped to read + trading info only) and pastes
 # into the bot - no OAuth web server needed for
-# this phase. Each check opens one short-lived
-# WebSocket connection, asks everything needed,
-# then closes - never a persistent connection per
-# user, which wouldn't scale.
+# this phase.
+#
+# CONNECTION FLOW (confirmed via live network trace
+# against Deriv's Playground on 2026-06-20 - Deriv's
+# API is mid-migration to a new system, and this is
+# NOT the same flow shown in older/legacy examples):
+#   1. GET /trading/v1/options/accounts
+#      (Bearer token + Deriv-App-ID header)
+#      -> lists every account tied to this token
+#   2. POST /trading/v1/options/accounts/{accountId}/otp
+#      -> returns a short-lived WebSocket URL with a
+#         one-time code already embedded in it
+#   3. Connect directly to that wss:// URL - no
+#      further auth headers or "authorize" message
+#      needed, the embedded code handles it
+#   4. Send balance/portfolio requests on that
+#      connection, then close it
+# Never a persistent connection per user - opens,
+# asks everything needed, closes, every time.
+#
 # Requires a Supabase table: deriv_accounts.
 # Columns: user_id (text, unique), deriv_loginid
 # (text), api_token (text), currency (text),
 # linked_at (text), last_synced (text).
 # ============================================
 
-async def deriv_fetch_account_snapshot(token):
+DERIV_API_BASE = "https://api.derivws.com"
+
+def deriv_api_headers(token):
+    return {
+        "Authorization": f"Bearer {token}",
+        "Deriv-App-ID": DERIV_APP_ID or "",
+    }
+
+async def deriv_get_options_accounts(token):
     """
-    Opens one short-lived WebSocket connection to Deriv, authorizes
-    with the user's token, and fetches both balance and open
-    positions before closing. Returns None if authorization fails
-    (invalid/expired token) or on any connection error.
+    Step 1: lists every account (real and virtual) tied to this
+    token. Returns the raw parsed JSON on success, or None on any
+    failure. The exact field names here are being confirmed against
+    live testing - deriv_fetch_account_snapshot below logs the raw
+    response if it can't find an account in the shape it expects,
+    so the actual shape can be adjusted from real output rather
+    than another guess.
     """
     if not DERIV_APP_ID:
         print("[DERIV] No DERIV_APP_ID set")
         return None
+    try:
+        url = f"{DERIV_API_BASE}/trading/v1/options/accounts"
+        response = requests.get(url, headers=deriv_api_headers(token), timeout=10)
+        if response.status_code != 200:
+            print(f"[DERIV] Accounts lookup failed {response.status_code}: {response.text}")
+            return None
+        return response.json()
+    except Exception as e:
+        print(f"[DERIV] deriv_get_options_accounts error: {e}")
+        return None
 
-    url = f"wss://ws.derivws.com/websockets/v3?app_id={DERIV_APP_ID}"
+async def deriv_get_otp_url(token, account_id):
+    """
+    Step 2: exchanges the token + a specific account ID for the
+    short-lived WebSocket URL with the one-time code embedded.
+    """
+    try:
+        url = f"{DERIV_API_BASE}/trading/v1/options/accounts/{account_id}/otp"
+        response = requests.post(url, headers=deriv_api_headers(token), timeout=10)
+        if response.status_code != 200:
+            print(f"[DERIV] OTP request failed {response.status_code}: {response.text}")
+            return None
+        data = response.json()
+        return data.get("data", {}).get("url")
+    except Exception as e:
+        print(f"[DERIV] deriv_get_otp_url error: {e}")
+        return None
+
+async def deriv_fetch_account_snapshot(token):
+    """
+    Full flow: list accounts -> pick the real one -> get its OTP
+    WebSocket URL -> connect and fetch balance/positions. Returns
+    None on failure, or a dict with is_virtual=True (no balance
+    data) if only demo accounts are found, so the caller's existing
+    "that's a demo account" rejection message still fires correctly.
+    """
+    accounts_data = await deriv_get_options_accounts(token)
+    if not accounts_data:
+        return None
+
+    accounts_list = accounts_data.get("data")
+    if not isinstance(accounts_list, list):
+        accounts_list = accounts_data.get("accounts")
+
+    if not accounts_list:
+        print(f"[DERIV] Unexpected accounts response shape: {accounts_data}")
+        return None
+
+    real_account = None
+    for acct in accounts_list:
+        is_virtual = bool(
+            acct.get("is_virtual")
+            or str(acct.get("account_type", "")).lower() in ("demo", "virtual")
+        )
+        if not is_virtual:
+            real_account = acct
+            break
+
+    if not real_account:
+        print(f"[DERIV] No real account found in: {accounts_list}")
+        return {
+            "loginid": None,
+            "is_virtual": True,
+            "currency": None,
+            "balance": None,
+            "open_contracts": [],
+        }
+
+    account_id = (
+        real_account.get("account_id")
+        or real_account.get("loginid")
+        or real_account.get("id")
+    )
+    currency = real_account.get("currency", "")
+
+    if not account_id:
+        print(f"[DERIV] Could not find account_id in: {real_account}")
+        return None
+
+    ws_url = await deriv_get_otp_url(token, account_id)
+    if not ws_url:
+        return None
 
     try:
-        async with websockets.connect(url, open_timeout=10, close_timeout=5) as ws:
-            await ws.send(json.dumps({"authorize": token}))
-            auth_response = json.loads(await ws.recv())
-
-            if "error" in auth_response:
-                print(f"[DERIV] Authorize failed: {auth_response['error'].get('message')}")
-                return None
-
-            authorize_data = auth_response.get("authorize", {})
-            loginid = authorize_data.get("loginid", "")
-            is_virtual = authorize_data.get("is_virtual", 0) == 1
-            currency = authorize_data.get("currency", "")
-
+        async with websockets.connect(ws_url, open_timeout=10, close_timeout=5) as ws:
             await ws.send(json.dumps({"balance": 1}))
             balance_response = json.loads(await ws.recv())
-            balance = balance_response.get("balance", {}).get("balance")
+            balance_block = balance_response.get("data", balance_response.get("balance", {}))
+            balance = balance_block.get("balance") if isinstance(balance_block, dict) else None
 
             await ws.send(json.dumps({"portfolio": 1}))
             portfolio_response = json.loads(await ws.recv())
-            open_contracts = portfolio_response.get("portfolio", {}).get("contracts", [])
+            portfolio_block = portfolio_response.get("data", portfolio_response.get("portfolio", {}))
+            open_contracts = (
+                portfolio_block.get("contracts", [])
+                if isinstance(portfolio_block, dict) else []
+            )
 
             return {
-                "loginid": loginid,
-                "is_virtual": is_virtual,
+                "loginid": account_id,
+                "is_virtual": False,
                 "currency": currency,
                 "balance": balance,
                 "open_contracts": open_contracts,
             }
     except Exception as e:
-        print(f"[DERIV] Connection error: {e}")
+        print(f"[DERIV] WebSocket connection error: {e}")
         return None
 
 def save_deriv_account(user_id, loginid, token, currency):

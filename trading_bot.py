@@ -607,18 +607,52 @@ async def deriv_fetch_account_snapshot(token):
 
     try:
         async with websockets.connect(ws_url, open_timeout=10, close_timeout=5) as ws:
+
+            async def recv_typed(expected_type, max_attempts=5):
+                """
+                Reads frames until one matching expected_type arrives,
+                instead of trusting that the very next frame received
+                is necessarily the response to what was just sent.
+                Deriv's socket can send other frames (e.g. unsolicited
+                notifications); blindly parsing whatever arrives first
+                risks silently treating an unrelated frame as the real
+                response - which would make open_contracts wrongly
+                look empty without raising any error at all.
+                """
+                for _ in range(max_attempts):
+                    raw = json.loads(await ws.recv())
+                    if raw.get("msg_type") == expected_type:
+                        return raw
+                    if raw.get("error"):
+                        print(f"[DERIV] {expected_type} request returned an error: {raw['error']}")
+                        return raw
+                print(f"[DERIV] Gave up waiting for msg_type={expected_type} after {max_attempts} frames")
+                return None
+
             await ws.send(json.dumps({"balance": 1}))
-            balance_response = json.loads(await ws.recv())
+            balance_response = await recv_typed("balance") or {}
             balance_block = balance_response.get("data", balance_response.get("balance", {}))
             balance = balance_block.get("balance") if isinstance(balance_block, dict) else None
 
             await ws.send(json.dumps({"portfolio": 1}))
-            portfolio_response = json.loads(await ws.recv())
+            portfolio_response = await recv_typed("portfolio") or {}
             portfolio_block = portfolio_response.get("data", portfolio_response.get("portfolio", {}))
             open_contracts = (
                 portfolio_block.get("contracts", [])
                 if isinstance(portfolio_block, dict) else []
             )
+            # TEMP DIAGNOSTIC: the auto-copy no-stacking check assumed
+            # each contract has a "symbol" field, but this was never
+            # confirmed against a real response - and a real V75
+            # double-trade slipped through, suggesting that assumption
+            # may be wrong (or symbol isn't what's actually returned).
+            # Logging the raw shape here so the next real scan tells
+            # us the truth, instead of guessing again. Remove this
+            # print once the real field name is confirmed and the
+            # no-stacking check (see held_symbols in run_auto_copy_scan)
+            # is fixed to match it.
+            if open_contracts:
+                print(f"[DERIV DIAGNOSTIC] Raw open_contracts sample: {open_contracts[0]}")
 
             return {
                 "loginid": account_id,
@@ -630,6 +664,155 @@ async def deriv_fetch_account_snapshot(token):
     except Exception as e:
         print(f"[DERIV] WebSocket connection error: {e}")
         return None
+
+# ============================================
+# AUTO-COPY TRADE TRACKING (NEW)
+# Independent of Deriv's live portfolio socket
+# read - that read's "is this index already
+# held" check (open_contracts/symbol matching in
+# run_auto_copy_scan) was never confirmed against
+# a real response, and a genuine double-trade on
+# V75 slipped through it. This adds a second,
+# DB-backed source of truth: every auto-copy
+# trade gets its own row here the moment it's
+# placed, and the no-stacking check in
+# run_auto_copy_scan checks BOTH this table AND
+# the live socket read before allowing a new
+# trade on the same user+symbol - either one
+# saying "still open" is enough to block it.
+#
+# Requires a Supabase table: auto_copy_trades
+# Columns: id (uuid/int, pk), user_id (text),
+# symbol (text), contract_id (text),
+# direction (text), stake/risk/win (numeric),
+# status (text: OPEN/CLOSED), profit (numeric,
+# nullable), placed_at (timestamptz),
+# closed_at (timestamptz, nullable)
+# ============================================
+
+def log_auto_copy_trade(user_id, symbol, contract_id, direction, stake, risk, win):
+    try:
+        url = f"{SUPABASE_URL}/rest/v1/auto_copy_trades"
+        payload = {
+            "user_id": str(user_id),
+            "symbol": symbol,
+            "contract_id": str(contract_id),
+            "direction": direction,
+            "stake": stake,
+            "risk": risk,
+            "win": win,
+            "status": "OPEN",
+            "placed_at": datetime.utcnow().isoformat(),
+        }
+        response = requests.post(url, headers=sb_headers(), json=payload, timeout=10)
+        if response.status_code not in (200, 201):
+            print(f"[AUTO-COPY LOG] ❌ Failed to log trade for {user_id}/{symbol}: {response.status_code} {response.text}")
+            return False
+        return True
+    except Exception as e:
+        print(f"[AUTO-COPY LOG] error: {e}")
+        return False
+
+def has_open_auto_copy_trade(user_id, symbol):
+    """
+    DB-backed half of the no-stacking check - independent of whatever
+    Deriv's live portfolio socket returns. Fails CLOSED (blocks the
+    trade) on a DB read error, the opposite default to
+    has_open_signal_for_pair - a missed auto-copy trade is far less
+    costly than risking a real duplicate position with real money.
+    """
+    try:
+        url = (
+            f"{SUPABASE_URL}/rest/v1/auto_copy_trades"
+            f"?user_id=eq.{user_id}&symbol=eq.{symbol}&status=eq.OPEN&select=id&limit=1"
+        )
+        response = requests.get(url, headers=sb_headers(), timeout=10)
+        data = response.json()
+        return len(data) > 0
+    except Exception as e:
+        print(f"[AUTO-COPY LOG] has_open_auto_copy_trade error: {e}")
+        return True  # fail CLOSED here - see docstring
+
+async def get_deriv_contract_outcome(token, contract_id):
+    """
+    Asks Deriv directly whether a specific contract has closed yet,
+    via proposal_open_contract - mirrors get_mt5_trade_outcome's role
+    for MT5 trades. Returns ("CLOSED", profit) once is_sold is true,
+    ("OPEN", None) while still running, or (None, None) if the check
+    itself failed (caller should treat this as "try again later", NOT
+    as confirmation the trade is closed).
+    """
+    accounts_data = await deriv_get_options_accounts(token)
+    if not accounts_data:
+        return None, None
+    accounts_list = accounts_data.get("data") or accounts_data.get("accounts")
+    if not accounts_list:
+        return None, None
+    real_account = next(
+        (a for a in accounts_list if not bool(
+            a.get("is_virtual") or str(a.get("account_type", "")).lower() in ("demo", "virtual")
+        )),
+        None
+    )
+    if not real_account:
+        return None, None
+    account_id = real_account.get("account_id") or real_account.get("loginid") or real_account.get("id")
+    if not account_id:
+        return None, None
+
+    ws_url = await deriv_get_otp_url(token, account_id)
+    if not ws_url:
+        return None, None
+
+    try:
+        async with websockets.connect(ws_url, open_timeout=10, close_timeout=5) as ws:
+            await ws.send(json.dumps({
+                "proposal_open_contract": 1,
+                "contract_id": int(contract_id)
+            }))
+            raw = json.loads(await ws.recv())
+
+            if raw.get("error"):
+                print(f"[AUTO-COPY OUTCOME] Error for contract {contract_id}: {raw['error']}")
+                return None, None
+
+            contract = raw.get("proposal_open_contract", {})
+            # TEMP DIAGNOSTIC: is_sold/profit are standard, long-
+            # documented Deriv fields, but given the symbol field
+            # mistake earlier, logging the raw shape here too until
+            # this is confirmed against a real closed contract.
+            print(f"[AUTO-COPY OUTCOME] Raw proposal_open_contract for {contract_id}: {contract}")
+
+            if not contract.get("is_sold"):
+                return "OPEN", None
+
+            return "CLOSED", contract.get("profit")
+    except Exception as e:
+        print(f"[AUTO-COPY OUTCOME] Connection error for {contract_id}: {e}")
+        return None, None
+
+def mark_auto_copy_trade_closed(contract_id, profit):
+    try:
+        url = f"{SUPABASE_URL}/rest/v1/auto_copy_trades?contract_id=eq.{contract_id}"
+        payload = {
+            "status": "CLOSED",
+            "profit": profit,
+            "closed_at": datetime.utcnow().isoformat(),
+        }
+        response = requests.patch(url, headers=sb_headers(), json=payload, timeout=10)
+        return response.status_code in (200, 204)
+    except Exception as e:
+        print(f"[AUTO-COPY LOG] mark_auto_copy_trade_closed error: {e}")
+        return False
+
+def get_open_auto_copy_trades():
+    try:
+        url = f"{SUPABASE_URL}/rest/v1/auto_copy_trades?status=eq.OPEN&select=*"
+        response = requests.get(url, headers=sb_headers(), timeout=10)
+        return response.json()
+    except Exception as e:
+        print(f"[AUTO-COPY LOG] get_open_auto_copy_trades error: {e}")
+        return []
 
 def save_deriv_account(user_id, loginid, token, currency):
     try:
@@ -1449,10 +1632,16 @@ async def run_auto_copy_scan(context: ContextTypes.DEFAULT_TYPE):
             low_balance_hit = False
 
             for index_key, trade_context in fresh_signals.items():
+                # Two independent checks must BOTH say "not held" before
+                # a trade is allowed - the live socket read (symbol
+                # matching against open_contracts) and this DB-backed
+                # check. Either one saying "still open" blocks the
+                # trade. The socket-based check alone already let a
+                # real V75 double-trade through once, so it's no
+                # longer trusted on its own.
                 if trade_context["symbol"] in held_symbols:
-                    # Already holding a position on this index - the
-                    # no-stacking rule means this signal is skipped
-                    # for this user entirely, not queued for later.
+                    continue
+                if has_open_auto_copy_trade(user_id, trade_context["symbol"]):
                     continue
 
                 stake, risk, win, was_reduced = get_auto_copy_trade_amounts(
@@ -1481,6 +1670,12 @@ async def run_auto_copy_scan(context: ContextTypes.DEFAULT_TYPE):
                 low_balance_notified.discard(user_id)  # back above $5 and a trade just succeeded - reset so a future dip warns again
 
                 contract_id = buy_data.get("contract_id", "—")
+
+                log_auto_copy_trade(
+                    user_id, trade_context["symbol"], contract_id,
+                    trade_context["direction"], stake, risk, win
+                )
+
                 reduced_note = (
                     f" <i>(stake reduced to ${stake} for balance)</i>"
                     if was_reduced else ""
@@ -5050,6 +5245,45 @@ async def check_open_signals(context: ContextTypes.DEFAULT_TYPE):
                 update_signal_status(sig["id"], "SL_HIT")
 
 # ============================================
+# AUTO-COPY TRADE MONITOR (NEW)
+# Deriv equivalent of check_open_signals/
+# get_mt5_trade_outcome above, but for
+# auto_copy_trades rows instead of signal_log.
+# Runs every 15 minutes: for each row still
+# marked OPEN, asks Deriv directly whether that
+# contract has actually closed yet (real
+# profit/loss, not inferred), and marks it CLOSED
+# once it has. This is what allows
+# has_open_auto_copy_trade's no-stacking check to
+# correctly free up an index again once a
+# position genuinely finishes - without this,
+# every row would stay OPEN forever and silently
+# block all future trades on that index.
+# ============================================
+
+async def check_open_auto_copy_trades(context: ContextTypes.DEFAULT_TYPE):
+    open_trades = get_open_auto_copy_trades()
+    if not open_trades:
+        return
+
+    accounts_by_user = {a["user_id"]: a for a in get_all_auto_copy_accounts()}
+
+    for trade in open_trades:
+        user_id = trade.get("user_id")
+        contract_id = trade.get("contract_id")
+        account = accounts_by_user.get(user_id)
+        if not account or not contract_id:
+            continue
+
+        outcome, profit = await get_deriv_contract_outcome(
+            account["api_token"], contract_id
+        )
+        if outcome == "CLOSED":
+            mark_auto_copy_trade_closed(contract_id, profit)
+        # outcome == "OPEN" -> still running, nothing to do
+        # outcome is None -> lookup failed, retry next sweep
+
+# ============================================
 # WEEKLY PERFORMANCE REPORT (NEW)
 # Runs every Sunday at 23:00 UTC, covering the
 # full Monday 00:00 UTC -> Sunday 23:00 UTC week
@@ -5189,6 +5423,17 @@ def main():
         interval=900,
         first=60,
         name="tp_sl_monitor"
+    )
+
+    # Auto-copy trade monitor - Deriv equivalent of the TP/SL monitor
+    # above. Marks auto_copy_trades rows CLOSED once Deriv confirms
+    # the real outcome, which is what frees an index back up for the
+    # no-stacking check once a position genuinely finishes.
+    job_queue.run_repeating(
+        check_open_auto_copy_trades,
+        interval=900,
+        first=90,
+        name="auto_copy_trade_monitor"
     )
 
     # Auto-copy scan - independent of the channel posting schedule.

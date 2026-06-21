@@ -7,6 +7,8 @@ import json
 import time
 import websockets
 
+from metaapi_cloud_sdk import MetaApi
+
 from datetime import datetime, timedelta
 from pathlib import Path
 
@@ -312,13 +314,60 @@ def log_signal(signal_data):
             "posted_at": datetime.utcnow().isoformat(),
             "status": "OPEN",
         }
-        requests.post(url, headers=sb_headers(), json=payload, timeout=10)
-        print(
-            f"[SIGNAL LOG] ✅ Logged {signal_data['pair_name']} "
-            f"{signal_data['direction']}"
-        )
+        headers = sb_headers()
+        headers["Prefer"] = "return=representation"
+        response = requests.post(url, headers=headers, json=payload, timeout=10)
+        if response.status_code in (200, 201):
+            result = response.json()
+            signal_id = result[0]["id"] if result else None
+            print(
+                f"[SIGNAL LOG] ✅ Logged {signal_data['pair_name']} "
+                f"{signal_data['direction']} (id={signal_id})"
+            )
+            return signal_id
+        else:
+            print(
+                f"[SIGNAL LOG] ❌ Failed to log {signal_data['pair_name']} "
+                f"{signal_data['direction']} | "
+                f"{response.status_code}: {response.text}"
+            )
+            return None
     except Exception as e:
         print(f"[SIGNAL LOG] log_signal error: {e}")
+        return None
+
+def attach_mt5_order_id(signal_id, order_id):
+    """
+    Links a placed MT5 order back onto its signal_log row, so the
+    trade's eventual real outcome (TP, SL, or a manual close in
+    profit/loss) can later be looked up directly from MT5 instead of
+    inferred from a separate price feed. Requires an mt5_order_id
+    column on signal_log.
+    """
+    if not signal_id or not order_id:
+        return
+    try:
+        url = f"{SUPABASE_URL}/rest/v1/signal_log?id=eq.{signal_id}"
+        payload = {"mt5_order_id": order_id}
+        response = requests.patch(url, headers=sb_headers(), json=payload, timeout=10)
+        if response.status_code in (200, 204):
+            print(f"[SIGNAL LOG] ✅ Linked MT5 order {order_id} to signal {signal_id}")
+        else:
+            print(
+                f"[SIGNAL LOG] ❌ Failed to link MT5 order {order_id} to "
+                f"signal {signal_id} | {response.status_code}: {response.text}"
+            )
+    except Exception as e:
+        print(f"[SIGNAL LOG] attach_mt5_order_id error: {e}")
+
+async def place_and_link_mt5_trade(signal_id, signal_data):
+    """
+    Places the MT5 trade exactly once, then links the resulting
+    order_id back onto its signal_log row. Runs as a background task
+    so channel posting never waits on MT5 execution.
+    """
+    order_id = await place_mt5_trade(signal_data)
+    attach_mt5_order_id(signal_id, order_id)
 
 def get_open_signals():
     try:
@@ -336,10 +385,19 @@ def update_signal_status(signal_id, status):
             "status": status,
             "closed_at": datetime.utcnow().isoformat(),
         }
-        requests.patch(url, headers=sb_headers(), json=payload, timeout=10)
-        print(f"[SIGNAL LOG] Signal {signal_id} -> {status}")
+        response = requests.patch(url, headers=sb_headers(), json=payload, timeout=10)
+        if response.status_code in (200, 204):
+            print(f"[SIGNAL LOG] ✅ Signal {signal_id} -> {status}")
+            return True
+        else:
+            print(
+                f"[SIGNAL LOG] ❌ Failed to update signal {signal_id} -> "
+                f"{status} | {response.status_code}: {response.text}"
+            )
+            return False
     except Exception as e:
         print(f"[SIGNAL LOG] update_signal_status error: {e}")
+        return False
 
 def get_signals_since(start_dt):
     try:
@@ -2802,6 +2860,74 @@ async def place_mt5_trade(signal_data):
         return None
 
 # ============================================
+# METAAPI — CHECK REAL TRADE OUTCOME (NEW)
+# Uses the MetaApi Python SDK (not raw requests,
+# since deal history is websocket/RPC-only - see
+# https://metaapi.cloud/docs/client/ for details)
+# to ask MT5 directly what happened to a placed
+# order: still open, or closed with a real profit/
+# loss. This replaces inferring the outcome from
+# the cached price feed, which couldn't see manual
+# closes or slippage past the posted TP/SL levels.
+#
+# A simple market order's positionId equals its
+# orderId, so the order_id saved by
+# attach_mt5_order_id can be used directly as the
+# position_id lookup key. A still-open position has
+# only its opening (DEAL_ENTRY_IN) deal; once
+# closed, a second deal appears with
+# entryType DEAL_ENTRY_OUT and a non-zero profit
+# (positive = win, negative = loss) - this is true
+# whether it closed via TP, SL, or a manual close.
+#
+# Opens a fresh RPC connection per call rather than
+# holding one open permanently, since this only
+# needs to run once per signal during the 15-minute
+# monitor sweep.
+# ============================================
+
+async def get_mt5_trade_outcome(position_id):
+    """
+    Returns ('CLOSED', profit) if the position has closed (TP, SL, or
+    manual), ('OPEN', None) if it's still running, or (None, None) if
+    the lookup itself failed (e.g. network/auth issue) - callers should
+    treat None as "couldn't tell, try again next sweep" and NOT close
+    out the signal on a failed lookup.
+    """
+    if not METAAPI_TOKEN or not METAAPI_ACCOUNT_ID or not position_id:
+        return None, None
+    try:
+        api = MetaApi(token=METAAPI_TOKEN)
+        account = await api.metatrader_account_api.get_account(
+            account_id=METAAPI_ACCOUNT_ID
+        )
+        connection = account.get_rpc_connection()
+        await connection.connect()
+        await connection.wait_synchronized()
+
+        deals = await connection.get_deals_by_position(
+            position_id=str(position_id)
+        )
+
+        closing_deal = next(
+            (d for d in deals if d.get("entryType") == "DEAL_ENTRY_OUT"),
+            None
+        )
+        if closing_deal is None:
+            return "OPEN", None
+
+        profit = closing_deal.get("profit", 0)
+        print(
+            f"[MT5 OUTCOME] Position {position_id} closed — "
+            f"profit: {profit}"
+        )
+        return "CLOSED", profit
+
+    except Exception as e:
+        print(f"[MT5 OUTCOME] ❌ Lookup failed for {position_id}: {e}")
+        return None, None
+
+# ============================================
 # GEMINI AI — GENERAL (breakdowns, news)
 # ============================================
 
@@ -3913,7 +4039,7 @@ async def _post_signal_for_pair(bot, pair_keyword):
             print(f"[AUTO SIGNAL] ❌ Could not fetch price for {pair_keyword}.")
         return
 
-    log_signal(signal_data)
+    signal_id = log_signal(signal_data)
 
     for channel_id in [CHANNEL_1_ID, CHANNEL_2_ID]:
         try:
@@ -3935,10 +4061,13 @@ async def _post_signal_for_pair(bot, pair_keyword):
                 f"posted to {channel_id}"
             )
 
-            asyncio.create_task(place_mt5_trade(signal_data))
-
         except Exception as e:
             print(f"[AUTO SIGNAL] ❌ Failed for {channel_id}: {e}")
+
+    # Placed exactly once per signal, regardless of how many
+    # channels it's posted to - this used to fire once per channel
+    # in the loop above, silently doubling every trade's exposure.
+    asyncio.create_task(place_and_link_mt5_trade(signal_id, signal_data))
 
 async def post_auto_signal(context: ContextTypes.DEFAULT_TYPE):
     pair_keyword = context.job.data
@@ -4197,14 +4326,19 @@ async def catch_up_missed_signals(app):
         await _post_signal_for_pair(app.bot, data)
 
 # ============================================
-# TP/SL MONITOR (NEW)
-# Runs every 15 minutes. Checks every OPEN
-# signal in signal_log against current price
-# (via the same shared price_cache everything
-# else already uses, so this adds no extra API
-# load beyond what's already happening) and
-# marks it TP_HIT or SL_HIT the moment price
-# reaches either level.
+# TP/SL MONITOR
+# Runs every 15 minutes. For each OPEN signal,
+# checks the REAL MT5 outcome via mt5_order_id
+# (see get_mt5_trade_outcome above) - this is
+# ground truth from the actual trade, so it
+# correctly catches manual closes and slippage,
+# not just price crossing the posted TP/SL level.
+#
+# Falls back to the old price-feed inference only
+# for signals with no mt5_order_id on the row (e.g.
+# logged before this fix, or if trade placement
+# failed for that signal) - so nothing regresses
+# for older rows still sitting OPEN.
 # ============================================
 
 async def check_open_signals(context: ContextTypes.DEFAULT_TYPE):
@@ -4213,6 +4347,18 @@ async def check_open_signals(context: ContextTypes.DEFAULT_TYPE):
         return
 
     for sig in open_signals:
+        mt5_order_id = sig.get("mt5_order_id")
+
+        if mt5_order_id:
+            outcome, profit = await get_mt5_trade_outcome(mt5_order_id)
+            if outcome == "CLOSED":
+                status = "TP_HIT" if profit >= 0 else "SL_HIT"
+                update_signal_status(sig["id"], status)
+            # outcome == "OPEN" -> still running, nothing to do
+            # outcome is None -> lookup failed, retry next sweep
+            continue
+
+        # No mt5_order_id on this row - fall back to price inference
         pair_name = sig.get("pair_name")
         pair_key = next(
             (k for k, c in PAIR_CONFIG.items() if c["pair_name"] == pair_name),
@@ -4386,11 +4532,15 @@ def main():
     )
 
     # Weekly performance report - every Sunday at 23:00 UTC
+    # NOTE: PTB v20+ uses cron-style day indexing for run_daily's
+    # `days` param (0=Sunday ... 6=Saturday), NOT Python's
+    # datetime.weekday() convention (0=Monday ... 6=Sunday). days=(6,)
+    # was firing Saturday, not Sunday - days=(0,) is correct here.
     job_queue.run_daily(
         post_weekly_report,
         time=parse_time("23:00"),
         name="weekly_report",
-        days=(6,)
+        days=(0,)
     )
 
     print("Nexora AI Running...")

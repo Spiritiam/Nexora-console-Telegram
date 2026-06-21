@@ -1107,19 +1107,30 @@ async def send_tier_selection(bot, user_id, trade_context):
         reply_markup=InlineKeyboardMarkup(tier_buttons)
     )
 
-def friendly_trade_error(raw_error):
+def friendly_trade_error(raw_error, auto_copy_context=False):
     """
     Translates a raw Deriv API error into plain English for display
     to the end user - retail/beginner audience, so raw API jargon
     like "Multiplier is not in acceptable range" should never reach
     them directly. The raw error is always still logged in full by
     the caller for diagnosis - this only changes what gets shown.
+
+    auto_copy_context=True swaps out wording that tells the user to
+    manually retap/retry - irrelevant for auto-copy, since nothing
+    was tapped and the next attempt happens automatically on the
+    next scan, not on demand.
     """
     lowered = raw_error.lower()
     if "multiplier" in lowered:
+        if auto_copy_context:
+            return "This stake amount isn't supported for this index right now. It'll be retried automatically on the next signal."
         return "This stake amount isn't supported for this index right now. Try a different stake, or use 🎯 Trade This Signal again."
     if "insufficient" in lowered or "not enough" in lowered or "balance" in lowered:
+        if auto_copy_context:
+            return "Your account balance is too low for this stake. Top up your Deriv account to resume auto-copy trades."
         return "Your account balance is too low for this stake. Try a smaller amount, or top up your Deriv account."
+    if auto_copy_context:
+        return "We couldn't place this trade right now. It'll be retried automatically on the next signal."
     return "We couldn't place this trade right now. Try again in a moment, or try a different stake."
 
 async def deriv_execute_multiplier_trade(token, symbol, contract_type, multiplier, stake, risk, win):
@@ -1329,7 +1340,7 @@ async def run_auto_copy_for_signal(bot, trade_context):
                     text=(
                         f"❌ <b>Auto-copy trade failed.</b>\n\n"
                         f"<b>{trade_context['direction']} {trade_context['display']}</b>\n"
-                        f"{friendly_trade_error(error)}"
+                        f"{friendly_trade_error(error, auto_copy_context=True)}"
                     ),
                     parse_mode=ParseMode.HTML
                 )
@@ -1429,6 +1440,14 @@ async def run_auto_copy_scan(context: ContextTypes.DEFAULT_TYPE):
                 if c.get("symbol")
             }
 
+            # Collected here and sent as ONE summary DM at the end of
+            # this user's loop, rather than one message per index -
+            # up to 5 indices firing in the same scan used to mean up
+            # to 5 separate notifications for the same 30-min round.
+            placed_lines = []
+            failed_lines = []
+            low_balance_hit = False
+
             for index_key, trade_context in fresh_signals.items():
                 if trade_context["symbol"] in held_symbols:
                     # Already holding a position on this index - the
@@ -1441,23 +1460,7 @@ async def run_auto_copy_scan(context: ContextTypes.DEFAULT_TYPE):
                 )
 
                 if stake is None:
-                    if user_id not in low_balance_notified:
-                        await bot.send_message(
-                            chat_id=int(user_id),
-                            text=(
-                                f"⚠️ <b>Auto-copy paused — balance too low.</b>\n\n"
-                                f"Your balance (${balance}) is too low even "
-                                f"for the smallest stake tier ($5). Top up "
-                                f"your Deriv account to resume auto-copy "
-                                f"trades.\n\n"
-                                f"<i>You won't get this reminder again "
-                                f"until your balance is back above $5 - "
-                                f"signals will keep being skipped "
-                                f"silently until then.</i>"
-                            ),
-                            parse_mode=ParseMode.HTML
-                        )
-                        low_balance_notified.add(user_id)
+                    low_balance_hit = True
                     continue
 
                 buy_data, error = await deriv_execute_multiplier_trade(
@@ -1469,14 +1472,9 @@ async def run_auto_copy_scan(context: ContextTypes.DEFAULT_TYPE):
                 )
 
                 if error:
-                    await bot.send_message(
-                        chat_id=int(user_id),
-                        text=(
-                            f"❌ <b>Auto-copy trade failed.</b>\n\n"
-                            f"<b>{trade_context['direction']} {trade_context['display']}</b>\n"
-                            f"{friendly_trade_error(error)}"
-                        ),
-                        parse_mode=ParseMode.HTML
+                    failed_lines.append(
+                        f"❌ <b>{trade_context['direction']} {trade_context['display']}</b>\n"
+                        f"{friendly_trade_error(error, auto_copy_context=True)}"
                     )
                     continue
 
@@ -1484,19 +1482,13 @@ async def run_auto_copy_scan(context: ContextTypes.DEFAULT_TYPE):
 
                 contract_id = buy_data.get("contract_id", "—")
                 reduced_note = (
-                    f"\n\n<i>Stake auto-reduced to ${stake} to fit your "
-                    f"current balance.</i>" if was_reduced else ""
+                    f" <i>(stake reduced to ${stake} for balance)</i>"
+                    if was_reduced else ""
                 )
-                await bot.send_message(
-                    chat_id=int(user_id),
-                    text=(
-                        f"🤖 <b>Auto-copy trade placed!</b>\n\n"
-                        f"<b>{trade_context['direction']} {trade_context['display']}</b>\n"
-                        f"Stake: ${stake} | Risk ${risk} → Win ${win}\n"
-                        f"Contract ID: {contract_id}"
-                        f"{reduced_note}"
-                    ),
-                    parse_mode=ParseMode.HTML
+                placed_lines.append(
+                    f"✅ <b>{trade_context['direction']} {trade_context['display']}</b>\n"
+                    f"Stake: ${stake} | Risk ${risk} → Win ${win} | "
+                    f"ID: {contract_id}{reduced_note}"
                 )
 
                 # Treat this index as now held for the rest of THIS
@@ -1504,6 +1496,33 @@ async def run_auto_copy_scan(context: ContextTypes.DEFAULT_TYPE):
                 # on the same index for the same user even if it
                 # somehow appeared twice in fresh_signals.
                 held_symbols.add(trade_context["symbol"])
+
+            if low_balance_hit and user_id not in low_balance_notified:
+                await bot.send_message(
+                    chat_id=int(user_id),
+                    text=(
+                        f"⚠️ <b>Auto-copy paused — balance too low.</b>\n\n"
+                        f"Your balance (${balance}) is too low even "
+                        f"for the smallest stake tier ($5). Top up "
+                        f"your Deriv account to resume auto-copy "
+                        f"trades.\n\n"
+                        f"<i>You won't get this reminder again "
+                        f"until your balance is back above $5 - "
+                        f"signals will keep being skipped "
+                        f"silently until then.</i>"
+                    ),
+                    parse_mode=ParseMode.HTML
+                )
+                low_balance_notified.add(user_id)
+
+            if placed_lines or failed_lines:
+                summary = "🤖 <b>Auto-Copy — this round:</b>\n\n"
+                summary += "\n\n".join(placed_lines + failed_lines)
+                await bot.send_message(
+                    chat_id=int(user_id),
+                    text=summary,
+                    parse_mode=ParseMode.HTML
+                )
 
         except Exception as e:
             print(f"[AUTO-COPY SCAN] ❌ Unexpected error for {user_id}: {e}")

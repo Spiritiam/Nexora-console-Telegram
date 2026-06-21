@@ -620,6 +620,60 @@ def get_deriv_account(user_id):
         print(f"[DERIV] get_deriv_account error: {e}")
         return None
 
+def save_auto_copy_settings(user_id, enabled, stake=None, risk_mode=None, risk=None, win=None):
+    """
+    Saves auto-copy trading preferences onto the user's existing
+    deriv_accounts row (PATCH, not a full upsert - this never touches
+    api_token/loginid, only the auto-copy columns). risk_mode is
+    either "fixed" (always use this risk/win) or "signal" (always
+    follow the signal's own suggested risk/win, scaled if the stake
+    is auto-reduced for low balance - see get_auto_copy_trade_amounts).
+    """
+    try:
+        url = (
+            f"{SUPABASE_URL}/rest/v1/deriv_accounts"
+            f"?user_id=eq.{user_id}"
+        )
+        payload = {"auto_copy_enabled": enabled}
+        if stake is not None:
+            payload["auto_copy_stake"] = stake
+        if risk_mode is not None:
+            payload["auto_copy_risk_mode"] = risk_mode
+        if risk is not None:
+            payload["auto_copy_risk"] = risk
+        if win is not None:
+            payload["auto_copy_win"] = win
+
+        response = requests.patch(
+            url, headers=sb_headers(), json=payload, timeout=10
+        )
+        if response.status_code not in (200, 204):
+            print(f"[DERIV] save_auto_copy_settings unexpected status {response.status_code}: {response.text}")
+            return False
+        return True
+    except Exception as e:
+        print(f"[DERIV] save_auto_copy_settings error: {e}")
+        return False
+
+def get_all_auto_copy_accounts():
+    """
+    Returns every deriv_accounts row with auto_copy_enabled = true,
+    for the signal-posting loop to iterate over. Each row already
+    carries its own api_token, so no separate lookup is needed per
+    user.
+    """
+    try:
+        url = (
+            f"{SUPABASE_URL}/rest/v1/deriv_accounts"
+            f"?auto_copy_enabled=eq.true&select=*"
+        )
+        response = requests.get(url, headers=sb_headers(), timeout=15)
+        data = response.json()
+        return data if isinstance(data, list) else []
+    except Exception as e:
+        print(f"[DERIV] get_all_auto_copy_accounts error: {e}")
+        return []
+
 # ============================================
 # DERIV SYNTHETIC SIGNALS + MULTIPLIER TRADING
 # (NEW) — PHASE 2
@@ -700,6 +754,7 @@ STAKE_TIERS = [
 ]
 
 pending_trades = {}  # user_id -> trade context dict, one pending trade at a time
+pending_autocopy_setup = {}  # user_id -> {stake, risk, win} chosen so far, mid-setup
 
 SYNTHETIC_ROTATION_ORDER = ["r10", "r25", "r50", "r75", "r100"]
 
@@ -1103,6 +1158,150 @@ async def deriv_execute_multiplier_trade(token, symbol, contract_type, multiplie
     except Exception as e:
         print(f"[SYNTH TRADE] Connection error: {e}")
         return None, "Connection error while placing the trade."
+
+# ============================================
+# AUTO-COPY TRADING (NEW)
+# Lets a user opt into having every synthetic
+# signal traded automatically on their own
+# linked Deriv account, instead of manually
+# tapping "Trade This Signal" each time. Set up
+# via the existing Connect Deriv flow, fully
+# optional, off by default for every account.
+#
+# Stake stepdown: if the user's saved stake
+# doesn't fit their current balance, this tries
+# progressively smaller tiers from STAKE_TIERS
+# (largest that fits) rather than failing
+# outright. If even the smallest ($5) doesn't
+# fit, the trade is skipped - never silently
+# trades a different amount without telling the
+# user which amount it used and why.
+# ============================================
+
+def get_auto_copy_trade_amounts(account, trade_context, balance):
+    """
+    Returns (stake, risk, win, was_reduced) for one user's auto-copy
+    trade given their saved settings and current balance, or
+    (None, None, None, None) if no stake fits even at the smallest
+    tier. risk_mode "signal" follows the signal's own suggested
+    risk/win (scaled to match if the stake gets stepped down, so the
+    risk:reward ratio stays the same as originally suggested);
+    "fixed" always uses the user's own saved risk/win unchanged.
+    """
+    saved_stake = account.get("auto_copy_stake") or DEFAULT_SYNTHETIC_STAKE
+    risk_mode = account.get("auto_copy_risk_mode") or "fixed"
+
+    if risk_mode == "signal":
+        base_risk = trade_context["risk"]
+        base_win = trade_context["win"]
+    else:
+        base_risk = account.get("auto_copy_risk") or DEFAULT_RISK
+        base_win = account.get("auto_copy_win") or DEFAULT_WIN
+
+    if balance >= saved_stake:
+        return saved_stake, base_risk, base_win, False
+
+    # Saved stake doesn't fit - step down through the standard tiers,
+    # largest-that-fits-first, scaling risk/win to match proportionally
+    # so the risk:reward ratio is preserved at the smaller size.
+    for tier in sorted(STAKE_TIERS, key=lambda t: t["stake"], reverse=True):
+        if tier["stake"] <= saved_stake and balance >= tier["stake"]:
+            scale = tier["stake"] / saved_stake
+            return (
+                tier["stake"],
+                round(base_risk * scale, 2),
+                round(base_win * scale, 2),
+                True
+            )
+
+    return None, None, None, None
+
+async def run_auto_copy_for_signal(bot, trade_context):
+    """
+    Fires the same signal's trade automatically for every user with
+    auto_copy_enabled = true on their own linked Deriv account. Each
+    user is fully isolated in its own try/except - one broken token
+    or one API hiccup never blocks or skips anyone else. Always runs
+    as a background task from the signal-posting function, so it
+    never delays or blocks the channel post itself.
+    """
+    accounts = get_all_auto_copy_accounts()
+    if not accounts:
+        return
+
+    print(f"[AUTO-COPY] Running for {len(accounts)} opted-in account(s)")
+
+    for account in accounts:
+        user_id = account.get("user_id")
+        token = account.get("api_token")
+        if not user_id or not token:
+            continue
+
+        try:
+            snapshot = await deriv_fetch_account_snapshot(token)
+            if not snapshot or snapshot.get("balance") is None:
+                print(f"[AUTO-COPY] Couldn't read balance for {user_id}, skipping this signal")
+                continue
+
+            balance = snapshot["balance"]
+            stake, risk, win, was_reduced = get_auto_copy_trade_amounts(
+                account, trade_context, balance
+            )
+
+            if stake is None:
+                await bot.send_message(
+                    chat_id=int(user_id),
+                    text=(
+                        f"⚠️ <b>Auto-copy skipped this signal.</b>\n\n"
+                        f"<b>{trade_context['direction']} {trade_context['display']}</b>\n"
+                        f"Your balance (${balance}) is too low even for "
+                        f"the smallest stake tier ($5). Top up your "
+                        f"Deriv account to resume auto-copy trades."
+                    ),
+                    parse_mode=ParseMode.HTML
+                )
+                continue
+
+            buy_data, error = await deriv_execute_multiplier_trade(
+                token,
+                trade_context["symbol"],
+                trade_context["contract_type"],
+                trade_context["multiplier"],
+                stake, risk, win,
+            )
+
+            if error:
+                await bot.send_message(
+                    chat_id=int(user_id),
+                    text=(
+                        f"❌ <b>Auto-copy trade failed.</b>\n\n"
+                        f"<b>{trade_context['direction']} {trade_context['display']}</b>\n"
+                        f"{friendly_trade_error(error)}"
+                    ),
+                    parse_mode=ParseMode.HTML
+                )
+                continue
+
+            contract_id = buy_data.get("contract_id", "—")
+            reduced_note = (
+                f"\n\n<i>Stake auto-reduced to ${stake} to fit your "
+                f"current balance.</i>" if was_reduced else ""
+            )
+            await bot.send_message(
+                chat_id=int(user_id),
+                text=(
+                    f"🤖 <b>Auto-copy trade placed!</b>\n\n"
+                    f"<b>{trade_context['direction']} {trade_context['display']}</b>\n"
+                    f"Stake: ${stake} | Risk ${risk} → Win ${win}\n"
+                    f"Contract ID: {contract_id}"
+                    f"{reduced_note}"
+                ),
+                parse_mode=ParseMode.HTML
+            )
+
+        except Exception as e:
+            print(f"[AUTO-COPY] ❌ Unexpected error for {user_id}: {e}")
+            continue
 
 # ============================================
 # AI BIAS USAGE TRACKING (NEW)
@@ -3219,15 +3418,31 @@ async def handle_buttons(update: Update, context: ContextTypes.DEFAULT_TYPE):
             snapshot = await deriv_fetch_account_snapshot(existing["api_token"])
             if snapshot:
                 open_count = len(snapshot["open_contracts"])
+                auto_on = bool(existing.get("auto_copy_enabled"))
+                status_line = (
+                    f"🤖 <b>Auto-Copy:</b> ON (${existing.get('auto_copy_stake', '—')} stake)"
+                    if auto_on else
+                    "✋ <b>Auto-Copy:</b> OFF (manual mode)"
+                )
+                toggle_button = (
+                    InlineKeyboardButton("🛑 Turn Auto-Copy OFF", callback_data="autocopy_setup_manual")
+                    if auto_on else
+                    InlineKeyboardButton("🤖 Turn Auto-Copy ON", callback_data="autocopy_setup_start")
+                )
                 await update.message.reply_text(
                     f"🔗 <b>Linked Deriv Options Account</b>\n\n"
                     f"<b>Account:</b> {snapshot['loginid']}\n"
                     f"<b>Balance:</b> {snapshot['balance']} {snapshot['currency']}\n"
-                    f"<b>Open Positions:</b> {open_count}\n\n"
+                    f"<b>Open Positions:</b> {open_count}\n"
+                    f"{status_line}\n\n"
                     f"ℹ️ <i>This shows your Options account only. Your MT5 "
                     f"and cTrader balances aren't connected yet.</i>",
                     parse_mode=ParseMode.HTML,
                     reply_markup=main_keyboard
+                )
+                await update.message.reply_text(
+                    "Want to change your trading mode?",
+                    reply_markup=InlineKeyboardMarkup([[toggle_button]])
                 )
             else:
                 await update.message.reply_text(
@@ -3563,7 +3778,143 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             parse_mode=ParseMode.HTML
         )
 
-    elif data.startswith("execconfirm_"):
+    elif data == "autocopy_setup_manual":
+
+        user_id = str(update.callback_query.from_user.id)
+        save_auto_copy_settings(user_id, enabled=False)
+
+        await context.bot.send_message(
+            chat_id=int(user_id),
+            text=(
+                "✋ <b>Got it — manual mode.</b>\n\n"
+                "Tap 🎯 Trade This Signal on any signal whenever you "
+                "want to trade it. You can switch to Auto-Copy anytime "
+                "from 🔗 Connect Deriv."
+            ),
+            parse_mode=ParseMode.HTML,
+            reply_markup=main_keyboard
+        )
+
+    elif data == "autocopy_setup_start":
+
+        user_id = str(update.callback_query.from_user.id)
+
+        tier_buttons = [
+            [InlineKeyboardButton(
+                f"${t['stake']} | Risk ${t['risk']} → Win ${t['win']}",
+                callback_data=f"autocopystake_{user_id}_{t['stake']}"
+            )]
+            for t in STAKE_TIERS
+        ]
+
+        await context.bot.send_message(
+            chat_id=int(user_id),
+            text=(
+                "🤖 <b>Auto-Copy Setup — Step 1 of 2</b>\n\n"
+                "Choose the stake to use on every signal:"
+            ),
+            parse_mode=ParseMode.HTML,
+            reply_markup=InlineKeyboardMarkup(tier_buttons)
+        )
+
+    elif data.startswith("autocopystake_"):
+
+        body = data.replace("autocopystake_", "")
+        user_id, stake_str = body.rsplit("_", 1)
+        stake = float(stake_str)
+
+        tier = next((t for t in STAKE_TIERS if t["stake"] == stake), None)
+        if not tier:
+            return
+
+        # Stashed here briefly until the risk-mode choice on the next
+        # tap completes the save - mirrors pending_trades, a short-
+        # lived per-user dict, not a persistent store.
+        pending_autocopy_setup[user_id] = {
+            "stake": tier["stake"],
+            "risk": tier["risk"],
+            "win": tier["win"],
+        }
+
+        await context.bot.send_message(
+            chat_id=int(user_id),
+            text=(
+                "🤖 <b>Auto-Copy Setup — Step 2 of 2</b>\n\n"
+                f"Stake set to ${tier['stake']}. Now choose how risk/"
+                "target should be decided on each trade:"
+            ),
+            parse_mode=ParseMode.HTML,
+            reply_markup=InlineKeyboardMarkup([
+                [InlineKeyboardButton(
+                    f"📌 Always use Risk ${tier['risk']} → Win ${tier['win']}",
+                    callback_data=f"autocopyrisk_{user_id}_fixed"
+                )],
+                [InlineKeyboardButton(
+                    "📊 Follow each signal's suggested risk/target",
+                    callback_data=f"autocopyrisk_{user_id}_signal"
+                )],
+            ])
+        )
+
+    elif data.startswith("autocopyrisk_"):
+
+        body = data.replace("autocopyrisk_", "")
+        user_id, risk_mode = body.rsplit("_", 1)
+
+        setup = pending_autocopy_setup.pop(user_id, None)
+        if not setup:
+            await context.bot.send_message(
+                chat_id=int(user_id),
+                text=(
+                    "⚠️ <b>That setup expired.</b>\n\n"
+                    "Tap 🔗 Connect Deriv and choose Auto-Copy again."
+                ),
+                parse_mode=ParseMode.HTML
+            )
+            return
+
+        saved = save_auto_copy_settings(
+            user_id,
+            enabled=True,
+            stake=setup["stake"],
+            risk_mode=risk_mode,
+            risk=setup["risk"],
+            win=setup["win"],
+        )
+
+        if not saved:
+            await context.bot.send_message(
+                chat_id=int(user_id),
+                text=(
+                    "⚠️ <b>Couldn't save your auto-copy settings right "
+                    "now.</b>\n\nPlease try again in a moment from "
+                    "🔗 Connect Deriv."
+                ),
+                parse_mode=ParseMode.HTML,
+                reply_markup=main_keyboard
+            )
+            return
+
+        mode_desc = (
+            f"a fixed Risk ${setup['risk']} → Win ${setup['win']}"
+            if risk_mode == "fixed"
+            else "each signal's own suggested risk/target"
+        )
+        await context.bot.send_message(
+            chat_id=int(user_id),
+            text=(
+                "✅ <b>Auto-Copy is ON.</b>\n\n"
+                f"Every synthetic index signal will trade automatically "
+                f"at ${setup['stake']} stake, using {mode_desc}.\n\n"
+                "If your balance is ever too low, a smaller stake is "
+                "tried automatically and you'll get a DM either way.\n\n"
+                "<i>Turn this off anytime from 🔗 Connect Deriv.</i>"
+            ),
+            parse_mode=ParseMode.HTML,
+            reply_markup=main_keyboard
+        )
+
+
 
         user_id = data.replace("execconfirm_", "")
         trade_context = pending_trades.pop(user_id, None)  # pop immediately, prevents a double-tap re-executing
@@ -3795,9 +4146,24 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await send_tier_selection(context.bot, user_id, pending_trade)
         else:
             await update.message.reply_text(
-                "<i>Tap 🔗 Connect Deriv anytime to check your balance "
-                "again.</i>",
-                parse_mode=ParseMode.HTML
+                "🤖 <b>One more thing - how do you want to trade?</b>\n\n"
+                "<b>Manual</b> - tap 🎯 Trade This Signal yourself "
+                "each time a signal posts.\n\n"
+                "<b>Auto-copy</b> - every synthetic index signal trades "
+                "automatically on this account, no tapping needed. "
+                "You set the stake once, and it's never on by default - "
+                "you can turn it off anytime.",
+                parse_mode=ParseMode.HTML,
+                reply_markup=InlineKeyboardMarkup([
+                    [InlineKeyboardButton(
+                        "✋ Manual (tap each time)",
+                        callback_data="autocopy_setup_manual"
+                    )],
+                    [InlineKeyboardButton(
+                        "🤖 Set up Auto-Copy",
+                        callback_data="autocopy_setup_start"
+                    )],
+                ])
             )
         return
 
@@ -4140,6 +4506,12 @@ async def _post_synthetic_signal_for_index(bot, index_key):
             print(f"[AUTO SYNTH] ✅ {index_key.upper()} posted to {channel_id}")
         except Exception as e:
             print(f"[AUTO SYNTH] ❌ Failed for {channel_id}: {e}")
+
+    # Fired once per signal, after both channel posts - never inside
+    # the loop above, same double-fire mistake already fixed once for
+    # MT5 placement. Background task so a slow/large auto-copy run
+    # never delays the channel post itself.
+    asyncio.create_task(run_auto_copy_for_signal(bot, trade_context))
 
 async def post_auto_synthetic_signal(context: ContextTypes.DEFAULT_TYPE):
     slot_number = context.job.data

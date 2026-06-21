@@ -406,6 +406,30 @@ def get_open_signals():
         print(f"[SIGNAL LOG] get_open_signals error: {e}")
         return []
 
+def has_open_signal_for_pair(pair_name):
+    """
+    True if this pair already has a signal sitting OPEN in signal_log -
+    used to stop a fresh scheduled signal (e.g. BTCUSD) from posting/
+    trading while the previous one on the same pair hasn't closed in
+    profit or loss yet (see get_mt5_trade_outcome / check_open_signals
+    for how a signal eventually closes).
+    """
+    try:
+        url = (
+            f"{SUPABASE_URL}/rest/v1/signal_log"
+            f"?status=eq.OPEN&pair_name=eq.{pair_name}&select=id&limit=1"
+        )
+        response = requests.get(url, headers=sb_headers(), timeout=10)
+        data = response.json()
+        return len(data) > 0
+    except Exception as e:
+        print(f"[SIGNAL LOG] has_open_signal_for_pair error: {e}")
+        # Fail safe by NOT blocking the signal - an unreachable DB
+        # check should never silently stall the whole schedule, and
+        # the duplicate-trade risk from one failed check is much
+        # smaller than missing scheduled signals indefinitely.
+        return False
+
 def update_signal_status(signal_id, status):
     try:
         url = f"{SUPABASE_URL}/rest/v1/signal_log?id=eq.{signal_id}"
@@ -783,6 +807,7 @@ STAKE_TIERS = [
 
 pending_trades = {}  # user_id -> trade context dict, one pending trade at a time
 pending_autocopy_setup = {}  # user_id -> {stake, risk, win} chosen so far, mid-setup
+low_balance_notified = set()  # user_id's already warned about low balance this "episode" - cleared the moment a trade succeeds again, so the warning doesn't repeat every 30-min scan
 
 SYNTHETIC_ROTATION_ORDER = ["r10", "r25", "r50", "r75", "r100"]
 
@@ -1416,18 +1441,23 @@ async def run_auto_copy_scan(context: ContextTypes.DEFAULT_TYPE):
                 )
 
                 if stake is None:
-                    await bot.send_message(
-                        chat_id=int(user_id),
-                        text=(
-                            f"⚠️ <b>Auto-copy skipped this signal.</b>\n\n"
-                            f"<b>{trade_context['direction']} {trade_context['display']}</b>\n"
-                            f"Your balance (${balance}) is too low even "
-                            f"for the smallest stake tier ($5). Top up "
-                            f"your Deriv account to resume auto-copy "
-                            f"trades."
-                        ),
-                        parse_mode=ParseMode.HTML
-                    )
+                    if user_id not in low_balance_notified:
+                        await bot.send_message(
+                            chat_id=int(user_id),
+                            text=(
+                                f"⚠️ <b>Auto-copy paused — balance too low.</b>\n\n"
+                                f"Your balance (${balance}) is too low even "
+                                f"for the smallest stake tier ($5). Top up "
+                                f"your Deriv account to resume auto-copy "
+                                f"trades.\n\n"
+                                f"<i>You won't get this reminder again "
+                                f"until your balance is back above $5 - "
+                                f"signals will keep being skipped "
+                                f"silently until then.</i>"
+                            ),
+                            parse_mode=ParseMode.HTML
+                        )
+                        low_balance_notified.add(user_id)
                     continue
 
                 buy_data, error = await deriv_execute_multiplier_trade(
@@ -1449,6 +1479,8 @@ async def run_auto_copy_scan(context: ContextTypes.DEFAULT_TYPE):
                         parse_mode=ParseMode.HTML
                     )
                     continue
+
+                low_balance_notified.discard(user_id)  # back above $5 and a trade just succeeded - reset so a future dip warns again
 
                 contract_id = buy_data.get("contract_id", "—")
                 reduced_note = (
@@ -4622,6 +4654,14 @@ async def _post_signal_for_pair(bot, pair_keyword):
     now = datetime.utcnow().strftime('%H:%M UTC')
 
     print(f"[AUTO SIGNAL] {pair_keyword.upper()} firing at {now}")
+
+    pair_name = PAIR_CONFIG.get(pair_keyword, {}).get("pair_name", pair_keyword.upper())
+    if has_open_signal_for_pair(pair_name):
+        print(
+            f"[AUTO SIGNAL] ⏸️ {pair_keyword.upper()} skipped — a "
+            f"previous {pair_name} signal hasn't closed yet."
+        )
+        return
 
     image_file_id, direction, signal, signal_data = (
         await build_signal_response(pair_keyword, user_id=None)

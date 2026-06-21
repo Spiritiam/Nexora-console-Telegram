@@ -1332,6 +1332,152 @@ async def run_auto_copy_for_signal(bot, trade_context):
             continue
 
 # ============================================
+# AUTO-COPY — INDEPENDENT 30-MIN SCAN (NEW)
+# The channel only posts 1-2x/day by design, to
+# avoid spamming the public channel - but
+# auto-copy users expect to see frequent activity
+# on their own account, the way real copy-trading
+# services behave. This runs completely
+# separately from channel posting: every 30
+# minutes, checks all 5 indices for a fresh
+# signal and trades it for every opted-in user -
+# but ONLY on an index where that user currently
+# has NO open position. A signal on an index the
+# user is already holding is skipped entirely for
+# them (not queued, not retried) until that
+# position closes - this is the deliberate
+# no-stacking rule, not a bug. Each index is
+# analyzed once per scan and shared across every
+# user (the market structure is identical for
+# everyone), so this costs 5 structure checks per
+# scan regardless of how many users are opted in -
+# NOT 5x the number of users.
+# ============================================
+
+async def run_auto_copy_scan(context: ContextTypes.DEFAULT_TYPE):
+    accounts = get_all_auto_copy_accounts()
+    if not accounts:
+        return
+
+    print(f"[AUTO-COPY SCAN] Running for {len(accounts)} opted-in account(s)")
+    bot = context.bot
+
+    # One structure check per index, shared across every user below -
+    # the market doesn't change per-user, so this is computed once.
+    fresh_signals = {}
+    for index_key, config in SYNTHETIC_CONFIG.items():
+        result = await analyze_synthetic_structure(index_key, config)
+        if not result:
+            continue
+        direction, confidence, reason = result
+        contract_type = "MULTUP" if direction == "BUY" else "MULTDOWN"
+        fresh_signals[index_key] = {
+            "index_key": index_key,
+            "symbol": config["symbol"],
+            "display": config["display"],
+            "direction": direction,
+            "contract_type": contract_type,
+            "multiplier": config["default_multiplier"],
+            "risk": DEFAULT_RISK,
+            "win": DEFAULT_WIN,
+        }
+
+    if not fresh_signals:
+        print("[AUTO-COPY SCAN] No usable signal on any index this round")
+        return
+
+    for account in accounts:
+        user_id = account.get("user_id")
+        token = account.get("api_token")
+        if not user_id or not token:
+            continue
+
+        try:
+            snapshot = await deriv_fetch_account_snapshot(token)
+            if not snapshot or snapshot.get("balance") is None:
+                print(f"[AUTO-COPY SCAN] Couldn't read account for {user_id}, skipping this round")
+                continue
+
+            balance = snapshot["balance"]
+            held_symbols = {
+                c.get("symbol") for c in snapshot.get("open_contracts", [])
+                if c.get("symbol")
+            }
+
+            for index_key, trade_context in fresh_signals.items():
+                if trade_context["symbol"] in held_symbols:
+                    # Already holding a position on this index - the
+                    # no-stacking rule means this signal is skipped
+                    # for this user entirely, not queued for later.
+                    continue
+
+                stake, risk, win, was_reduced = get_auto_copy_trade_amounts(
+                    account, trade_context, balance
+                )
+
+                if stake is None:
+                    await bot.send_message(
+                        chat_id=int(user_id),
+                        text=(
+                            f"⚠️ <b>Auto-copy skipped this signal.</b>\n\n"
+                            f"<b>{trade_context['direction']} {trade_context['display']}</b>\n"
+                            f"Your balance (${balance}) is too low even "
+                            f"for the smallest stake tier ($5). Top up "
+                            f"your Deriv account to resume auto-copy "
+                            f"trades."
+                        ),
+                        parse_mode=ParseMode.HTML
+                    )
+                    continue
+
+                buy_data, error = await deriv_execute_multiplier_trade(
+                    token,
+                    trade_context["symbol"],
+                    trade_context["contract_type"],
+                    trade_context["multiplier"],
+                    stake, risk, win,
+                )
+
+                if error:
+                    await bot.send_message(
+                        chat_id=int(user_id),
+                        text=(
+                            f"❌ <b>Auto-copy trade failed.</b>\n\n"
+                            f"<b>{trade_context['direction']} {trade_context['display']}</b>\n"
+                            f"{friendly_trade_error(error)}"
+                        ),
+                        parse_mode=ParseMode.HTML
+                    )
+                    continue
+
+                contract_id = buy_data.get("contract_id", "—")
+                reduced_note = (
+                    f"\n\n<i>Stake auto-reduced to ${stake} to fit your "
+                    f"current balance.</i>" if was_reduced else ""
+                )
+                await bot.send_message(
+                    chat_id=int(user_id),
+                    text=(
+                        f"🤖 <b>Auto-copy trade placed!</b>\n\n"
+                        f"<b>{trade_context['direction']} {trade_context['display']}</b>\n"
+                        f"Stake: ${stake} | Risk ${risk} → Win ${win}\n"
+                        f"Contract ID: {contract_id}"
+                        f"{reduced_note}"
+                    ),
+                    parse_mode=ParseMode.HTML
+                )
+
+                # Treat this index as now held for the rest of THIS
+                # scan, so a single round never opens two positions
+                # on the same index for the same user even if it
+                # somehow appeared twice in fresh_signals.
+                held_symbols.add(trade_context["symbol"])
+
+        except Exception as e:
+            print(f"[AUTO-COPY SCAN] ❌ Unexpected error for {user_id}: {e}")
+            continue
+
+# ============================================
 # AI BIAS USAGE TRACKING (NEW)
 # Requires a Supabase table: ai_bias_usage
 # Columns: user_id (text), usage_date (text),
@@ -3940,7 +4086,10 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 f"at ${setup['stake']} stake, using {mode_desc}.\n\n"
                 "If your balance is ever too low, a smaller stake is "
                 "tried automatically and you'll get a DM either way.\n\n"
-                "<i>Turn this off anytime from 🔗 Connect Deriv.</i>"
+                "⚠️ <i>Reminder: trades now happen on your account "
+                "automatically, with real money. Trading carries risk "
+                "of loss. Turn this off anytime from 🔗 Connect "
+                "Deriv.</i>"
             ),
             parse_mode=ParseMode.HTML,
             reply_markup=main_keyboard
@@ -4190,21 +4339,29 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await send_tier_selection(context.bot, user_id, pending_trade)
         else:
             await update.message.reply_text(
-                "🤖 <b>One more thing - how do you want to trade?</b>\n\n"
-                "<b>Manual</b> - tap 🎯 Trade This Signal yourself "
-                "each time a signal posts.\n\n"
-                "<b>Auto-copy</b> - every synthetic index signal trades "
-                "automatically on this account, no tapping needed. "
-                "You set the stake once, and it's never on by default - "
-                "you can turn it off anytime.",
+                "🎯 <b>Last step — pick how you want to trade:</b>\n\n"
+                "✋ <b>Manual</b>\n"
+                "You stay in control. Every time a signal posts, you "
+                "tap to confirm before anything happens on your "
+                "account.\n\n"
+                "🤖 <b>Auto-Copy</b>\n"
+                "Hands-off. Signals trade automatically on your "
+                "account — no tapping needed. You choose your stake "
+                "once, and can switch back to Manual anytime.\n\n"
+                "⚠️ <b>Please note:</b> Auto-Copy places real trades "
+                "with real money on your account without asking you "
+                "first, every time. Nexora AI is not a licensed "
+                "financial advisor — trading carries risk, and you can "
+                "lose money. Only enable Auto-Copy with funds you're "
+                "fully comfortable risking.",
                 parse_mode=ParseMode.HTML,
                 reply_markup=InlineKeyboardMarkup([
                     [InlineKeyboardButton(
-                        "✋ Manual (tap each time)",
+                        "✋ Manual — I'll tap each time",
                         callback_data="autocopy_setup_manual"
                     )],
                     [InlineKeyboardButton(
-                        "🤖 Set up Auto-Copy",
+                        "🤖 Auto-Copy — trade for me",
                         callback_data="autocopy_setup_start"
                     )],
                 ])
@@ -4973,6 +5130,18 @@ def main():
         interval=900,
         first=60,
         name="tp_sl_monitor"
+    )
+
+    # Auto-copy scan - independent of the channel posting schedule.
+    # Checks all 5 synthetic indices every 30 minutes and trades any
+    # fresh signal for every opted-in auto-copy user (skipping any
+    # index they're already holding a position on - see
+    # run_auto_copy_scan's docstring for why).
+    job_queue.run_repeating(
+        run_auto_copy_scan,
+        interval=1800,
+        first=120,
+        name="auto_copy_scan"
     )
 
     # Weekly performance report - every Sunday at 23:00 UTC

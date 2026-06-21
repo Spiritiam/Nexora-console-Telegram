@@ -581,7 +581,10 @@ async def deriv_fetch_account_snapshot(token):
 
 def save_deriv_account(user_id, loginid, token, currency):
     try:
-        url = f"{SUPABASE_URL}/rest/v1/deriv_accounts"
+        url = (
+            f"{SUPABASE_URL}/rest/v1/deriv_accounts"
+            f"?on_conflict=user_id"
+        )
         payload = {
             "user_id": str(user_id),
             "deriv_loginid": loginid,

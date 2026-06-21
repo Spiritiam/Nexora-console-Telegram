@@ -1494,6 +1494,14 @@ async def run_auto_copy_for_signal(bot, trade_context):
     or one API hiccup never blocks or skips anyone else. Always runs
     as a background task from the signal-posting function, so it
     never delays or blocks the channel post itself.
+
+    Uses the SAME no-stacking checks as run_auto_copy_scan (the
+    30-min loop) - this function used to have none of them, which
+    was the actual cause of repeated real double-trades: it runs
+    independently from a channel post, with no shared awareness of
+    what the 30-min scan already opened. Both functions now check
+    (and log to) the same auto_copy_trades table, so whichever one
+    runs second correctly sees what the other already placed.
     """
     accounts = get_all_auto_copy_accounts()
     if not accounts:
@@ -1508,9 +1516,21 @@ async def run_auto_copy_for_signal(bot, trade_context):
             continue
 
         try:
+            if has_open_auto_copy_trade(user_id, trade_context["symbol"]):
+                print(f"[AUTO-COPY] {user_id} already holds {trade_context['symbol']}, skipping")
+                continue
+
             snapshot = await deriv_fetch_account_snapshot(token)
             if not snapshot or snapshot.get("balance") is None:
                 print(f"[AUTO-COPY] Couldn't read balance for {user_id}, skipping this signal")
+                continue
+
+            held_symbols = {
+                c.get("symbol") for c in snapshot.get("open_contracts", [])
+                if c.get("symbol")
+            }
+            if trade_context["symbol"] in held_symbols:
+                print(f"[AUTO-COPY] {user_id} already holds {trade_context['symbol']} (live socket), skipping")
                 continue
 
             balance = snapshot["balance"]
@@ -1519,17 +1539,21 @@ async def run_auto_copy_for_signal(bot, trade_context):
             )
 
             if stake is None:
-                await bot.send_message(
-                    chat_id=int(user_id),
-                    text=(
-                        f"⚠️ <b>Auto-copy skipped this signal.</b>\n\n"
-                        f"<b>{trade_context['direction']} {trade_context['display']}</b>\n"
-                        f"Your balance (${balance}) is too low even for "
-                        f"the smallest stake tier ($5). Top up your "
-                        f"Deriv account to resume auto-copy trades."
-                    ),
-                    parse_mode=ParseMode.HTML
-                )
+                if user_id not in low_balance_notified:
+                    await bot.send_message(
+                        chat_id=int(user_id),
+                        text=(
+                            f"⚠️ <b>Auto-copy paused — balance too low.</b>\n\n"
+                            f"Your balance (${balance}) is too low even "
+                            f"for the smallest stake tier ($5). Top up "
+                            f"your Deriv account to resume auto-copy "
+                            f"trades.\n\n"
+                            f"<i>You won't get this reminder again "
+                            f"until your balance is back above $5.</i>"
+                        ),
+                        parse_mode=ParseMode.HTML
+                    )
+                    low_balance_notified.add(user_id)
                 continue
 
             buy_data, error = await deriv_execute_multiplier_trade(
@@ -1541,33 +1565,22 @@ async def run_auto_copy_for_signal(bot, trade_context):
             )
 
             if error:
-                await bot.send_message(
-                    chat_id=int(user_id),
-                    text=(
-                        f"❌ <b>Auto-copy trade failed.</b>\n\n"
-                        f"<b>{trade_context['direction']} {trade_context['display']}</b>\n"
-                        f"{friendly_trade_error(error, auto_copy_context=True)}"
-                    ),
-                    parse_mode=ParseMode.HTML
+                log_auto_copy_failure(
+                    user_id, trade_context["symbol"],
+                    friendly_trade_error(error, auto_copy_context=True)
                 )
                 continue
 
+            low_balance_notified.discard(user_id)
+
             contract_id = buy_data.get("contract_id", "—")
-            reduced_note = (
-                f"\n\n<i>Stake auto-reduced to ${stake} to fit your "
-                f"current balance.</i>" if was_reduced else ""
+            log_auto_copy_trade(
+                user_id, trade_context["symbol"], contract_id,
+                trade_context["direction"], stake, risk, win
             )
-            await bot.send_message(
-                chat_id=int(user_id),
-                text=(
-                    f"🤖 <b>Auto-copy trade placed!</b>\n\n"
-                    f"<b>{trade_context['direction']} {trade_context['display']}</b>\n"
-                    f"Stake: ${stake} | Risk ${risk} → Win ${win}\n"
-                    f"Contract ID: {contract_id}"
-                    f"{reduced_note}"
-                ),
-                parse_mode=ParseMode.HTML
-            )
+            # No immediate success DM here either - consistent with
+            # run_auto_copy_scan, this is picked up by the same
+            # once-daily digest (send_auto_copy_daily_digest) instead.
 
         except Exception as e:
             print(f"[AUTO-COPY] ❌ Unexpected error for {user_id}: {e}")

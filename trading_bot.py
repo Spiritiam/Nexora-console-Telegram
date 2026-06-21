@@ -3130,6 +3130,31 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = str(update.message.from_user.id)
     username = update.message.from_user.username or "Trader"
 
+    # Arrived here via the channel's "Trade This Signal" deep-link
+    # button (?start=chantrade_<index_key>) rather than a plain /start.
+    # This replaces the old callback_data version of this button, which
+    # silently failed for anyone who hadn't already started a DM with
+    # the bot - Telegram blocks bots from messaging users who haven't
+    # initiated contact, so the tap did nothing visible. A url= deep
+    # link sidesteps that since opening it IS the user starting the DM.
+    if context.args and context.args[0].startswith("chantrade_"):
+        index_key = context.args[0].replace("chantrade_", "")
+        shared_context = channel_signal_context.get(index_key)
+
+        if not shared_context:
+            await update.message.reply_text(
+                "⚠️ <b>This signal has expired.</b>\n\n"
+                "Request a fresh one by typing the index name "
+                "(e.g. R_100) in Signal mode.",
+                parse_mode=ParseMode.HTML,
+                reply_markup=main_keyboard
+            )
+            return
+
+        pending_trades[user_id] = dict(shared_context)  # copy - each tapper gets their own independent trade
+        await send_tier_selection(context.bot, user_id, pending_trades[user_id])
+        return
+
     if is_verified(user_id):
         await update.message.reply_text(
             f"👋 <b>Welcome back, {username}!</b>\n\n"
@@ -4105,7 +4130,7 @@ async def _post_synthetic_signal_for_index(bot, index_key):
                 reply_markup=InlineKeyboardMarkup([[
                     InlineKeyboardButton(
                         "🎯 Trade This Signal",
-                        callback_data=f"chantrade_{index_key}"
+                        url=f"https://t.me/{BOT_USERNAME}?start=chantrade_{index_key}"
                     )
                 ]])
             )

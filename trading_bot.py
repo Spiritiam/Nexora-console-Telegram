@@ -814,6 +814,29 @@ def get_open_auto_copy_trades():
         print(f"[AUTO-COPY LOG] get_open_auto_copy_trades error: {e}")
         return []
 
+def log_auto_copy_failure(user_id, symbol, reason):
+    """
+    Logs a failed auto-copy attempt for the once-daily digest to
+    count, instead of DMing the user immediately about every single
+    failure - failures like "stake not supported" aren't actionable
+    in the moment (auto-copy retries on the next scan automatically),
+    so they're batched into one end-of-day line instead of one
+    message per round. Requires a Supabase table: auto_copy_failures
+    Columns: id (pk), user_id (text), symbol (text), reason (text),
+    failed_at (timestamptz)
+    """
+    try:
+        url = f"{SUPABASE_URL}/rest/v1/auto_copy_failures"
+        payload = {
+            "user_id": str(user_id),
+            "symbol": symbol,
+            "reason": reason,
+            "failed_at": datetime.utcnow().isoformat(),
+        }
+        requests.post(url, headers=sb_headers(), json=payload, timeout=10)
+    except Exception as e:
+        print(f"[AUTO-COPY LOG] log_auto_copy_failure error: {e}")
+
 def save_deriv_account(user_id, loginid, token, currency):
     try:
         url = (
@@ -1623,12 +1646,13 @@ async def run_auto_copy_scan(context: ContextTypes.DEFAULT_TYPE):
                 if c.get("symbol")
             }
 
-            # Collected here and sent as ONE summary DM at the end of
-            # this user's loop, rather than one message per index -
-            # up to 5 indices firing in the same scan used to mean up
-            # to 5 separate notifications for the same 30-min round.
-            placed_lines = []
-            failed_lines = []
+            # No per-round messaging anymore - successes are logged
+            # via log_auto_copy_trade (used by has_open_auto_copy_trade
+            # AND by the once-daily digest below), failures are logged
+            # via log_auto_copy_failure for the digest to count. The
+            # low-balance warning below is the one exception that
+            # still sends immediately, since it's actionable in the
+            # moment (top up) rather than just "wait for the retry."
             low_balance_hit = False
 
             for index_key, trade_context in fresh_signals.items():
@@ -1661,9 +1685,9 @@ async def run_auto_copy_scan(context: ContextTypes.DEFAULT_TYPE):
                 )
 
                 if error:
-                    failed_lines.append(
-                        f"❌ <b>{trade_context['direction']} {trade_context['display']}</b>\n"
-                        f"{friendly_trade_error(error, auto_copy_context=True)}"
+                    log_auto_copy_failure(
+                        user_id, trade_context["symbol"],
+                        friendly_trade_error(error, auto_copy_context=True)
                     )
                     continue
 
@@ -1674,16 +1698,6 @@ async def run_auto_copy_scan(context: ContextTypes.DEFAULT_TYPE):
                 log_auto_copy_trade(
                     user_id, trade_context["symbol"], contract_id,
                     trade_context["direction"], stake, risk, win
-                )
-
-                reduced_note = (
-                    f" <i>(stake reduced to ${stake} for balance)</i>"
-                    if was_reduced else ""
-                )
-                placed_lines.append(
-                    f"✅ <b>{trade_context['direction']} {trade_context['display']}</b>\n"
-                    f"Stake: ${stake} | Risk ${risk} → Win ${win} | "
-                    f"ID: {contract_id}{reduced_note}"
                 )
 
                 # Treat this index as now held for the rest of THIS
@@ -1709,15 +1723,6 @@ async def run_auto_copy_scan(context: ContextTypes.DEFAULT_TYPE):
                     parse_mode=ParseMode.HTML
                 )
                 low_balance_notified.add(user_id)
-
-            if placed_lines or failed_lines:
-                summary = "🤖 <b>Auto-Copy — this round:</b>\n\n"
-                summary += "\n\n".join(placed_lines + failed_lines)
-                await bot.send_message(
-                    chat_id=int(user_id),
-                    text=summary,
-                    parse_mode=ParseMode.HTML
-                )
 
         except Exception as e:
             print(f"[AUTO-COPY SCAN] ❌ Unexpected error for {user_id}: {e}")
@@ -5284,6 +5289,117 @@ async def check_open_auto_copy_trades(context: ContextTypes.DEFAULT_TYPE):
         # outcome is None -> lookup failed, retry next sweep
 
 # ============================================
+# AUTO-COPY DAILY DIGEST (NEW)
+# Replaces the old per-30-min summary DM, which
+# was too noisy (up to 5 results every round,
+# several times a day). Instead, every individual
+# trade placement is logged silently throughout
+# the day (log_auto_copy_trade / log_auto_copy_
+# failure - see run_auto_copy_scan), and ONE
+# digest per user is sent at 23:59 UTC summarizing
+# the whole day: how many trades placed (with
+# details) and a single count of how many failed
+# (no per-failure detail, since none of it is
+# actionable - see friendly_trade_error's
+# auto_copy_context wording).
+#
+# To avoid the chat filling up with daily digests
+# over time, sending today's digest first deletes
+# yesterday's (stored via its message_id on
+# deriv_accounts.last_digest_message_id) - so at
+# most one digest ever sits in a user's chat.
+# ============================================
+
+def get_todays_auto_copy_trades(user_id):
+    try:
+        today_start = datetime.utcnow().strftime("%Y-%m-%dT00:00:00")
+        url = (
+            f"{SUPABASE_URL}/rest/v1/auto_copy_trades"
+            f"?user_id=eq.{user_id}&placed_at=gte.{today_start}&select=*"
+        )
+        response = requests.get(url, headers=sb_headers(), timeout=10)
+        data = response.json()
+        return data if isinstance(data, list) else []
+    except Exception as e:
+        print(f"[AUTO-COPY DIGEST] get_todays_auto_copy_trades error: {e}")
+        return []
+
+def get_todays_auto_copy_failure_count(user_id):
+    try:
+        today_start = datetime.utcnow().strftime("%Y-%m-%dT00:00:00")
+        url = (
+            f"{SUPABASE_URL}/rest/v1/auto_copy_failures"
+            f"?user_id=eq.{user_id}&failed_at=gte.{today_start}&select=id"
+        )
+        response = requests.get(url, headers=sb_headers(), timeout=10)
+        data = response.json()
+        return len(data) if isinstance(data, list) else 0
+    except Exception as e:
+        print(f"[AUTO-COPY DIGEST] get_todays_auto_copy_failure_count error: {e}")
+        return 0
+
+def save_last_digest_message_id(user_id, message_id):
+    try:
+        url = f"{SUPABASE_URL}/rest/v1/deriv_accounts?user_id=eq.{user_id}"
+        requests.patch(
+            url, headers=sb_headers(),
+            json={"last_digest_message_id": message_id}, timeout=10
+        )
+    except Exception as e:
+        print(f"[AUTO-COPY DIGEST] save_last_digest_message_id error: {e}")
+
+async def send_auto_copy_daily_digest(context: ContextTypes.DEFAULT_TYPE):
+    accounts = get_all_auto_copy_accounts()
+    if not accounts:
+        return
+
+    bot = context.bot
+
+    for account in accounts:
+        user_id = account.get("user_id")
+        if not user_id:
+            continue
+
+        trades_today = get_todays_auto_copy_trades(user_id)
+        failure_count = get_todays_auto_copy_failure_count(user_id)
+
+        if not trades_today and not failure_count:
+            continue  # nothing happened for this user today - no digest at all
+
+        lines = [
+            f"✅ <b>{t['direction']} {SYNTHETIC_CONFIG.get(t['symbol'], {}).get('display', t['symbol'])}</b>\n"
+            f"Stake: ${t['stake']} | Risk ${t['risk']} → Win ${t['win']} | ID: {t['contract_id']}"
+            for t in trades_today
+        ]
+
+        digest = "🤖 <b>Auto-Copy — today's summary</b>\n\n"
+        digest += "\n\n".join(lines) if lines else "<i>No trades placed today.</i>"
+        if failure_count:
+            digest += (
+                f"\n\n<i>{failure_count} other signal"
+                f"{'s' if failure_count != 1 else ''} couldn't be "
+                f"placed today — no action needed, they retry "
+                f"automatically.</i>"
+            )
+
+        try:
+            old_message_id = account.get("last_digest_message_id")
+            if old_message_id:
+                try:
+                    await bot.delete_message(chat_id=int(user_id), message_id=int(old_message_id))
+                except Exception as e:
+                    print(f"[AUTO-COPY DIGEST] Couldn't delete yesterday's digest for {user_id}: {e}")
+
+            sent = await bot.send_message(
+                chat_id=int(user_id),
+                text=digest,
+                parse_mode=ParseMode.HTML
+            )
+            save_last_digest_message_id(user_id, sent.message_id)
+        except Exception as e:
+            print(f"[AUTO-COPY DIGEST] ❌ Couldn't send digest to {user_id}: {e}")
+
+# ============================================
 # WEEKLY PERFORMANCE REPORT (NEW)
 # Runs every Sunday at 23:00 UTC, covering the
 # full Monday 00:00 UTC -> Sunday 23:00 UTC week
@@ -5446,6 +5562,16 @@ def main():
         interval=1800,
         first=120,
         name="auto_copy_scan"
+    )
+
+    # Auto-copy daily digest - one summary per user at 23:59 UTC,
+    # replacing the old per-30-min summary DM. EVERY_DAY (not weekday-
+    # restricted) since synthetic indices trade 24/7.
+    job_queue.run_daily(
+        send_auto_copy_daily_digest,
+        time=parse_time("23:59"),
+        name="auto_copy_daily_digest",
+        days=EVERY_DAY
     )
 
     # Weekly performance report - every Sunday at 23:00 UTC

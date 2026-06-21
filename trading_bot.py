@@ -238,19 +238,47 @@ def is_verified(user_id):
         print(f"[DB] is_verified error: {e}")
         return False
 
+def get_verified_user_by_email(email):
+    """
+    Returns the verified_users row already using this email (if any),
+    so a second Telegram account can't reuse an email that's already
+    verified on a different account.
+    """
+    try:
+        url = (
+            f"{SUPABASE_URL}/rest/v1/verified_users"
+            f"?email=eq.{email}&select=user_id"
+        )
+        response = requests.get(url, headers=sb_headers(), timeout=10)
+        data = response.json()
+        if data:
+            return data[0]
+        return None
+    except Exception as e:
+        print(f"[DB] get_verified_user_by_email error: {e}")
+        return None
+
 def add_verified_user(user_id, email):
     try:
-        url = f"{SUPABASE_URL}/rest/v1/verified_users"
+        url = (
+            f"{SUPABASE_URL}/rest/v1/verified_users"
+            f"?on_conflict=user_id"
+        )
         payload = {
             "user_id": str(user_id),
             "email": email,
             "verified_at": datetime.utcnow().isoformat()
         }
         headers = {**sb_headers(), "Prefer": "resolution=merge-duplicates"}
-        requests.post(url, headers=headers, json=payload, timeout=10)
+        response = requests.post(url, headers=headers, json=payload, timeout=10)
+        if response.status_code not in (200, 201):
+            print(f"[DB] ❌ add_verified_user unexpected status {response.status_code}: {response.text}")
+            return False
         print(f"[DB] ✅ Verified user saved: {user_id}")
+        return True
     except Exception as e:
         print(f"[DB] add_verified_user error: {e}")
+        return False
 
 def get_trial_count(user_id):
     try:
@@ -3366,7 +3394,9 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
             f"━━━━━━━━━━━━━━━━━━━━━\n\n"
             f"📊 <b>Signal</b> — Get a live trading signal right now\n\n"
             f"📚 <b>Breakdown</b> — Get a full AI market analysis\n\n"
-            f"<i>Both buttons are at the bottom of your screen 👇</i>",
+            f"🔗 <b>Connect Deriv</b> — Link your Deriv account to trade "
+            f"signals directly, manually or fully automatic\n\n"
+            f"<i>All three buttons are at the bottom of your screen 👇</i>",
             parse_mode=ParseMode.HTML,
             reply_markup=main_keyboard
         )
@@ -3386,7 +3416,9 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
             f"━━━━━━━━━━━━━━━━━━━━━\n\n"
             f"📊 <b>Signal</b> — Get a live trading signal right now\n\n"
             f"📚 <b>Breakdown</b> — Get a full AI market analysis\n\n"
-            f"<i>Both buttons are at the bottom of your screen 👇</i>",
+            f"🔗 <b>Connect Deriv</b> — Link your Deriv account to trade "
+            f"signals directly, manually or fully automatic\n\n"
+            f"<i>All three buttons are at the bottom of your screen 👇</i>",
             parse_mode=ParseMode.HTML,
             reply_markup=main_keyboard
         )
@@ -4030,6 +4062,18 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 "Please enter the email address you used to "
                 "register on Exness 👇\n\n"
                 "<i>Example: yourname@gmail.com</i>",
+                parse_mode=ParseMode.HTML
+            )
+            return
+
+        existing_owner = get_verified_user_by_email(email)
+        if existing_owner and str(existing_owner.get("user_id")) != user_id:
+            await update.message.reply_text(
+                "🚫 <b>This email has already been used and verified by "
+                "another account.</b>\n\n"
+                "Each Exness email can only verify one Nexora AI "
+                "account. If this is your email, please continue using "
+                "your original Telegram account.",
                 parse_mode=ParseMode.HTML
             )
             return

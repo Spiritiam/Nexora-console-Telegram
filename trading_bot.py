@@ -1088,7 +1088,6 @@ STAKE_TIERS = [
 ]
 
 pending_autocopy_setup = {}  # user_id -> {stake, risk, win} chosen so far, mid-setup
-custom_amount_step_message_id = {}  # user_id -> message_id of the current step's prompt, so it can be deleted the moment the user advances to the next step
 
 # ============================================
 # PENDING TRADE STORAGE (DB-backed)
@@ -4252,27 +4251,6 @@ async def handle_buttons(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         return
 
-async def advance_custom_amount_step(bot, user_id, text, reply_markup=None):
-    """
-    Deletes the previous step's prompt (if tracked) before sending
-    the next one, so the chat stays clean as the user moves through
-    the 3-step custom amount flow in real time - not a 24h delayed
-    cleanup like schedule_auto_delete, since the point here is the
-    chat looking tidy immediately, not eventually.
-    """
-    old_message_id = custom_amount_step_message_id.get(user_id)
-    if old_message_id:
-        try:
-            await bot.delete_message(chat_id=int(user_id), message_id=old_message_id)
-        except Exception as e:
-            print(f"[CUSTOM AMOUNT FLOW] Couldn't delete previous step for {user_id}: {e}")
-
-    sent = await bot.send_message(
-        chat_id=int(user_id), text=text, parse_mode=ParseMode.HTML, reply_markup=reply_markup
-    )
-    custom_amount_step_message_id[user_id] = sent.message_id
-    return sent
-
 # ============================================
 # CALLBACK HANDLER — APPROVE / REJECT
 # ============================================
@@ -4534,85 +4512,19 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             )
             return
 
-        user_modes[user_id] = "awaiting_custom_stake"
+        user_modes[user_id] = "awaiting_trade_confirm"
 
-        await advance_custom_amount_step(
-            context.bot, user_id,
-            "✏️ <b>Step 1 of 3 — Set your stake:</b>\n\n"
-            "Type any amount, e.g. <code>3</code> or "
-            "<code>7.5</code>."
+        await context.bot.send_message(
+            chat_id=int(user_id),
+            text=(
+                "✏️ <b>Enter your stake amount:</b>\n\n"
+                "Want to set your own risk/target?\n"
+                "Type three numbers that serve as — stake, risk, "
+                "target — like <code>3, 2, 10</code> or "
+                "<code>3 2 10</code>."
+            ),
+            parse_mode=ParseMode.HTML
         )
-
-    elif data.startswith("customrisk_"):
-
-        body = data.replace("customrisk_", "")
-        user_id, suggested_value = body.rsplit("_", 1)
-
-        trade_context = pending_trades.get(user_id)
-        if not trade_context:
-            await context.bot.send_message(
-                chat_id=int(user_id),
-                text=(
-                    "⚠️ <b>That trade has expired.</b>\n\n"
-                    "Please request a new signal and tap 🎯 Trade This "
-                    "Signal again."
-                ),
-                parse_mode=ParseMode.HTML
-            )
-            return
-
-        trade_context["risk"] = float(suggested_value)
-        pending_trades[user_id] = trade_context
-        user_modes[user_id] = "awaiting_custom_win"
-
-        suggested_win = round(trade_context["stake"] * 0.6, 2)
-        await advance_custom_amount_step(
-            context.bot, user_id,
-            f"✏️ <b>Step 3 of 3 — Set your target (take profit):</b>\n\n"
-            f"Type any amount, or tap below to use the suggested "
-            f"${suggested_win}.",
-            reply_markup=InlineKeyboardMarkup([[
-                InlineKeyboardButton(
-                    f"Use suggested (${suggested_win})",
-                    callback_data=f"customwin_{user_id}_{suggested_win}"
-                )
-            ]])
-        )
-
-    elif data.startswith("customwin_"):
-
-        body = data.replace("customwin_", "")
-        user_id, suggested_value = body.rsplit("_", 1)
-
-        trade_context = pending_trades.get(user_id)
-        if not trade_context:
-            await context.bot.send_message(
-                chat_id=int(user_id),
-                text=(
-                    "⚠️ <b>That trade has expired.</b>\n\n"
-                    "Please request a new signal and tap 🎯 Trade This "
-                    "Signal again."
-                ),
-                parse_mode=ParseMode.HTML
-            )
-            return
-
-        trade_context["win"] = float(suggested_value)
-        pending_trades[user_id] = trade_context
-        user_modes[user_id] = None
-
-        await advance_custom_amount_step(
-            context.bot, user_id,
-            f"🎯 <b>Confirm this trade:</b>\n\n"
-            f"<b>{trade_context['direction']} {trade_context['display']}</b>\n"
-            f"Stake: ${trade_context['stake']} | "
-            f"Risk ${trade_context['risk']} → Target ${trade_context['win']}",
-            reply_markup=InlineKeyboardMarkup([[
-                InlineKeyboardButton("✅ Confirm", callback_data=f"execconfirm_{user_id}"),
-                InlineKeyboardButton("✏️ Edit", callback_data=f"edittrade_{user_id}"),
-            ]])
-        )
-        custom_amount_step_message_id.pop(user_id, None)
 
     elif data == "autocopy_setup_manual":
 
@@ -5084,7 +4996,7 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
             )
         return
 
-    if user_modes.get(user_id) == "awaiting_custom_stake":
+    if user_modes.get(user_id) == "awaiting_trade_confirm":
 
         trade_context = pending_trades.get(user_id)
         if not trade_context:
@@ -5098,135 +5010,55 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
             )
             return
 
-        stake_match = re.fullmatch(r"[\d.]+", message.strip())
-        if not stake_match:
+        reply = message.strip().lower()
+
+        stake_match = re.search(r"stake\s*=\s*([\d.]+)", reply)
+        risk_match = re.search(r"risk\s*=\s*([\d.]+)", reply)
+        win_match = re.search(r"win\s*=\s*([\d.]+)", reply)
+
+        # Requires exactly 3 numbers - stake, risk, target must all
+        # be provided every time, no auto-derived shortcuts. Catches
+        # "3, 2, 10", "3 2 10", "3,2,10" etc: split on commas and/or
+        # whitespace, keep only the numeric pieces.
+        multi_number_parts = [
+            p for p in re.split(r"[,\s]+", reply) if re.fullmatch(r"[\d.]+", p)
+        ]
+
+        has_all_three_kv = stake_match and risk_match and win_match
+        has_all_three_plain = len(multi_number_parts) == 3
+
+        if not (has_all_three_kv or has_all_three_plain):
             await update.message.reply_text(
-                "⚠️ <b>That doesn't look like a number.</b>\n\n"
-                "Type just the stake amount, e.g. <code>3</code> or "
-                "<code>7.5</code>.",
+                "⚠️ <b>I didn't understand that.</b>\n\n"
+                "Type all three numbers — stake, risk, target — "
+                "like <code>3, 2, 10</code> or <code>3 2 10</code>.",
                 parse_mode=ParseMode.HTML
             )
             return
 
-        stake_value = float(stake_match.group(0))
-        trade_context["stake"] = stake_value
-        pending_trades[user_id] = trade_context
-        user_modes[user_id] = "awaiting_custom_risk"
+        if has_all_three_plain:
+            trade_context["stake"] = float(multi_number_parts[0])
+            trade_context["risk"] = float(multi_number_parts[1])
+            trade_context["win"] = float(multi_number_parts[2])
+        else:
+            trade_context["stake"] = float(stake_match.group(1))
+            trade_context["risk"] = float(risk_match.group(1))
+            trade_context["win"] = float(win_match.group(1))
 
-        try:
-            await update.message.delete()
-        except Exception:
-            pass
-
-        suggested_risk = round(stake_value * 0.3, 2)
-        await advance_custom_amount_step(
-            context.bot, user_id,
-            f"✏️ <b>Step 2 of 3 — Set your risk (stop loss):</b>\n\n"
-            f"Type any amount, or tap below to use the suggested "
-            f"${suggested_risk}.",
-            reply_markup=InlineKeyboardMarkup([[
-                InlineKeyboardButton(
-                    f"Use suggested (${suggested_risk})",
-                    callback_data=f"customrisk_{user_id}_{suggested_risk}"
-                )
-            ]])
-        )
-        return
-
-    if user_modes.get(user_id) == "awaiting_custom_risk":
-
-        trade_context = pending_trades.get(user_id)
-        if not trade_context:
-            user_modes[user_id] = None
-            await update.message.reply_text(
-                "⚠️ <b>That trade has expired.</b>\n\n"
-                "Please request a new signal and tap 🎯 Trade This Signal "
-                "again.",
-                parse_mode=ParseMode.HTML,
-                reply_markup=main_keyboard
-            )
-            return
-
-        risk_match = re.fullmatch(r"[\d.]+", message.strip())
-        if not risk_match:
-            await update.message.reply_text(
-                "⚠️ <b>That doesn't look like a number.</b>\n\n"
-                "Type just the risk amount, e.g. <code>2</code>, or "
-                "tap the suggested button above.",
-                parse_mode=ParseMode.HTML
-            )
-            return
-
-        risk_value = float(risk_match.group(0))
-        trade_context["risk"] = risk_value
-        pending_trades[user_id] = trade_context
-        user_modes[user_id] = "awaiting_custom_win"
-
-        try:
-            await update.message.delete()
-        except Exception:
-            pass
-
-        suggested_win = round(trade_context["stake"] * 0.6, 2)
-        await advance_custom_amount_step(
-            context.bot, user_id,
-            f"✏️ <b>Step 3 of 3 — Set your target (take profit):</b>\n\n"
-            f"Type any amount, or tap below to use the suggested "
-            f"${suggested_win}.",
-            reply_markup=InlineKeyboardMarkup([[
-                InlineKeyboardButton(
-                    f"Use suggested (${suggested_win})",
-                    callback_data=f"customwin_{user_id}_{suggested_win}"
-                )
-            ]])
-        )
-        return
-
-    if user_modes.get(user_id) == "awaiting_custom_win":
-
-        trade_context = pending_trades.get(user_id)
-        if not trade_context:
-            user_modes[user_id] = None
-            await update.message.reply_text(
-                "⚠️ <b>That trade has expired.</b>\n\n"
-                "Please request a new signal and tap 🎯 Trade This Signal "
-                "again.",
-                parse_mode=ParseMode.HTML,
-                reply_markup=main_keyboard
-            )
-            return
-
-        win_match = re.fullmatch(r"[\d.]+", message.strip())
-        if not win_match:
-            await update.message.reply_text(
-                "⚠️ <b>That doesn't look like a number.</b>\n\n"
-                "Type just the target amount, e.g. <code>10</code>, "
-                "or tap the suggested button above.",
-                parse_mode=ParseMode.HTML
-            )
-            return
-
-        trade_context["win"] = float(win_match.group(0))
         pending_trades[user_id] = trade_context
         user_modes[user_id] = None
 
-        try:
-            await update.message.delete()
-        except Exception:
-            pass
-
-        await advance_custom_amount_step(
-            context.bot, user_id,
+        await update.message.reply_text(
             f"🎯 <b>Confirm this trade:</b>\n\n"
             f"<b>{trade_context['direction']} {trade_context['display']}</b>\n"
             f"Stake: ${trade_context['stake']} | "
             f"Risk ${trade_context['risk']} → Target ${trade_context['win']}",
+            parse_mode=ParseMode.HTML,
             reply_markup=InlineKeyboardMarkup([[
                 InlineKeyboardButton("✅ Confirm", callback_data=f"execconfirm_{user_id}"),
                 InlineKeyboardButton("✏️ Edit", callback_data=f"edittrade_{user_id}"),
             ]])
         )
-        custom_amount_step_message_id.pop(user_id, None)
         return
 
     mode = user_modes.get(user_id)

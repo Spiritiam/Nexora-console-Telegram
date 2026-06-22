@@ -4521,8 +4521,9 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 "Just type a number, e.g. <code>3</code> or "
                 "<code>7.5</code> — risk and target will be set "
                 "automatically.\n\n"
-                "<i>Want full control instead? Send "
-                "</i><code>stake=20 risk=5 win=10</code>"
+                "Want to set your own risk/target too? Type three "
+                "numbers — stake, risk, target — like "
+                "<code>3, 2, 10</code> or <code>3 2 10</code>."
             ),
             parse_mode=ParseMode.HTML
         )
@@ -5019,17 +5020,36 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
         plain_number_match = re.fullmatch(r"[\d.]+", reply)
 
-        if not (stake_match or risk_match or win_match or plain_number_match):
+        # Catches what a beginner naturally tries instead of the
+        # stake=/risk=/win= syntax: "3,2,10", "3 2 10", "3, 2, 10",
+        # even just "3 10" (stake + win, risk auto-derived). Split on
+        # commas and/or whitespace, keep only the numeric pieces.
+        multi_number_parts = [
+            p for p in re.split(r"[,\s]+", reply) if re.fullmatch(r"[\d.]+", p)
+        ]
+
+        if not (stake_match or risk_match or win_match or plain_number_match or len(multi_number_parts) >= 2):
             await update.message.reply_text(
                 "⚠️ <b>I didn't understand that.</b>\n\n"
                 "Just type a number for your stake, e.g. "
-                "<code>3</code>, or for full control send:\n"
-                "<code>stake=20 risk=5 win=10</code>",
+                "<code>3</code>, or type stake, risk, target as "
+                "three numbers like <code>3, 2, 10</code>.",
                 parse_mode=ParseMode.HTML
             )
             return
 
-        if plain_number_match and not (stake_match or risk_match or win_match):
+        if len(multi_number_parts) >= 2 and not (stake_match or risk_match or win_match):
+            # 2 numbers = stake, win (risk auto-derived from stake).
+            # 3 numbers = stake, risk, win, in that order.
+            stake_value = float(multi_number_parts[0])
+            trade_context["stake"] = stake_value
+            if len(multi_number_parts) >= 3:
+                trade_context["risk"] = float(multi_number_parts[1])
+                trade_context["win"] = float(multi_number_parts[2])
+            else:
+                trade_context["risk"] = round(stake_value * 0.3, 2)
+                trade_context["win"] = float(multi_number_parts[1])
+        elif plain_number_match and not (stake_match or risk_match or win_match):
             # Simple path: just a stake amount. Risk/win auto-derived
             # using the same ~30%/~60% ratio already used across
             # every preset in STAKE_TIERS, so a typed-in stake behaves

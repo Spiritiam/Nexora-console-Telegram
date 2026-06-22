@@ -211,8 +211,19 @@ NEWS_RELEVANT_KEYWORDS = [
 ]
 
 def is_news_relevant(title, description):
+    """
+    Whole-word matching, not substring - the old `keyword in text`
+    check let short keywords like "eur", "yen", "boe" match inside
+    unrelated words/tickers (e.g. a German stock exchange ticker like
+    "XETR:3A9" slipping through, unrelated to forex or Bitcoin at
+    all). re.escape handles keywords with spaces (e.g. "interest
+    rate") safely inside the word-boundary pattern.
+    """
     text = f"{title} {description}".lower()
-    return any(keyword in text for keyword in NEWS_RELEVANT_KEYWORDS)
+    return any(
+        re.search(rf"\b{re.escape(keyword)}\b", text)
+        for keyword in NEWS_RELEVANT_KEYWORDS
+    )
 
 # ============================================
 # SUPABASE DATABASE FUNCTIONS
@@ -3384,19 +3395,24 @@ SOURCE: {source}
 FORMAT EXACTLY LIKE THIS — NO EXCEPTIONS:
 {session_label}
 
-🔹 [One line news item 1]
+🔹 [One line news item 1] — likely [Bullish/Bearish/Neutral] for [pair]
 
-🔹 [One line news item 2]
+🔹 [One line news item 2] — likely [Bullish/Bearish/Neutral] for [pair]
 
 STRICT RULES:
 - Maximum 2 bullet points ONLY
-- Each bullet point MAX 15 words
-- No long sentences
-- No paragraphs
+- Each bullet point MAX 20 words INCLUDING the sentiment tag
+- [pair] must be a real forex pair or BTC/USD this news actually
+  affects (e.g. EUR/USD, GBP/USD, XAU/USD, BTC/USD) - never invent
+  a pair the news doesn't relate to
+- State Bullish/Bearish/Neutral based on what the news itself
+  implies, not a guess - if direction genuinely isn't clear from
+  the details given, say Neutral rather than forcing a direction
+- No long sentences, no paragraphs
 - No markdown symbols like ** or ##
 - No hashtags
 - Make each point punchy and impactful
-- Focus on what matters most to forex and gold traders
+- Focus on what matters most to forex, gold, and Bitcoin traders
 """
     return await ask_gemini(prompt)
 
@@ -4483,6 +4499,22 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if existing_owner and str(existing_owner.get("user_id")) != user_id:
             await update.message.reply_text(
                 "🚫 <b>This email has already been used and verified by "
+                "another account.</b>\n\n"
+                "Each Exness email can only verify one Nexora AI "
+                "account. If this is your email, please continue using "
+                "your original Telegram account.",
+                parse_mode=ParseMode.HTML
+            )
+            return
+
+        pending_owner_id = next(
+            (uid for uid, pending_email in pending_verifications.items()
+             if pending_email == email and uid != user_id),
+            None
+        )
+        if pending_owner_id:
+            await update.message.reply_text(
+                "🚫 <b>This email is already awaiting verification on "
                 "another account.</b>\n\n"
                 "Each Exness email can only verify one Nexora AI "
                 "account. If this is your email, please continue using "

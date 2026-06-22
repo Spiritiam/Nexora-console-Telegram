@@ -1186,7 +1186,71 @@ SYNTHETIC_ROTATION_ORDER = ["r10", "r25", "r50", "r75", "r100"]
 # is copied into pending_trades for that specific tapper - each
 # tapper gets their own independent trade context from the same
 # underlying signal.
-channel_signal_context = {}
+#
+# DB-backed for the same reason pending_trades_db is: a plain
+# in-memory dict here meant every Railway restart wiped it
+# completely, permanently breaking every "Trade This Signal" button
+# on every channel post sent before that restart - they'd say
+# "This signal has expired" forever afterward, even just seconds
+# after a fresh restart, since nothing had re-populated that index's
+# entry yet. Requires a Supabase table: channel_signal_context_db
+# with RLS DISABLED (same as pending_trades_db - writes go through
+# the service-role key directly, not per-user Supabase auth).
+# Columns: index_key (text, primary key), symbol, contract_type,
+# direction, display (all text), multiplier, stake, risk, win (all
+# numeric), updated_at (timestamptz).
+
+class ChannelSignalContextStore:
+    """Dict-like interface backed by Supabase, same pattern as PendingTradesStore."""
+
+    def get(self, index_key, default=None):
+        try:
+            url = (
+                f"{SUPABASE_URL}/rest/v1/channel_signal_context_db"
+                f"?index_key=eq.{index_key}&select=*"
+            )
+            response = requests.get(url, headers=sb_headers(), timeout=10)
+            data = response.json()
+            if not data:
+                return default
+            row = data[0]
+            return {
+                "symbol": row.get("symbol"),
+                "contract_type": row.get("contract_type"),
+                "direction": row.get("direction"),
+                "display": row.get("display"),
+                "multiplier": row.get("multiplier"),
+                "stake": row.get("stake"),
+                "risk": row.get("risk"),
+                "win": row.get("win"),
+            }
+        except Exception as e:
+            print(f"[CHANNEL SIGNAL CONTEXT] get error: {e}")
+            return default
+
+    def __setitem__(self, index_key, trade_context):
+        try:
+            url = f"{SUPABASE_URL}/rest/v1/channel_signal_context_db?on_conflict=index_key"
+            payload = {
+                "index_key": str(index_key),
+                "symbol": trade_context.get("symbol"),
+                "contract_type": trade_context.get("contract_type"),
+                "direction": trade_context.get("direction"),
+                "display": trade_context.get("display"),
+                "multiplier": trade_context.get("multiplier"),
+                "stake": trade_context.get("stake"),
+                "risk": trade_context.get("risk"),
+                "win": trade_context.get("win"),
+                "updated_at": datetime.utcnow().isoformat(),
+            }
+            headers = {**sb_headers(), "Prefer": "resolution=merge-duplicates"}
+            response = requests.post(url, headers=headers, json=payload, timeout=10)
+            if response.status_code not in (200, 201):
+                print(f"[CHANNEL SIGNAL CONTEXT] set unexpected status {response.status_code}: {response.text}")
+        except Exception as e:
+            print(f"[CHANNEL SIGNAL CONTEXT] set error: {e}")
+
+channel_signal_context = ChannelSignalContextStore()
 
 def get_rotation_key(slot_number=0):
     """

@@ -5436,6 +5436,41 @@ async def _run_broadcast(bot, message_text, admin_chat_id):
     except Exception as e:
         print(f"[BROADCAST] Couldn't report completion to admin: {e}")
 
+# ============================================
+# TESTSYNTH (TEMPORARY - admin only)
+# Manually fires one fresh synthetic signal on
+# demand, instead of waiting for the next
+# scheduled slot. Added specifically to verify
+# the channel_signal_context_db fix without
+# waiting until tomorrow's 11:00 UTC post.
+# Remove once confirmed working.
+# ============================================
+
+async def testsynth_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = str(update.message.from_user.id)
+
+    if not ADMIN_USER_ID or user_id != str(ADMIN_USER_ID):
+        return  # silently ignore - don't reveal this command to anyone else
+
+    args = context.args
+    if not args:
+        await update.message.reply_text(
+            "Usage: /testsynth r10 | r25 | r50 | r75 | r100"
+        )
+        return
+
+    index_key = args[0].lower()
+    if index_key not in SYNTHETIC_CONFIG:
+        await update.message.reply_text(
+            f"Unknown index '{index_key}'. Use one of: "
+            f"{', '.join(SYNTHETIC_CONFIG.keys())}"
+        )
+        return
+
+    await update.message.reply_text(f"Firing a fresh {index_key.upper()} signal now...")
+    await _post_synthetic_signal_for_index(context.bot, index_key)
+    await update.message.reply_text("Done - check the channel and tap Trade This Signal.")
+
 async def broadcast_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = str(update.message.from_user.id)
 
@@ -5851,6 +5886,7 @@ def main():
 
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("broadcast", broadcast_command))
+    app.add_handler(CommandHandler("testsynth", testsynth_command))
     app.add_handler(CallbackQueryHandler(handle_callback))
 
     app.add_handler(

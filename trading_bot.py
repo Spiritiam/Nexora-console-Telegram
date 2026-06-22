@@ -408,6 +408,50 @@ async def place_and_link_mt5_trade(signal_id, signal_data):
     order_id = await place_mt5_trade(signal_data)
     attach_mt5_order_id(signal_id, order_id)
 
+async def _delete_message_job(context: ContextTypes.DEFAULT_TYPE):
+    """Callback for the scheduled auto-delete job below."""
+    job_data = context.job.data
+    try:
+        await context.bot.delete_message(
+            chat_id=job_data["chat_id"], message_id=job_data["message_id"]
+        )
+    except Exception as e:
+        # Common and harmless: user already deleted it themselves,
+        # blocked the bot, or it's been >48h (Telegram's own bot-
+        # message deletion limit in some cases). Never worth alarming
+        # over - just log and move on.
+        print(f"[AUTO-DELETE] Couldn't delete {job_data}: {e}")
+
+def schedule_auto_delete(chat_id, message_id, hours=24):
+    """
+    Schedules a DM message for deletion after `hours` (default 24).
+    Used for routine/non-critical bot DMs - signals, breakdowns, news,
+    trade placement confirmations - so a user's chat with the bot
+    doesn't pile up with old messages over time.
+
+    NEVER call this for: verification status messages, account
+    balance/connection info, or auto-copy settings confirmations -
+    those stay permanently, since a user may need to refer back to
+    them (e.g. "was I verified?", "what's my auto-copy stake set
+    to?").
+
+    Relies on _app_instance being set in main() - if main() hasn't
+    run yet (shouldn't happen in practice) this silently no-ops
+    rather than crashing the caller, since a missed auto-delete is
+    far less harmful than breaking the message send itself.
+    """
+    if _app_instance is None:
+        print("[AUTO-DELETE] _app_instance not set yet, skipping schedule")
+        return
+    try:
+        _app_instance.job_queue.run_once(
+            _delete_message_job,
+            when=timedelta(hours=hours),
+            data={"chat_id": chat_id, "message_id": message_id},
+        )
+    except Exception as e:
+        print(f"[AUTO-DELETE] Couldn't schedule delete: {e}")
+
 def get_open_signals():
     try:
         url = f"{SUPABASE_URL}/rest/v1/signal_log?status=eq.OPEN&select=*"
@@ -1045,6 +1089,12 @@ STAKE_TIERS = [
 
 pending_trades = {}  # user_id -> trade context dict, one pending trade at a time
 pending_autocopy_setup = {}  # user_id -> {stake, risk, win} chosen so far, mid-setup
+
+# Set once in main() right after the Application is built - lets
+# auto-delete scheduling work from any function (including ones that
+# only have a `bot` object, like the auto-copy background tasks)
+# without threading `context` through every call site.
+_app_instance = None
 
 SYNTHETIC_ROTATION_ORDER = ["r10", "r25", "r50", "r75", "r100"]
 
@@ -4480,7 +4530,7 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         contract_id = buy_data.get("contract_id", "—")
         buy_price = buy_data.get("buy_price", trade_context["stake"])
 
-        await context.bot.send_message(
+        sent_confirmation = await context.bot.send_message(
             chat_id=int(user_id),
             text=(
                 f"✅ <b>Trade placed!</b>\n\n"
@@ -4493,6 +4543,7 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             parse_mode=ParseMode.HTML,
             reply_markup=main_keyboard
         )
+        schedule_auto_delete(sent_confirmation.chat_id, sent_confirmation.message_id)
 
 # ============================================
 # HANDLE TEXT
@@ -4546,7 +4597,26 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
             )
             return
 
+        already_pending = user_id in pending_verifications
         pending_verifications[user_id] = email
+
+        if already_pending:
+            # Already has an open request in the admin queue - update
+            # the email they're tied to silently rather than posting
+            # a brand new "NEW VERIFICATION REQUEST" message. Without
+            # this, someone resubmitting (out of impatience, curiosity,
+            # or just not knowing it already went through) would
+            # flood the approval group with a fresh message every
+            # single time.
+            await update.message.reply_text(
+                "⏳ <b>You already have a verification request pending "
+                "review.</b>\n\n"
+                "No need to resubmit — your email has been updated to "
+                f"<b>{email}</b> and our team will review it shortly.\n\n"
+                "<i>Sit tight — greatness is loading! 🚀</i>",
+                parse_mode=ParseMode.HTML
+            )
+            return
 
         await update.message.reply_text(
             "⏳ <b>Got it! Your verification request has been submitted.</b>\n\n"
@@ -4828,16 +4898,17 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await wait_message.delete()
 
         if image_file_id:
-            await update.message.reply_photo(
+            sent_signal = await update.message.reply_photo(
                 photo=image_file_id,
                 caption=signal,
                 parse_mode=ParseMode.HTML
             )
+            schedule_auto_delete(sent_signal.chat_id, sent_signal.message_id)
 
             if not is_verified(user_id):
                 remaining = trial_remaining(user_id)
                 if remaining > 0:
-                    await update.message.reply_text(
+                    sent_trial_notice = await update.message.reply_text(
                         f"⚡ <b>You have {remaining} free trial "
                         f"signal(s) remaining.</b>\n\n"
                         f"Verify your Exness account for "
@@ -4847,6 +4918,7 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
                         parse_mode=ParseMode.HTML,
                         reply_markup=main_keyboard
                     )
+                    schedule_auto_delete(sent_trial_notice.chat_id, sent_trial_notice.message_id)
                 else:
                     user_modes[user_id] = "awaiting_email"
                     await send_verification_gate(update)
@@ -4890,11 +4962,12 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
             response,
             parse_mode=ParseMode.HTML
         )
+        schedule_auto_delete(wait_message.chat_id, wait_message.message_id)
 
         if not is_verified(user_id):
             remaining = trial_remaining(user_id)
             if remaining > 0:
-                await update.message.reply_text(
+                sent_trial_notice = await update.message.reply_text(
                     f"⚡ <b>You have {remaining} free trial "
                     f"signal(s) remaining.</b>\n\n"
                     f"Verify your Exness account for "
@@ -4904,6 +4977,7 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     parse_mode=ParseMode.HTML,
                     reply_markup=main_keyboard
                 )
+                schedule_auto_delete(sent_trial_notice.chat_id, sent_trial_notice.message_id)
             else:
                 user_modes[user_id] = "awaiting_email"
                 await send_verification_gate(update)
@@ -5529,12 +5603,15 @@ async def post_weekly_report(context: ContextTypes.DEFAULT_TYPE):
 
 def main():
 
+    global _app_instance
+
     app = (
         Application.builder()
         .token(TELEGRAM_TOKEN)
         .post_init(catch_up_missed_signals)
         .build()
     )
+    _app_instance = app
 
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("broadcast", broadcast_command))

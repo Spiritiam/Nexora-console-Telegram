@@ -1110,10 +1110,28 @@ pending_autocopy_setup = {}  # user_id -> {stake, risk, win} chosen so far, mid-
 class PendingTradesStore:
     """
     Drop-in dict-like interface backed by Supabase, so every existing
-    call site (pending_trades[user_id] = ..., pending_trades.get(...),
-    pending_trades.pop(...)) keeps working unchanged - only the
-    storage underneath moved from memory to a DB table.
+    call site (pending_trades[user_id] = ..., pending_trades[user_id]
+    read directly, pending_trades.get(...), pending_trades.pop(...))
+    keeps working unchanged - only the storage underneath moved from
+    memory to a DB table.
     """
+
+    def __getitem__(self, user_id):
+        """
+        Handles direct bracket reads (pending_trades[user_id]) -
+        distinct from .get(), and missed when this class was first
+        written, which crashed the /start deep-link handler with
+        TypeError: 'PendingTradesStore' object is not subscriptable
+        the moment someone tapped Trade This Signal on a fresh
+        channel post after the channel_signal_context_db fix went
+        live. Raises KeyError on a miss, matching real dict behavior,
+        since every call site here already checks truthiness/None
+        via .get() first before ever using bracket access.
+        """
+        result = self.get(user_id)
+        if result is None:
+            raise KeyError(user_id)
+        return result
 
     def get(self, user_id, default=None):
         try:

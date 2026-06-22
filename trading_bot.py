@@ -426,14 +426,14 @@ def schedule_auto_delete(chat_id, message_id, hours=24):
     """
     Schedules a DM message for deletion after `hours` (default 24).
     Used for routine/non-critical bot DMs - signals, breakdowns, news,
-    trade placement confirmations - so a user's chat with the bot
-    doesn't pile up with old messages over time.
+    setup prompts, and error/failure messages - so a user's chat with
+    the bot doesn't pile up with old messages over time.
 
     NEVER call this for: verification status messages, account
-    balance/connection info, or auto-copy settings confirmations -
-    those stay permanently, since a user may need to refer back to
-    them (e.g. "was I verified?", "what's my auto-copy stake set
-    to?").
+    balance/connection info, auto-copy settings confirmations, or
+    SUCCESSFUL trade placement confirmations - those stay permanently
+    (trade history, and things a user may need to refer back to,
+    e.g. "was I verified?", "what's my auto-copy stake set to?").
 
     Relies on _app_instance being set in main() - if main() hasn't
     run yet (shouldn't happen in practice) this silently no-ops
@@ -451,6 +451,19 @@ def schedule_auto_delete(chat_id, message_id, hours=24):
         )
     except Exception as e:
         print(f"[AUTO-DELETE] Couldn't schedule delete: {e}")
+
+async def send_and_auto_delete(bot, chat_id, text, **kwargs):
+    """
+    Sends a message and immediately schedules it for 24h auto-delete -
+    convenience wrapper for the many routine/error message call sites,
+    so each one doesn't need its own separate schedule_auto_delete
+    call after the send. Same NEVER-call-for exceptions as
+    schedule_auto_delete apply (verification, balance/connection info,
+    auto-copy settings, successful trade confirmations).
+    """
+    sent = await bot.send_message(chat_id=chat_id, text=text, **kwargs)
+    schedule_auto_delete(sent.chat_id, sent.message_id)
+    return sent
 
 def get_open_signals():
     try:
@@ -4086,13 +4099,14 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         shared_context = channel_signal_context.get(index_key)
 
         if not shared_context:
-            await update.message.reply_text(
+            sent_expired_signal = await update.message.reply_text(
                 "⚠️ <b>This signal has expired.</b>\n\n"
                 "Request a fresh one by typing the index name "
                 "(e.g. R_100) in Signal mode.",
                 parse_mode=ParseMode.HTML,
                 reply_markup=main_keyboard
             )
+            schedule_auto_delete(sent_expired_signal.chat_id, sent_expired_signal.message_id)
             return
 
         pending_trades[user_id] = dict(shared_context)  # copy - each tapper gets their own independent trade
@@ -4191,13 +4205,14 @@ async def handle_buttons(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     reply_markup=InlineKeyboardMarkup([[toggle_button]])
                 )
             else:
-                await update.message.reply_text(
+                sent_unreachable = await update.message.reply_text(
                     "⚠️ <b>Couldn't reach your linked Deriv account.</b>\n\n"
                     "Your saved token may have expired or been revoked. "
                     "Paste a new real-account API token below to relink.",
                     parse_mode=ParseMode.HTML,
                     reply_markup=main_keyboard
                 )
+                schedule_auto_delete(sent_unreachable.chat_id, sent_unreachable.message_id)
             user_modes[user_id] = "awaiting_deriv_token"
             return
 
@@ -4211,7 +4226,7 @@ async def handle_buttons(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     if "signal" in text:
         user_modes[user_id] = "signal"
-        await update.message.reply_text(
+        sent_signal_mode = await update.message.reply_text(
             "📊 <b>Signal Mode Activated</b>\n\n"
             "Now type the pair you want a signal for.\n\n"
             "<b>Available pairs:</b>\n"
@@ -4234,11 +4249,12 @@ async def handle_buttons(update: Update, context: ContextTypes.DEFAULT_TYPE):
             parse_mode=ParseMode.HTML,
             reply_markup=main_keyboard
         )
+        schedule_auto_delete(sent_signal_mode.chat_id, sent_signal_mode.message_id)
         return
 
     if "breakdown" in text:
         user_modes[user_id] = "breakdown"
-        await update.message.reply_text(
+        sent_breakdown_mode = await update.message.reply_text(
             "📚 <b>Breakdown Mode Activated</b>\n\n"
             "Now type your market question below.\n\n"
             "<b>Examples:</b>\n"
@@ -4249,6 +4265,7 @@ async def handle_buttons(update: Update, context: ContextTypes.DEFAULT_TYPE):
             parse_mode=ParseMode.HTML,
             reply_markup=main_keyboard
         )
+        schedule_auto_delete(sent_breakdown_mode.chat_id, sent_breakdown_mode.message_id)
         return
 
 # ============================================
@@ -4413,13 +4430,11 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         trade_context = pending_trades.get(user_id)
 
         if not trade_context:
-            await context.bot.send_message(
-                chat_id=int(user_id),
-                text=(
-                    "⚠️ <b>That trade has expired.</b>\n\n"
-                    "Please request a new signal and tap 🎯 Trade This "
-                    "Signal again."
-                ),
+            await send_and_auto_delete(
+                context.bot, int(user_id),
+                "⚠️ <b>That trade has expired.</b>\n\n"
+                "Please request a new signal and tap 🎯 Trade This "
+                "Signal again.",
                 parse_mode=ParseMode.HTML
             )
             return
@@ -4434,13 +4449,11 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         shared_context = channel_signal_context.get(index_key)
         if not shared_context:
             try:
-                await context.bot.send_message(
-                    chat_id=int(tapping_user_id),
-                    text=(
-                        "⚠️ <b>This signal has expired.</b>\n\n"
-                        "Request a fresh one by typing the index name "
-                        "(e.g. R_100) in Signal mode."
-                    ),
+                await send_and_auto_delete(
+                    context.bot, int(tapping_user_id),
+                    "⚠️ <b>This signal has expired.</b>\n\n"
+                    "Request a fresh one by typing the index name "
+                    "(e.g. R_100) in Signal mode.",
                     parse_mode=ParseMode.HTML
                 )
             except Exception as e:
@@ -4464,13 +4477,11 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         tier = next((t for t in STAKE_TIERS if t["stake"] == stake), None)
 
         if not trade_context or not tier:
-            await context.bot.send_message(
-                chat_id=int(user_id),
-                text=(
-                    "⚠️ <b>That trade has expired.</b>\n\n"
-                    "Please request a new signal and tap 🎯 Trade This "
-                    "Signal again."
-                ),
+            await send_and_auto_delete(
+                context.bot, int(user_id),
+                "⚠️ <b>That trade has expired.</b>\n\n"
+                "Please request a new signal and tap 🎯 Trade This "
+                "Signal again.",
                 parse_mode=ParseMode.HTML
             )
             return
@@ -4480,14 +4491,12 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         trade_context["win"] = tier["win"]
         pending_trades[user_id] = trade_context
 
-        await context.bot.send_message(
-            chat_id=int(user_id),
-            text=(
-                f"🎯 <b>Confirm this trade:</b>\n\n"
-                f"<b>{trade_context['direction']} {trade_context['display']}</b>\n"
-                f"Stake: ${trade_context['stake']} | "
-                f"Risk ${trade_context['risk']} → Target ${trade_context['win']}"
-            ),
+        await send_and_auto_delete(
+            context.bot, int(user_id),
+            f"🎯 <b>Confirm this trade:</b>\n\n"
+            f"<b>{trade_context['direction']} {trade_context['display']}</b>\n"
+            f"Stake: ${trade_context['stake']} | "
+            f"Risk ${trade_context['risk']} → Target ${trade_context['win']}",
             parse_mode=ParseMode.HTML,
             reply_markup=InlineKeyboardMarkup([[
                 InlineKeyboardButton("✅ Confirm", callback_data=f"execconfirm_{user_id}"),
@@ -4501,28 +4510,24 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         trade_context = pending_trades.get(user_id)
 
         if not trade_context:
-            await context.bot.send_message(
-                chat_id=int(user_id),
-                text=(
-                    "⚠️ <b>That trade has expired.</b>\n\n"
-                    "Please request a new signal and tap 🎯 Trade This "
-                    "Signal again."
-                ),
+            await send_and_auto_delete(
+                context.bot, int(user_id),
+                "⚠️ <b>That trade has expired.</b>\n\n"
+                "Please request a new signal and tap 🎯 Trade This "
+                "Signal again.",
                 parse_mode=ParseMode.HTML
             )
             return
 
         user_modes[user_id] = "awaiting_trade_confirm"
 
-        await context.bot.send_message(
-            chat_id=int(user_id),
-            text=(
-                "✏️ <b>Enter your stake amount:</b>\n\n"
-                "Want to set your own risk/target?\n"
-                "Type three numbers that serve as — stake, risk, "
-                "target — like <code>3, 2, 10</code> or "
-                "<code>3 2 10</code>."
-            ),
+        await send_and_auto_delete(
+            context.bot, int(user_id),
+            "✏️ <b>Enter your stake amount:</b>\n\n"
+            "Want to set your own risk/target?\n"
+            "Type three numbers that serve as — stake, risk, "
+            "target — like <code>3, 2, 10</code> or "
+            "<code>3 2 10</code>.",
             parse_mode=ParseMode.HTML
         )
 
@@ -4611,12 +4616,10 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
         setup = pending_autocopy_setup.pop(user_id, None)
         if not setup:
-            await context.bot.send_message(
-                chat_id=int(user_id),
-                text=(
-                    "⚠️ <b>That setup expired.</b>\n\n"
-                    "Tap 🔗 Connect Deriv and choose Auto-Copy again."
-                ),
+            await send_and_auto_delete(
+                context.bot, int(user_id),
+                "⚠️ <b>That setup expired.</b>\n\n"
+                "Tap 🔗 Connect Deriv and choose Auto-Copy again.",
                 parse_mode=ParseMode.HTML
             )
             return
@@ -4631,13 +4634,11 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
 
         if not saved:
-            await context.bot.send_message(
-                chat_id=int(user_id),
-                text=(
-                    "⚠️ <b>Couldn't save your auto-copy settings right "
-                    "now.</b>\n\nPlease try again in a moment from "
-                    "🔗 Connect Deriv."
-                ),
+            await send_and_auto_delete(
+                context.bot, int(user_id),
+                "⚠️ <b>Couldn't save your auto-copy settings right "
+                "now.</b>\n\nPlease try again in a moment from "
+                "🔗 Connect Deriv.",
                 parse_mode=ParseMode.HTML,
                 reply_markup=main_keyboard
             )
@@ -4671,26 +4672,22 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         trade_context = pending_trades.pop(user_id, None)  # pop immediately, prevents a double-tap re-executing
 
         if not trade_context:
-            await context.bot.send_message(
-                chat_id=int(user_id),
-                text=(
-                    "⚠️ <b>That trade has expired.</b>\n\n"
-                    "Please request a new signal and tap 🎯 Trade This "
-                    "Signal again."
-                ),
+            await send_and_auto_delete(
+                context.bot, int(user_id),
+                "⚠️ <b>That trade has expired.</b>\n\n"
+                "Please request a new signal and tap 🎯 Trade This "
+                "Signal again.",
                 parse_mode=ParseMode.HTML
             )
             return
 
         account = get_deriv_account(user_id)
         if not account:
-            await context.bot.send_message(
-                chat_id=int(user_id),
-                text=(
-                    "⚠️ <b>No linked Deriv account found.</b>\n\n"
-                    "Tap 🔗 Connect Deriv first to link your real account "
-                    "before trading."
-                ),
+            await send_and_auto_delete(
+                context.bot, int(user_id),
+                "⚠️ <b>No linked Deriv account found.</b>\n\n"
+                "Tap 🔗 Connect Deriv first to link your real account "
+                "before trading.",
                 parse_mode=ParseMode.HTML
             )
             return
@@ -4706,14 +4703,12 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             if snapshot and snapshot.get("balance") is not None:
                 if snapshot["balance"] < trade_context["stake"]:
                     await wait_message.delete()
-                    await context.bot.send_message(
-                        chat_id=int(user_id),
-                        text=(
-                            f"⚠️ <b>Not enough balance for this stake.</b>\n\n"
-                            f"Your balance: ${snapshot['balance']} | "
-                            f"Stake needed: ${trade_context['stake']}\n\n"
-                            f"Try a smaller amount, or top up your Deriv account."
-                        ),
+                    await send_and_auto_delete(
+                        context.bot, int(user_id),
+                        f"⚠️ <b>Not enough balance for this stake.</b>\n\n"
+                        f"Your balance: ${snapshot['balance']} | "
+                        f"Stake needed: ${trade_context['stake']}\n\n"
+                        f"Try a smaller amount, or top up your Deriv account.",
                         parse_mode=ParseMode.HTML,
                         reply_markup=main_keyboard
                     )
@@ -4737,9 +4732,9 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await wait_message.delete()
 
             if error:
-                await context.bot.send_message(
-                    chat_id=int(user_id),
-                    text=f"❌ <b>Trade not placed.</b>\n\n{friendly_trade_error(error)}",
+                await send_and_auto_delete(
+                    context.bot, int(user_id),
+                    f"❌ <b>Trade not placed.</b>\n\n{friendly_trade_error(error)}",
                     parse_mode=ParseMode.HTML,
                     reply_markup=main_keyboard
                 )
@@ -4761,7 +4756,8 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 parse_mode=ParseMode.HTML,
                 reply_markup=main_keyboard
             )
-            schedule_auto_delete(sent_confirmation.chat_id, sent_confirmation.message_id)
+            # Intentionally NOT auto-deleted - successful trade
+            # placements are kept permanently as trade history.
 
         except Exception as e:
             # Catch-all: this is exactly what was previously missing,
@@ -4774,12 +4770,10 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 await wait_message.delete()
             except Exception:
                 pass
-            await context.bot.send_message(
-                chat_id=int(user_id),
-                text=(
-                    "❌ <b>Something went wrong placing this trade.</b>\n\n"
-                    "Please request a new signal and try again."
-                ),
+            await send_and_auto_delete(
+                context.bot, int(user_id),
+                "❌ <b>Something went wrong placing this trade.</b>\n\n"
+                "Please request a new signal and try again.",
                 parse_mode=ParseMode.HTML,
                 reply_markup=main_keyboard
             )
@@ -4799,18 +4793,19 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
         email = message.strip().lower()
 
         if "@" not in email or "." not in email:
-            await update.message.reply_text(
+            sent_invalid_email = await update.message.reply_text(
                 "⚠️ <b>That doesn't look like a valid email address.</b>\n\n"
                 "Please enter the email address you used to "
                 "register on Exness 👇\n\n"
                 "<i>Example: yourname@gmail.com</i>",
                 parse_mode=ParseMode.HTML
             )
+            schedule_auto_delete(sent_invalid_email.chat_id, sent_invalid_email.message_id)
             return
 
         existing_owner = get_verified_user_by_email(email)
         if existing_owner and str(existing_owner.get("user_id")) != user_id:
-            await update.message.reply_text(
+            sent_email_used = await update.message.reply_text(
                 "🚫 <b>This email has already been used and verified by "
                 "another account.</b>\n\n"
                 "Each Exness email can only verify one Nexora AI "
@@ -4818,6 +4813,7 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 "your original Telegram account.",
                 parse_mode=ParseMode.HTML
             )
+            schedule_auto_delete(sent_email_used.chat_id, sent_email_used.message_id)
             return
 
         pending_owner_id = next(
@@ -4826,7 +4822,7 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
             None
         )
         if pending_owner_id:
-            await update.message.reply_text(
+            sent_email_pending = await update.message.reply_text(
                 "🚫 <b>This email is already awaiting verification on "
                 "another account.</b>\n\n"
                 "Each Exness email can only verify one Nexora AI "
@@ -4834,6 +4830,7 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 "your original Telegram account.",
                 parse_mode=ParseMode.HTML
             )
+            schedule_auto_delete(sent_email_pending.chat_id, sent_email_pending.message_id)
             return
 
         already_pending = user_id in pending_verifications
@@ -4909,7 +4906,7 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await wait_message.delete()
 
         if not snapshot:
-            await update.message.reply_text(
+            sent_bad_token = await update.message.reply_text(
                 "❌ <b>That token didn't work.</b>\n\n"
                 "Double-check you copied the full token and that it has "
                 "the <b>Trade</b> and <b>Account management</b> scopes "
@@ -4917,10 +4914,11 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 parse_mode=ParseMode.HTML,
                 reply_markup=main_keyboard
             )
+            schedule_auto_delete(sent_bad_token.chat_id, sent_bad_token.message_id)
             return
 
         if snapshot["is_virtual"]:
-            await update.message.reply_text(
+            sent_demo_account = await update.message.reply_text(
                 "🚫 <b>That's a demo account.</b>\n\n"
                 "Nexora account linking is for verified real-money "
                 "traders only. Please generate a token from your "
@@ -4928,6 +4926,7 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 parse_mode=ParseMode.HTML,
                 reply_markup=main_keyboard
             )
+            schedule_auto_delete(sent_demo_account.chat_id, sent_demo_account.message_id)
             return
 
         saved = save_deriv_account(
@@ -4935,13 +4934,14 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
 
         if not saved:
-            await update.message.reply_text(
+            sent_save_failed = await update.message.reply_text(
                 "⚠️ <b>Your account was verified but couldn't be saved "
                 "right now.</b>\n\nPlease try pasting the token again "
                 "in a moment.",
                 parse_mode=ParseMode.HTML,
                 reply_markup=main_keyboard
             )
+            schedule_auto_delete(sent_save_failed.chat_id, sent_save_failed.message_id)
             return
 
         open_count = len(snapshot["open_contracts"])
@@ -5001,13 +5001,14 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
         trade_context = pending_trades.get(user_id)
         if not trade_context:
             user_modes[user_id] = None
-            await update.message.reply_text(
+            sent_expired = await update.message.reply_text(
                 "⚠️ <b>That trade has expired.</b>\n\n"
                 "Please request a new signal and tap 🎯 Trade This Signal "
                 "again.",
                 parse_mode=ParseMode.HTML,
                 reply_markup=main_keyboard
             )
+            schedule_auto_delete(sent_expired.chat_id, sent_expired.message_id)
             return
 
         reply = message.strip().lower()
@@ -5028,12 +5029,13 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
         has_all_three_plain = len(multi_number_parts) == 3
 
         if not (has_all_three_kv or has_all_three_plain):
-            await update.message.reply_text(
+            sent_invalid = await update.message.reply_text(
                 "⚠️ <b>I didn't understand that.</b>\n\n"
                 "Type all three numbers — stake, risk, target — "
                 "like <code>3, 2, 10</code> or <code>3 2 10</code>.",
                 parse_mode=ParseMode.HTML
             )
+            schedule_auto_delete(sent_invalid.chat_id, sent_invalid.message_id)
             return
 
         if has_all_three_plain:
@@ -5048,7 +5050,7 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
         pending_trades[user_id] = trade_context
         user_modes[user_id] = None
 
-        await update.message.reply_text(
+        sent_confirm = await update.message.reply_text(
             f"🎯 <b>Confirm this trade:</b>\n\n"
             f"<b>{trade_context['direction']} {trade_context['display']}</b>\n"
             f"Stake: ${trade_context['stake']} | "
@@ -5059,6 +5061,7 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 InlineKeyboardButton("✏️ Edit", callback_data=f"edittrade_{user_id}"),
             ]])
         )
+        schedule_auto_delete(sent_confirm.chat_id, sent_confirm.message_id)
         return
 
     mode = user_modes.get(user_id)
@@ -5081,18 +5084,19 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await wait_message.delete()
 
             if not result:
-                await update.message.reply_text(
+                sent_no_signal = await update.message.reply_text(
                     "⚠️ <b>Unable to generate a signal right now.</b>\n"
                     "Please try again shortly.",
                     parse_mode=ParseMode.HTML,
                     reply_markup=main_keyboard
                 )
+                schedule_auto_delete(sent_no_signal.chat_id, sent_no_signal.message_id)
                 return
 
             signal_image_id, signal_message, trade_context = result
             pending_trades[user_id] = trade_context
 
-            await update.message.reply_photo(
+            sent_synth_signal = await update.message.reply_photo(
                 photo=signal_image_id,
                 caption=signal_message,
                 parse_mode=ParseMode.HTML,
@@ -5103,6 +5107,7 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     )]
                 ])
             )
+            schedule_auto_delete(sent_synth_signal.chat_id, sent_synth_signal.message_id)
             return
 
     if not is_verified(user_id) and get_trial_count(user_id) >= FREE_TRIAL_LIMIT:
@@ -5118,7 +5123,7 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
             and requested_key != "btcusd"
             and is_forex_market_closed()
         ):
-            await update.message.reply_text(
+            sent_market_closed = await update.message.reply_text(
                 "🌙 <b>Forex Market Closed for the Week</b>\n\n"
                 "Gold, Silver, Oil and all Forex pairs are closed "
                 "until the market reopens Sunday.\n\n"
@@ -5127,6 +5132,7 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 parse_mode=ParseMode.HTML,
                 reply_markup=main_keyboard
             )
+            schedule_auto_delete(sent_market_closed.chat_id, sent_market_closed.message_id)
             return
 
         if not is_verified(user_id):
@@ -5175,7 +5181,7 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     user_modes[user_id] = "awaiting_email"
                     await send_verification_gate(update)
         elif signal == "MARKET_CLOSED":
-            await update.message.reply_text(
+            sent_market_closed2 = await update.message.reply_text(
                 "🌙 <b>Forex Market Closed for the Week</b>\n\n"
                 "Gold, Silver, Oil and all Forex pairs are closed "
                 "until the market reopens Sunday.\n\n"
@@ -5184,12 +5190,14 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 parse_mode=ParseMode.HTML,
                 reply_markup=main_keyboard
             )
+            schedule_auto_delete(sent_market_closed2.chat_id, sent_market_closed2.message_id)
         else:
-            await update.message.reply_text(
+            sent_fetch_failed = await update.message.reply_text(
                 "⚠️ <b>Unable to fetch live market data.</b>\n"
                 "Please try again shortly.",
                 parse_mode=ParseMode.HTML
             )
+            schedule_auto_delete(sent_fetch_failed.chat_id, sent_fetch_failed.message_id)
         return
 
     if mode == "breakdown":
@@ -5235,7 +5243,7 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 await send_verification_gate(update)
         return
 
-    await update.message.reply_text(
+    sent_fallback = await update.message.reply_text(
         "👇 <b>Here's what you can do:</b>\n\n"
         "📊 <b>Signal</b> — Get a live trading signal right now\n\n"
         "📚 <b>Breakdown</b> — Get a full AI market analysis\n\n"
@@ -5243,6 +5251,7 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
         parse_mode=ParseMode.HTML,
         reply_markup=main_keyboard
     )
+    schedule_auto_delete(sent_fallback.chat_id, sent_fallback.message_id)
 
 # ============================================
 # AUTO SIGNAL — Button on Channel 1 only.

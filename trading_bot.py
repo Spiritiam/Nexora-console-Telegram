@@ -1087,8 +1087,90 @@ STAKE_TIERS = [
     {"stake": 100, "risk": 30, "win": 60},
 ]
 
-pending_trades = {}  # user_id -> trade context dict, one pending trade at a time
 pending_autocopy_setup = {}  # user_id -> {stake, risk, win} chosen so far, mid-setup
+
+# ============================================
+# PENDING TRADE STORAGE (DB-backed)
+# Was a plain in-memory dict - meant a trade
+# picked via "Custom Amount" or a stake tier
+# button could silently vanish if a Railway
+# redeploy landed in the gap before the user
+# tapped Confirm, since every redeploy restarts
+# the process and wipes in-memory state. Given
+# how often this file gets redeployed during
+# active development, this was a real, repeated
+# failure (confirmed via Railway's deployment
+# history), not a one-off. Requires a Supabase
+# table: pending_trades_db. Columns: user_id
+# (text, primary key), symbol, contract_type,
+# direction, display (all text), multiplier,
+# stake, risk, win (all numeric).
+# ============================================
+
+class PendingTradesStore:
+    """
+    Drop-in dict-like interface backed by Supabase, so every existing
+    call site (pending_trades[user_id] = ..., pending_trades.get(...),
+    pending_trades.pop(...)) keeps working unchanged - only the
+    storage underneath moved from memory to a DB table.
+    """
+
+    def get(self, user_id, default=None):
+        try:
+            url = (
+                f"{SUPABASE_URL}/rest/v1/pending_trades_db"
+                f"?user_id=eq.{user_id}&select=*"
+            )
+            response = requests.get(url, headers=sb_headers(), timeout=10)
+            data = response.json()
+            if not data:
+                return default
+            row = data[0]
+            return {
+                "symbol": row.get("symbol"),
+                "contract_type": row.get("contract_type"),
+                "direction": row.get("direction"),
+                "display": row.get("display"),
+                "multiplier": row.get("multiplier"),
+                "stake": row.get("stake"),
+                "risk": row.get("risk"),
+                "win": row.get("win"),
+            }
+        except Exception as e:
+            print(f"[PENDING TRADES] get error: {e}")
+            return default
+
+    def __setitem__(self, user_id, trade_context):
+        try:
+            url = f"{SUPABASE_URL}/rest/v1/pending_trades_db?on_conflict=user_id"
+            payload = {
+                "user_id": str(user_id),
+                "symbol": trade_context.get("symbol"),
+                "contract_type": trade_context.get("contract_type"),
+                "direction": trade_context.get("direction"),
+                "display": trade_context.get("display"),
+                "multiplier": trade_context.get("multiplier"),
+                "stake": trade_context.get("stake"),
+                "risk": trade_context.get("risk"),
+                "win": trade_context.get("win"),
+            }
+            headers = {**sb_headers(), "Prefer": "resolution=merge-duplicates"}
+            response = requests.post(url, headers=headers, json=payload, timeout=10)
+            if response.status_code not in (200, 201):
+                print(f"[PENDING TRADES] set unexpected status {response.status_code}: {response.text}")
+        except Exception as e:
+            print(f"[PENDING TRADES] set error: {e}")
+
+    def pop(self, user_id, default=None):
+        existing = self.get(user_id, default)
+        try:
+            url = f"{SUPABASE_URL}/rest/v1/pending_trades_db?user_id=eq.{user_id}"
+            requests.delete(url, headers=sb_headers(), timeout=10)
+        except Exception as e:
+            print(f"[PENDING TRADES] pop/delete error: {e}")
+        return existing
+
+pending_trades = PendingTradesStore()
 
 # Set once in main() right after the Application is built - lets
 # auto-delete scheduling work from any function (including ones that

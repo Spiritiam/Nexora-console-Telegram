@@ -1429,40 +1429,50 @@ async def deriv_execute_multiplier_trade(token, symbol, contract_type, multiplie
     stop_loss/take_profit are real dollar amounts on the stake,
     confirmed live - not price levels.
     Returns (buy_data, None) on success, or (None, error_message).
+    NEVER raises - every step is guarded, so a caller can always
+    trust it gets back a clean (None, "...") on any failure instead
+    of an uncaught exception silently killing the whole request (this
+    previously happened here: a real trade got stuck forever on
+    "Placing your trade..." with no error shown at all, because
+    nothing above the inner websocket try/except was protected).
     """
-    accounts_data = await deriv_get_options_accounts(token)
-    if not accounts_data:
-        return None, "Couldn't verify your Deriv account."
+    try:
+        accounts_data = await deriv_get_options_accounts(token)
+        if not accounts_data:
+            return None, "Couldn't verify your Deriv account."
 
-    accounts_list = accounts_data.get("data")
-    if not isinstance(accounts_list, list):
-        accounts_list = accounts_data.get("accounts")
-    if not accounts_list:
-        return None, "Couldn't read your account list."
+        accounts_list = accounts_data.get("data")
+        if not isinstance(accounts_list, list):
+            accounts_list = accounts_data.get("accounts")
+        if not accounts_list:
+            return None, "Couldn't read your account list."
 
-    real_account = None
-    for acct in accounts_list:
-        is_virtual = bool(
-            acct.get("is_virtual")
-            or str(acct.get("account_type", "")).lower() in ("demo", "virtual")
+        real_account = None
+        for acct in accounts_list:
+            is_virtual = bool(
+                acct.get("is_virtual")
+                or str(acct.get("account_type", "")).lower() in ("demo", "virtual")
+            )
+            if not is_virtual:
+                real_account = acct
+                break
+
+        if not real_account:
+            return None, "No real account found on this token."
+
+        account_id = (
+            real_account.get("account_id")
+            or real_account.get("loginid")
+            or real_account.get("id")
         )
-        if not is_virtual:
-            real_account = acct
-            break
+        currency = real_account.get("currency", "USD")
 
-    if not real_account:
-        return None, "No real account found on this token."
-
-    account_id = (
-        real_account.get("account_id")
-        or real_account.get("loginid")
-        or real_account.get("id")
-    )
-    currency = real_account.get("currency", "USD")
-
-    ws_url = await deriv_get_otp_url(token, account_id)
-    if not ws_url:
-        return None, "Couldn't establish a trading connection."
+        ws_url = await deriv_get_otp_url(token, account_id)
+        if not ws_url:
+            return None, "Couldn't establish a trading connection."
+    except Exception as e:
+        print(f"[SYNTH TRADE] ❌ Account/connection setup failed: {e}")
+        return None, "Couldn't set up the trade connection. Please try again."
 
     try:
         async with websockets.connect(ws_url, open_timeout=10, close_timeout=10) as ws:
@@ -2485,6 +2495,43 @@ def find_swing_points(candles, strength=2):
             swings.append({"index": i, "type": "low", "price": low})
     return swings
 
+def detect_trend_continuation(candles):
+    """
+    Distinct from detect_bos_choch (which compares the last TWO
+    swing points) and detect_liquidity_sweep (which looks for a
+    reversal AT a level) - this measures sustained directional
+    momentum across the most recent candles' closes, the actual
+    "is this a continuation move" question. A clean run of mostly-
+    higher (or mostly-lower) closes, with no big snap-back candle
+    against that direction, suggests the move is still being
+    accepted rather than already exhausted.
+
+    Requires at least 6 of the last 7 closes to move the same way,
+    AND the most recent candle to not be a strong rejection candle
+    against that direction (closing in the opposite half of its own
+    range) - a single strong rejection candle is treated as the
+    market already pushing back, not a continuation anymore.
+    """
+    if len(candles) < 8:
+        return None
+
+    recent = candles[-7:]
+    diffs = [recent[i]["close"] - recent[i - 1]["close"] for i in range(1, len(recent))]
+
+    up_moves = sum(1 for d in diffs if d > 0)
+    down_moves = sum(1 for d in diffs if d < 0)
+
+    last = candles[-1]
+    candle_range = last["high"] - last["low"]
+    closed_upper_half = candle_range > 0 and (last["close"] - last["low"]) / candle_range >= 0.5
+
+    if up_moves >= 6 and closed_upper_half:
+        return {"direction": "BUY", "detail": "sustained bullish continuation across recent candles"}
+    if down_moves >= 6 and not closed_upper_half:
+        return {"direction": "SELL", "detail": "sustained bearish continuation across recent candles"}
+
+    return None
+
 def detect_liquidity_sweep(candles, swings):
     """
     Checks the last 3 candles for a wick that pierces beyond the
@@ -2647,6 +2694,10 @@ def analyze_timeframe(candles):
     bos = detect_bos_choch(swings)
     if bos:
         factors.append({**bos, "weight": 2})
+
+    continuation = detect_trend_continuation(candles)
+    if continuation:
+        factors.append({**continuation, "weight": 2})
 
     ob = detect_order_block(candles)
     if ob:
@@ -4302,9 +4353,12 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await context.bot.send_message(
             chat_id=int(user_id),
             text=(
-                "✏️ <b>Enter your custom amounts:</b>\n\n"
-                "Send something like:\n"
-                "<code>stake=20 risk=5 win=10</code>"
+                "✏️ <b>Enter your stake amount:</b>\n\n"
+                "Just type a number, e.g. <code>3</code> or "
+                "<code>7.5</code> — risk and target will be set "
+                "automatically.\n\n"
+                "<i>Want full control instead? Send "
+                "</i><code>stake=20 risk=5 win=10</code>"
             ),
             parse_mode=ParseMode.HTML
         )
@@ -4448,7 +4502,7 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             reply_markup=main_keyboard
         )
 
-
+    elif data.startswith("execconfirm_"):
 
         user_id = data.replace("execconfirm_", "")
         trade_context = pending_trades.pop(user_id, None)  # pop immediately, prevents a double-tap re-executing
@@ -4484,66 +4538,88 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             parse_mode=ParseMode.HTML
         )
 
-        snapshot = await deriv_fetch_account_snapshot(account["api_token"])
-        if snapshot and snapshot.get("balance") is not None:
-            if snapshot["balance"] < trade_context["stake"]:
-                await wait_message.delete()
+        try:
+            snapshot = await deriv_fetch_account_snapshot(account["api_token"])
+            if snapshot and snapshot.get("balance") is not None:
+                if snapshot["balance"] < trade_context["stake"]:
+                    await wait_message.delete()
+                    await context.bot.send_message(
+                        chat_id=int(user_id),
+                        text=(
+                            f"⚠️ <b>Not enough balance for this stake.</b>\n\n"
+                            f"Your balance: ${snapshot['balance']} | "
+                            f"Stake needed: ${trade_context['stake']}\n\n"
+                            f"Try a smaller amount, or top up your Deriv account."
+                        ),
+                        parse_mode=ParseMode.HTML,
+                        reply_markup=main_keyboard
+                    )
+                    return
+
+            await wait_message.edit_text(
+                "⏳ <b>Placing your trade...</b>",
+                parse_mode=ParseMode.HTML
+            )
+
+            buy_data, error = await deriv_execute_multiplier_trade(
+                account["api_token"],
+                trade_context["symbol"],
+                trade_context["contract_type"],
+                trade_context["multiplier"],
+                trade_context["stake"],
+                trade_context["risk"],
+                trade_context["win"],
+            )
+
+            await wait_message.delete()
+
+            if error:
                 await context.bot.send_message(
                     chat_id=int(user_id),
-                    text=(
-                        f"⚠️ <b>Not enough balance for this stake.</b>\n\n"
-                        f"Your balance: ${snapshot['balance']} | "
-                        f"Stake needed: ${trade_context['stake']}\n\n"
-                        f"Try a smaller amount, or top up your Deriv account."
-                    ),
+                    text=f"❌ <b>Trade not placed.</b>\n\n{friendly_trade_error(error)}",
                     parse_mode=ParseMode.HTML,
                     reply_markup=main_keyboard
                 )
                 return
 
-        await wait_message.edit_text(
-            "⏳ <b>Placing your trade...</b>",
-            parse_mode=ParseMode.HTML
-        )
+            contract_id = buy_data.get("contract_id", "—")
+            buy_price = buy_data.get("buy_price", trade_context["stake"])
 
-        buy_data, error = await deriv_execute_multiplier_trade(
-            account["api_token"],
-            trade_context["symbol"],
-            trade_context["contract_type"],
-            trade_context["multiplier"],
-            trade_context["stake"],
-            trade_context["risk"],
-            trade_context["win"],
-        )
-
-        await wait_message.delete()
-
-        if error:
-            await context.bot.send_message(
+            sent_confirmation = await context.bot.send_message(
                 chat_id=int(user_id),
-                text=f"❌ <b>Trade not placed.</b>\n\n{friendly_trade_error(error)}",
+                text=(
+                    f"✅ <b>Trade placed!</b>\n\n"
+                    f"<b>{trade_context['direction']} {trade_context['display']}</b>\n"
+                    f"Stake: ${buy_price}\n"
+                    f"Contract ID: {contract_id}\n\n"
+                    f"<i>Deriv will automatically close this at your stop loss, "
+                    f"take profit, or stop-out level.</i>"
+                ),
                 parse_mode=ParseMode.HTML,
                 reply_markup=main_keyboard
             )
-            return
+            schedule_auto_delete(sent_confirmation.chat_id, sent_confirmation.message_id)
 
-        contract_id = buy_data.get("contract_id", "—")
-        buy_price = buy_data.get("buy_price", trade_context["stake"])
-
-        sent_confirmation = await context.bot.send_message(
-            chat_id=int(user_id),
-            text=(
-                f"✅ <b>Trade placed!</b>\n\n"
-                f"<b>{trade_context['direction']} {trade_context['display']}</b>\n"
-                f"Stake: ${buy_price}\n"
-                f"Contract ID: {contract_id}\n\n"
-                f"<i>Deriv will automatically close this at your stop loss, "
-                f"take profit, or stop-out level.</i>"
-            ),
-            parse_mode=ParseMode.HTML,
-            reply_markup=main_keyboard
-        )
-        schedule_auto_delete(sent_confirmation.chat_id, sent_confirmation.message_id)
+        except Exception as e:
+            # Catch-all: this is exactly what was previously missing,
+            # and exactly why a real trade once got stuck forever on
+            # "Placing your trade..." with no error message and no
+            # trade ever placed. Whatever goes wrong here, the user
+            # always gets told something instead of silence.
+            print(f"[EXECCONFIRM] ❌ Unexpected error for {user_id}: {e}")
+            try:
+                await wait_message.delete()
+            except Exception:
+                pass
+            await context.bot.send_message(
+                chat_id=int(user_id),
+                text=(
+                    "❌ <b>Something went wrong placing this trade.</b>\n\n"
+                    "Please request a new signal and try again."
+                ),
+                parse_mode=ParseMode.HTML,
+                reply_markup=main_keyboard
+            )
 
 # ============================================
 # HANDLE TEXT
@@ -4777,21 +4853,35 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
         risk_match = re.search(r"risk\s*=\s*([\d.]+)", reply)
         win_match = re.search(r"win\s*=\s*([\d.]+)", reply)
 
-        if not (stake_match or risk_match or win_match):
+        plain_number_match = re.fullmatch(r"[\d.]+", reply)
+
+        if not (stake_match or risk_match or win_match or plain_number_match):
             await update.message.reply_text(
                 "⚠️ <b>I didn't understand that.</b>\n\n"
-                "Send custom values like:\n"
+                "Just type a number for your stake, e.g. "
+                "<code>3</code>, or for full control send:\n"
                 "<code>stake=20 risk=5 win=10</code>",
                 parse_mode=ParseMode.HTML
             )
             return
 
-        if stake_match:
-            trade_context["stake"] = float(stake_match.group(1))
-        if risk_match:
-            trade_context["risk"] = float(risk_match.group(1))
-        if win_match:
-            trade_context["win"] = float(win_match.group(1))
+        if plain_number_match and not (stake_match or risk_match or win_match):
+            # Simple path: just a stake amount. Risk/win auto-derived
+            # using the same ~30%/~60% ratio already used across
+            # every preset in STAKE_TIERS, so a typed-in stake behaves
+            # consistently with the tier buttons rather than needing
+            # the user to understand risk/reward math themselves.
+            stake_value = float(plain_number_match.group(0))
+            trade_context["stake"] = stake_value
+            trade_context["risk"] = round(stake_value * 0.3, 2)
+            trade_context["win"] = round(stake_value * 0.6, 2)
+        else:
+            if stake_match:
+                trade_context["stake"] = float(stake_match.group(1))
+            if risk_match:
+                trade_context["risk"] = float(risk_match.group(1))
+            if win_match:
+                trade_context["win"] = float(win_match.group(1))
 
         pending_trades[user_id] = trade_context
         user_modes[user_id] = None

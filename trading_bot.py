@@ -100,21 +100,61 @@ SL_HIT_IMAGE_FILE_ID = "AgACAgQAAxkBAAIBIWowI9Lxu93CIKFD5YSHFbJ8_MB-AAJBD2sbbT2B
 # DAILY SCHEDULE (UTC)
 # ============================================
 
+# ============================================
+# DAILY SCHEDULE (UTC)
+# Times are in UTC - "07:00 UTC" = 8AM Lagos,
+# "17:00 UTC" = 6PM Lagos, "11:00 UTC" = 12PM
+# Lagos, matching how the team actually thinks
+# about these slots.
+#
+# MORNING_PAIR_BY_WEEKDAY / EVENING_PAIR_BY_WEEKDAY
+# use Python's datetime.weekday() convention:
+# 0=Monday ... 6=Sunday. This is DELIBERATELY
+# different from PTB's run_daily `days` param
+# (which is cron-style, 0=Sunday...6=Saturday -
+# see the weekly_report fix elsewhere in this file
+# for the exact bug that confusion caused before).
+# Both daily jobs below run EVERY day and look up
+# today's pair themselves, rather than relying on
+# run_daily's days= restriction per pair - that
+# mechanism can't vary the pair by day, only
+# include/exclude whole days.
+#
+# A day with no evening pair (Sat/Sun) maps to
+# None - the job simply does nothing that slot.
+# ============================================
+
+MORNING_PAIR_BY_WEEKDAY = {
+    0: "xauusd",  # Monday
+    1: "xauusd",  # Tuesday
+    2: "xauusd",  # Wednesday
+    3: "xauusd",  # Thursday
+    4: "xauusd",  # Friday
+    5: "btcusd",  # Saturday
+    6: "btcusd",  # Sunday
+}
+
+EVENING_PAIR_BY_WEEKDAY = {
+    0: "btcusd",  # Monday
+    1: "xagusd",  # Tuesday
+    2: "usoil",   # Wednesday
+    3: "btcusd",  # Thursday
+    4: "usoil",   # Friday
+    5: None,      # Saturday - no evening forex/crypto slot, volatility only
+    6: None,      # Sunday - no evening forex/crypto slot, volatility only
+}
+
 DAILY_SCHEDULE = [
-    ("06:00", "news",   "morning"),   # 7:00 AM Lagos
-    ("07:00", "signal", "xauusd"),    # 8:00 AM Lagos
-    ("13:00", "signal", "gbpjpy"),    # 2:00 PM Lagos
-    ("19:00", "signal", "btcusd"),    # 8:00 PM Lagos
+    ("06:00", "news", "morning"),  # 7:00 AM Lagos
 ]
 
-# Synthetic index channel posts (NEW) - rotates through all 5
-# indices, one post on weekdays, two on weekends (slot 0/1 picks a
-# different index for each of the two weekend posts on the same
-# day - see get_rotation_key below).
+# Synthetic index channel posts - rotates through all 5 indices.
+# Wednesday gets its own dedicated 12PM Lagos (11:00 UTC) slot in
+# addition to the existing weekend slots (Sat/Sun 6PM Lagos = 17:00
+# UTC) - so volatility indices post Wed/Sat/Sun, not every day.
 SYNTHETIC_SCHEDULE = [
-    ("11:00", "weekday", 0),
-    ("11:00", "weekend", 0),
-    ("17:00", "weekend", 1),
+    ("11:00", "wednesday_only", 0),
+    ("17:00", "weekend", 0),
 ]
 
 # ============================================
@@ -5326,8 +5366,30 @@ async def _post_signal_for_pair(bot, pair_keyword):
     # in the loop above, silently doubling every trade's exposure.
     asyncio.create_task(place_and_link_mt5_trade(signal_id, signal_data))
 
-async def post_auto_signal(context: ContextTypes.DEFAULT_TYPE):
-    pair_keyword = context.job.data
+async def post_morning_signal(context: ContextTypes.DEFAULT_TYPE):
+    """
+    Runs every day at 07:00 UTC (8AM Lagos). Looks up today's pair
+    from MORNING_PAIR_BY_WEEKDAY rather than having a fixed pair
+    baked into the job itself - this is what lets the same single
+    job serve XAUUSD on weekdays and BTCUSD on weekends.
+    """
+    weekday = datetime.utcnow().weekday()  # 0=Monday ... 6=Sunday
+    pair_keyword = MORNING_PAIR_BY_WEEKDAY.get(weekday)
+    if not pair_keyword:
+        return
+    await _post_signal_for_pair(context.bot, pair_keyword)
+
+async def post_evening_signal(context: ContextTypes.DEFAULT_TYPE):
+    """
+    Runs every day at 17:00 UTC (6PM Lagos). Looks up today's pair
+    from EVENING_PAIR_BY_WEEKDAY - None on Sat/Sun, since those days
+    only get the volatility-index slot in the evening, not a forex/
+    crypto signal.
+    """
+    weekday = datetime.utcnow().weekday()  # 0=Monday ... 6=Sunday
+    pair_keyword = EVENING_PAIR_BY_WEEKDAY.get(weekday)
+    if not pair_keyword:
+        return
     await _post_signal_for_pair(context.bot, pair_keyword)
 
 # ============================================
@@ -5938,12 +6000,21 @@ def main():
             hour=h, minute=m, second=0, microsecond=0
         ).time()
 
-    # BTCUSD trades 24/7 so it runs every day. Every other scheduled
-    # pair (gold, forex) has its market closed Sat/Sun - posting then
-    # would use stale Friday-close prices, so those are restricted to
-    # weekdays only (0=Monday ... 6=Sunday).
-    WEEKDAYS_ONLY = (0, 1, 2, 3, 4)
+    # PTB v20+ run_daily's `days` param is CRON-STYLE: 0=Sunday ...
+    # 6=Saturday - NOT Python's datetime.weekday() convention
+    # (0=Monday...6=Sunday) used everywhere else in this file (e.g.
+    # MORNING_PAIR_BY_WEEKDAY/EVENING_PAIR_BY_WEEKDAY above, and
+    # post_morning_signal/post_evening_signal's own weekday() calls).
+    # This exact mix-up already caused one real bug fixed earlier
+    # (weekly_report firing Saturday instead of Sunday) - the
+    # previous WEEKDAYS_ONLY=(0,1,2,3,4)/WEEKEND_ONLY=(5,6) below
+    # were ALSO wrong under this convention (they actually selected
+    # Sun-Thu and Fri-Sat respectively, not Mon-Fri/Sat-Sun) and are
+    # corrected here.
+    WEEKDAYS_ONLY = (1, 2, 3, 4, 5)  # Mon-Fri, cron-style
+    WEEKEND_ONLY = (6, 0)            # Sat-Sun, cron-style
     EVERY_DAY = (0, 1, 2, 3, 4, 5, 6)
+    WEDNESDAY_ONLY = (3,)            # cron-style: 3=Wednesday
 
     for i, (utc_time, post_type, data) in enumerate(DAILY_SCHEDULE):
         if post_type == "news":
@@ -5953,20 +6024,32 @@ def main():
                 name=f"news_{i}_{data}",
                 data=data
             )
-        elif post_type == "signal":
-            days = EVERY_DAY if data == "btcusd" else WEEKDAYS_ONLY
-            job_queue.run_daily(
-                post_auto_signal,
-                time=parse_time(utc_time),
-                name=f"signal_{i}_{data}",
-                data=data,
-                days=days
-            )
 
-    WEEKEND_ONLY = (5, 6)
+    # Morning and evening signal slots both run EVERY day - each job
+    # looks up today's actual pair itself (MORNING_PAIR_BY_WEEKDAY /
+    # EVENING_PAIR_BY_WEEKDAY, using Python's weekday() convention),
+    # since run_daily's days= can only include/exclude whole days,
+    # not switch which pair fires on which day.
+    job_queue.run_daily(
+        post_morning_signal,
+        time=parse_time("07:00"),
+        name="morning_signal",
+        days=EVERY_DAY
+    )
+    job_queue.run_daily(
+        post_evening_signal,
+        time=parse_time("17:00"),
+        name="evening_signal",
+        days=EVERY_DAY
+    )
 
     for i, (utc_time, schedule_type, slot_number) in enumerate(SYNTHETIC_SCHEDULE):
-        days = WEEKDAYS_ONLY if schedule_type == "weekday" else WEEKEND_ONLY
+        if schedule_type == "wednesday_only":
+            days = WEDNESDAY_ONLY
+        elif schedule_type == "weekend":
+            days = WEEKEND_ONLY
+        else:
+            days = WEEKDAYS_ONLY
         job_queue.run_daily(
             post_auto_synthetic_signal,
             time=parse_time(utc_time),

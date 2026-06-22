@@ -924,6 +924,27 @@ def save_auto_copy_settings(user_id, enabled, stake=None, risk_mode=None, risk=N
         print(f"[DERIV] save_auto_copy_settings error: {e}")
         return False
 
+def set_low_balance_notified(user_id, notified):
+    """
+    DB-backed replacement for the old in-memory low_balance_notified
+    set, which silently reset to empty on every Railway restart -
+    causing the same "balance too low" warning to repeat every time
+    the bot redeployed, even though the user had already seen it
+    minutes or hours earlier. Stored on deriv_accounts so it survives
+    restarts and only actually changes when the balance episode
+    itself starts or ends.
+    """
+    try:
+        url = f"{SUPABASE_URL}/rest/v1/deriv_accounts?user_id=eq.{user_id}"
+        requests.patch(
+            url, headers=sb_headers(),
+            json={"low_balance_notified": notified}, timeout=10
+        )
+    except Exception as e:
+        print(f"[DERIV] set_low_balance_notified error: {e}")
+
+
+
 def get_all_auto_copy_accounts():
     """
     Returns every deriv_accounts row with auto_copy_enabled = true,
@@ -1024,7 +1045,6 @@ STAKE_TIERS = [
 
 pending_trades = {}  # user_id -> trade context dict, one pending trade at a time
 pending_autocopy_setup = {}  # user_id -> {stake, risk, win} chosen so far, mid-setup
-low_balance_notified = set()  # user_id's already warned about low balance this "episode" - cleared the moment a trade succeeds again, so the warning doesn't repeat every 30-min scan
 
 SYNTHETIC_ROTATION_ORDER = ["r10", "r25", "r50", "r75", "r100"]
 
@@ -1550,7 +1570,7 @@ async def run_auto_copy_for_signal(bot, trade_context):
             )
 
             if stake is None:
-                if user_id not in low_balance_notified:
+                if not account.get("low_balance_notified"):
                     await bot.send_message(
                         chat_id=int(user_id),
                         text=(
@@ -1564,7 +1584,7 @@ async def run_auto_copy_for_signal(bot, trade_context):
                         ),
                         parse_mode=ParseMode.HTML
                     )
-                    low_balance_notified.add(user_id)
+                    set_low_balance_notified(user_id, True)
                 continue
 
             buy_data, error = await deriv_execute_multiplier_trade(
@@ -1582,7 +1602,8 @@ async def run_auto_copy_for_signal(bot, trade_context):
                 )
                 continue
 
-            low_balance_notified.discard(user_id)
+            if account.get("low_balance_notified"):
+                set_low_balance_notified(user_id, False)
 
             contract_id = buy_data.get("contract_id", "—")
             log_auto_copy_trade(
@@ -1715,7 +1736,9 @@ async def run_auto_copy_scan(context: ContextTypes.DEFAULT_TYPE):
                     )
                     continue
 
-                low_balance_notified.discard(user_id)  # back above $5 and a trade just succeeded - reset so a future dip warns again
+                if account.get("low_balance_notified"):
+                    set_low_balance_notified(user_id, False)
+                    account["low_balance_notified"] = False  # keep this loop's local copy in sync, since account is read again below this same iteration
 
                 contract_id = buy_data.get("contract_id", "—")
 
@@ -1730,7 +1753,7 @@ async def run_auto_copy_scan(context: ContextTypes.DEFAULT_TYPE):
                 # somehow appeared twice in fresh_signals.
                 held_symbols.add(trade_context["symbol"])
 
-            if low_balance_hit and user_id not in low_balance_notified:
+            if low_balance_hit and not account.get("low_balance_notified"):
                 await bot.send_message(
                     chat_id=int(user_id),
                     text=(
@@ -1746,7 +1769,7 @@ async def run_auto_copy_scan(context: ContextTypes.DEFAULT_TYPE):
                     ),
                     parse_mode=ParseMode.HTML
                 )
-                low_balance_notified.add(user_id)
+                set_low_balance_notified(user_id, True)
 
         except Exception as e:
             print(f"[AUTO-COPY SCAN] ❌ Unexpected error for {user_id}: {e}")

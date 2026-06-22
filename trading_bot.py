@@ -1482,8 +1482,8 @@ async def analyze_synthetic_structure(index_key, config):
         else:
             primary = h1_sorted[0]
             reason = (
-                f"{primary['detail'].capitalize()} confirmed on both "
-                f"H1 and H4, high-confluence setup."
+                f"{config['display']} showing {primary['detail']} on "
+                f"both H1 and H4 ({confidence}% confluence)."
             )
     elif h4_details:
         reason = f"{' and '.join(h4_details).capitalize()} on H4."
@@ -3021,12 +3021,16 @@ def analyze_smc_structure(pair_key, config):
             else:
                 reason = f"{h1_text.capitalize()} on H1."
         else:
-            # All H1 factors are also present on H4 — use the
-            # strongest shared one rather than just repeating it
+            # All H1 factors are also present on H4 - use the
+            # strongest shared one, but weave in this pair's own name
+            # and confidence so two different instruments that both
+            # legitimately detected the exact same factor (a real,
+            # not fabricated, coincidence) don't read as copy-pasted
+            # from each other.
             primary = h1_sorted[0]
             reason = (
-                f"{primary['detail'].capitalize()} confirmed on both "
-                f"H1 and H4, high-confluence setup."
+                f"{config['pair_name']} showing {primary['detail']} on "
+                f"both H1 and H4 ({confidence}% confluence)."
             )
     elif h4_details:
         h4_text = " and ".join(h4_details)

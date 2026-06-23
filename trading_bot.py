@@ -3360,16 +3360,27 @@ async def build_signal_response(question, user_id=None):
 
     strength = "STRONG"
 
+    # SL/TP pip multiplier: 3x/6x (still a 2:1 ratio) for every pair
+    # EXCEPT XAUUSD, which uses a tighter 2x/4x so trades resolve
+    # faster instead of stalling open for as long - this is
+    # deliberately a per-pair override, not a global change, since
+    # every other pair's existing 150/300-pip-equivalent distance is
+    # untouched.
+    if matched_key == "xauusd":
+        sl_multiplier, tp_multiplier = 2, 4
+    else:
+        sl_multiplier, tp_multiplier = 3, 6
+
     if direction == "BUY":
         entry_price = round(live_price, decimals)
-        stop_loss = round(live_price - (pip_size * 3), decimals)
-        take_profit = round(live_price + (pip_size * 6), decimals)
+        stop_loss = round(live_price - (pip_size * sl_multiplier), decimals)
+        take_profit = round(live_price + (pip_size * tp_multiplier), decimals)
         signal_emoji = "🟢"
         image_file_id = BUY_IMAGE_FILE_ID
     else:
         entry_price = round(live_price, decimals)
-        stop_loss = round(live_price + (pip_size * 3), decimals)
-        take_profit = round(live_price - (pip_size * 6), decimals)
+        stop_loss = round(live_price + (pip_size * sl_multiplier), decimals)
+        take_profit = round(live_price - (pip_size * tp_multiplier), decimals)
         signal_emoji = "🔴"
         image_file_id = SELL_IMAGE_FILE_ID
 

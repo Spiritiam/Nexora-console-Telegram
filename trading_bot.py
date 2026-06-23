@@ -197,7 +197,90 @@ def get_channel_button():
 # ============================================
 
 user_modes = {}
-pending_verifications = {}
+
+# DB-backed for the same reason pending_trades_db/channel_signal_
+# context_db are: a plain in-memory dict here meant a Railway restart
+# between someone submitting a verification request and it being
+# approved/rejected wiped all memory of "this person already has a
+# pending request" - so the SAME person resubmitting hours later (not
+# a different account, the identical user_id) looked like a brand new
+# request, flooding the admin approval group with duplicate cards for
+# the same person. Requires a Supabase table: pending_verifications_db
+# (user_id text primary key, email text), RLS DISABLED (same as the
+# other _db tables - writes go through the service-role key directly).
+
+class PendingVerificationsStore:
+    """Dict-like interface backed by Supabase - get/set/del/in/items() all supported."""
+
+    def get(self, user_id, default=None):
+        try:
+            url = (
+                f"{SUPABASE_URL}/rest/v1/pending_verifications_db"
+                f"?user_id=eq.{user_id}&select=email"
+            )
+            response = requests.get(url, headers=sb_headers(), timeout=10)
+            data = response.json()
+            return data[0]["email"] if data else default
+        except Exception as e:
+            print(f"[PENDING VERIFICATIONS] get error: {e}")
+            return default
+
+    def __getitem__(self, user_id):
+        result = self.get(user_id)
+        if result is None:
+            raise KeyError(user_id)
+        return result
+
+    def __setitem__(self, user_id, email):
+        try:
+            url = f"{SUPABASE_URL}/rest/v1/pending_verifications_db?on_conflict=user_id"
+            headers = {**sb_headers(), "Prefer": "resolution=merge-duplicates"}
+            response = requests.post(
+                url, headers=headers,
+                json={"user_id": str(user_id), "email": email}, timeout=10
+            )
+            if response.status_code not in (200, 201):
+                print(f"[PENDING VERIFICATIONS] set unexpected status {response.status_code}: {response.text}")
+        except Exception as e:
+            print(f"[PENDING VERIFICATIONS] set error: {e}")
+
+    def __delitem__(self, user_id):
+        try:
+            url = f"{SUPABASE_URL}/rest/v1/pending_verifications_db?user_id=eq.{user_id}"
+            requests.delete(url, headers=sb_headers(), timeout=10)
+        except Exception as e:
+            print(f"[PENDING VERIFICATIONS] delete error: {e}")
+
+    def __contains__(self, user_id):
+        try:
+            url = (
+                f"{SUPABASE_URL}/rest/v1/pending_verifications_db"
+                f"?user_id=eq.{user_id}&select=user_id"
+            )
+            response = requests.get(url, headers=sb_headers(), timeout=10)
+            data = response.json()
+            return len(data) > 0
+        except Exception as e:
+            print(f"[PENDING VERIFICATIONS] contains error: {e}")
+            return False
+
+    def items(self):
+        """
+        Used only by the duplicate-email-across-different-users check
+        (a different user trying to claim an email already pending on
+        someone else's account) - fetches all pending rows for that
+        comparison.
+        """
+        try:
+            url = f"{SUPABASE_URL}/rest/v1/pending_verifications_db?select=user_id,email"
+            response = requests.get(url, headers=sb_headers(), timeout=10)
+            data = response.json()
+            return [(row["user_id"], row["email"]) for row in data] if isinstance(data, list) else []
+        except Exception as e:
+            print(f"[PENDING VERIFICATIONS] items error: {e}")
+            return []
+
+pending_verifications = PendingVerificationsStore()
 
 # ============================================
 # SIGNAL DIRECTION CONSISTENCY

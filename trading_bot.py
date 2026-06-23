@@ -62,6 +62,8 @@ METAAPI_ACCOUNT_ID = os.getenv("METAAPI_ACCOUNT_ID")
 
 CHANNEL_1_ID = os.getenv("CHANNEL_1_ID", "-1001722756645")
 CHANNEL_2_ID = os.getenv("CHANNEL_2_ID", "-1002468228698")
+CHANNEL_3_ID = os.getenv("CHANNEL_3_ID", "-1003928419513")  # Official Nexora AI channel - builds its own audience, gets the same content (signals/news) plus the same "Get Your Own Signal" CTA button as Channel 1
+FOLLOW_GATE_CHANNEL = "@nexoraaitrading"  # https://t.me/nexoraaitrading - bot MUST be added as admin here for get_chat_member to work reliably
 
 # ============================================
 # VERIFICATION GROUP ID
@@ -448,6 +450,52 @@ def increment_trial(user_id):
 
 def trial_remaining(user_id):
     return max(0, FREE_TRIAL_LIMIT - get_trial_count(user_id))
+
+async def is_following_channel(bot, user_id):
+    """
+    Checks real Telegram membership status via get_chat_member -
+    requires the bot to be an admin of FOLLOW_GATE_CHANNEL, otherwise
+    Telegram won't reliably report other users' status. MEMBER,
+    ADMINISTRATOR, and OWNER all count as "following"; LEFT and
+    BANNED do not. Fails toward letting the user through (returns
+    True) on any API error - a broken check should never permanently
+    lock someone out of the bot entirely.
+    """
+    try:
+        member = await bot.get_chat_member(chat_id=FOLLOW_GATE_CHANNEL, user_id=int(user_id))
+        return member.status in ("member", "administrator", "creator", "owner")
+    except Exception as e:
+        print(f"[FOLLOW GATE] Couldn't check membership for {user_id}: {e}")
+        return True
+
+def is_first_time_user(user_id):
+    """
+    True only if this user has NEVER been seen before at all - no
+    verified_users row, no trial_users row. Distinct from
+    trial_remaining()>0, which is also true for someone who's used
+    the bot before but simply hasn't burned through their trials yet -
+    that's a returning user, not a first-time one. Used specifically
+    to gate the channel-follow requirement to genuine first contact
+    only, per explicit instruction that returning users should never
+    see it.
+    """
+    if is_verified(user_id):
+        return False
+    try:
+        url = (
+            f"{SUPABASE_URL}/rest/v1/trial_users"
+            f"?user_id=eq.{user_id}&select=user_id"
+        )
+        response = requests.get(url, headers=sb_headers(), timeout=10)
+        data = response.json()
+        return len(data) == 0
+    except Exception as e:
+        print(f"[DB] is_first_time_user error: {e}")
+        # Fail toward NOT gating - a DB hiccup should never block
+        # someone from using the bot at all, and worst case a
+        # returning user just doesn't see the follow-channel prompt
+        # this one time, which is harmless.
+        return False
 
 # ============================================
 # SIGNAL LOG (NEW)
@@ -1847,6 +1895,30 @@ async def send_tier_selection(bot, user_id, trade_context):
         await send_connect_instructions(bot, user_id)
         return
 
+    # A row existing in deriv_accounts only means a token was SAVED
+    # at some point - it doesn't mean it still works. A confirmed real
+    # case: a user's token had silently died, but get_deriv_account
+    # above still found a row, so they sailed past this point, picked
+    # a stake, hit Confirm, and only THEN discovered (via a confusing
+    # generic "Trade not placed" message) that their connection was
+    # broken - by which point they assumed the bot itself was faulty.
+    # Checking the LIVE connection here, before showing any stake
+    # options at all, catches this at the very first tap instead.
+    snapshot = await deriv_fetch_account_snapshot(account["api_token"])
+    if not snapshot:
+        await bot.send_message(
+            chat_id=int(user_id),
+            text=(
+                "⚠️ <b>Couldn't reach your linked Deriv account.</b>\n\n"
+                "Your saved token may have expired or been revoked. "
+                "Tap 🔗 Connect Deriv and paste a new real-account API "
+                "token to relink before trading."
+            ),
+            parse_mode=ParseMode.HTML,
+            reply_markup=main_keyboard
+        )
+        return
+
     tier_buttons = [
         [InlineKeyboardButton(
             f"${t['stake']} | Risk ${t['risk']} → Win ${t['win']}",
@@ -1882,6 +1954,19 @@ def friendly_trade_error(raw_error, auto_copy_context=False):
     next scan, not on demand.
     """
     lowered = raw_error.lower()
+    if "couldn't verify your deriv account" in lowered or "no real account found" in lowered or "couldn't read your account list" in lowered:
+        # This is what a dead/expired/revoked Deriv API token actually
+        # looks like by the time it reaches here - the real failure
+        # reason (e.g. "Invalid or expired token") gets logged to
+        # Railway by deriv_get_options_accounts but discarded before
+        # reaching this point. Confirmed real case: a user's token had
+        # silently died, and this message used to fall through to the
+        # generic "try again or try a different stake" text below,
+        # which gave no hint that relinking was the actual fix needed -
+        # they assumed the bot itself was broken.
+        if auto_copy_context:
+            return "Your linked Deriv account couldn't be reached. Your token may have expired - relink it from 🔗 Connect Deriv to resume auto-copy trades."
+        return "Your linked Deriv account couldn't be reached. Your token may have expired or been revoked - tap 🔗 Connect Deriv and paste a new token to relink."
     if "multiplier" in lowered:
         if auto_copy_context:
             return "This stake amount isn't supported for this index right now. It'll be retried automatically on the next signal."
@@ -4212,25 +4297,26 @@ async def post_news(context: ContextTypes.DEFAULT_TYPE):
     if calendar:
         summary += calendar
 
-    try:
-        await context.bot.send_photo(
-            chat_id=CHANNEL_1_ID,
-            photo=image_url,
-            caption=summary,
-            parse_mode=ParseMode.HTML
-        )
-        print(f"[NEWS] ✅ {session_type} posted to Channel 1")
-    except Exception as e:
-        print(f"[NEWS] AI image failed, posting text only: {e}")
+    for channel_id in [CHANNEL_1_ID, CHANNEL_2_ID, CHANNEL_3_ID]:
         try:
-            await context.bot.send_message(
-                chat_id=CHANNEL_1_ID,
-                text=summary,
+            await context.bot.send_photo(
+                chat_id=channel_id,
+                photo=image_url,
+                caption=summary,
                 parse_mode=ParseMode.HTML
             )
-            print(f"[NEWS] ✅ {session_type} posted (text only) to Channel 1")
-        except Exception as e2:
-            print(f"[NEWS] ❌ Failed: {e2}")
+            print(f"[NEWS] ✅ {session_type} posted to {channel_id}")
+        except Exception as e:
+            print(f"[NEWS] AI image failed for {channel_id}, posting text only: {e}")
+            try:
+                await context.bot.send_message(
+                    chat_id=channel_id,
+                    text=summary,
+                    parse_mode=ParseMode.HTML
+                )
+                print(f"[NEWS] ✅ {session_type} posted (text only) to {channel_id}")
+            except Exception as e2:
+                print(f"[NEWS] ❌ Failed for {channel_id}: {e2}")
 
 # ============================================
 # METAAPI — PLACE TRADE ON MT5 (0.1 lot)
@@ -4574,6 +4660,35 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         pending_trades[user_id] = dict(shared_context)  # copy - each tapper gets their own independent trade
         await send_tier_selection(context.bot, user_id, pending_trades[user_id])
         return
+
+    # Channel-follow gate - genuine first-time users ONLY, per explicit
+    # instruction that returning users should never see this. Sits
+    # here, after the chantrade_ branch above (so someone already
+    # mid-trade-flow from a channel tap is never interrupted by this),
+    # and before the existing is_verified/trial_remaining checks below.
+    if is_first_time_user(user_id):
+        already_following = await is_following_channel(context.bot, user_id)
+        if not already_following:
+            await update.message.reply_text(
+                f"👋 <b>Welcome to Nexora AI, {username}!</b>\n\n"
+                f"Before we get started, please follow our official "
+                f"channel for live signals, news, and updates:\n\n"
+                f"👉 {FOLLOW_GATE_CHANNEL}\n\n"
+                f"<i>Once you've followed, tap the button below to "
+                f"continue.</i>",
+                parse_mode=ParseMode.HTML,
+                reply_markup=InlineKeyboardMarkup([
+                    [InlineKeyboardButton(
+                        "📢 Follow Nexora AI Channel",
+                        url=f"https://t.me/{FOLLOW_GATE_CHANNEL.lstrip('@')}"
+                    )],
+                    [InlineKeyboardButton(
+                        "✅ I've Followed — Continue",
+                        callback_data="followgate_check"
+                    )]
+                ])
+            )
+            return
 
     if is_verified(user_id):
         await update.message.reply_text(
@@ -4993,6 +5108,61 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             parse_mode=ParseMode.HTML
         )
 
+    elif data == "followgate_check":
+
+        user_id = str(update.callback_query.from_user.id)
+        username = update.callback_query.from_user.username or "Trader"
+
+        # Re-checks REAL membership - never just trusts that the
+        # button was tapped, since someone could tap "I've Followed"
+        # without actually having followed.
+        now_following = await is_following_channel(context.bot, user_id)
+        if not now_following:
+            await context.bot.send_message(
+                chat_id=int(user_id),
+                text=(
+                    "⚠️ <b>We couldn't confirm you've followed the "
+                    "channel yet.</b>\n\n"
+                    f"Please follow {FOLLOW_GATE_CHANNEL} first, then "
+                    "tap the button again."
+                ),
+                parse_mode=ParseMode.HTML,
+                reply_markup=InlineKeyboardMarkup([
+                    [InlineKeyboardButton(
+                        "📢 Follow Nexora AI Channel",
+                        url=f"https://t.me/{FOLLOW_GATE_CHANNEL.lstrip('@')}"
+                    )],
+                    [InlineKeyboardButton(
+                        "✅ I've Followed — Continue",
+                        callback_data="followgate_check"
+                    )]
+                ])
+            )
+            return
+
+        remaining = trial_remaining(user_id)
+        await context.bot.send_message(
+            chat_id=int(user_id),
+            text=(
+                f"✅ <b>Thanks for following!</b>\n\n"
+                f"👋 <b>Hello {username}, welcome to Nexora AI! 🤖</b>\n\n"
+                f"I am your personal AI trading assistant — delivering "
+                f"<b>professional trading signals</b>, live market analysis "
+                f"and AI-powered breakdowns.\n\n"
+                f"🎁 <b>You have {remaining} FREE trial signal(s) to use!</b>\n\n"
+                f"━━━━━━━━━━━━━━━━━━━━━\n"
+                f"👇 <b>TAP ONE OF THE OPTIONS BELOW TO START:</b>\n"
+                f"━━━━━━━━━━━━━━━━━━━━━\n\n"
+                f"📊 <b>Signal</b> — Get a live trading signal right now\n\n"
+                f"📚 <b>Breakdown</b> — Get a full AI market analysis\n\n"
+                f"🔗 <b>Connect Deriv</b> — Link your Deriv account to trade "
+                f"signals directly, manually or fully automatic\n\n"
+                f"<i>All three buttons are at the bottom of your screen 👇</i>"
+            ),
+            parse_mode=ParseMode.HTML,
+            reply_markup=main_keyboard
+        )
+
     elif data == "autocopy_setup_manual":
 
         user_id = str(update.callback_query.from_user.id)
@@ -5245,6 +5415,15 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
 # ============================================
 
 async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
+
+    if update.message is None or update.message.from_user is None or update.message.text is None:
+        # Some update types (e.g. edited messages, or messages with
+        # no text like a bare photo/sticker) can reach this handler
+        # with nothing usable to act on - nothing to act on, so just
+        # return rather than crash. This was previously an unhandled
+        # AttributeError that PTB's error handler caught and logged,
+        # but never should have reached that point.
+        return
 
     user_id = str(update.message.from_user.id)
     username = update.message.from_user.username or "Trader"
@@ -5760,11 +5939,11 @@ async def _post_signal_for_pair(bot, pair_keyword):
 
     signal_id = log_signal(signal_data)
 
-    for channel_id in [CHANNEL_1_ID, CHANNEL_2_ID]:
+    for channel_id in [CHANNEL_1_ID, CHANNEL_2_ID, CHANNEL_3_ID]:
         try:
             markup = (
                 get_channel_button()
-                if channel_id == CHANNEL_1_ID
+                if channel_id in (CHANNEL_1_ID, CHANNEL_3_ID)
                 else None
             )
 
@@ -5836,7 +6015,7 @@ async def _post_synthetic_signal_for_index(bot, index_key):
     signal_image_id, signal_message, trade_context = result
     channel_signal_context[index_key] = trade_context
 
-    for channel_id in [CHANNEL_1_ID, CHANNEL_2_ID]:
+    for channel_id in [CHANNEL_1_ID, CHANNEL_2_ID, CHANNEL_3_ID]:
         try:
             await bot.send_photo(
                 chat_id=channel_id,
@@ -6366,7 +6545,7 @@ async def post_weekly_report(context: ContextTypes.DEFAULT_TYPE):
         f"<i>Trade safe 💼🔥</i>"
     )
 
-    for channel_id in [CHANNEL_1_ID, CHANNEL_2_ID]:
+    for channel_id in [CHANNEL_1_ID, CHANNEL_2_ID, CHANNEL_3_ID]:
         try:
             await context.bot.send_message(
                 chat_id=channel_id,
@@ -6444,7 +6623,8 @@ def main():
                 post_news,
                 time=parse_time(utc_time),
                 name=f"news_{i}_{data}",
-                data=data
+                data=data,
+                job_kwargs={"misfire_grace_time": 300}
             )
 
     # Morning and evening signal slots both run EVERY day - each job
@@ -6452,17 +6632,29 @@ def main():
     # EVENING_PAIR_BY_WEEKDAY, using Python's weekday() convention),
     # since run_daily's days= can only include/exclude whole days,
     # not switch which pair fires on which day.
+    #
+    # misfire_grace_time=300 (5 min): confirmed via real Railway logs
+    # that evening_signal was silently skipped entirely on a day it
+    # was delayed by barely over 1 second past its exact scheduled
+    # moment - APScheduler's default grace window is too tight now
+    # that many more jobs run concurrently (tick burst every 60s,
+    # auto-copy scan every 30 min, TP/SL monitor every 15 min) than
+    # when these two jobs were first built, so brief scheduler
+    # contention was enough to cause a full missed day rather than
+    # just a few seconds' delay.
     job_queue.run_daily(
         post_morning_signal,
         time=parse_time("07:00"),
         name="morning_signal",
-        days=EVERY_DAY
+        days=EVERY_DAY,
+        job_kwargs={"misfire_grace_time": 300}
     )
     job_queue.run_daily(
         post_evening_signal,
         time=parse_time("17:00"),
         name="evening_signal",
-        days=EVERY_DAY
+        days=EVERY_DAY,
+        job_kwargs={"misfire_grace_time": 300}
     )
 
     for i, (utc_time, schedule_type, slot_number) in enumerate(SYNTHETIC_SCHEDULE):
@@ -6477,7 +6669,8 @@ def main():
             time=parse_time(utc_time),
             name=f"synth_{i}_{schedule_type}_{slot_number}",
             data=slot_number,
-            days=days
+            days=days,
+            job_kwargs={"misfire_grace_time": 300}
         )
 
     # TP/SL monitor - checks every OPEN logged signal every 15 minutes
@@ -6511,18 +6704,20 @@ def main():
         name="auto_copy_scan"
     )
 
-    # Tick Burst auto-copy scan - separate, parallel strategy from
-    # the ICT/SMC scan above, NOT merged into it. Runs every 60
-    # seconds (matching the EA's M1 candle cadence - the source EA's
-    # burst detection is fundamentally per-1-minute-candle, so
-    # checking more often than that would just re-detect the same
-    # candle's burst, not find anything new).
-    job_queue.run_repeating(
-        run_tickburst_auto_copy_scan,
-        interval=60,
-        first=30,
-        name="tickburst_auto_copy_scan"
-    )
+    # Tick Burst auto-copy scan - DISABLED per explicit instruction
+    # after it caused real account losses across multiple users and
+    # was found unreliable. Function code (run_tickburst_auto_copy_
+    # scan, detect_tick_burst, deriv_get_tick_count) is left intact
+    # below, untouched, in case this strategy is revisited later -
+    # but this job registration is commented out, so it does NOT run
+    # at all right now. Do not re-enable without explicit confirmation.
+    #
+    # job_queue.run_repeating(
+    #     run_tickburst_auto_copy_scan,
+    #     interval=60,
+    #     first=30,
+    #     name="tickburst_auto_copy_scan"
+    # )
 
     # Auto-copy daily digest - one summary per user at 23:59 UTC,
     # replacing the old per-30-min summary DM. EVERY_DAY (not weekday-
@@ -6531,7 +6726,8 @@ def main():
         send_auto_copy_daily_digest,
         time=parse_time("23:59"),
         name="auto_copy_daily_digest",
-        days=EVERY_DAY
+        days=EVERY_DAY,
+        job_kwargs={"misfire_grace_time": 300}
     )
 
     # Weekly performance report - every Sunday at 23:00 UTC
@@ -6543,7 +6739,8 @@ def main():
         post_weekly_report,
         time=parse_time("23:00"),
         name="weekly_report",
-        days=(0,)
+        days=(0,),
+        job_kwargs={"misfire_grace_time": 300}
     )
 
     print("Nexora AI Running...")

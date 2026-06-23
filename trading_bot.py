@@ -1408,6 +1408,180 @@ async def deriv_get_candles(symbol, granularity, count=60):
         print(f"[SYNTH] Connection error: {e}")
         return None
 
+async def deriv_get_tick_count(symbol, seconds_window=60):
+    """
+    Returns how many real ticks occurred on `symbol` in the last
+    `seconds_window` seconds, via Deriv's ticks_history with
+    style="ticks" and an explicit start/end epoch range (confirmed
+    real Deriv API capability - start/end accept epoch timestamps,
+    and the returned history.prices/times arrays' length IS the tick
+    count for that window). This is the data-source equivalent of
+    the MQL5 Tick Burst EA's OnTick() counter, but via periodic
+    polling rather than a continuously open live listener - the bot
+    isn't a persistently-running process reacting to every tick the
+    way an EA inside MT5 is, so this asks "how many ticks just
+    happened" on a schedule instead.
+
+    Returns None on any failure - callers should treat None as
+    "couldn't read this round, skip and try again next scan", never
+    as zero ticks.
+    """
+    if not DERIV_SERVICE_TOKEN:
+        print("[TICKBURST] No DERIV_SERVICE_TOKEN set")
+        return None
+
+    accounts_data = await deriv_get_options_accounts(DERIV_SERVICE_TOKEN)
+    if not accounts_data:
+        return None
+
+    accounts_list = accounts_data.get("data")
+    if not isinstance(accounts_list, list):
+        accounts_list = accounts_data.get("accounts")
+    if not accounts_list:
+        return None
+
+    account_id = (
+        accounts_list[0].get("account_id")
+        or accounts_list[0].get("loginid")
+        or accounts_list[0].get("id")
+    )
+    if not account_id:
+        return None
+
+    ws_url = await deriv_get_otp_url(DERIV_SERVICE_TOKEN, account_id)
+    if not ws_url:
+        return None
+
+    try:
+        async with websockets.connect(ws_url, open_timeout=10, close_timeout=5) as ws:
+            now_epoch = int(time.time())
+            await ws.send(json.dumps({
+                "ticks_history": symbol,
+                "style": "ticks",
+                "start": now_epoch - seconds_window,
+                "end": "latest",
+                "adjust_start_time": 1,
+            }))
+            response = json.loads(await ws.recv())
+            if "error" in response:
+                print(f"[TICKBURST] ticks_history error for {symbol}: {response['error'].get('message')}")
+                return None
+            history = response.get("history", {})
+            times = history.get("times", [])
+            return len(times)
+    except Exception as e:
+        print(f"[TICKBURST] Connection error for {symbol}: {e}")
+        return None
+
+# ============================================
+# TICK BURST DETECTION (NEW)
+# Ports the core logic of SpiritFX_TickBurstScalper.mq5
+# (the MQL5 EA already running on MT5) to the
+# synthetic indices auto-copy path. Same
+# percentile-vs-rolling-history burst detection,
+# same FOLLOW direction logic (bullish candle on
+# a burst -> BUY, bearish -> SELL) - just driven
+# by periodic polling of Deriv's real tick data
+# instead of MT5's live OnTick() stream, since the
+# bot isn't a continuously-running process the way
+# an EA inside MT5 is.
+#
+# Rolling history is in-memory and per-index - a
+# Railway restart resets it to empty, which just
+# means burst detection starts cold (no false
+# bursts, no missed real ones) rather than reading
+# stale/wrong history - same reasoning as why
+# get_rotation_key is deliberately stateless.
+# ============================================
+
+TICKBURST_LOOKBACK = 3        # how many recent 1-min windows to compare against (aggressive mode from the EA)
+TICKBURST_PERCENTILE = 55.0   # aggressive mode threshold from the EA
+TICKBURST_MIN_TICKS = 2        # aggressive mode minimum from the EA
+TICKBURST_MIN_BODY_PCT = 0.05  # minimum candle body move, as a % of price - unit-agnostic substitute for the EA's MinBodyPoints, since per-index pip/point conventions on synthetics vary and aren't reliably knowable without manual testing (same lesson as the earlier R_75 multiplier mistake)
+
+tickburst_history = {}  # index_key -> list of recent per-minute tick counts, oldest first
+
+def _calc_percentile(values, pct):
+    """Same linear-interpolation percentile calc as the EA's CalcPercentile()."""
+    if not values:
+        return 0
+    sorted_vals = sorted(values)
+    idx = (pct / 100.0) * (len(sorted_vals) - 1)
+    lo = int(idx)
+    hi = lo + 1 if idx != lo else lo
+    hi = min(hi, len(sorted_vals) - 1)
+    if lo == hi:
+        return sorted_vals[lo]
+    return sorted_vals[lo] + (idx - lo) * (sorted_vals[hi] - sorted_vals[lo])
+
+async def detect_tick_burst(index_key, config):
+    """
+    Returns (direction, tick_count, threshold) if a burst is detected
+    this round, or None if not (no burst, or not enough rolling
+    history yet to judge against). Mirrors the EA's burst_detected
+    condition and FOLLOW direction logic exactly - bullish 1-min
+    candle on a burst -> BUY, bearish -> SELL, doji/flat body
+    (smaller than TICKBURST_MIN_BODY_POINTS) -> skip, same as the EA
+    discarding "doji/body too small" bursts.
+    """
+    symbol = config["symbol"]
+
+    tick_count = await deriv_get_tick_count(symbol, seconds_window=60)
+    if tick_count is None:
+        return None
+
+    history = tickburst_history.setdefault(index_key, [])
+
+    if len(history) < 2:
+        history.append(tick_count)
+        return None  # not enough rolling history yet to judge a burst against, same as the EA's historyCount < 2 gate
+
+    threshold = _calc_percentile(history, TICKBURST_PERCENTILE)
+
+    burst_detected = (
+        tick_count >= TICKBURST_MIN_TICKS
+        and threshold > 0
+        and tick_count > threshold
+    )
+
+    history.append(tick_count)
+    if len(history) > TICKBURST_LOOKBACK:
+        history.pop(0)
+
+    if not burst_detected:
+        return None
+
+    # 1-minute candle body check, via the most recent two 1m candles -
+    # same role as the EA reading iOpen()/bid on the current M1 bar.
+    # Deliberately NOT using a per-index pip-size table here - pip
+    # conventions genuinely vary per Volatility index (confirmed: this
+    # is exactly the same kind of per-index guess that turned out
+    # wrong before for R_75's multiplier) and aren't reliably knowable
+    # without manually testing each one against the broker. Instead,
+    # body size is measured as a % of the candle's own price level,
+    # which is unit-agnostic and works correctly regardless of each
+    # index's actual point/decimal convention.
+    candles = await deriv_get_candles(symbol, 60, count=2)
+    if not candles:
+        return None
+
+    last_candle = candles[-1]
+    body_move = abs(last_candle["close"] - last_candle["open"])
+    body_pct = (body_move / last_candle["open"]) * 100 if last_candle["open"] else 0
+
+    if body_pct < TICKBURST_MIN_BODY_PCT:
+        print(f"[TICKBURST] {index_key.upper()} burst detected but body too small ({body_pct:.4f}%) - skipping, same as EA's doji guard")
+        return None
+
+    # FOLLOW mode: bullish burst candle -> BUY, bearish -> SELL.
+    direction = "BUY" if last_candle["close"] > last_candle["open"] else "SELL"
+
+    print(
+        f"[TICKBURST] {index_key.upper()} -> {direction} | "
+        f"ticks={tick_count} threshold={threshold:.1f} body={body_pct:.4f}%"
+    )
+    return direction, tick_count, threshold
+
 async def get_cached_synthetic_candles(index_key, symbol, granularity_label, granularity_seconds, count=60):
     cache_key = f"{index_key}_{granularity_label}"
     now = time.time()
@@ -2050,6 +2224,156 @@ async def run_auto_copy_scan(context: ContextTypes.DEFAULT_TYPE):
 
         except Exception as e:
             print(f"[AUTO-COPY SCAN] ❌ Unexpected error for {user_id}: {e}")
+            continue
+
+# ============================================
+# TICK BURST AUTO-COPY SCAN (NEW)
+# Parallel to run_auto_copy_scan above, NOT
+# merged into it - per explicit instruction, Tick
+# Burst is its own separate strategy/scan, not
+# blended with ICT/SMC. Reuses the exact same
+# proven per-user trade-execution logic (no-
+# stacking checks across both the live socket
+# read AND the DB-backed table, balance stepdown,
+# success/failure logging into the same auto_copy_
+# trades/auto_copy_failures tables and daily
+# digest) - only the SIGNAL SOURCE differs
+# (detect_tick_burst instead of
+# analyze_synthetic_structure).
+#
+# Scoped to auto-copy only for now, per explicit
+# instruction - manual /signal requests still use
+# ICT/SMC. All 5 Volatility indices from day one,
+# FOLLOW direction mode, same existing stake/risk
+# framework (NOT the EA's %-balance-SL/fixed-$-TP
+# model) - all per explicit instruction.
+# ============================================
+
+async def run_tickburst_auto_copy_scan(context: ContextTypes.DEFAULT_TYPE):
+    accounts = get_all_auto_copy_accounts()
+    if not accounts:
+        return
+
+    print(f"[TICKBURST AUTO-COPY] Running for {len(accounts)} opted-in account(s)")
+    bot = context.bot
+
+    # One burst check per index, shared across every user below - the
+    # market doesn't change per-user, so this is computed once per
+    # scan, same reasoning as run_auto_copy_scan's fresh_signals.
+    fresh_signals = {}
+    for index_key, config in SYNTHETIC_CONFIG.items():
+        result = await detect_tick_burst(index_key, config)
+        if not result:
+            continue
+        direction, tick_count, threshold = result
+        contract_type = "MULTUP" if direction == "BUY" else "MULTDOWN"
+        fresh_signals[index_key] = {
+            "index_key": index_key,
+            "symbol": config["symbol"],
+            "display": config["display"],
+            "direction": direction,
+            "contract_type": contract_type,
+            "multiplier": config["default_multiplier"],
+            "risk": DEFAULT_RISK,
+            "win": DEFAULT_WIN,
+        }
+
+    if not fresh_signals:
+        return  # no burst on any index this round - normal, not an error
+
+    for account in accounts:
+        user_id = account.get("user_id")
+        token = account.get("api_token")
+        if not user_id or not token:
+            continue
+
+        try:
+            snapshot = await deriv_fetch_account_snapshot(token)
+            if not snapshot or snapshot.get("balance") is None:
+                print(f"[TICKBURST AUTO-COPY] Couldn't read account for {user_id}, skipping this round")
+                continue
+
+            balance = snapshot["balance"]
+            held_symbols = {
+                c.get("symbol") for c in snapshot.get("open_contracts", [])
+                if c.get("symbol")
+            }
+
+            low_balance_hit = False
+
+            for index_key, trade_context in fresh_signals.items():
+                # Same dual no-stacking check as run_auto_copy_scan -
+                # both the live socket read AND the DB-backed table
+                # must agree nothing's already open on this index for
+                # this user before a new trade is allowed. This also
+                # means Tick Burst and ICT/SMC auto-copy correctly see
+                # EACH OTHER's open positions (same shared
+                # auto_copy_trades table and held_symbols source) -
+                # if ICT/SMC already has a position open on R_75, a
+                # Tick Burst signal on R_75 is skipped too, and vice
+                # versa. Never two simultaneous strategies stacking
+                # positions on the same index for the same user.
+                if trade_context["symbol"] in held_symbols:
+                    continue
+                if has_open_auto_copy_trade(user_id, trade_context["symbol"]):
+                    continue
+
+                stake, risk, win, was_reduced = get_auto_copy_trade_amounts(
+                    account, trade_context, balance
+                )
+
+                if stake is None:
+                    low_balance_hit = True
+                    continue
+
+                buy_data, error = await deriv_execute_multiplier_trade(
+                    token,
+                    trade_context["symbol"],
+                    trade_context["contract_type"],
+                    trade_context["multiplier"],
+                    stake, risk, win,
+                )
+
+                if error:
+                    log_auto_copy_failure(
+                        user_id, trade_context["symbol"],
+                        friendly_trade_error(error, auto_copy_context=True)
+                    )
+                    continue
+
+                if account.get("low_balance_notified"):
+                    set_low_balance_notified(user_id, False)
+                    account["low_balance_notified"] = False
+
+                contract_id = buy_data.get("contract_id", "—")
+
+                log_auto_copy_trade(
+                    user_id, trade_context["symbol"], contract_id,
+                    trade_context["direction"], stake, risk, win
+                )
+
+                held_symbols.add(trade_context["symbol"])
+
+            if low_balance_hit and not account.get("low_balance_notified"):
+                await bot.send_message(
+                    chat_id=int(user_id),
+                    text=(
+                        f"⚠️ <b>Auto-copy paused — balance too low.</b>\n\n"
+                        f"Your balance (${balance}) is too low even "
+                        f"for the smallest stake tier ($5). Top up "
+                        f"your Deriv account to resume auto-copy "
+                        f"trades.\n\n"
+                        f"<i>You won't get this reminder again "
+                        f"until your balance is back above $5 - "
+                        f"signals will keep being skipped "
+                        f"silently until then.</i>"
+                    ),
+                    parse_mode=ParseMode.HTML
+                )
+                set_low_balance_notified(user_id, True)
+
+        except Exception as e:
+            print(f"[TICKBURST AUTO-COPY] ❌ Unexpected error for {user_id}: {e}")
             continue
 
 # ============================================
@@ -6102,6 +6426,19 @@ def main():
         interval=1800,
         first=120,
         name="auto_copy_scan"
+    )
+
+    # Tick Burst auto-copy scan - separate, parallel strategy from
+    # the ICT/SMC scan above, NOT merged into it. Runs every 60
+    # seconds (matching the EA's M1 candle cadence - the source EA's
+    # burst detection is fundamentally per-1-minute-candle, so
+    # checking more often than that would just re-detect the same
+    # candle's burst, not find anything new).
+    job_queue.run_repeating(
+        run_tickburst_auto_copy_scan,
+        interval=60,
+        first=30,
+        name="tickburst_auto_copy_scan"
     )
 
     # Auto-copy daily digest - one summary per user at 23:59 UTC,

@@ -3132,21 +3132,18 @@ def get_silver_price():
         response = requests.get(url, params=params, timeout=10)
         data = response.json()
         metals = data.get("metals", {})
-        # CONFIRMED REAL BUG, via a real raw API response pulled
-        # directly (not through this code): metals.dev's plain
-        # "silver" field returned 57.422 at a moment where every
-        # independent real-world source (Trading Economics, JM
-        # Bullion, USAGOLD, Bullion.com) agreed silver was trading
-        # $58-66 - the SAME response's own "lbma_silver" field read
-        # 60.6, squarely inside that real range. This was never a
-        # parsing bug - metals.get("silver") was correctly reading
-        # exactly what was in that field, the field itself is just
-        # stale/unreliable on metals.dev's side. Preferring
-        # lbma_silver now, since it's the one confirmed to actually
-        # match reality - falling back to the plain field only if
-        # lbma_silver is ever missing.
+        # REVERTED a previous change here: an earlier session switched
+        # this to prefer lbma_silver after one specific real check
+        # where lbma_silver happened to match outside sources better
+        # than the plain "silver" field. That reasoning was backwards -
+        # CONFIRMED via a real broker (MT5) H1 chart showing a fast,
+        # genuine intraday drop in live silver down to ~57.49, while
+        # lbma_silver is a TWICE-DAILY LBMA FIXING rate, not a
+        # continuous feed - it necessarily lags behind real intraday
+        # moves until its next fix. The plain "silver" field is the
+        # continuously-updating one and is the correct field to use
+        # for a live trading signal. Back to the original field.
         price = (
-            metals.get("lbma_silver") or
             metals.get("silver") or
             metals.get("XAG") or
             metals.get("xag") or
@@ -3253,54 +3250,146 @@ def get_silver_daily_history(days=21):
         return None
 
 
+def _xagusd_check_ma_trend(closes):
+    """Price vs its own 10-day average - the original single check."""
+    ma_period = min(10, len(closes) - 1)
+    if ma_period < 3:
+        return None
+    short_ma = sum(closes[-ma_period:]) / ma_period
+    current_price = closes[-1]
+    if current_price == short_ma:
+        return None
+    direction = "BUY" if current_price > short_ma else "SELL"
+    direction_word = "above" if direction == "BUY" else "below"
+    return {
+        "direction": direction,
+        "detail": f"daily price ({current_price:.2f}) trading {direction_word} its {ma_period}-day average ({short_ma:.2f})",
+    }
+
+
+def _xagusd_check_momentum(closes, lookback=5):
+    """
+    Rate of change vs N days ago - genuinely different math from the
+    MA check (comparing two specific points, not a smoothed average),
+    same real daily closes.
+    """
+    lookback = min(lookback, len(closes) - 1)
+    if lookback < 2:
+        return None
+    current_price = closes[-1]
+    past_price = closes[-1 - lookback]
+    if current_price == past_price:
+        return None
+    direction = "BUY" if current_price > past_price else "SELL"
+    pct_change = (current_price - past_price) / past_price * 100
+    direction_word = "up" if direction == "BUY" else "down"
+    return {
+        "direction": direction,
+        "detail": f"price is {direction_word} {abs(pct_change):.2f}% over the last {lookback} days ({past_price:.2f} → {current_price:.2f})",
+    }
+
+
+def _xagusd_check_breakout(closes, lookback=10):
+    """
+    Has today's close broken the prior N days' high/low - same idea
+    as strategy_breakout/strategy_volatility_breakout_scalper, just
+    applied to daily closes instead of intraday OHLC (no real
+    high/low data to use here, only closes, so this checks against
+    the recent closing range rather than true wicks).
+    """
+    lookback = min(lookback, len(closes) - 1)
+    if lookback < 3:
+        return None
+    current_price = closes[-1]
+    prior_closes = closes[-1 - lookback:-1]
+    recent_high = max(prior_closes)
+    recent_low = min(prior_closes)
+    if current_price > recent_high:
+        return {
+            "direction": "BUY",
+            "detail": f"today's close ({current_price:.2f}) broke above the prior {lookback}-day closing high ({recent_high:.2f})",
+        }
+    if current_price < recent_low:
+        return {
+            "direction": "SELL",
+            "detail": f"today's close ({current_price:.2f}) broke below the prior {lookback}-day closing low ({recent_low:.2f})",
+        }
+    return None
+
+
 def generate_xagusd_daily_fallback():
     """
-    Dedicated, intentionally SIMPLE daily-trend check for XAGUSD only
+    Dedicated, intentionally SIMPLE daily-trend bank for XAGUSD only
     - built because metals.dev's free daily price history is the only
     real, live data source available for silver (TwelveData and API
     Ninjas both gate real intraday/historical OHLC for commodities
     behind paid tiers - confirmed directly from their own docs/error
     responses, not assumed).
 
+    Runs 3 independent checks against the SAME real daily closes
+    (MA trend, momentum/rate-of-change, recent-range breakout) and
+    combines them the same way run_strategy_bank combines its votes -
+    majority direction wins, confidence scales with how many agree.
+    Per explicit instruction: this must never behave worse than the
+    single-check version it replaces - if all 3 agree, or only 1
+    fires, or anything in between, a signal still goes out; the ONLY
+    case that returns None (falling through to the existing honest
+    no-data path) is if literally zero of the 3 checks produce
+    anything at all, exactly matching the old behavior's only None
+    case (current_price == short_ma, a precise tie).
+
     Deliberately NOT dressed up to look like the main strategy bank:
-    - Single check (price vs short daily MA), not multiple independent
-      strategies voting
-    - Confidence capped well below the main bank's range, since one
-      simple daily check is genuinely weaker evidence than 2+
-      independent H1-confirmed strategies agreeing
+    - Only 3 simple checks computable from real daily closes alone,
+      no RSI/MACD/Bollinger (those need period-tuning never validated
+      at daily granularity for this pair - adapting them blind was
+      explicitly ruled out earlier)
+    - Confidence hard-capped well below the main bank's 76-95 range,
+      regardless of how many of these 3 agree, since even 3/3 daily
+      checks agreeing is still weaker evidence than independently
+      confirmed H1 strategies
     - No fabricated OHLC - the chart this feeds is a line of real
       daily closes, never a candlestick pretending to have real
       wicks it doesn't have
 
     Returns (direction, confidence, reason, daily_history) or None if
-    real data isn't available right now - never invents a direction.
+    real data isn't available right now, or none of the 3 checks
+    found anything - never invents a direction.
     """
     history = get_silver_daily_history()
     if not history or len(history) < 10:
         return None
 
     closes = [h["close"] for h in history]
-    current_price = closes[-1]
-    ma_period = min(10, len(closes) - 1)
-    short_ma = sum(closes[-ma_period:]) / ma_period
 
-    if current_price == short_ma:
+    votes = []
+    for check_fn in (_xagusd_check_ma_trend, _xagusd_check_momentum, _xagusd_check_breakout):
+        try:
+            result = check_fn(closes)
+            if result:
+                votes.append(result)
+        except Exception as e:
+            print(f"[XAGUSD DAILY] {check_fn.__name__} failed: {e}")
+            continue
+
+    if not votes:
         return None
 
-    direction = "BUY" if current_price > short_ma else "SELL"
-    pct_diff = abs(current_price - short_ma) / short_ma * 100
+    buy_votes = [v for v in votes if v["direction"] == "BUY"]
+    sell_votes = [v for v in votes if v["direction"] == "SELL"]
+    winning_votes = buy_votes if len(buy_votes) >= len(sell_votes) else sell_votes
+    direction = "BUY" if winning_votes is buy_votes else "SELL"
 
-    # Confidence scales gently with how far price has moved from its
-    # own short MA, but is hard-capped at 70 - intentionally always
-    # below the main strategy bank's 76-95 floor, since this is one
-    # simple daily check, not multiple independently-confirmed
-    # strategies.
-    confidence = min(70, 55 + round(pct_diff * 4))
+    # Confidence still hard-capped at 70, well below the main bank's
+    # 76-95 floor - scales gently with how many of the 3 checks agree
+    # (1 -> 58, 2 -> 64, 3 -> 70), but never crosses into "looks as
+    # rigorous as the main bank" territory.
+    confidence = min(70, 52 + len(winning_votes) * 6)
 
-    direction_word = "above" if direction == "BUY" else "below"
-    reason = (
-        f"Silver's daily price ({current_price:.2f}) is trading {direction_word} "
-        f"its {ma_period}-day average ({short_ma:.2f})."
+    bullet_lines = [f"• {v['detail']}" for v in winning_votes]
+    reason = "\n".join(bullet_lines)
+
+    print(
+        f"[XAGUSD DAILY] -> {direction} | {len(winning_votes)}/3 checks agreeing"
     )
 
     return direction, confidence, reason, history
@@ -5901,17 +5990,14 @@ async def build_signal_response(question, user_id=None):
         # XAGUSD daily fallback - real daily closes, no real OHLC, so
         # this uses the dedicated line-chart generator, never the
         # candlestick one (which would have to fabricate fake wicks
-        # around a single daily price point). entry_price/stop_loss/
-        # take_profit ARE passed through here, per explicit
-        # instruction, restyled to match the candlestick charts'
-        # Entry/SL/TP treatment exactly - these are real numbers
-        # computed from the live spot price above, same as every
-        # other pair, not fabricated for this fallback.
+        # around a single daily price point). Per explicit
+        # instruction, reverted back to the clean trend-only view -
+        # entry/sl/tp are deliberately NOT passed here, so no price
+        # target lines/labels are drawn on this chart (the message
+        # text below still states real Entry/SL/TP numbers, just not
+        # the chart itself).
         chart_path = os.path.join(CHART_OUTPUT_DIR, f"{matched_key}_daily_{int(time.time())}.png")
-        chart_ok = generate_daily_line_chart(
-            display, direction, daily_fallback_history, chart_path,
-            entry=entry_price, sl=stop_loss, tp=take_profit,
-        )
+        chart_ok = generate_daily_line_chart(display, direction, daily_fallback_history, chart_path)
         if chart_ok:
             image_file_id = chart_path
     else:

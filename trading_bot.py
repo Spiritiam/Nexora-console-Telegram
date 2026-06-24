@@ -1876,16 +1876,16 @@ async def analyze_synthetic_structure(index_key, config):
     )
     return direction, confidence, reason
 
-async def build_synthetic_signal_response(index_key, min_agree=3):
+async def build_synthetic_signal_response(index_key, min_agree=2):
     """
     Builds the signal message, image, and the trade context that
     gets stored for if/when the user taps "Trade This Signal".
     Returns (image_file_id, message_html, trade_context), or None
     if no signal could be generated.
 
-    min_agree defaults to 3 (DM/manual request bar) - scheduled
-    channel posts explicitly pass 2 instead, per the same scheduled-
-    vs-manual split used for forex/gold/crypto signals.
+    min_agree=2 is the floor everywhere now, scheduled and DM/manual
+    alike, per explicit instruction - 2 agreeing strategies posts a
+    real signal; 3+ only raises the confidence %, it's not a gate.
     """
     config = SYNTHETIC_CONFIG.get(index_key)
     if not config:
@@ -4395,7 +4395,7 @@ SYNTHETIC_STRATEGY_BANK = [
     strategy_volatility_breakout_scalper,
 ]
 
-def run_strategy_bank(pair_key, config, h1_candles, h4_candles, daily_candles, min_agree=3):
+def run_strategy_bank(pair_key, config, h1_candles, h4_candles, daily_candles, min_agree=2):
     """
     Runs every strategy in STRATEGY_BANK plus the existing ICT/SMC
     structure analysis (analyze_smc_structure), and requires at
@@ -4406,11 +4406,15 @@ def run_strategy_bank(pair_key, config, h1_candles, h4_candles, daily_candles, m
     case where the latest 1-2 candles were already contradicting the
     structure it was scoring.
 
-    min_agree is deliberately a parameter, not a constant - scheduled
-    channel posts use a lower bar (2) than DM/manual requests (3),
-    per explicit instruction, since a stricter bar would otherwise
-    make scheduled posts fall back to the much weaker rule-based bias
-    far more often than calling a real strategy-backed signal.
+    min_agree=2 is the floor everywhere now, per explicit instruction
+    - 2 independently agreeing strategies is treated as a real,
+    postable signal rather than falling back to the much weaker
+    rule-based bias. 3 is no longer a hard gate; it's a stronger
+    signal that earns a higher confidence score instead (see the
+    confidence calc below, which already scales with len(winning_votes)
+    - 2 agreeing -> 82%, 3 -> 88%, etc.) - so the only difference
+    between 2 and 3 agreeing strategies is the % shown, not whether
+    it posts at all.
 
     Returns (direction, confidence, reason, agreeing_strategies) or
     None if the bar isn't met. confidence scales with how many
@@ -4471,7 +4475,7 @@ def run_strategy_bank(pair_key, config, h1_candles, h4_candles, daily_candles, m
 
     return direction, confidence, reason, agreeing_names
 
-async def run_strategy_bank_synthetic(index_key, config, h1_candles, h4_candles, daily_candles, m1_candles=None, min_agree=3):
+async def run_strategy_bank_synthetic(index_key, config, h1_candles, h4_candles, daily_candles, m1_candles=None, min_agree=2):
     """
     Async sibling of run_strategy_bank, for synthetic (Deriv)
     indices - but with a DELIBERATELY DIFFERENT roster
@@ -4822,12 +4826,12 @@ async def build_signal_response(question, user_id=None):
     h4_candles = get_cached_candles(matched_key, config, "4h", outputsize=60)
     daily_candles = get_cached_candles(matched_key, config, "1day", outputsize=10)
 
-    # Scheduled channel posts (user_id=None) use a lower agreement
-    # bar (2) than DM/manual requests (3) - per explicit instruction,
-    # since requiring 3 for every scheduled slot would make it fall
-    # back to the much weaker rule-based bias far more often than
-    # posting a real strategy-backed signal.
-    min_agree = 2 if user_id is None else 3
+    # min_agree=2 is now the floor for BOTH scheduled channel posts
+    # and DM/manual requests, per explicit instruction - 2 agreeing
+    # strategies is a real, postable signal on its own; 3 agreeing
+    # no longer gates whether it posts, only how high the confidence
+    # % comes out (see run_strategy_bank's confidence calc).
+    min_agree = 2
 
     bank_result = run_strategy_bank(
         matched_key, config, h1_candles, h4_candles, daily_candles, min_agree=min_agree
@@ -6864,7 +6868,7 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 parse_mode=ParseMode.HTML
             )
 
-            result = await build_synthetic_signal_response(synthetic_key, min_agree=3)
+            result = await build_synthetic_signal_response(synthetic_key, min_agree=2)
 
             await wait_message.delete()
 

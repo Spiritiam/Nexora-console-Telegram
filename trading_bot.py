@@ -4622,6 +4622,30 @@ async def run_strategy_bank_synthetic(index_key, config, h1_candles, h4_candles,
     """
     votes = []
 
+    # Diagnostic: confirm what candle data actually arrived for THIS
+    # index before blaming the strategies themselves. Added after a
+    # confirmed real case where R_100 specifically returned zero
+    # votes every round while R_10/R_25/R_50 succeeded in the same
+    # minute with the identical strategy roster - the difference has
+    # to be in the data reaching these functions, not the functions
+    # themselves, since no per-strategy exception was ever logged for
+    # R_100 (meaning every strategy ran and legitimately found
+    # nothing, rather than crashing).
+    print(
+        f"[STRATEGY BANK SYNTH DIAG] {index_key} candle counts - "
+        f"h1={len(h1_candles) if h1_candles else 0} "
+        f"h4={len(h4_candles) if h4_candles else 0} "
+        f"daily={len(daily_candles) if daily_candles else 0} "
+        f"m1={len(m1_candles) if m1_candles else 0}"
+    )
+    if m1_candles:
+        last_candle = m1_candles[-1]
+        print(
+            f"[STRATEGY BANK SYNTH DIAG] {index_key} last m1 candle: "
+            f"open={last_candle.get('open')} high={last_candle.get('high')} "
+            f"low={last_candle.get('low')} close={last_candle.get('close')}"
+        )
+
     for strategy_fn in SYNTHETIC_STRATEGY_BANK:
         try:
             sig = inspect.signature(strategy_fn)

@@ -4037,13 +4037,13 @@ def strategy_trend_following(pair_key, config, h1_candles, h4_candles, daily_can
         return {
             "strategy_name": "Trend Following (MA)",
             "direction": "BUY",
-            "detail": f"price above 20/50 MA, MAs aligned bullish",
+            "detail": f"price {current_price:.2f} above 20MA {ma20:.2f} above 50MA {ma50:.2f}, bullish alignment",
         }
     if current_price < ma20 < ma50:
         return {
             "strategy_name": "Trend Following (MA)",
             "direction": "SELL",
-            "detail": f"price below 20/50 MA, MAs aligned bearish",
+            "detail": f"price {current_price:.2f} below 20MA {ma20:.2f} below 50MA {ma50:.2f}, bearish alignment",
         }
 
     return None
@@ -4200,13 +4200,13 @@ def strategy_momentum_macd(pair_key, config, h1_candles, h4_candles, daily_candl
         return {
             "strategy_name": "Momentum (MACD)",
             "direction": "BUY",
-            "detail": "MACD just crossed bullish on the most recent candle",
+            "detail": f"MACD {curr_macd:.4f} crossed above signal {curr_signal:.4f} this candle",
         }
     if crossed_bearish:
         return {
             "strategy_name": "Momentum (MACD)",
             "direction": "SELL",
-            "detail": "MACD just crossed bearish on the most recent candle",
+            "detail": f"MACD {curr_macd:.4f} crossed below signal {curr_signal:.4f} this candle",
         }
 
     return None
@@ -4435,13 +4435,13 @@ def strategy_ema_pullback_scalper(pair_key, config, h1_candles, h4_candles, dail
         return {
             "strategy_name": "EMA Pullback Scalper",
             "direction": "BUY",
-            "detail": "EMA20>50 uptrend, pullback to EMA20, bullish engulfing",
+            "detail": f"EMA20 {current_ema20:.2f} above EMA50 {current_ema50:.2f}, pullback + bullish engulfing",
         }
     if current_ema20 < current_ema50 and pulled_back_to_ema20 and detect_bearish_engulfing(candles):
         return {
             "strategy_name": "EMA Pullback Scalper",
             "direction": "SELL",
-            "detail": "EMA20<50 downtrend, pullback to EMA20, bearish engulfing",
+            "detail": f"EMA20 {current_ema20:.2f} below EMA50 {current_ema50:.2f}, pullback + bearish engulfing",
         }
 
     return None

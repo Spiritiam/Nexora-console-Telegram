@@ -3727,7 +3727,23 @@ def analyze_smc_structure(pair_key, config):
     H4.") so there's no separate Timeframe Confirmation row
     repeating part of it.
     """
-    h1_candles = get_cached_candles(pair_key, config, "1h", outputsize=60)
+    # h1 outputsize matches build_signal_response's own h1 fetch
+    # (210) on purpose - CONFIRMED REAL REGRESSION: after fixing
+    # get_cached_candles' cache key to include outputsize (so a
+    # 60-candle cache entry and a 210-candle cache entry are never
+    # silently confused for each other), this function's OWN h1
+    # fetch at outputsize=60 stopped sharing a cache entry with
+    # build_signal_response's h1@210 fetch - meaning every single
+    # signal request now made a genuinely new extra API call for h1
+    # that didn't exist before, on EVERY pair, not just oil/silver.
+    # That's what pushed ordinary forex pairs (confirmed via real
+    # logs: EURUSD, USDJPY, USDCAD) into the same rate-limit
+    # territory oil/silver were already hitting. analyze_timeframe
+    # has no upper bound on candle count (only a len>=15 floor), so
+    # requesting 210 here costs nothing functionally - it just lets
+    # this call and build_signal_response's collapse back into ONE
+    # shared cache entry/API call instead of two.
+    h1_candles = get_cached_candles(pair_key, config, "1h", outputsize=210)
     h4_candles = get_cached_candles(pair_key, config, "4h", outputsize=60)
 
     h1_factors = analyze_timeframe(h1_candles)

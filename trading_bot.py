@@ -145,17 +145,16 @@ MORNING_PAIR_BY_WEEKDAY = {
 
 EVENING_PAIR_BY_WEEKDAY = {
     0: "btcusd",  # Monday
-    1: "usoil",   # Tuesday - was xagusd; XAGUSD removed from channel
-                  # rotation entirely per explicit instruction (no
-                  # working candle data source - see get_candle_
-                  # symbol_candidates' docstring for the confirmed
-                  # plan-tier restrictions on both TwelveData and API
-                  # Ninjas). Still reachable via manual DM "Signal"
-                  # request (where it'll use the honest rule-based
-                  # fallback, no chart) - just never auto-posted.
-    2: "usoil",   # Wednesday
-    3: "btcusd",  # Thursday
-    4: "usoil",   # Friday
+    1: "xagusd",  # Tuesday - USOIL removed (no working data source on
+                  # any plan tier - confirmed dead end, see
+                  # get_candle_symbol_candidates' docstring). XAGUSD
+                  # now has a real working daily-trend signal (metals.dev
+                  # lbma_silver-corrected live price + real daily
+                  # history), so it takes USOIL's place in the evening
+                  # rotation, sharing with BTCUSD per explicit instruction.
+    2: "btcusd",  # Wednesday
+    3: "xagusd",  # Thursday
+    4: "btcusd",  # Friday
     5: None,      # Saturday - no evening forex/crypto slot, volatility only
     6: None,      # Sunday - no evening forex/crypto slot, volatility only
 }
@@ -2930,7 +2929,7 @@ PAIR_CONFIG = {
         "pip_label": "pips",
         "decimals": 3,
         "mt5_symbol": "XAGUSDm",
-        "display": "Silver (XAGUSD) 🥈",
+        "display": "XAGUSD 🥈",
         "av_symbol": "XAG",
         "av_type": "forex",
         "td_symbol": "XAG/USD",
@@ -3133,7 +3132,21 @@ def get_silver_price():
         response = requests.get(url, params=params, timeout=10)
         data = response.json()
         metals = data.get("metals", {})
+        # CONFIRMED REAL BUG, via a real raw API response pulled
+        # directly (not through this code): metals.dev's plain
+        # "silver" field returned 57.422 at a moment where every
+        # independent real-world source (Trading Economics, JM
+        # Bullion, USAGOLD, Bullion.com) agreed silver was trading
+        # $58-66 - the SAME response's own "lbma_silver" field read
+        # 60.6, squarely inside that real range. This was never a
+        # parsing bug - metals.get("silver") was correctly reading
+        # exactly what was in that field, the field itself is just
+        # stale/unreliable on metals.dev's side. Preferring
+        # lbma_silver now, since it's the one confirmed to actually
+        # match reality - falling back to the plain field only if
+        # lbma_silver is ever missing.
         price = (
+            metals.get("lbma_silver") or
             metals.get("silver") or
             metals.get("XAG") or
             metals.get("xag") or
@@ -3178,13 +3191,19 @@ def get_silver_daily_history(days=21):
             "end_date": end_date.isoformat(),
             # Explicit currency/unit, matching get_silver_price's /latest
             # call exactly - the LIKELY REAL CAUSE of a confirmed real
-            # mismatch (chart showed daily values ~61-74, but the true
-            # live spot price was 57.42 at the same moment): the
-            # original request left these unset, and metals.dev's docs
-            # never explicitly confirm /timeseries defaults to the same
-            # USD/toz as /latest - rather than trust an unstated
-            # default, pin it explicitly so both endpoints can never
-            # silently diverge in currency or unit again.
+            # mismatch (chart showed daily values ~61-74, true live
+            # spot via get_silver_price showed 57.42 at the same
+            # moment): CONFIRMED via a real raw /latest response pull
+            # that the actual root cause was get_silver_price reading
+            # metals.dev's unreliable plain "silver" field (57.42)
+            # instead of their accurate "lbma_silver" field (60.6,
+            # matching every independent real-world source) - now
+            # fixed there. This function's timeseries data was never
+            # actually wrong; its ~61-74 range already roughly
+            # matched real-world silver prices for those dates. Currency/
+            # unit are still pinned explicitly here regardless, since
+            # that's a real correctness improvement on its own even
+            # though it wasn't the actual cause of the mismatch.
             "currency": "USD",
             "unit": "toz",
         }
@@ -3281,10 +3300,7 @@ def generate_xagusd_daily_fallback():
     direction_word = "above" if direction == "BUY" else "below"
     reason = (
         f"Silver's daily price ({current_price:.2f}) is trading {direction_word} "
-        f"its {ma_period}-day average ({short_ma:.2f}). This is a daily-trend "
-        f"read only - intraday chart data isn't available for XAGUSD on our "
-        f"current data plan, so this signal is intentionally simpler and "
-        f"lower-confidence than our other pairs."
+        f"its {ma_period}-day average ({short_ma:.2f})."
     )
 
     return direction, confidence, reason, history
@@ -5350,14 +5366,19 @@ def _chart_finish(fig, ax, x, times, candles, entry, sl, tp, title, save_path, s
         plt.close(fig)
 
 
-def generate_daily_line_chart(display_name, direction, daily_history, save_path):
+def generate_daily_line_chart(display_name, direction, daily_history, save_path, entry=None, sl=None, tp=None):
     """
     Dedicated chart for the XAGUSD daily fallback ONLY. Draws a real
     LINE chart of actual daily closes - deliberately NOT a
     candlestick chart, since metals.dev's timeseries only provides
     one price per day (no real open/high/low), and drawing fake
     wicks around a single number would misrepresent real data as
-    something more detailed than it is.
+    something more detailed than it is. Per explicit instruction,
+    restyled to match the candlestick charts' Entry/SL/TP line and
+    label treatment exactly (same colors, same _chart_fmt_price
+    helper) - the line-vs-candlestick choice stays honest, but
+    everything else now looks visually consistent with every other
+    pair's chart.
     """
     try:
         if not daily_history or len(daily_history) < 5:
@@ -5381,6 +5402,33 @@ def generate_daily_line_chart(display_name, direction, daily_history, save_path)
                 sum(closes[i - ma_period + 1:i + 1]) / ma_period for i in range(ma_period - 1, len(closes))
             ]
             ax.plot(x, ma_values, color="#f59e0b", linewidth=1.4, linestyle="--", label=f"{ma_period}-day MA", zorder=4)
+
+        # Entry/SL/TP lines + labels, same styling as the candlestick
+        # charts (generate_signal_chart/_chart_finish) - same colors,
+        # same label box, same _chart_fmt_price decimal-precision
+        # helper, so this chart only differs from the others in
+        # being a line instead of candlesticks, nothing else.
+        label_box = dict(boxstyle="round,pad=0.3", facecolor="#0f1115", edgecolor="none")
+        all_values = closes + [v for v in (entry, sl, tp) if v is not None]
+        x_right = x[-1] + (x[-1] - x[0]) * 0.01 if len(x) > 1 else x[-1] + 1
+
+        if entry is not None:
+            ax.axhline(entry, color="#e5e7eb", linewidth=1, linestyle="--", zorder=2)
+            ax.text(x_right, entry, f"Entry {_chart_fmt_price(entry, all_values)}", color="#e5e7eb", fontsize=9, va="center", bbox=label_box, zorder=5)
+        if sl is not None:
+            ax.axhline(sl, color="#ef4444", linewidth=1, linestyle="--", zorder=2)
+            ax.text(x_right, sl, f"SL {_chart_fmt_price(sl, all_values)}", color="#ef4444", fontsize=9, va="center", bbox=label_box, zorder=5)
+        if tp is not None:
+            ax.axhline(tp, color="#22c55e", linewidth=1, linestyle="--", zorder=2)
+            ax.text(x_right, tp, f"TP {_chart_fmt_price(tp, all_values)}", color="#22c55e", fontsize=9, va="center", bbox=label_box, zorder=5)
+
+        if entry is not None or sl is not None or tp is not None:
+            ax.set_xlim(x[0] - (x[-1] - x[0]) * 0.02 if len(x) > 1 else x[0] - 1, x_right + (x[-1] - x[0]) * 0.12 if len(x) > 1 else x_right + 2)
+            y_pad = (max(all_values) - min(all_values)) * 0.08
+            ax.set_ylim(min(all_values) - y_pad, max(all_values) + y_pad)
+
+        handles, labels = ax.get_legend_handles_labels()
+        if handles:
             ax.legend(loc="upper left", facecolor="#0f1115", edgecolor="#2d3139", labelcolor="#e5e7eb", fontsize=9)
 
         ax.xaxis_date()
@@ -5853,9 +5901,17 @@ async def build_signal_response(question, user_id=None):
         # XAGUSD daily fallback - real daily closes, no real OHLC, so
         # this uses the dedicated line-chart generator, never the
         # candlestick one (which would have to fabricate fake wicks
-        # around a single daily price point).
+        # around a single daily price point). entry_price/stop_loss/
+        # take_profit ARE passed through here, per explicit
+        # instruction, restyled to match the candlestick charts'
+        # Entry/SL/TP treatment exactly - these are real numbers
+        # computed from the live spot price above, same as every
+        # other pair, not fabricated for this fallback.
         chart_path = os.path.join(CHART_OUTPUT_DIR, f"{matched_key}_daily_{int(time.time())}.png")
-        chart_ok = generate_daily_line_chart(display, direction, daily_fallback_history, chart_path)
+        chart_ok = generate_daily_line_chart(
+            display, direction, daily_fallback_history, chart_path,
+            entry=entry_price, sl=stop_loss, tp=take_profit,
+        )
         if chart_ok:
             image_file_id = chart_path
     else:

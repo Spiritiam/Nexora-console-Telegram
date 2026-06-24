@@ -29,6 +29,7 @@ from telegram.ext import (
 )
 
 from telegram.constants import ParseMode
+from telegram.error import TimedOut
 
 # ============================================
 # ENV VARIABLES
@@ -4303,9 +4304,26 @@ async def post_news(context: ContextTypes.DEFAULT_TYPE):
                 chat_id=channel_id,
                 photo=image_url,
                 caption=summary,
-                parse_mode=ParseMode.HTML
+                parse_mode=ParseMode.HTML,
+                read_timeout=60,
+                write_timeout=60,
+                connect_timeout=30,
             )
             print(f"[NEWS] ✅ {session_type} posted to {channel_id}")
+        except TimedOut:
+            # Confirmed real PTB behavior: send_photo can raise
+            # TimedOut for a request that Telegram actually completed
+            # successfully (the bot's own read timeout expires while
+            # waiting for Telegram's confirmation, even though
+            # Telegram already finished posting it - especially
+            # likely here since image_url points to Pollinations.ai,
+            # which Telegram has to fetch server-side and can be
+            # slow). This was the actual cause of the photo AND a
+            # text-only duplicate both posting - treating a timeout
+            # as "uncertain" rather than "definitely failed" means no
+            # automatic duplicate gets sent, since the photo most
+            # likely did go through.
+            print(f"[NEWS] ⚠️ {session_type} timed out for {channel_id} - likely posted anyway, NOT sending a duplicate")
         except Exception as e:
             print(f"[NEWS] AI image failed for {channel_id}, posting text only: {e}")
             try:

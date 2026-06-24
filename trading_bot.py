@@ -581,18 +581,20 @@ async def place_and_link_mt5_trade(signal_id, signal_data):
     attach_mt5_order_id(signal_id, order_id)
 
 async def _delete_message_job(context: ContextTypes.DEFAULT_TYPE):
-    """Callback for the scheduled auto-delete job below."""
-    job_data = context.job.data
-    try:
-        await context.bot.delete_message(
-            chat_id=job_data["chat_id"], message_id=job_data["message_id"]
-        )
-    except Exception as e:
-        # Common and harmless: user already deleted it themselves,
-        # blocked the bot, or it's been >48h (Telegram's own bot-
-        # message deletion limit in some cases). Never worth alarming
-        # over - just log and move on.
-        print(f"[AUTO-DELETE] Couldn't delete {job_data}: {e}")
+    """No longer used - process_due_auto_deletes performs deletions directly now. Kept as a no-op stub only if something external still references it."""
+    pass
+
+# DB-backed for the same reason pending_trades_db/channel_signal_
+# context_db/pending_verifications_db all are: scheduling via
+# job_queue.run_once alone only lives in the bot's live memory, and
+# Railway restarts (confirmed to happen frequently during active
+# development) silently wipe every pending deletion that hasn't
+# fired yet - this is almost certainly the real reason "24h
+# auto-delete never seems to work" despite the scheduling code
+# itself being correct. Requires a Supabase table:
+# auto_delete_queue_db (id bigint identity primary key, chat_id
+# text, message_id bigint, delete_at timestamptz), RLS DISABLED
+# (same as the other _db tables).
 
 def schedule_auto_delete(chat_id, message_id, hours=24):
     """
@@ -607,22 +609,63 @@ def schedule_auto_delete(chat_id, message_id, hours=24):
     (trade history, and things a user may need to refer back to,
     e.g. "was I verified?", "what's my auto-copy stake set to?").
 
-    Relies on _app_instance being set in main() - if main() hasn't
-    run yet (shouldn't happen in practice) this silently no-ops
-    rather than crashing the caller, since a missed auto-delete is
-    far less harmful than breaking the message send itself.
+    Writes to auto_delete_queue_db rather than (or in addition to)
+    scheduling an in-memory job - process_due_auto_deletes (a
+    recurring job, see main()) is what actually performs the
+    deletion once delete_at has passed, and that sweep survives
+    restarts since it reads fresh from the DB every time it runs.
     """
-    if _app_instance is None:
-        print("[AUTO-DELETE] _app_instance not set yet, skipping schedule")
-        return
     try:
-        _app_instance.job_queue.run_once(
-            _delete_message_job,
-            when=timedelta(hours=hours),
-            data={"chat_id": chat_id, "message_id": message_id},
-        )
+        url = f"{SUPABASE_URL}/rest/v1/auto_delete_queue_db"
+        payload = {
+            "chat_id": str(chat_id),
+            "message_id": message_id,
+            "delete_at": (datetime.utcnow() + timedelta(hours=hours)).isoformat(),
+        }
+        response = requests.post(url, headers=sb_headers(), json=payload, timeout=10)
+        if response.status_code not in (200, 201):
+            print(f"[AUTO-DELETE] Couldn't queue delete: {response.status_code} {response.text}")
     except Exception as e:
-        print(f"[AUTO-DELETE] Couldn't schedule delete: {e}")
+        print(f"[AUTO-DELETE] Couldn't queue delete: {e}")
+
+async def process_due_auto_deletes(context: ContextTypes.DEFAULT_TYPE):
+    """
+    Recurring sweep (see main()) that does the actual deleting - the
+    part schedule_auto_delete itself no longer does directly. Reads
+    every row whose delete_at has already passed, attempts the
+    delete, then removes the row from the queue regardless of
+    whether the delete succeeded (a message that's already gone,
+    blocked, or past Telegram's deletion window should never be
+    retried forever).
+    """
+    try:
+        now_str = datetime.utcnow().isoformat()
+        url = (
+            f"{SUPABASE_URL}/rest/v1/auto_delete_queue_db"
+            f"?delete_at=lte.{now_str}&select=id,chat_id,message_id"
+        )
+        response = requests.get(url, headers=sb_headers(), timeout=15)
+        due_rows = response.json()
+    except Exception as e:
+        print(f"[AUTO-DELETE] Couldn't fetch due deletes: {e}")
+        return
+
+    if not isinstance(due_rows, list) or not due_rows:
+        return
+
+    for row in due_rows:
+        row_id = row.get("id")
+        chat_id = row.get("chat_id")
+        message_id = row.get("message_id")
+        try:
+            await context.bot.delete_message(chat_id=int(chat_id), message_id=int(message_id))
+        except Exception as e:
+            print(f"[AUTO-DELETE] Couldn't delete chat={chat_id} msg={message_id}: {e}")
+        try:
+            del_url = f"{SUPABASE_URL}/rest/v1/auto_delete_queue_db?id=eq.{row_id}"
+            requests.delete(del_url, headers=sb_headers(), timeout=10)
+        except Exception as e:
+            print(f"[AUTO-DELETE] Couldn't remove queue row {row_id}: {e}")
 
 async def send_and_auto_delete(bot, chat_id, text, **kwargs):
     """
@@ -6296,6 +6339,72 @@ async def testsynth_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await _post_synthetic_signal_for_index(context.bot, index_key)
     await update.message.reply_text("Done - check the channel and tap Trade This Signal.")
 
+# ============================================
+# PURGEDIGESTS (TEMPORARY - admin only)
+# One-time push-delete of every existing auto-
+# copy digest message still sitting in chats -
+# the digest job itself is now permanently
+# disabled (see main()), but messages it already
+# sent before that don't disappear on their own.
+# Run once, then this command can be removed.
+# ============================================
+
+async def purgedigests_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = str(update.message.from_user.id)
+
+    if not ADMIN_USER_ID or user_id != str(ADMIN_USER_ID):
+        return  # silently ignore - don't reveal this command to anyone else
+
+    try:
+        url = (
+            f"{SUPABASE_URL}/rest/v1/deriv_accounts"
+            f"?last_digest_message_id=not.is.null&select=user_id,last_digest_message_id"
+        )
+        response = requests.get(url, headers=sb_headers(), timeout=15)
+        rows = response.json()
+    except Exception as e:
+        await update.message.reply_text(f"Couldn't fetch accounts: {e}")
+        return
+
+    if not isinstance(rows, list) or not rows:
+        await update.message.reply_text("No existing digest messages found to delete.")
+        return
+
+    await update.message.reply_text(f"Deleting {len(rows)} existing digest message(s)...")
+
+    deleted = 0
+    failed = 0
+    for row in rows:
+        target_user_id = row.get("user_id")
+        message_id = row.get("last_digest_message_id")
+        if not target_user_id or not message_id:
+            continue
+        try:
+            await context.bot.delete_message(
+                chat_id=int(target_user_id), message_id=int(message_id)
+            )
+            deleted += 1
+        except Exception as e:
+            failed += 1
+            print(f"[PURGE DIGESTS] Couldn't delete for {target_user_id}: {e}")
+        # Clear the saved message_id either way, so this never tries
+        # to delete the same (now-gone or already-failed) message
+        # again on a future run.
+        try:
+            url = f"{SUPABASE_URL}/rest/v1/deriv_accounts?user_id=eq.{target_user_id}"
+            requests.patch(
+                url, headers=sb_headers(),
+                json={"last_digest_message_id": None}, timeout=10
+            )
+        except Exception as e:
+            print(f"[PURGE DIGESTS] Couldn't clear saved id for {target_user_id}: {e}")
+
+    await update.message.reply_text(
+        f"Done. Deleted: {deleted} | Failed: {failed} "
+        f"(likely already deleted, or message older than Telegram's "
+        f"48h bot-delete window)."
+    )
+
 async def broadcast_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = str(update.message.from_user.id)
 
@@ -6712,6 +6821,7 @@ def main():
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("broadcast", broadcast_command))
     app.add_handler(CommandHandler("testsynth", testsynth_command))
+    app.add_handler(CommandHandler("purgedigests", purgedigests_command))
     app.add_handler(CallbackQueryHandler(handle_callback))
 
     app.add_handler(
@@ -6816,6 +6926,19 @@ def main():
         interval=900,
         first=60,
         name="tp_sl_monitor"
+    )
+
+    # Auto-delete sweep - performs the actual deletion for anything
+    # in auto_delete_queue_db whose time has come. Every 10 minutes
+    # is frequent enough that a message disappears close to its real
+    # 24h mark, without needing the in-memory job_queue.run_once that
+    # used to silently lose every pending deletion on a Railway
+    # restart (the actual root cause of "auto-delete never works").
+    job_queue.run_repeating(
+        process_due_auto_deletes,
+        interval=600,
+        first=45,
+        name="auto_delete_sweep"
     )
 
     # Auto-copy trade monitor - Deriv equivalent of the TP/SL monitor

@@ -191,7 +191,7 @@ def get_channel_button():
     return InlineKeyboardMarkup([
         [InlineKeyboardButton(
             "🤖 Get Your Own Signal",
-            url=f"https://t.me/{BOT_USERNAME}?start=channelcta"
+            callback_data="channelcta"
         )]
     ])
 
@@ -5126,6 +5126,125 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             parse_mode=ParseMode.HTML
         )
 
+    elif data == "channelcta":
+
+        user_id = str(update.callback_query.from_user.id)
+        username = update.callback_query.from_user.username or "Trader"
+
+        # Mirrors start()'s exact logic (minus the chantrade_ deep-
+        # link branch, which doesn't apply here) - this button is
+        # tapped from a channel post, not a signal-specific deep
+        # link, so it should behave exactly like a fresh /start.
+        if is_first_time_user(user_id):
+            already_following = await is_following_channel(context.bot, user_id)
+            if not already_following:
+                await context.bot.send_message(
+                    chat_id=int(user_id),
+                    text=(
+                        f"👋 <b>Welcome to Nexora AI, {username}!</b>\n\n"
+                        f"Before we get started, please follow our official "
+                        f"channel for live signals, news, and updates:\n\n"
+                        f"👉 {FOLLOW_GATE_CHANNEL}\n\n"
+                        f"<i>Once you've followed, tap the button below to "
+                        f"continue.</i>"
+                    ),
+                    parse_mode=ParseMode.HTML,
+                    reply_markup=InlineKeyboardMarkup([
+                        [InlineKeyboardButton(
+                            "📢 Follow Nexora AI Channel",
+                            url=f"https://t.me/{FOLLOW_GATE_CHANNEL.lstrip('@')}"
+                        )],
+                        [InlineKeyboardButton(
+                            "✅ I've Followed — Continue",
+                            callback_data="followgate_check"
+                        )]
+                    ])
+                )
+                return
+
+        if is_verified(user_id):
+            await context.bot.send_message(
+                chat_id=int(user_id),
+                text=(
+                    f"👋 <b>Welcome back, {username}!</b>\n\n"
+                    f"✅ You're a <b>verified Nexora AI trader.</b>\n\n"
+                    f"━━━━━━━━━━━━━━━━━━━━━\n"
+                    f"👇 <b>What would you like to do today?</b>\n"
+                    f"━━━━━━━━━━━━━━━━━━━━━\n\n"
+                    f"📊 <b>Signal</b> — Get a live trading signal right now\n\n"
+                    f"📚 <b>Breakdown</b> — Get a full AI market analysis\n\n"
+                    f"🔗 <b>Connect Deriv</b> — Link your Deriv account to trade "
+                    f"signals directly, manually or fully automatic\n\n"
+                    f"<i>All three buttons are at the bottom of your screen 👇</i>"
+                ),
+                parse_mode=ParseMode.HTML,
+                reply_markup=main_keyboard
+            )
+            return
+
+        remaining = trial_remaining(user_id)
+        if remaining > 0:
+            await context.bot.send_message(
+                chat_id=int(user_id),
+                text=(
+                    f"👋 <b>Hello {username}, welcome to Nexora AI! 🤖</b>\n\n"
+                    f"I am your personal AI trading assistant — delivering "
+                    f"<b>professional trading signals</b>, live market analysis "
+                    f"and AI-powered breakdowns.\n\n"
+                    f"🎁 <b>You have {remaining} FREE trial signal(s) to use!</b>\n\n"
+                    f"━━━━━━━━━━━━━━━━━━━━━\n"
+                    f"👇 <b>TAP ONE OF THE OPTIONS BELOW TO START:</b>\n"
+                    f"━━━━━━━━━━━━━━━━━━━━━\n\n"
+                    f"📊 <b>Signal</b> — Get a live trading signal right now\n\n"
+                    f"📚 <b>Breakdown</b> — Get a full AI market analysis\n\n"
+                    f"🔗 <b>Connect Deriv</b> — Link your Deriv account to trade "
+                    f"signals directly, manually or fully automatic\n\n"
+                    f"<i>All three buttons are at the bottom of your screen 👇</i>"
+                ),
+                parse_mode=ParseMode.HTML,
+                reply_markup=main_keyboard
+            )
+            return
+
+        user_modes[user_id] = "awaiting_email"
+        await context.bot.send_message(
+            chat_id=int(user_id),
+            text=(
+                "🔐 <b>You've used your 3 FREE trial signals!</b>\n\n"
+                "Hope you loved what you saw! 🔥\n\n"
+                "To continue enjoying <b>UNLIMITED FREE signals</b>, "
+                "live market analysis and AI breakdowns — "
+                "you just need <b>ONE simple step:</b>\n\n"
+                "━━━━━━━━━━━━━━━━━━━━━\n"
+                "🔓 <b>HOW TO UNLOCK FULL ACCESS</b>\n"
+                "━━━━━━━━━━━━━━━━━━━━━\n\n"
+                "📌 Register a <b>FREE</b> trading account with our official "
+                "broker partner — <b>Exness</b> — using our unique link.\n\n"
+                "<b>No payment. No subscription. Completely FREE.</b>\n\n"
+                "━━━━━━━━━━━━━━━━━━━━━\n"
+                "👇 <b>CHOOSE YOUR SITUATION:</b>\n"
+                "━━━━━━━━━━━━━━━━━━━━━\n\n"
+                "✅ <b>SITUATION 1</b> — Already registered on Exness "
+                "using our link before:\n"
+                "👉 Simply type the email address you used to register "
+                "on Exness below and we will verify you instantly.\n\n"
+                "📝 <b>SITUATION 2</b> — Not yet registered or registered "
+                "without our link:\n"
+                "👉 Click the button below to create your FREE Exness "
+                "account using our official link. Once done, come back "
+                "here and type the email you registered with.\n\n"
+                "━━━━━━━━━━━━━━━━━━━━━\n"
+                "📧 <b>Already registered? Type your Exness email now 👇</b>"
+            ),
+            parse_mode=ParseMode.HTML,
+            reply_markup=InlineKeyboardMarkup([
+                [InlineKeyboardButton(
+                    "📝 I'm New — Register on Exness FREE 👆",
+                    url=EXNESS_LINK
+                )]
+            ])
+        )
+
     elif data == "followgate_check":
 
         user_id = str(update.callback_query.from_user.id)
@@ -6737,16 +6856,18 @@ def main():
     #     name="tickburst_auto_copy_scan"
     # )
 
-    # Auto-copy daily digest - one summary per user at 23:59 UTC,
-    # replacing the old per-30-min summary DM. EVERY_DAY (not weekday-
-    # restricted) since synthetic indices trade 24/7.
-    job_queue.run_daily(
-        send_auto_copy_daily_digest,
-        time=parse_time("23:59"),
-        name="auto_copy_daily_digest",
-        days=EVERY_DAY,
-        job_kwargs={"misfire_grace_time": 300}
-    )
+    # Auto-copy daily digest - PERMANENTLY DISABLED per explicit
+    # instruction. Function code (send_auto_copy_daily_digest) is
+    # left intact below in case this is revisited later, but this
+    # job registration is commented out - it will NOT run at all.
+    #
+    # job_queue.run_daily(
+    #     send_auto_copy_daily_digest,
+    #     time=parse_time("23:59"),
+    #     name="auto_copy_daily_digest",
+    #     days=EVERY_DAY,
+    #     job_kwargs={"misfire_grace_time": 300}
+    # )
 
     # Weekly performance report - every Sunday at 23:00 UTC
     # NOTE: PTB v20+ uses cron-style day indexing for run_daily's

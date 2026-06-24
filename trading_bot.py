@@ -191,7 +191,7 @@ def get_channel_button():
     return InlineKeyboardMarkup([
         [InlineKeyboardButton(
             "🤖 Get Your Own Signal",
-            url=f"https://t.me/{BOT_USERNAME}"
+            url=f"https://t.me/{BOT_USERNAME}?start=channelcta"
         )]
     ])
 

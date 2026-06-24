@@ -1216,6 +1216,30 @@ def set_low_balance_notified(user_id, notified):
     except Exception as e:
         print(f"[DERIV] set_low_balance_notified error: {e}")
 
+def set_token_invalid_notified(user_id, notified):
+    """
+    Same DB-backed tell-once pattern as set_low_balance_notified
+    above, but for a dead/expired/revoked Deriv token - confirmed
+    real case (401 "Invalid or expired token" from deriv_get_options_
+    accounts) where auto-copy silently stopped trading for a user
+    every single scan, forever, with nothing ever telling them why or
+    that relinking would fix it. Without this flag the same warning
+    would otherwise repeat every 30 minutes once added, instead of
+    once per dead-token episode.
+
+    REQUIRES a token_invalid_notified column on deriv_accounts (same
+    type/default as the existing low_balance_notified column) - add
+    this column in Supabase before deploying this change.
+    """
+    try:
+        url = f"{SUPABASE_URL}/rest/v1/deriv_accounts?user_id=eq.{user_id}"
+        requests.patch(
+            url, headers=sb_headers(),
+            json={"token_invalid_notified": notified}, timeout=10
+        )
+    except Exception as e:
+        print(f"[DERIV] set_token_invalid_notified error: {e}")
+
 
 
 def get_all_auto_copy_accounts():
@@ -1277,17 +1301,22 @@ SYNTHETIC_CONFIG = {
     # Multiplier 100 is doubly confirmed safe: tested directly on
     # R_100 (real trade executed successfully), and present in R_75's
     # confirmed valid set (50/100/200/300/500, returned directly by
-    # Deriv after a rejected guess). Standardizing all five on 100
-    # for now rather than leaving the old per-index guesses, which
-    # turned out unreliable - R_75's original guess of 150 wasn't
-    # even in the valid set. R_10/R_25/R_50 still haven't been
-    # individually tested, so their true max multiplier (possibly
-    # higher, since lower-volatility indices often allow more) is
-    # still unknown - worth testing each the same way R_75 just was.
+    # Deriv after a rejected guess). R_75 is now CONFIRMED live via a
+    # real proposal error on 2026-06-24: Deriv's own response stated
+    # the actual accepted set is {400, 1000, 2000, 3000, 4000} - 100
+    # was wrong, just like the earlier 150 guess was wrong. Using 400
+    # here (the lowest confirmed-valid value, least leveraged) rather
+    # than guessing again. R_10/R_25/R_50/R_100 are UNCONFIRMED still
+    # - left at 100 for now, but deriv_execute_multiplier_trade has a
+    # safety net: if Deriv rejects whatever value is sent, it parses
+    # the real accepted list straight out of Deriv's own error message
+    # and retries once with the lowest valid value, so trades on the
+    # unconfirmed indices still go through correctly even before each
+    # is individually tested and hardcoded the same way R_75 just was.
     "r10": {"symbol": "R_10", "display": "Volatility 10 Index", "default_multiplier": 100},
     "r25": {"symbol": "R_25", "display": "Volatility 25 Index", "default_multiplier": 100},
     "r50": {"symbol": "R_50", "display": "Volatility 50 Index", "default_multiplier": 100},
-    "r75": {"symbol": "R_75", "display": "Volatility 75 Index", "default_multiplier": 100},
+    "r75": {"symbol": "R_75", "display": "Volatility 75 Index", "default_multiplier": 400},
     "r100": {"symbol": "R_100", "display": "Volatility 100 Index", "default_multiplier": 100},
 }
 
@@ -1883,9 +1912,11 @@ async def build_synthetic_signal_response(index_key, min_agree=2):
     Returns (image_file_id, message_html, trade_context), or None
     if no signal could be generated.
 
-    min_agree=2 is the floor everywhere now, scheduled and DM/manual
-    alike, per explicit instruction - 2 agreeing strategies posts a
-    real signal; 3+ only raises the confidence %, it's not a gate.
+    min_agree=2 is the PREFERRED bar, scheduled and DM/manual alike -
+    per explicit instruction, run_strategy_bank_synthetic always
+    sends a signal as long as at least one strategy fired, only
+    scaling confidence % down rather than gating whether it posts.
+    None here now only means the candle data itself wasn't available.
     """
     config = SYNTHETIC_CONFIG.get(index_key)
     if not config:
@@ -1964,7 +1995,12 @@ async def send_connect_instructions(bot, user_id):
             "<b>Account management</b>\n"
             "4️⃣ Copy the token and paste it here\n\n"
             "⚠️ <b>Real accounts only</b> — demo/virtual tokens will be "
-            "rejected."
+            "rejected.\n\n"
+            "⚠️ <b>Use the API token from step 3, not a login/session "
+            "code.</b> Some users accidentally paste a short-lived "
+            "code instead — that type expires within hours and will "
+            "make trading stop working until you reconnect with the "
+            "correct token."
         ),
         parse_mode=ParseMode.HTML,
         reply_markup=main_keyboard
@@ -2052,8 +2088,8 @@ def friendly_trade_error(raw_error, auto_copy_context=False):
         # which gave no hint that relinking was the actual fix needed -
         # they assumed the bot itself was broken.
         if auto_copy_context:
-            return "Your linked Deriv account couldn't be reached. Your token may have expired - relink it from 🔗 Connect Deriv to resume auto-copy trades."
-        return "Your linked Deriv account couldn't be reached. Your token may have expired or been revoked - tap 🔗 Connect Deriv and paste a new token to relink."
+            return "Your linked Deriv account couldn't be reached. Your token may have expired - this often happens if a short-lived login code was used instead of the permanent API token. Relink with the correct token from 🔗 Connect Deriv to resume auto-copy trades."
+        return "Your linked Deriv account couldn't be reached. Your token may have expired or been revoked - this often happens if a short-lived login code was used instead of the permanent API token. Tap 🔗 Connect Deriv and paste the correct token to relink."
     if "multiplier" in lowered:
         if auto_copy_context:
             return "This stake amount isn't supported for this index right now. It'll be retried automatically on the next signal."
@@ -2141,7 +2177,42 @@ async def deriv_execute_multiplier_trade(token, symbol, contract_type, multiplie
             if "error" in proposal_response:
                 err = proposal_response["error"].get("message", "Unknown error")
                 print(f"[SYNTH TRADE] Proposal error: {err}")
-                return None, f"Couldn't get a quote: {err}"
+
+                # Deriv's own error message states the real accepted
+                # multiplier list for THIS symbol/account, e.g.
+                # "Multiplier is not in acceptable range. Accepts
+                # 400,1000,2000,3000,4000." - confirmed live, this is
+                # NOT the same set for every Volatility index, so
+                # hardcoding a single guessed number (the same mistake
+                # already made once with BTCUSD's pip_size) would just
+                # trade the wrong index correctly and the rest wrong
+                # again. Instead: parse the real numbers Deriv just
+                # gave us and retry ONCE with the lowest one - that's
+                # the safest (least leveraged) valid choice, and it's
+                # always correct because it came from Deriv itself,
+                # not a guess.
+                accepted_match = re.search(r"Accepts\s+([\d,\s]+)", err)
+                if accepted_match and "multiplier" in err.lower():
+                    accepted_values = [
+                        int(v) for v in accepted_match.group(1).split(",") if v.strip().isdigit()
+                    ]
+                    if accepted_values:
+                        retry_multiplier = min(accepted_values)
+                        print(
+                            f"[SYNTH TRADE] Retrying {symbol} with valid "
+                            f"multiplier {retry_multiplier} (Deriv accepts: {accepted_values})"
+                        )
+                        proposal_request["multiplier"] = retry_multiplier
+                        await ws.send(json.dumps(proposal_request))
+                        proposal_response = json.loads(await ws.recv())
+                        if "error" in proposal_response:
+                            retry_err = proposal_response["error"].get("message", "Unknown error")
+                            print(f"[SYNTH TRADE] Retry proposal error: {retry_err}")
+                            return None, f"Couldn't get a quote: {retry_err}"
+                    else:
+                        return None, f"Couldn't get a quote: {err}"
+                else:
+                    return None, f"Couldn't get a quote: {err}"
 
             proposal = proposal_response.get("proposal", {})
             proposal_id = proposal.get("id")
@@ -2396,7 +2467,40 @@ async def run_auto_copy_scan(context: ContextTypes.DEFAULT_TYPE):
             snapshot = await deriv_fetch_account_snapshot(token)
             if not snapshot or snapshot.get("balance") is None:
                 print(f"[AUTO-COPY SCAN] Couldn't read account for {user_id}, skipping this round")
+
+                # Confirmed real case: a dead/expired/revoked token
+                # makes EVERY future scan fail identically for this
+                # user, silently, forever - they were never told,
+                # and the daily digest that would have surfaced this
+                # is permanently disabled. Tell them once (same DB-
+                # backed dedup pattern as low_balance_notified below)
+                # so they know to relink via 🔗 Connect Deriv, rather
+                # than auto-copy just quietly never trading for them
+                # again with no explanation.
+                if not account.get("token_invalid_notified"):
+                    try:
+                        await bot.send_message(
+                            chat_id=int(user_id),
+                            text=(
+                                "⚠️ <b>Auto-copy paused — Deriv connection lost.</b>\n\n"
+                                + friendly_trade_error("Couldn't verify your Deriv account.", auto_copy_context=True)
+                                + "\n\n<i>You won't get this reminder again until "
+                                "you relink your account.</i>"
+                            ),
+                            parse_mode=ParseMode.HTML
+                        )
+                        set_token_invalid_notified(user_id, True)
+                    except Exception as notify_err:
+                        print(f"[AUTO-COPY SCAN] Couldn't notify {user_id} about dead token: {notify_err}")
                 continue
+
+            # Token is working again - clear the flag so a FUTURE
+            # dead-token episode (e.g. after they relink, it dies
+            # again later) notifies them again instead of staying
+            # silently suppressed forever from one old episode.
+            if account.get("token_invalid_notified"):
+                set_token_invalid_notified(user_id, False)
+                account["token_invalid_notified"] = False
 
             balance = snapshot["balance"]
             held_symbols = {
@@ -4398,28 +4502,34 @@ SYNTHETIC_STRATEGY_BANK = [
 def run_strategy_bank(pair_key, config, h1_candles, h4_candles, daily_candles, min_agree=2):
     """
     Runs every strategy in STRATEGY_BANK plus the existing ICT/SMC
-    structure analysis (analyze_smc_structure), and requires at
-    least `min_agree` of them to independently agree on the SAME
-    direction before returning a real signal. This directly replaces
-    the old single-strategy approach, where ICT/SMC alone calling a
-    "STRONG" signal was enough to post, even on a confirmed real
-    case where the latest 1-2 candles were already contradicting the
-    structure it was scoring.
+    structure analysis (analyze_smc_structure), and prefers at least
+    `min_agree` of them to independently agree on the SAME direction.
 
-    min_agree=2 is the floor everywhere now, per explicit instruction
-    - 2 independently agreeing strategies is treated as a real,
-    postable signal rather than falling back to the much weaker
-    rule-based bias. 3 is no longer a hard gate; it's a stronger
-    signal that earns a higher confidence score instead (see the
-    confidence calc below, which already scales with len(winning_votes)
-    - 2 agreeing -> 82%, 3 -> 88%, etc.) - so the only difference
-    between 2 and 3 agreeing strategies is the % shown, not whether
-    it posts at all.
+    min_agree=2 is the PREFERRED bar, not a hard gate - per explicit
+    instruction, every strategy in this bank (including ICT/SMC) is
+    individually pre-verified/trusted, so even 1 agreeing strategy is
+    an acceptable signal to send, just at a lower, honestly-scaled
+    confidence (1 agreeing -> 76%, 2 -> 82%, 3 -> 88%, etc.) rather
+    than falling back to the much weaker rule-based bias. The bank
+    only returns None when literally NO strategy cast any vote at
+    all (votes is empty) - a real "couldn't analyze this pair right
+    now" case, not a disagreement, since there's nothing to fall
+    back to.
+
+    SPECIAL CASE - exactly 1 winning vote: if that lone vote is
+    ICT/SMC, per explicit instruction prefer pairing it down to any
+    OTHER single strategy instead, if one fired at all (regardless of
+    its direction) - ICT/SMC is the most subjective/discretionary
+    strategy in the bank, so when only one vote exists at all, a
+    more mechanical rule-based strategy (RSI, MACD, MA, breakout,
+    etc.) is the safer single signal to send. ICT/SMC only sends
+    alone if it's truly the ONLY strategy that produced any result
+    whatsoever this round.
 
     Returns (direction, confidence, reason, agreeing_strategies) or
-    None if the bar isn't met. confidence scales with how many
-    strategies agreed, same spirit as analyze_smc_structure's
-    confluence-based confidence.
+    None if no strategy produced any result at all. confidence scales
+    with how many strategies agreed, same spirit as
+    analyze_smc_structure's confluence-based confidence.
     """
     votes = []
 
@@ -4451,12 +4561,25 @@ def run_strategy_bank(pair_key, config, h1_candles, h4_candles, daily_candles, m
     winning_votes = buy_votes if len(buy_votes) >= len(sell_votes) else sell_votes
     direction = "BUY" if winning_votes is buy_votes else "SELL"
 
+    # Exactly 1 winning vote AND it's ICT/SMC -> swap to any other
+    # single strategy that fired this round, if one exists at all.
+    if len(winning_votes) == 1 and winning_votes[0]["strategy_name"] == "ICT/SMC":
+        non_smc_votes = [v for v in votes if v["strategy_name"] != "ICT/SMC"]
+        if non_smc_votes:
+            replacement = non_smc_votes[0]
+            print(
+                f"[STRATEGY BANK] {pair_key} - sole vote was ICT/SMC, "
+                f"swapping to {replacement['strategy_name']} per explicit instruction"
+            )
+            winning_votes = [replacement]
+            direction = replacement["direction"]
+
     if len(winning_votes) < min_agree:
         print(
             f"[STRATEGY BANK] {pair_key} only {len(winning_votes)} strategy(ies) "
-            f"agreed on {direction} (need {min_agree}) - no signal this round"
+            f"agreed on {direction} (below preferred {min_agree}) - sending anyway, every "
+            f"strategy in this bank is independently trusted"
         )
-        return None
 
     agreeing_names = [v["strategy_name"] for v in winning_votes]
     confidence = min(95, 70 + len(winning_votes) * 6)
@@ -4486,6 +4609,16 @@ async def run_strategy_bank_synthetic(index_key, config, h1_candles, h4_candles,
     ORB are all excluded here - those strategies' underlying
     assumptions don't hold on an RNG-generated instrument, even
     though their pattern-matching would still technically run.
+
+    min_agree=2 is the PREFERRED bar, not a hard gate - per explicit
+    instruction, every strategy in SYNTHETIC_STRATEGY_BANK is
+    individually pre-verified/trusted, so 1 agreeing strategy is also
+    an acceptable signal to send, just at a lower, honestly-scaled
+    confidence (see the formula below: 1 agreeing -> 76%, 2 -> 82%,
+    3 -> 88%, etc.). The bank only returns None when literally NO
+    strategy cast any vote at all (votes is empty) - that's a real
+    "couldn't analyze this index right now" case, not a disagreement,
+    since there's nothing whatsoever to fall back to.
     """
     votes = []
 
@@ -4515,16 +4648,16 @@ async def run_strategy_bank_synthetic(index_key, config, h1_candles, h4_candles,
     if len(winning_votes) < min_agree:
         print(
             f"[STRATEGY BANK SYNTH] {index_key} only {len(winning_votes)} strategy(ies) "
-            f"agreed on {direction} (need {min_agree}) - no signal this round"
+            f"agreed on {direction} (below preferred {min_agree}) - sending anyway, every "
+            f"strategy in this bank is independently trusted"
         )
-        return None
 
     agreeing_names = [v["strategy_name"] for v in winning_votes]
     confidence = min(95, 70 + len(winning_votes) * 6)
 
     detail_strings = [v["detail"] for v in winning_votes[:3]]
     reason = (
-        f"{len(winning_votes)} independent strategies agree on {direction}: "
+        f"{len(winning_votes)} independent strategy(ies) agree on {direction}: "
         + "; ".join(detail_strings)
         + ("." if len(detail_strings) == len(winning_votes) else f", and {len(winning_votes) - 3} more.")
     )
@@ -4826,11 +4959,14 @@ async def build_signal_response(question, user_id=None):
     h4_candles = get_cached_candles(matched_key, config, "4h", outputsize=60)
     daily_candles = get_cached_candles(matched_key, config, "1day", outputsize=10)
 
-    # min_agree=2 is now the floor for BOTH scheduled channel posts
-    # and DM/manual requests, per explicit instruction - 2 agreeing
-    # strategies is a real, postable signal on its own; 3 agreeing
-    # no longer gates whether it posts, only how high the confidence
-    # % comes out (see run_strategy_bank's confidence calc).
+    # min_agree=2 is the PREFERRED bar everywhere, scheduled and DM
+    # alike - per explicit instruction, run_strategy_bank itself now
+    # always sends a real strategy-backed signal as long as AT LEAST
+    # ONE strategy fired (every strategy in the bank is individually
+    # trusted), only adjusting confidence % rather than gating
+    # whether it posts. generate_rule_based_bias below is now only
+    # reached in the genuinely rare case where literally no strategy
+    # produced any result at all (no usable candle data this round).
     min_agree = 2
 
     bank_result = run_strategy_bank(

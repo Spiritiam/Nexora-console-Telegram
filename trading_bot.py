@@ -3406,23 +3406,27 @@ def get_candle_symbol_candidates(config):
     """
     Ordered candidate symbols to try for candle data.
 
-    Oil: CONFIRMED via real Railway logs that "CL1!" 404s every
-    single time on this TwelveData plan ("**symbol** or **figi**
-    parameter is missing or invalid") - it is NOT a valid symbol
-    here, full stop, not a rate-limit or transient issue. Trying it
-    first wasted an API credit on a guaranteed failure before USOIL
-    (which can work) got a turn, and on an 8-credit-per-minute plan
-    that wasted attempt was directly contributing to the 429 "out of
-    API credits" errors seen immediately after. Dropped entirely -
-    going straight to USOIL, the symbol that's actually valid.
+    Oil: NEITHER "CL1!" NOR "USOIL" work - both confirmed 404ing via
+    real Railway logs ("**symbol** or **figi** parameter is missing
+    or invalid"). Checked TwelveData's own commodities documentation
+    directly (twelvedata.com/commodities and twelvedata.com/forex):
+    their actual listed symbol for this instrument is "WTI/USD"
+    ("Crude Oil WTI Spot (WTI)"), following the same XXX/USD pattern
+    as XAU/USD and XAG/USD, which already work correctly elsewhere in
+    this file. Their own product pages state time_series access
+    starts from the Basic plan (lower than XAGUSD's Grow/Venture
+    requirement), so this has a real chance of working on this
+    account - but this is documentation-based, NOT yet confirmed
+    against a live API response. If "WTI/USD" also 404s, check the
+    real error message (plan-tier restriction vs bad symbol) before
+    trying anything else - don't guess a third symbol blind.
 
-    Silver does NOT get a fallback - CONFIRMED via the same logs that
+    Silver does NOT get a fallback - CONFIRMED via real logs that
     XAG/USD candle data 404s with "available starting with the Grow
-    or Venture plan" - a plan-tier restriction, not a bad symbol, so
-    no alternate spelling would fix it.
+    or Venture plan" - a plan-tier restriction, not a bad symbol.
     """
     if config.get("use_oil_api"):
-        return ["USOIL"]
+        return ["WTI/USD"]
     return [config.get("td_symbol", config["symbol"])]
 
 def get_cached_candles(pair_key, config, interval, outputsize=60):

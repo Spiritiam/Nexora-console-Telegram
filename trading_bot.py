@@ -4004,32 +4004,46 @@ def strategy_london_session_orb(pair_key, config, h1_candles, h4_candles, daily_
 
 def strategy_trend_following(pair_key, config, h1_candles, h4_candles, daily_candles):
     """
-    Simple moving average trend filter: price above both a 50 and
-    200-period H1 MA, with the 50 above the 200 (a real "golden
-    cross" alignment) -> BUY. Mirror case for SELL. Deliberately
-    simple and well-known - this strategy's whole purpose in the
-    bank is to catch sustained directional moves that pure structure
-    analysis sometimes under-weights, not to be clever.
+    Simple moving average trend filter: price above both a 20 and
+    50-period H1 MA, with the 20 above the 50 (a real "golden cross"
+    alignment, scaled down from the original 50/200 pairing) -> BUY.
+    Mirror case for SELL. Deliberately simple and well-known - this
+    strategy's whole purpose in the bank is to catch sustained
+    directional moves that pure structure analysis sometimes
+    under-weights, not to be clever.
+
+    CONFIRMED BUG FIX: this previously required 200 H1 candles
+    (len(h1_candles) < 200 gate) to even attempt a result. Checked
+    every call site directly: the synthetic path
+    (get_cached_synthetic_candles for "1h") always fetches exactly
+    60, so this was silently DEAD on every Volatility index, always,
+    immediately returning None before doing any real work. The main
+    forex signal path (build_signal_response) does fetch 210, so it
+    wasn't dead there - but lowering to a 20/50 MA pair (both
+    reachable with 60 candles) fixes synthetics without changing
+    forex's behavior in any meaningful way (210 candles is still
+    plenty for a 20/50 pair, and the same bullish/bearish alignment
+    logic applies either way).
     """
-    if not h1_candles or len(h1_candles) < 200:
+    if not h1_candles or len(h1_candles) < 50:
         return None
 
     closes = [c["close"] for c in h1_candles]
+    ma20 = sum(closes[-20:]) / 20
     ma50 = sum(closes[-50:]) / 50
-    ma200 = sum(closes[-200:]) / 200
     current_price = closes[-1]
 
-    if current_price > ma50 > ma200:
+    if current_price > ma20 > ma50:
         return {
             "strategy_name": "Trend Following (MA)",
             "direction": "BUY",
-            "detail": f"price above 50/200 MA, MAs aligned bullish",
+            "detail": f"price above 20/50 MA, MAs aligned bullish",
         }
-    if current_price < ma50 < ma200:
+    if current_price < ma20 < ma50:
         return {
             "strategy_name": "Trend Following (MA)",
             "direction": "SELL",
-            "detail": f"price below 50/200 MA, MAs aligned bearish",
+            "detail": f"price below 20/50 MA, MAs aligned bearish",
         }
 
     return None

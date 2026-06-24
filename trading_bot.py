@@ -3176,12 +3176,41 @@ def get_silver_daily_history(days=21):
             "api_key": METALS_API_KEY,
             "start_date": start_date.isoformat(),
             "end_date": end_date.isoformat(),
+            # Explicit currency/unit, matching get_silver_price's /latest
+            # call exactly - the LIKELY REAL CAUSE of a confirmed real
+            # mismatch (chart showed daily values ~61-74, but the true
+            # live spot price was 57.42 at the same moment): the
+            # original request left these unset, and metals.dev's docs
+            # never explicitly confirm /timeseries defaults to the same
+            # USD/toz as /latest - rather than trust an unstated
+            # default, pin it explicitly so both endpoints can never
+            # silently diverge in currency or unit again.
+            "currency": "USD",
+            "unit": "toz",
         }
         response = requests.get(url, params=params, timeout=10)
         data = response.json()
         if data.get("status") != "success":
             print(f"[SILVER DAILY] metals.dev timeseries error: {data}")
             return None
+
+        # CONFIRMED REAL GAP, now fixed: this function previously only
+        # logged on failure paths - when the request technically
+        # succeeded (status == "success") but returned values at a
+        # totally different price level than the real spot price
+        # (real case: chart showed ~61-74, true spot was 57.42), there
+        # was NO log line anywhere showing what was actually received,
+        # making the mismatch impossible to diagnose from logs alone.
+        # Logging the request window, the response's own currency/unit
+        # fields (the most likely real cause - this endpoint can
+        # return a different currency/unit than the /latest endpoint
+        # if either isn't explicitly pinned to match), and the actual
+        # first/last parsed values every time, success or not.
+        print(
+            f"[SILVER DAILY] Requested {start_date.isoformat()} to "
+            f"{end_date.isoformat()} | response currency={data.get('currency')} "
+            f"unit={data.get('unit')}"
+        )
 
         rates = data.get("rates", {})
         history = []
@@ -3193,6 +3222,11 @@ def get_silver_daily_history(days=21):
         if len(history) < 5:
             print(f"[SILVER DAILY] Only {len(history)} days returned, too thin to use")
             return None
+
+        print(
+            f"[SILVER DAILY] Parsed {len(history)} days | "
+            f"first={history[0]} | last={history[-1]}"
+        )
 
         return history
     except Exception as e:

@@ -5,6 +5,7 @@ import requests
 import re
 import json
 import time
+import inspect
 import websockets
 
 from metaapi_cloud_sdk import MetaApi
@@ -1525,7 +1526,7 @@ def match_synthetic_key(question):
                 return key
     return None
 
-SYNTHETIC_CANDLE_CACHE_SECONDS = {"1h": 3600, "4h": 14400}
+SYNTHETIC_CANDLE_CACHE_SECONDS = {"1m": 30, "5m": 120, "1h": 3600, "4h": 14400}
 synthetic_candle_cache = {}
 
 async def deriv_get_candles(symbol, granularity, count=60):
@@ -1845,22 +1846,34 @@ async def analyze_synthetic_structure(index_key, config):
     )
     return direction, confidence, reason
 
-async def build_synthetic_signal_response(index_key):
+async def build_synthetic_signal_response(index_key, min_agree=3):
     """
     Builds the signal message, image, and the trade context that
     gets stored for if/when the user taps "Trade This Signal".
     Returns (image_file_id, message_html, trade_context), or None
     if no signal could be generated.
+
+    min_agree defaults to 3 (DM/manual request bar) - scheduled
+    channel posts explicitly pass 2 instead, per the same scheduled-
+    vs-manual split used for forex/gold/crypto signals.
     """
     config = SYNTHETIC_CONFIG.get(index_key)
     if not config:
         return None
 
-    result = await analyze_synthetic_structure(index_key, config)
+    symbol = config["symbol"]
+    h1_candles = await get_cached_synthetic_candles(index_key, symbol, "1h", 3600, 60)
+    h4_candles = await get_cached_synthetic_candles(index_key, symbol, "4h", 14400, 60)
+    daily_candles = await get_cached_synthetic_candles(index_key, symbol, "1day", 86400, 10)
+    m1_candles = await get_cached_synthetic_candles(index_key, symbol, "1m", 60, 60)
+
+    result = await run_strategy_bank_synthetic(
+        index_key, config, h1_candles, h4_candles, daily_candles, m1_candles=m1_candles, min_agree=min_agree
+    )
     if not result:
         return None
 
-    direction, confidence, reason = result
+    direction, confidence, reason, agreeing_strategies = result
     contract_type = "MULTUP" if direction == "BUY" else "MULTDOWN"
 
     if direction == "BUY":
@@ -1873,7 +1886,7 @@ async def build_synthetic_signal_response(index_key):
     message = (
         f"{emoji} <b>STRONG {direction} {config['display']}</b> ⚡\n\n"
         f"<b>Confidence:</b> {confidence}%\n\n"
-        f"<b>Reason:</b> {reason}\n\n"
+        f"<b>Reason:</b>\n{reason}\n\n"
         f"<b>Suggested:</b> ${DEFAULT_SYNTHETIC_STAKE} stake | "
         f"Risk ${DEFAULT_RISK} → Target ${DEFAULT_WIN}\n"
         f"<i>(Stake and risk/target are adjustable before you confirm)</i>\n\n"
@@ -2316,10 +2329,17 @@ async def run_auto_copy_scan(context: ContextTypes.DEFAULT_TYPE):
     # the market doesn't change per-user, so this is computed once.
     fresh_signals = {}
     for index_key, config in SYNTHETIC_CONFIG.items():
-        result = await analyze_synthetic_structure(index_key, config)
+        symbol = config["symbol"]
+        h1_candles = await get_cached_synthetic_candles(index_key, symbol, "1h", 3600, 60)
+        h4_candles = await get_cached_synthetic_candles(index_key, symbol, "4h", 14400, 60)
+        daily_candles = await get_cached_synthetic_candles(index_key, symbol, "1day", 86400, 10)
+        m1_candles = await get_cached_synthetic_candles(index_key, symbol, "1m", 60, 60)
+        result = await run_strategy_bank_synthetic(
+            index_key, config, h1_candles, h4_candles, daily_candles, m1_candles=m1_candles, min_agree=2
+        )
         if not result:
             continue
-        direction, confidence, reason = result
+        direction, confidence, reason, agreeing_strategies = result
         contract_type = "MULTUP" if direction == "BUY" else "MULTDOWN"
         fresh_signals[index_key] = {
             "index_key": index_key,
@@ -3169,6 +3189,7 @@ def get_cached_price_data(pair_key, symbol, config):
 CANDLE_CACHE_SECONDS = {
     "1h": 3600,
     "4h": 14400,
+    "1day": 21600,  # 6h - previous day's high/low doesn't change intraday, no need to refetch often
 }
 
 candle_cache = {}
@@ -3194,6 +3215,7 @@ def get_candles_twelvedata(symbol, interval, outputsize=60):
                 "high": float(v["high"]),
                 "low": float(v["low"]),
                 "close": float(v["close"]),
+                "volume": float(v["volume"]) if v.get("volume") not in (None, "") else None,
             })
         candles.reverse()  # twelvedata returns newest first; we want oldest -> newest
         return candles
@@ -3582,6 +3604,903 @@ def analyze_smc_structure(pair_key, config):
     return direction, confidence, reason, timeframe_confirmation
 
 # ============================================
+# STRATEGY BANK (NEW)
+# A real signal now requires at least 2-3 of
+# these independent strategies to agree on the
+# same direction before posting at all - per
+# explicit instruction, replacing the old
+# single-strategy (ICT/SMC only) approach that
+# could call a "STRONG" signal off one structure
+# reading even when fresher price action was
+# already contradicting it (the real, confirmed
+# case that triggered this whole rebuild: a BUY
+# call on Volatility 10 right as the latest 1-2
+# candles on both H1 and H4 showed a rejection
+# back down).
+#
+# Every strategy function below shares one
+# interface: takes (pair_key, config, h1_candles,
+# h4_candles, daily_candles) and returns either
+# None (no signal from this strategy right now)
+# or a dict: {"strategy_name": str, "direction":
+# "BUY"/"SELL", "detail": str}. This uniform
+# shape is what lets run_strategy_bank treat all
+# 10 identically regardless of each one's
+# internal logic.
+# ============================================
+
+def calculate_rsi(candles, period=14):
+    """
+    Standard Wilder's RSI. Returns a list of RSI values aligned to
+    candles[period:] (the first `period` candles can't have an RSI
+    yet), or [] if there isn't enough data.
+    """
+    if len(candles) < period + 1:
+        return []
+
+    closes = [c["close"] for c in candles]
+    deltas = [closes[i] - closes[i - 1] for i in range(1, len(closes))]
+
+    gains = [d if d > 0 else 0 for d in deltas]
+    losses = [-d if d < 0 else 0 for d in deltas]
+
+    avg_gain = sum(gains[:period]) / period
+    avg_loss = sum(losses[:period]) / period
+
+    rsi_values = []
+    for i in range(period, len(deltas)):
+        if i > period:
+            avg_gain = (avg_gain * (period - 1) + gains[i]) / period
+            avg_loss = (avg_loss * (period - 1) + losses[i]) / period
+        rs = avg_gain / avg_loss if avg_loss != 0 else float("inf")
+        rsi = 100 - (100 / (1 + rs))
+        rsi_values.append(rsi)
+
+    return rsi_values
+
+def detect_bullish_engulfing(candles):
+    if len(candles) < 2:
+        return False
+    prev, last = candles[-2], candles[-1]
+    prev_bearish = prev["close"] < prev["open"]
+    last_bullish = last["close"] > last["open"]
+    engulfs = last["open"] <= prev["close"] and last["close"] >= prev["open"]
+    return prev_bearish and last_bullish and engulfs
+
+def detect_bearish_engulfing(candles):
+    if len(candles) < 2:
+        return False
+    prev, last = candles[-2], candles[-1]
+    prev_bullish = prev["close"] > prev["open"]
+    last_bearish = last["close"] < last["open"]
+    engulfs = last["open"] >= prev["close"] and last["close"] <= prev["open"]
+    return prev_bullish and last_bearish and engulfs
+
+def detect_rsi_divergence(candles, rsi_values, direction, lookback=10):
+    """
+    Bullish divergence: price makes a lower low while RSI makes a
+    higher low (momentum quietly improving even as price still
+    falls). Bearish divergence: price makes a higher high while RSI
+    makes a lower high. Compares the most recent extreme against the
+    prior one within `lookback` candles - a simplified, real check,
+    not a guess.
+    """
+    if len(rsi_values) < lookback or len(candles) < lookback:
+        return False
+
+    recent_candles = candles[-lookback:]
+    recent_rsi = rsi_values[-lookback:]
+
+    if direction == "BUY":
+        lows = [(i, c["low"]) for i, c in enumerate(recent_candles)]
+        lows_sorted = sorted(lows, key=lambda x: x[1])
+        if len(lows_sorted) < 2:
+            return False
+        idx1, idx2 = lows_sorted[0][0], lows_sorted[1][0]
+        first_idx, second_idx = min(idx1, idx2), max(idx1, idx2)
+        if second_idx == first_idx:
+            return False
+        price_lower_low = recent_candles[second_idx]["low"] < recent_candles[first_idx]["low"]
+        rsi_higher_low = recent_rsi[second_idx] > recent_rsi[first_idx]
+        return price_lower_low and rsi_higher_low and second_idx > first_idx
+    else:
+        highs = [(i, c["high"]) for i, c in enumerate(recent_candles)]
+        highs_sorted = sorted(highs, key=lambda x: -x[1])
+        if len(highs_sorted) < 2:
+            return False
+        idx1, idx2 = highs_sorted[0][0], highs_sorted[1][0]
+        first_idx, second_idx = min(idx1, idx2), max(idx1, idx2)
+        if second_idx == first_idx:
+            return False
+        price_higher_high = recent_candles[second_idx]["high"] > recent_candles[first_idx]["high"]
+        rsi_lower_high = recent_rsi[second_idx] < recent_rsi[first_idx]
+        return price_higher_high and rsi_lower_high and second_idx > first_idx
+
+def strategy_rsi_extreme_reversal(pair_key, config, h1_candles, h4_candles, daily_candles):
+    """
+    BUY: RSI < 20, bullish divergence, bullish engulfing - all three.
+    SELL: RSI > 80, bearish divergence, bearish engulfing - all three.
+    Requires all three conditions together, not just RSI alone -
+    matches the real strategy as specified, not a watered-down
+    version that fires on RSI extremes by themselves (which would
+    be far too frequent and far weaker).
+    """
+    if not h1_candles or len(h1_candles) < 25:
+        return None
+
+    rsi_values = calculate_rsi(h1_candles, period=14)
+    if not rsi_values:
+        return None
+
+    current_rsi = rsi_values[-1]
+
+    if current_rsi < 20:
+        if detect_rsi_divergence(h1_candles, rsi_values, "BUY") and detect_bullish_engulfing(h1_candles):
+            return {
+                "strategy_name": "RSI Extreme Reversal",
+                "direction": "BUY",
+                "detail": f"RSI oversold ({current_rsi:.0f}) + bullish divergence + engulfing",
+            }
+    elif current_rsi > 80:
+        if detect_rsi_divergence(h1_candles, rsi_values, "SELL") and detect_bearish_engulfing(h1_candles):
+            return {
+                "strategy_name": "RSI Extreme Reversal",
+                "direction": "SELL",
+                "detail": f"RSI overbought ({current_rsi:.0f}) + bearish divergence + engulfing",
+            }
+
+    return None
+
+def strategy_previous_day_high_low_manipulation(pair_key, config, h1_candles, h4_candles, daily_candles):
+    """
+    BUY: previous day's low gets swept (wicked below, but closes back
+    above it within the most recent few H1 candles), then structure
+    breaks upward. SELL: mirror case on the previous day's high.
+    Real liquidity-hunt logic, not a guess - requires both the sweep
+    AND a confirming break of structure afterward, same discipline as
+    detect_liquidity_sweep elsewhere in this file.
+    """
+    if not daily_candles or len(daily_candles) < 2 or not h1_candles or len(h1_candles) < 10:
+        return None
+
+    prev_day = daily_candles[-2]  # most recent FULLY CLOSED day, not today's still-forming one
+    prev_day_high = prev_day["high"]
+    prev_day_low = prev_day["low"]
+
+    recent_h1 = h1_candles[-5:]
+    swings = find_swing_points(h1_candles, strength=2)
+
+    for c in recent_h1:
+        if c["low"] < prev_day_low and c["close"] > prev_day_low:
+            bos = detect_bos_choch(swings)
+            if bos and bos["direction"] == "BUY":
+                return {
+                    "strategy_name": "Previous Day High/Low Manipulation",
+                    "direction": "BUY",
+                    "detail": f"prior day low swept ({prev_day_low:.2f}), bullish break",
+                }
+
+    for c in recent_h1:
+        if c["high"] > prev_day_high and c["close"] < prev_day_high:
+            bos = detect_bos_choch(swings)
+            if bos and bos["direction"] == "SELL":
+                return {
+                    "strategy_name": "Previous Day High/Low Manipulation",
+                    "direction": "SELL",
+                    "detail": f"prior day high swept ({prev_day_high:.2f}), bearish break",
+                }
+
+    return None
+
+LONDON_SESSION_START_UTC = 7   # 7:00 UTC - London open
+LONDON_SESSION_RANGE_HOURS = 1  # opening range = first hour after open
+
+def strategy_london_session_orb(pair_key, config, h1_candles, h4_candles, daily_candles):
+    """
+    Marks the London opening range (first hour after 7:00 UTC open),
+    then looks for a breakout beyond that range followed by a retest
+    of the broken level - the real ORB entry trigger, not just
+    "price is now outside the range" (which would just be a raw
+    breakout, not this specific strategy). Best suited to GBPUSD per
+    the original spec, but not hard-restricted to it - any pair can
+    still independently confirm it if the data supports it, since
+    the bank's job is to let strategies vote where they genuinely
+    apply, not gate by pair name.
+    """
+    if not h1_candles or len(h1_candles) < 6:
+        return None
+
+    now = datetime.utcnow()
+    if now.hour < LONDON_SESSION_START_UTC + LONDON_SESSION_RANGE_HOURS:
+        return None  # opening range hasn't even finished forming yet today
+
+    todays_candles = [
+        c for c in h1_candles
+        if c.get("time") and c["time"][:10] == now.strftime("%Y-%m-%d")
+    ]
+    if len(todays_candles) < 2:
+        return None
+
+    range_candles = [
+        c for c in todays_candles
+        if c.get("time") and LONDON_SESSION_START_UTC <= int(c["time"][11:13]) < LONDON_SESSION_START_UTC + LONDON_SESSION_RANGE_HOURS
+    ]
+    if not range_candles:
+        return None
+
+    range_high = max(c["high"] for c in range_candles)
+    range_low = min(c["low"] for c in range_candles)
+
+    post_range_candles = [
+        c for c in todays_candles
+        if c.get("time") and int(c["time"][11:13]) >= LONDON_SESSION_START_UTC + LONDON_SESSION_RANGE_HOURS
+    ]
+    if len(post_range_candles) < 2:
+        return None
+
+    breakout_candle = None
+    for c in post_range_candles[:-1]:
+        if c["close"] > range_high:
+            breakout_candle = ("BUY", c)
+            break
+        if c["close"] < range_low:
+            breakout_candle = ("SELL", c)
+            break
+
+    if not breakout_candle:
+        return None
+
+    direction, _ = breakout_candle
+    last = post_range_candles[-1]
+
+    if direction == "BUY" and range_low <= last["low"] <= range_high * 1.002 and last["close"] > range_high:
+        return {
+            "strategy_name": "London Session ORB",
+            "direction": "BUY",
+            "detail": f"London opening range ({range_low:.2f}-{range_high:.2f}) broken upward and retested",
+        }
+    if direction == "SELL" and range_low * 0.998 <= last["high"] <= range_high and last["close"] < range_low:
+        return {
+            "strategy_name": "London Session ORB",
+            "direction": "SELL",
+            "detail": f"London opening range ({range_low:.2f}-{range_high:.2f}) broken downward and retested",
+        }
+
+    return None
+
+def strategy_trend_following(pair_key, config, h1_candles, h4_candles, daily_candles):
+    """
+    Simple moving average trend filter: price above both a 50 and
+    200-period H1 MA, with the 50 above the 200 (a real "golden
+    cross" alignment) -> BUY. Mirror case for SELL. Deliberately
+    simple and well-known - this strategy's whole purpose in the
+    bank is to catch sustained directional moves that pure structure
+    analysis sometimes under-weights, not to be clever.
+    """
+    if not h1_candles or len(h1_candles) < 200:
+        return None
+
+    closes = [c["close"] for c in h1_candles]
+    ma50 = sum(closes[-50:]) / 50
+    ma200 = sum(closes[-200:]) / 200
+    current_price = closes[-1]
+
+    if current_price > ma50 > ma200:
+        return {
+            "strategy_name": "Trend Following (MA)",
+            "direction": "BUY",
+            "detail": f"price above 50/200 MA, MAs aligned bullish",
+        }
+    if current_price < ma50 < ma200:
+        return {
+            "strategy_name": "Trend Following (MA)",
+            "direction": "SELL",
+            "detail": f"price below 50/200 MA, MAs aligned bearish",
+        }
+
+    return None
+
+def strategy_breakout(pair_key, config, h1_candles, h4_candles, daily_candles):
+    """
+    General consolidation-range breakout - distinct from London ORB
+    (which is specifically the session opening range). Looks for a
+    tight recent range (last 10 candles, high-low spread under 1.5x
+    the prior 20 candles' average range) followed by the most recent
+    candle closing clearly outside it - a genuine breakout from
+    quiet conditions, not just any directional candle.
+    """
+    if not h1_candles or len(h1_candles) < 30:
+        return None
+
+    consolidation = h1_candles[-11:-1]
+    prior = h1_candles[-31:-11]
+    if not consolidation or not prior:
+        return None
+
+    consolidation_range = max(c["high"] for c in consolidation) - min(c["low"] for c in consolidation)
+    prior_avg_range = sum(c["high"] - c["low"] for c in prior) / len(prior)
+    if prior_avg_range == 0:
+        return None
+
+    is_tight = consolidation_range < prior_avg_range * 1.5
+    if not is_tight:
+        return None
+
+    range_high = max(c["high"] for c in consolidation)
+    range_low = min(c["low"] for c in consolidation)
+    last = h1_candles[-1]
+
+    if last["close"] > range_high:
+        return {
+            "strategy_name": "Breakout",
+            "direction": "BUY",
+            "detail": f"broke above consolidation ({range_low:.2f}-{range_high:.2f})",
+        }
+    if last["close"] < range_low:
+        return {
+            "strategy_name": "Breakout",
+            "direction": "SELL",
+            "detail": f"broke below consolidation ({range_low:.2f}-{range_high:.2f})",
+        }
+
+    return None
+
+def strategy_support_resistance_bounce(pair_key, config, h1_candles, h4_candles, daily_candles):
+    """
+    Finds horizontal levels tested at least twice in recent history
+    (a real, well-recognized S/R level, not a one-off touch), then
+    checks if the most recent candle just bounced off one with a
+    rejection wick. Simpler and cruder than ICT's order blocks on
+    purpose - this is meant to be the "classic, universally
+    recognized level" complement, not a duplicate of order-block logic.
+    """
+    if not h1_candles or len(h1_candles) < 30:
+        return None
+
+    swings = find_swing_points(h1_candles, strength=2)
+    if not swings:
+        return None
+
+    tolerance = 0.0015  # 0.15% - levels within this band count as "the same level"
+    level_touches = {}
+    for s in swings:
+        matched = False
+        for level in list(level_touches.keys()):
+            if abs(s["price"] - level) / level <= tolerance:
+                level_touches[level].append(s)
+                matched = True
+                break
+        if not matched:
+            level_touches[s["price"]] = [s]
+
+    tested_levels = {lvl: touches for lvl, touches in level_touches.items() if len(touches) >= 2}
+    if not tested_levels:
+        return None
+
+    last = h1_candles[-1]
+    candle_range = last["high"] - last["low"]
+    if candle_range == 0:
+        return None
+
+    for level, touches in tested_levels.items():
+        level_type = touches[0]["type"]
+        if level_type == "low" and last["low"] <= level * (1 + tolerance) and (last["close"] - last["low"]) / candle_range >= 0.6:
+            return {
+                "strategy_name": "Support/Resistance Bounce",
+                "direction": "BUY",
+                "detail": f"price bounced off a well-tested support level (~{level:.2f})",
+            }
+        if level_type == "high" and last["high"] >= level * (1 - tolerance) and (last["high"] - last["close"]) / candle_range >= 0.6:
+            return {
+                "strategy_name": "Support/Resistance Bounce",
+                "direction": "SELL",
+                "detail": f"price rejected a well-tested resistance level (~{level:.2f})",
+            }
+
+    return None
+
+def calculate_macd(candles, fast=12, slow=26, signal=9):
+    """
+    Standard MACD: EMA(fast) - EMA(slow), with a signal line as the
+    EMA of that difference. Returns (macd_line, signal_line) as
+    parallel lists, or ([], []) if there isn't enough data.
+    """
+    if len(candles) < slow + signal:
+        return [], []
+
+    closes = [c["close"] for c in candles]
+
+    def ema(values, period):
+        k = 2 / (period + 1)
+        result = [values[0]]
+        for v in values[1:]:
+            result.append(v * k + result[-1] * (1 - k))
+        return result
+
+    ema_fast = ema(closes, fast)
+    ema_slow = ema(closes, slow)
+    macd_line = [f - s for f, s in zip(ema_fast, ema_slow)]
+    signal_line = ema(macd_line, signal)
+
+    return macd_line, signal_line
+
+def strategy_momentum_macd(pair_key, config, h1_candles, h4_candles, daily_candles):
+    """
+    MACD line crossing above its signal line (bullish) or below
+    (bearish), specifically while the cross is FRESH (happened on
+    the most recent candle, not several candles ago) - this is the
+    strategy specifically meant to catch momentum that's accelerating
+    or decelerating RIGHT NOW, which is exactly what was missing from
+    the confirmed real case that triggered this whole rebuild (a
+    structure-based BUY call posted right as momentum was already
+    visibly fading on the latest candles).
+    """
+    if not h1_candles or len(h1_candles) < 40:
+        return None
+
+    macd_line, signal_line = calculate_macd(h1_candles)
+    if len(macd_line) < 2 or len(signal_line) < 2:
+        return None
+
+    prev_macd, curr_macd = macd_line[-2], macd_line[-1]
+    prev_signal, curr_signal = signal_line[-2], signal_line[-1]
+
+    crossed_bullish = prev_macd <= prev_signal and curr_macd > curr_signal
+    crossed_bearish = prev_macd >= prev_signal and curr_macd < curr_signal
+
+    if crossed_bullish:
+        return {
+            "strategy_name": "Momentum (MACD)",
+            "direction": "BUY",
+            "detail": "MACD just crossed bullish on the most recent candle",
+        }
+    if crossed_bearish:
+        return {
+            "strategy_name": "Momentum (MACD)",
+            "direction": "SELL",
+            "detail": "MACD just crossed bearish on the most recent candle",
+        }
+
+    return None
+
+def detect_breaker_block(candles, swings):
+    """
+    A breaker block is an order block that FAILED - price swept
+    through a swing point that should have held, invalidating the
+    order block that formed it, which then flips polarity: what was
+    resistance becomes support (bullish breaker) or what was support
+    becomes resistance (bearish breaker). Distinct from
+    detect_order_block (which looks for a block that's still
+    holding, not one that's already failed and flipped).
+    """
+    if len(candles) < 10 or not swings:
+        return None
+
+    recent_highs = [s for s in swings if s["type"] == "high"]
+    recent_lows = [s for s in swings if s["type"] == "low"]
+    current_price = candles[-1]["close"]
+
+    # Bullish breaker: a swing low got swept (price broke below it),
+    # then price reversed back above that same level - the old
+    # support, having failed, now acts as a new support/breaker zone
+    # if price returns to test it from above.
+    if len(recent_lows) >= 2:
+        broken_low = recent_lows[-2]
+        if any(c["low"] < broken_low["price"] for c in candles[broken_low["index"]:-1]):
+            if current_price > broken_low["price"]:
+                zone_low = broken_low["price"]
+                zone_high = broken_low["price"] * 1.002
+                if zone_low <= current_price <= zone_high:
+                    return {"direction": "BUY", "detail": "bullish breaker block reaction"}
+
+    # Bearish breaker: mirror case on a swept swing high.
+    if len(recent_highs) >= 2:
+        broken_high = recent_highs[-2]
+        if any(c["high"] > broken_high["price"] for c in candles[broken_high["index"]:-1]):
+            if current_price < broken_high["price"]:
+                zone_high = broken_high["price"]
+                zone_low = broken_high["price"] * 0.998
+                if zone_low <= current_price <= zone_high:
+                    return {"direction": "SELL", "detail": "bearish breaker block reaction"}
+
+    return None
+
+def strategy_unicorn_model(pair_key, config, h1_candles, h4_candles, daily_candles):
+    """
+    The highest-conviction strategy in the bank, per the original
+    spec - requires ALL FOUR to align in the same direction: a
+    liquidity sweep, a market structure shift (BOS/CHoCH), a fair
+    value gap, and a breaker block reaction. Deliberately the
+    strictest strategy here, since when all four genuinely align
+    together it's meant to be a rare, high-quality setup, not a
+    frequent one.
+    """
+    if not h1_candles or len(h1_candles) < 15:
+        return None
+
+    swings = find_swing_points(h1_candles, strength=2)
+    sweep = detect_liquidity_sweep(h1_candles, swings)
+    mss = detect_bos_choch(swings)
+    fvg = detect_fvg(h1_candles)
+    breaker = detect_breaker_block(h1_candles, swings)
+
+    components = [sweep, mss, fvg, breaker]
+    if any(c is None for c in components):
+        return None
+
+    directions = {c["direction"] for c in components}
+    if len(directions) != 1:
+        return None  # all four must agree on the SAME direction, not just all be present
+
+    direction = directions.pop()
+    return {
+        "strategy_name": "Unicorn Model",
+        "direction": direction,
+        "detail": "liquidity sweep, market structure shift, fair value gap, and breaker block all aligned",
+    }
+
+def strategy_volume_profile_poc(pair_key, config, h1_candles, h4_candles, daily_candles):
+    """
+    DIAGNOSTIC ONLY - does not yet cast a real vote. True Volume
+    Profile (Point of Control, Value Area High/Low) requires genuine
+    traded volume, which forex/gold pairs don't reliably have through
+    TwelveData (they're quoted as currency pairs, not exchange-traded
+    instruments with real centralized volume), and synthetic indices
+    have no real volume concept at all (RNG-generated, no actual
+    trades). BTC/USD might have real volume depending on which
+    exchange TwelveData sources it from - this logs whatever is
+    actually returned so that can be confirmed with real data before
+    building the real strategy on top of it, rather than guessing
+    (the same discipline already applied elsewhere in this file after
+    the R_75 multiplier guess turned out wrong). Always returns None
+    until volume is confirmed real and non-null across enough recent
+    candles to trust.
+    """
+    if pair_key != "btcusd" or not h1_candles:
+        return None
+
+    volumes = [c.get("volume") for c in h1_candles[-10:]]
+    non_null_count = sum(1 for v in volumes if v is not None and v > 0)
+
+    print(
+        f"[POC DIAGNOSTIC] BTCUSD last 10 H1 candles volume sample: {volumes} "
+        f"({non_null_count}/10 non-null/non-zero)"
+    )
+
+    return None  # never casts a real vote yet - diagnostic only, see docstring
+
+def _shorten_for_bullet(reason_text, max_words=10):
+    """
+    ICT/SMC's reason text (from analyze_smc_structure/analyze_
+    synthetic_structure) was written as a full standalone sentence,
+    often longer than every other strategy's detail string - this
+    trims it to its first clause for clean bullet display alongside
+    the rest, since the strategy bank's reason is now several short
+    bullets, not one long paragraph.
+    """
+    first_clause = re.split(r"[,.]", reason_text)[0].strip()
+    words = first_clause.split()
+    if len(words) > max_words:
+        first_clause = " ".join(words[:max_words]) + "..."
+    return first_clause
+
+def calculate_bollinger_bands(candles, period=20, std_dev=2):
+    """
+    Standard Bollinger Bands: a simple moving average with upper/
+    lower bands at std_dev standard deviations. Returns (upper,
+    middle, lower) for the MOST RECENT candle only, or (None, None,
+    None) if there isn't enough data.
+    """
+    if len(candles) < period:
+        return None, None, None
+
+    closes = [c["close"] for c in candles[-period:]]
+    middle = sum(closes) / period
+    variance = sum((c - middle) ** 2 for c in closes) / period
+    std = variance ** 0.5
+
+    upper = middle + (std_dev * std)
+    lower = middle - (std_dev * std)
+    return upper, middle, lower
+
+def calculate_ema_series(candles, period):
+    """Returns the full EMA series (not just the latest value) for crossover/pullback comparisons."""
+    if len(candles) < period:
+        return []
+    closes = [c["close"] for c in candles]
+    k = 2 / (period + 1)
+    ema_values = [closes[0]]
+    for price in closes[1:]:
+        ema_values.append(price * k + ema_values[-1] * (1 - k))
+    return ema_values
+
+def strategy_bollinger_rsi_mean_reversion(pair_key, config, h1_candles, h4_candles, daily_candles, m1_candles=None):
+    """
+    Synthetics-specific (per explicit instruction: best for V75,
+    V100, V50). BUY: price closes below the lower Bollinger Band,
+    RSI below 25, and the NEXT candle closes bullish (confirmation,
+    not just the extreme alone - the original spec explicitly
+    requires this third condition). SELL: mirror case on the upper
+    band / RSI above 75. Operates on M1 candles if provided
+    (matching the original spec's scalping timeframe), falling back
+    to H1 if M1 isn't available, since this strategy is also usable
+    on slower timeframes for non-scalping callers.
+    """
+    candles = m1_candles if m1_candles else h1_candles
+    if not candles or len(candles) < 25:
+        return None
+
+    rsi_values = calculate_rsi(candles, period=14)
+    if len(rsi_values) < 2:
+        return None
+
+    upper, middle, lower = calculate_bollinger_bands(candles[:-1], period=20)
+    if upper is None:
+        return None
+
+    setup_candle = candles[-2]
+    confirm_candle = candles[-1]
+    setup_rsi = rsi_values[-2]
+
+    if setup_candle["close"] < lower and setup_rsi < 25 and confirm_candle["close"] > confirm_candle["open"]:
+        return {
+            "strategy_name": "Bollinger+RSI Mean Reversion",
+            "direction": "BUY",
+            "detail": f"closed below lower BB, RSI {setup_rsi:.0f}, bullish confirm",
+        }
+
+    upper2, _, lower2 = calculate_bollinger_bands(candles[:-1], period=20)
+    if setup_candle["close"] > upper and setup_rsi > 75 and confirm_candle["close"] < confirm_candle["open"]:
+        return {
+            "strategy_name": "Bollinger+RSI Mean Reversion",
+            "direction": "SELL",
+            "detail": f"closed above upper BB, RSI {setup_rsi:.0f}, bearish confirm",
+        }
+
+    return None
+
+def strategy_ema_pullback_scalper(pair_key, config, h1_candles, h4_candles, daily_candles, m1_candles=None):
+    """
+    Synthetics-specific (per explicit instruction: best for V75,
+    V100, M1 or M5 timeframe). BUY: EMA20 above EMA50 (uptrend),
+    price pulls back to touch/near EMA20, then a bullish engulfing
+    candle confirms the bounce. SELL: mirror case in a downtrend.
+    """
+    candles = m1_candles if m1_candles else h1_candles
+    if not candles or len(candles) < 55:
+        return None
+
+    ema20 = calculate_ema_series(candles, 20)
+    ema50 = calculate_ema_series(candles, 50)
+    if len(ema20) < 2 or len(ema50) < 2:
+        return None
+
+    current_ema20 = ema20[-1]
+    current_ema50 = ema50[-1]
+    last = candles[-1]
+    tolerance = 0.0015
+
+    pulled_back_to_ema20 = abs(last["low"] - current_ema20) / current_ema20 <= tolerance or \
+        abs(last["high"] - current_ema20) / current_ema20 <= tolerance
+
+    if current_ema20 > current_ema50 and pulled_back_to_ema20 and detect_bullish_engulfing(candles):
+        return {
+            "strategy_name": "EMA Pullback Scalper",
+            "direction": "BUY",
+            "detail": "EMA20>50 uptrend, pullback to EMA20, bullish engulfing",
+        }
+    if current_ema20 < current_ema50 and pulled_back_to_ema20 and detect_bearish_engulfing(candles):
+        return {
+            "strategy_name": "EMA Pullback Scalper",
+            "direction": "SELL",
+            "detail": "EMA20<50 downtrend, pullback to EMA20, bearish engulfing",
+        }
+
+    return None
+
+def strategy_volatility_breakout_scalper(pair_key, config, h1_candles, h4_candles, daily_candles, m1_candles=None):
+    """
+    Synthetics-specific, HFT-style per original spec: BUY when the
+    most recent candle closes above the highest high of the prior 10
+    candles; SELL when it closes below the lowest low of the prior
+    10. Deliberately the simplest, fastest-firing strategy in the
+    synthetic roster - "enter instantly" on a clean break, no
+    additional confirmation required, matching the original spec.
+    """
+    candles = m1_candles if m1_candles else h1_candles
+    if not candles or len(candles) < 11:
+        return None
+
+    prior_10 = candles[-11:-1]
+    last = candles[-1]
+
+    highest_high = max(c["high"] for c in prior_10)
+    lowest_low = min(c["low"] for c in prior_10)
+
+    if last["close"] > highest_high:
+        return {
+            "strategy_name": "Volatility Breakout Scalper",
+            "direction": "BUY",
+            "detail": f"broke above 10-candle high ({highest_high:.2f})",
+        }
+    if last["close"] < lowest_low:
+        return {
+            "strategy_name": "Volatility Breakout Scalper",
+            "direction": "SELL",
+            "detail": f"broke below 10-candle low ({lowest_low:.2f})",
+        }
+
+    return None
+
+STRATEGY_BANK = [
+    strategy_rsi_extreme_reversal,
+    strategy_unicorn_model,
+    strategy_previous_day_high_low_manipulation,
+    strategy_london_session_orb,
+    strategy_trend_following,
+    strategy_breakout,
+    strategy_support_resistance_bounce,
+    strategy_momentum_macd,
+    strategy_volume_profile_poc,  # diagnostic only right now, always returns None - see docstring
+]
+
+# Distinct roster for synthetic (Deriv) indices - per explicit
+# instruction, removes every ICT/FVG-dependent strategy (ICT/SMC,
+# Unicorn Model, Previous Day H/L Manipulation, London Session ORB),
+# since synthetics have no real liquidity, sessions, or institutional
+# order flow for those strategies' underlying assumptions to hold.
+# Keeps the price-action/indicator-based strategies that don't
+# depend on those assumptions, and adds three synthetics-specific
+# scalping strategies suited to how RNG-driven instruments actually
+# behave (mean reversion off Bollinger extremes, EMA pullback
+# continuation, and raw volatility breakout).
+SYNTHETIC_STRATEGY_BANK = [
+    strategy_rsi_extreme_reversal,
+    strategy_trend_following,
+    strategy_breakout,
+    strategy_support_resistance_bounce,
+    strategy_momentum_macd,
+    strategy_bollinger_rsi_mean_reversion,
+    strategy_ema_pullback_scalper,
+    strategy_volatility_breakout_scalper,
+]
+
+def run_strategy_bank(pair_key, config, h1_candles, h4_candles, daily_candles, min_agree=3):
+    """
+    Runs every strategy in STRATEGY_BANK plus the existing ICT/SMC
+    structure analysis (analyze_smc_structure), and requires at
+    least `min_agree` of them to independently agree on the SAME
+    direction before returning a real signal. This directly replaces
+    the old single-strategy approach, where ICT/SMC alone calling a
+    "STRONG" signal was enough to post, even on a confirmed real
+    case where the latest 1-2 candles were already contradicting the
+    structure it was scoring.
+
+    min_agree is deliberately a parameter, not a constant - scheduled
+    channel posts use a lower bar (2) than DM/manual requests (3),
+    per explicit instruction, since a stricter bar would otherwise
+    make scheduled posts fall back to the much weaker rule-based bias
+    far more often than calling a real strategy-backed signal.
+
+    Returns (direction, confidence, reason, agreeing_strategies) or
+    None if the bar isn't met. confidence scales with how many
+    strategies agreed, same spirit as analyze_smc_structure's
+    confluence-based confidence.
+    """
+    votes = []
+
+    smc_result = analyze_smc_structure(pair_key, config)
+    if smc_result:
+        smc_direction, smc_confidence, smc_reason, _ = smc_result
+        votes.append({
+            "strategy_name": "ICT/SMC",
+            "direction": smc_direction,
+            "detail": _shorten_for_bullet(smc_reason),
+        })
+
+    for strategy_fn in STRATEGY_BANK:
+        try:
+            result = strategy_fn(pair_key, config, h1_candles, h4_candles, daily_candles)
+            if result:
+                votes.append(result)
+        except Exception as e:
+            print(f"[STRATEGY BANK] {strategy_fn.__name__} failed for {pair_key}: {e}")
+            continue
+
+    if not votes:
+        return None
+
+    buy_votes = [v for v in votes if v["direction"] == "BUY"]
+    sell_votes = [v for v in votes if v["direction"] == "SELL"]
+
+    winning_votes = buy_votes if len(buy_votes) >= len(sell_votes) else sell_votes
+    direction = "BUY" if winning_votes is buy_votes else "SELL"
+
+    if len(winning_votes) < min_agree:
+        print(
+            f"[STRATEGY BANK] {pair_key} only {len(winning_votes)} strategy(ies) "
+            f"agreed on {direction} (need {min_agree}) - no signal this round"
+        )
+        return None
+
+    agreeing_names = [v["strategy_name"] for v in winning_votes]
+    confidence = min(95, 70 + len(winning_votes) * 6)
+
+    # Short bullet points, one per agreeing strategy, instead of one
+    # long run-on sentence - reads cleanly even with 2-3 strategies
+    # stacked together, rather than risking a wall of text that
+    # looks bogus or padded.
+    bullet_lines = [f"• {v['strategy_name']}: {v['detail']}" for v in winning_votes]
+    reason = "\n".join(bullet_lines)
+
+    print(
+        f"[STRATEGY BANK] {pair_key} -> {direction} | "
+        f"{len(winning_votes)} agreeing: {', '.join(agreeing_names)}"
+    )
+
+    return direction, confidence, reason, agreeing_names
+
+async def run_strategy_bank_synthetic(index_key, config, h1_candles, h4_candles, daily_candles, m1_candles=None, min_agree=3):
+    """
+    Async sibling of run_strategy_bank, for synthetic (Deriv)
+    indices - but with a DELIBERATELY DIFFERENT roster
+    (SYNTHETIC_STRATEGY_BANK, not STRATEGY_BANK) and NO ICT/SMC vote
+    at all. Per explicit instruction: synthetics have no real
+    liquidity, sessions, or institutional order flow, so ICT/SMC,
+    Unicorn Model, Previous Day H/L Manipulation, and London Session
+    ORB are all excluded here - those strategies' underlying
+    assumptions don't hold on an RNG-generated instrument, even
+    though their pattern-matching would still technically run.
+    """
+    votes = []
+
+    for strategy_fn in SYNTHETIC_STRATEGY_BANK:
+        try:
+            sig = inspect.signature(strategy_fn)
+            if "m1_candles" in sig.parameters:
+                result = strategy_fn(index_key, config, h1_candles, h4_candles, daily_candles, m1_candles=m1_candles)
+            else:
+                result = strategy_fn(index_key, config, h1_candles, h4_candles, daily_candles)
+            if result:
+                votes.append(result)
+        except Exception as e:
+            print(f"[STRATEGY BANK SYNTH] {strategy_fn.__name__} failed for {index_key}: {e}")
+            continue
+
+    if not votes:
+        return None
+
+    buy_votes = [v for v in votes if v["direction"] == "BUY"]
+    sell_votes = [v for v in votes if v["direction"] == "SELL"]
+
+    winning_votes = buy_votes if len(buy_votes) >= len(sell_votes) else sell_votes
+    direction = "BUY" if winning_votes is buy_votes else "SELL"
+
+    if len(winning_votes) < min_agree:
+        print(
+            f"[STRATEGY BANK SYNTH] {index_key} only {len(winning_votes)} strategy(ies) "
+            f"agreed on {direction} (need {min_agree}) - no signal this round"
+        )
+        return None
+
+    agreeing_names = [v["strategy_name"] for v in winning_votes]
+    confidence = min(95, 70 + len(winning_votes) * 6)
+
+    detail_strings = [v["detail"] for v in winning_votes[:3]]
+    reason = (
+        f"{len(winning_votes)} independent strategies agree on {direction}: "
+        + "; ".join(detail_strings)
+        + ("." if len(detail_strings) == len(winning_votes) else f", and {len(winning_votes) - 3} more.")
+    )
+
+    print(
+        f"[STRATEGY BANK SYNTH] {index_key} -> {direction} | "
+        f"{len(winning_votes)} agreeing: {', '.join(agreeing_names)}"
+    )
+
+    return direction, confidence, reason, agreeing_names
+
+# ============================================
 # SESSION DETECTION
 # ============================================
 
@@ -3867,10 +4786,23 @@ async def build_signal_response(question, user_id=None):
     used_smc = False
     used_ai_layer = False
 
-    smc_result = analyze_smc_structure(matched_key, config)
-    if smc_result:
-        direction, confidence, reason, timeframe_confirmation = smc_result
-        used_smc = True
+    h1_candles = get_cached_candles(matched_key, config, "1h", outputsize=60)
+    h4_candles = get_cached_candles(matched_key, config, "4h", outputsize=60)
+    daily_candles = get_cached_candles(matched_key, config, "1day", outputsize=10)
+
+    # Scheduled channel posts (user_id=None) use a lower agreement
+    # bar (2) than DM/manual requests (3) - per explicit instruction,
+    # since requiring 3 for every scheduled slot would make it fall
+    # back to the much weaker rule-based bias far more often than
+    # posting a real strategy-backed signal.
+    min_agree = 2 if user_id is None else 3
+
+    bank_result = run_strategy_bank(
+        matched_key, config, h1_candles, h4_candles, daily_candles, min_agree=min_agree
+    )
+    if bank_result:
+        direction, confidence, reason, agreeing_strategies = bank_result
+        used_smc = "ICT/SMC" in agreeing_strategies
         last_signal_direction[matched_key] = (direction, time.time())
 
     if not direction:
@@ -3929,7 +4861,7 @@ async def build_signal_response(question, user_id=None):
         f"<b>Confidence:</b> {confidence}%\n"
         f"<b>Session:</b> {session}\n\n"
         f"<b>Reason:</b>\n"
-        f"<b>Technical Analysis:</b> {reason}\n\n"
+        f"<b>Technical Analysis:</b>\n{reason}\n\n"
     )
     if fundamental_reason:
         response += f"<b>Fundamental Analysis:</b> {fundamental_reason}\n\n"
@@ -5900,7 +6832,7 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 parse_mode=ParseMode.HTML
             )
 
-            result = await build_synthetic_signal_response(synthetic_key)
+            result = await build_synthetic_signal_response(synthetic_key, min_agree=3)
 
             await wait_message.delete()
 
@@ -6187,7 +7119,7 @@ async def post_evening_signal(context: ContextTypes.DEFAULT_TYPE):
 async def _post_synthetic_signal_for_index(bot, index_key):
     print(f"[AUTO SYNTH] {index_key.upper()} firing")
 
-    result = await build_synthetic_signal_response(index_key)
+    result = await build_synthetic_signal_response(index_key, min_agree=2)
     if not result:
         print(f"[AUTO SYNTH] ❌ No signal generated for {index_key}, skipping post")
         return

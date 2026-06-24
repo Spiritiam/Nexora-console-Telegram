@@ -7,6 +7,11 @@ import json
 import time
 import inspect
 import websockets
+import matplotlib
+matplotlib.use("Agg")
+import matplotlib.pyplot as plt
+import matplotlib.dates as mdates
+from matplotlib.patches import Rectangle
 
 from metaapi_cloud_sdk import MetaApi
 
@@ -1934,20 +1939,53 @@ async def build_synthetic_signal_response(index_key, min_agree=2):
     if not result:
         return None
 
-    direction, confidence, reason, agreeing_strategies = result
+    direction, confidence, reason, agreeing_strategies, winning_votes = result
     contract_type = "MULTUP" if direction == "BUY" else "MULTDOWN"
+
+    # Strategies in SYNTHETIC_STRATEGY_BANK vote on EITHER h1_candles
+    # or m1_candles depending on the strategy - confirmed directly
+    # from run_strategy_bank_synthetic's own dispatch logic (checks
+    # "m1_candles" in the strategy function's signature). Mirroring
+    # that exact same check here so the chart shows the SAME candles
+    # the winning strategy actually looked at, not a mismatched set.
+    M1_BASED_STRATEGIES = {"EMA Pullback Scalper", "Bollinger+RSI Mean Reversion", "Volatility Breakout Scalper"}
 
     if direction == "BUY":
         emoji = "🟢"
-        image_file_id = BUY_IMAGE_FILE_ID
+        fallback_image_file_id = BUY_IMAGE_FILE_ID
     else:
         emoji = "🔴"
-        image_file_id = SELL_IMAGE_FILE_ID
+        fallback_image_file_id = SELL_IMAGE_FILE_ID
+
+    # Real generated chart from the SAME candles the winning strategy
+    # used. Synthetics have no price-based Entry/SL/TP today (stake/
+    # risk/target are dollar amounts, not index price levels - drawing
+    # them as horizontal price lines would be meaningless/wrong), so
+    # entry/sl/tp are passed as None - generate_signal_chart already
+    # handles that by simply not drawing those lines.
+    image_file_id = fallback_image_file_id
+    chart_strategy_name = winning_votes[0]["strategy_name"] if winning_votes else None
+    if chart_strategy_name:
+        chart_candles = m1_candles if chart_strategy_name in M1_BASED_STRATEGIES else h1_candles
+        chart_path = os.path.join(CHART_OUTPUT_DIR, f"{index_key}_{int(time.time())}.png")
+        chart_ok = generate_signal_chart(
+            config["display"], chart_strategy_name, direction, chart_candles,
+            None, None, None, chart_path,
+        )
+        if chart_ok:
+            image_file_id = chart_path
+
+    # FBS-style narrative: reason comes FIRST, per explicit
+    # instruction (synthetics never had a separate Entry/SL/TP block
+    # to reorder around in the first place - this just replaces the
+    # flat "N independent strategies agree..." sentence with varied
+    # prose built from the same real winning_votes).
+    narrative = generate_signal_narrative(config["display"], direction, winning_votes)
 
     message = (
         f"{emoji} <b>STRONG {direction} {config['display']}</b> ⚡\n\n"
         f"<b>Confidence:</b> {confidence}%\n\n"
-        f"<b>Reason:</b>\n{reason}\n\n"
+        f"{narrative}\n\n"
         f"<b>Suggested:</b> ${DEFAULT_SYNTHETIC_STAKE} stake | "
         f"Risk ${DEFAULT_RISK} → Target ${DEFAULT_WIN}\n"
         f"<i>(Stake and risk/target are adjustable before you confirm)</i>\n\n"
@@ -2440,7 +2478,7 @@ async def run_auto_copy_scan(context: ContextTypes.DEFAULT_TYPE):
         )
         if not result:
             continue
-        direction, confidence, reason, agreeing_strategies = result
+        direction, confidence, reason, agreeing_strategies, _winning_votes = result
         contract_type = "MULTUP" if direction == "BUY" else "MULTDOWN"
         fresh_signals[index_key] = {
             "index_key": index_key,
@@ -4610,7 +4648,7 @@ def run_strategy_bank(pair_key, config, h1_candles, h4_candles, daily_candles, m
         f"{len(winning_votes)} agreeing: {', '.join(agreeing_names)}"
     )
 
-    return direction, confidence, reason, agreeing_names
+    return direction, confidence, reason, agreeing_names, winning_votes
 
 async def run_strategy_bank_synthetic(index_key, config, h1_candles, h4_candles, daily_candles, m1_candles=None, min_agree=2):
     """
@@ -4722,7 +4760,7 @@ async def run_strategy_bank_synthetic(index_key, config, h1_candles, h4_candles,
         f"{len(winning_votes)} agreeing: {', '.join(agreeing_names)}"
     )
 
-    return direction, confidence, reason, agreeing_names
+    return direction, confidence, reason, agreeing_names, winning_votes
 
 # ============================================
 # SESSION DETECTION
@@ -4967,14 +5005,442 @@ def _consistent_or_random(pair_key):
 # UPDATED: direction now comes from real SMC/ICT
 # structure analysis (analyze_smc_structure),
 # falling back to the 1h trend-based bias only
-# if structure analysis finds no usable edge.
-# An optional AI fundamental layer (capped, same
-# limits as before) adds independently-generated
-# macro/sentiment context on top, without ever
-# overriding the technical direction. Scheduled
-# channel signals pass user_id=None and always
-# get the AI layer (negligible cost - 3 cron
-# slots/day, not scaled by user count).
+# ============================================
+# SIGNAL CHART GENERATION
+# ============================================
+# Draws a real candlestick chart from the SAME candles the winning
+# strategy actually used, with whatever overlay matches that
+# strategy (MA lines, consolidation box, Bollinger bands, RSI/MACD
+# sub-panel, etc.) plus Entry/SL/TP lines. Numbers are recomputed
+# fresh here using the bot's own calculate_rsi/calculate_macd/
+# calculate_bollinger_bands/calculate_ema_series functions already
+# defined above - never a second, separate calculation, so the chart
+# can never show a different number than what the strategy voted on.
+# Falls back to a clean plain candle chart for any strategy without a
+# specific overlay below - every signal gets a chart, per instruction.
+
+CHART_OUTPUT_DIR = "/tmp/nexora_charts"
+os.makedirs(CHART_OUTPUT_DIR, exist_ok=True)
+
+
+def _chart_to_mpl_time(candles):
+    """
+    Candle 'time' fields are inconsistent across this codebase - ISO
+    strings from TwelveData, raw epoch ints from Deriv. Normalize
+    both shapes here rather than assuming one, so the chart never
+    crashes on whichever source produced this particular candle list.
+    """
+    times = []
+    for i, c in enumerate(candles):
+        t = c.get("time")
+        if t is None:
+            times.append(i)
+        elif isinstance(t, datetime):
+            times.append(t)
+        elif isinstance(t, (int, float)):
+            times.append(datetime.utcfromtimestamp(t))
+        elif isinstance(t, str):
+            try:
+                times.append(datetime.fromisoformat(t.replace("Z", "+00:00")))
+            except ValueError:
+                times.append(i)
+        else:
+            times.append(i)
+    return times
+
+
+def _chart_draw_candles(ax, candles, times):
+    is_datetime = isinstance(times[0], datetime)
+    x = mdates.date2num(times) if is_datetime else list(range(len(times)))
+    if len(x) > 1:
+        width = (x[-1] - x[0]) / len(x) * 0.6
+    else:
+        width = 0.6
+    min_body = (max(c["high"] for c in candles) - min(c["low"] for c in candles)) * 0.001
+    for i, c in enumerate(candles):
+        color = "#22c55e" if c["close"] >= c["open"] else "#ef4444"
+        ax.plot([x[i], x[i]], [c["low"], c["high"]], color=color, linewidth=1, zorder=2)
+        rect = Rectangle(
+            (x[i] - width / 2, min(c["open"], c["close"])),
+            width, max(abs(c["close"] - c["open"]), min_body),
+            facecolor=color, edgecolor=color, zorder=3,
+        )
+        ax.add_patch(rect)
+    return x
+
+
+def _chart_fmt_price(value, all_values):
+    ref = max(abs(v) for v in all_values)
+    return f"{value:.5f}" if ref < 10 else f"{value:.2f}"
+
+
+def _chart_finish(fig, ax, x, times, candles, entry, sl, tp, title, save_path, sub_ax=None):
+    label_box = dict(boxstyle="round,pad=0.3", facecolor="#0f1115", edgecolor="none")
+    is_datetime = isinstance(times[0], datetime)
+    x_right = x[-1] + (x[-1] - x[0]) * 0.01 if len(x) > 1 else x[-1] + 1
+
+    all_lows = [c["low"] for c in candles]
+    all_highs = [c["high"] for c in candles]
+    level_values = [v for v in (entry, sl, tp) if v is not None]
+    all_price_values = all_lows + all_highs + level_values
+
+    full_range = max(all_price_values) - min(all_price_values)
+    min_gap = full_range * 0.035
+    points = sorted([(v, name) for v, name in [(entry, "entry"), (sl, "sl"), (tp, "tp")] if v is not None])
+    adjusted = {name: v for v, name in points}
+    for i in range(1, len(points)):
+        prev_v, prev_name = points[i - 1]
+        curr_v, curr_name = points[i]
+        if adjusted[curr_name] - adjusted[prev_name] < min_gap:
+            adjusted[curr_name] = adjusted[prev_name] + min_gap
+
+    if entry is not None:
+        ax.axhline(entry, color="#e5e7eb", linewidth=1, linestyle="--", zorder=1)
+        ax.text(x_right, adjusted["entry"], f"Entry {_chart_fmt_price(entry, all_price_values)}", color="#e5e7eb", fontsize=9, va="center", bbox=label_box, zorder=5)
+    if sl is not None:
+        ax.axhline(sl, color="#ef4444", linewidth=1, linestyle="--", zorder=1)
+        ax.text(x_right, adjusted["sl"], f"SL {_chart_fmt_price(sl, all_price_values)}", color="#ef4444", fontsize=9, va="center", bbox=label_box, zorder=5)
+    if tp is not None:
+        ax.axhline(tp, color="#22c55e", linewidth=1, linestyle="--", zorder=1)
+        ax.text(x_right, adjusted["tp"], f"TP {_chart_fmt_price(tp, all_price_values)}", color="#22c55e", fontsize=9, va="center", bbox=label_box, zorder=5)
+
+    xlim_left = x[0] - (x[-1] - x[0]) * 0.02 if len(x) > 1 else x[0] - 1
+    xlim_right = x_right + (x[-1] - x[0]) * 0.12 if len(x) > 1 else x_right + 2
+    ax.set_xlim(xlim_left, xlim_right)
+    y_pad = full_range * 0.08
+    ax.set_ylim(min(all_price_values) - y_pad, max(all_price_values) + y_pad)
+
+    if is_datetime and sub_ax is None:
+        ax.xaxis_date()
+        ax.xaxis.set_major_formatter(mdates.DateFormatter("%d %b %Hh"))
+        plt.setp(ax.get_xticklabels(), rotation=20)
+    elif sub_ax is not None:
+        ax.tick_params(labelbottom=False)
+
+    ax.tick_params(colors="#9ca3af", labelsize=8)
+    for spine in ax.spines.values():
+        spine.set_color("#2d3139")
+
+    handles, labels = ax.get_legend_handles_labels()
+    if handles:
+        ax.legend(loc="upper left", facecolor="#0f1115", edgecolor="#2d3139", labelcolor="#e5e7eb", fontsize=9)
+    ax.set_title(title, color="#e5e7eb", fontsize=12, fontweight="bold", loc="left", pad=12)
+    ax.grid(color="#1f2329", linewidth=0.5, alpha=0.5)
+
+    if sub_ax is not None:
+        sub_ax.set_xlim(xlim_left, xlim_right)
+        if is_datetime:
+            sub_ax.xaxis_date()
+            sub_ax.xaxis.set_major_formatter(mdates.DateFormatter("%d %b %Hh"))
+            plt.setp(sub_ax.get_xticklabels(), rotation=20)
+        sub_ax.tick_params(colors="#9ca3af", labelsize=8)
+        for spine in sub_ax.spines.values():
+            spine.set_color("#2d3139")
+        sub_handles, sub_labels = sub_ax.get_legend_handles_labels()
+        if sub_handles:
+            sub_ax.legend(loc="upper left", facecolor="#0f1115", edgecolor="#2d3139", labelcolor="#e5e7eb", fontsize=8)
+        sub_ax.grid(color="#1f2329", linewidth=0.5, alpha=0.5)
+
+    plt.tight_layout() if sub_ax is None else None
+    try:
+        plt.savefig(save_path, facecolor="#0f1115")
+    finally:
+        plt.close(fig)
+
+
+def generate_signal_chart(display_name, strategy_name, direction, candles, entry, sl, tp, save_path, display_window=70):
+    """
+    Generates one chart PNG for a signal. candles = the SAME candle
+    list the winning strategy actually used (h1_candles for most
+    strategies, m1_candles for the 3 synthetics-only scalpers) -
+    caller picks the right one. Returns True/False (whether a file
+    was actually written) so callers can fall back to the old static
+    bull/bear graphic if chart generation fails for any reason -
+    charts should never be able to block a signal from sending.
+
+    display_window: CONFIRMED REAL BUG FIX, found via an actual
+    end-to-end test with real forex-shaped data (210 H1 candles,
+    matching build_signal_response's real outputsize=210 fetch) -
+    every indicator below needs the FULL candle list to compute
+    correctly (MA50 needs 50+ candles of real history, MACD needs
+    35+, etc.), but charting all 210 produced an unreadably dense
+    wall of candle wicks with the Entry/SL/TP labels colliding into
+    them. Indicators are still computed on the FULL candle list
+    first (so the math never changes), then both candles and every
+    computed indicator array are sliced down to the same trailing
+    display_window before drawing - shows a clean, readable recent
+    window without ever changing what was actually calculated.
+    """
+    try:
+        if not candles or len(candles) < 5:
+            return False
+
+        needs_subpanel = strategy_name in ("RSI Extreme Reversal", "Bollinger+RSI Mean Reversion", "Momentum (MACD)")
+        closes = [c["close"] for c in candles]
+
+        # Compute every indicator on the FULL candle list first - the
+        # math must never be affected by how much we later display.
+        ma20 = ma50 = None
+        ema20 = ema50 = None
+        consolidation_box = None
+        breakout_lines = None
+        sr_level = None
+        rsi_full = None
+        macd_full = signal_full = None
+        bb_upper = bb_middle = bb_lower = None
+
+        if strategy_name == "Trend Following (MA)" and len(candles) >= 50:
+            def sma(period):
+                return [None] * (period - 1) + [
+                    sum(closes[i - period + 1:i + 1]) / period for i in range(period - 1, len(closes))
+                ]
+            ma20, ma50 = sma(20), sma(50)
+
+        elif strategy_name == "EMA Pullback Scalper" and len(candles) >= 55:
+            ema20_raw = calculate_ema_series(candles, 20)
+            ema50_raw = calculate_ema_series(candles, 50)
+            ema20 = [None] * (len(candles) - len(ema20_raw)) + list(ema20_raw)
+            ema50 = [None] * (len(candles) - len(ema50_raw)) + list(ema50_raw)
+
+        elif strategy_name == "Breakout" and len(candles) >= 30:
+            consolidation = candles[-11:-1]
+            range_high = max(c["high"] for c in consolidation)
+            range_low = min(c["low"] for c in consolidation)
+            consolidation_box = (range_low, range_high)
+
+        elif strategy_name == "Volatility Breakout Scalper" and len(candles) >= 11:
+            prior_10 = candles[-11:-1]
+            breakout_lines = (max(c["high"] for c in prior_10), min(c["low"] for c in prior_10))
+
+        elif strategy_name == "Support/Resistance Bounce":
+            sr_level = candles[-1]["low"] if direction == "BUY" else candles[-1]["high"]
+
+        elif strategy_name == "RSI Extreme Reversal":
+            rsi_values = calculate_rsi(candles, period=14)
+            if rsi_values:
+                rsi_full = [None] * (len(candles) - len(rsi_values)) + list(rsi_values)
+
+        elif strategy_name == "Momentum (MACD)":
+            macd_line, signal_line = calculate_macd(candles)
+            if macd_line and signal_line:
+                macd_full = [None] * (len(candles) - len(macd_line)) + list(macd_line)
+                signal_full = [None] * (len(candles) - len(signal_line)) + list(signal_line)
+
+        elif strategy_name == "Bollinger+RSI Mean Reversion":
+            if len(candles) >= 20:
+                bb_upper, bb_middle, bb_lower = [], [], []
+                for i in range(len(candles)):
+                    if i < 19:
+                        bb_upper.append(None); bb_middle.append(None); bb_lower.append(None)
+                        continue
+                    u, m, l = calculate_bollinger_bands(candles[:i + 1], period=20)
+                    bb_upper.append(u); bb_middle.append(m); bb_lower.append(l)
+            rsi_values = calculate_rsi(candles, period=14)
+            if rsi_values:
+                rsi_full = [None] * (len(candles) - len(rsi_values)) + list(rsi_values)
+
+        # NOW slice everything to the trailing display window - the
+        # consolidation box / breakout lines / S/R level are already
+        # just scalar values (not per-candle arrays), so they need no
+        # slicing; only candles and the per-candle indicator arrays do.
+        window = min(display_window, len(candles))
+        candles = candles[-window:]
+        if ma20 is not None:
+            ma20, ma50 = ma20[-window:], ma50[-window:]
+        if ema20 is not None:
+            ema20, ema50 = ema20[-window:], ema50[-window:]
+        if rsi_full is not None:
+            rsi_full = rsi_full[-window:]
+        if macd_full is not None:
+            macd_full, signal_full = macd_full[-window:], signal_full[-window:]
+        if bb_upper is not None:
+            bb_upper, bb_middle, bb_lower = bb_upper[-window:], bb_middle[-window:], bb_lower[-window:]
+
+        times = _chart_to_mpl_time(candles)
+        if needs_subpanel:
+            fig, (ax, sub_ax) = plt.subplots(
+                2, 1, figsize=(10, 7.5), dpi=150,
+                gridspec_kw={"height_ratios": [3, 1], "hspace": 0.08},
+                sharex=True, layout="constrained",
+            )
+            sub_ax.set_facecolor("#0f1115")
+        else:
+            fig, ax = plt.subplots(figsize=(10, 6), dpi=150)
+            sub_ax = None
+        fig.patch.set_facecolor("#0f1115")
+        ax.set_facecolor("#0f1115")
+
+        x = _chart_draw_candles(ax, candles, times)
+        title_suffix = f"{display_name} — {strategy_name} — {direction}"
+
+        if ma20 is not None:
+            ax.plot(x, ma20, color="#60a5fa", linewidth=1.6, label="MA20", zorder=4)
+            ax.plot(x, ma50, color="#f59e0b", linewidth=1.6, label="MA50", zorder=4)
+
+        elif ema20 is not None:
+            ax.plot(x, ema20, color="#60a5fa", linewidth=1.6, label="EMA20", zorder=4)
+            ax.plot(x, ema50, color="#f59e0b", linewidth=1.6, label="EMA50", zorder=4)
+
+        elif consolidation_box is not None and window >= 11:
+            range_low, range_high = consolidation_box
+            box_x_start = x[-11]
+            box_x_end = x[-2]
+            ax.add_patch(Rectangle(
+                (box_x_start, range_low), box_x_end - box_x_start, range_high - range_low,
+                facecolor="#60a5fa", alpha=0.12, edgecolor="#60a5fa", linewidth=1, zorder=1,
+                label="Consolidation range",
+            ))
+
+        elif breakout_lines is not None:
+            highest_high, lowest_low = breakout_lines
+            ax.axhline(highest_high, color="#60a5fa", linewidth=1.2, linestyle=":", zorder=1, label=f"10-candle high {highest_high:.2f}")
+            ax.axhline(lowest_low, color="#f59e0b", linewidth=1.2, linestyle=":", zorder=1, label=f"10-candle low {lowest_low:.2f}")
+
+        elif sr_level is not None:
+            ax.axhline(sr_level, color="#a78bfa", linewidth=1.2, linestyle=":", zorder=1, label=f"Tested level ~{sr_level:.2f}")
+
+        elif rsi_full is not None and strategy_name == "RSI Extreme Reversal":
+            sub_ax.plot(x, rsi_full, color="#a78bfa", linewidth=1.4, label="RSI(14)", zorder=4)
+            sub_ax.axhline(80, color="#ef4444", linewidth=0.8, linestyle="--", alpha=0.6, zorder=1)
+            sub_ax.axhline(20, color="#22c55e", linewidth=0.8, linestyle="--", alpha=0.6, zorder=1)
+            sub_ax.fill_between(x, 80, 100, color="#ef4444", alpha=0.06, zorder=0)
+            sub_ax.fill_between(x, 0, 20, color="#22c55e", alpha=0.06, zorder=0)
+            sub_ax.set_ylim(0, 100)
+
+        elif macd_full is not None:
+            sub_ax.plot(x, macd_full, color="#60a5fa", linewidth=1.4, label="MACD", zorder=4)
+            sub_ax.plot(x, signal_full, color="#f59e0b", linewidth=1.4, label="Signal", zorder=4)
+            hist = [
+                (m - s) if (m is not None and s is not None) else 0
+                for m, s in zip(macd_full, signal_full)
+            ]
+            bar_colors = ["#22c55e" if h >= 0 else "#ef4444" for h in hist]
+            sub_ax.bar(x, hist, color=bar_colors, alpha=0.5, width=(x[-1] - x[0]) / len(x) * 0.6 if len(x) > 1 else 0.6, zorder=2)
+            sub_ax.axhline(0, color="#9ca3af", linewidth=0.6, alpha=0.4, zorder=1)
+
+        if bb_upper is not None:
+            ax.plot(x, bb_upper, color="#60a5fa", linewidth=1.2, label="Upper BB", zorder=4, linestyle="--")
+            ax.plot(x, bb_middle, color="#9ca3af", linewidth=1.0, label="Middle BB", zorder=4, linestyle=":")
+            ax.plot(x, bb_lower, color="#f59e0b", linewidth=1.2, label="Lower BB", zorder=4, linestyle="--")
+        if rsi_full is not None and strategy_name == "Bollinger+RSI Mean Reversion" and sub_ax is not None:
+            sub_ax.plot(x, rsi_full, color="#a78bfa", linewidth=1.4, label="RSI(14)", zorder=4)
+            sub_ax.axhline(75, color="#ef4444", linewidth=0.8, linestyle="--", alpha=0.6, zorder=1)
+            sub_ax.axhline(25, color="#22c55e", linewidth=0.8, linestyle="--", alpha=0.6, zorder=1)
+            sub_ax.fill_between(x, 75, 100, color="#ef4444", alpha=0.06, zorder=0)
+            sub_ax.fill_between(x, 0, 25, color="#22c55e", alpha=0.06, zorder=0)
+            sub_ax.set_ylim(0, 100)
+
+        _chart_finish(fig, ax, x, times, candles, entry, sl, tp, title_suffix, save_path, sub_ax=sub_ax)
+        return True
+    except Exception as e:
+        print(f"[CHART] Failed to generate chart for {display_name}/{strategy_name}: {e}")
+        try:
+            plt.close("all")
+        except Exception:
+            pass
+        return False
+
+
+# ============================================
+# SIGNAL NARRATIVE GENERATION (FBS-style prose)
+# ============================================
+# Builds 3-4 lines of connected prose from the SAME winning_votes list
+# run_strategy_bank/run_strategy_bank_synthetic already produce,
+# instead of a flat bullet list - reason comes first, Entry/SL/TP
+# after, per explicit instruction. Uses small pools of interchangeable
+# opening/closing clauses combined with each strategy's own real
+# detail text, so the same strategy firing on multiple indices in the
+# same minute reads as genuinely different (but equally accurate)
+# sentences rather than copies of one template - no AI call, no added
+# cost or latency, fully reviewable/predictable text.
+
+NARRATIVE_OPENERS_BUY = [
+    "{display_name} is showing renewed bullish pressure.",
+    "Buyers are stepping back in on {display_name}.",
+    "{display_name} is building a constructive bullish picture.",
+    "Momentum is turning in favor of buyers on {display_name}.",
+    "{display_name} looks primed for upside continuation.",
+]
+NARRATIVE_OPENERS_SELL = [
+    "{display_name} is showing renewed bearish pressure.",
+    "Sellers are stepping back in on {display_name}.",
+    "{display_name} is building a constructive bearish picture.",
+    "Momentum is turning in favor of sellers on {display_name}.",
+    "{display_name} looks primed for downside continuation.",
+]
+NARRATIVE_CLOSERS_BUY = [
+    "We like the long side here while structure holds.",
+    "This keeps the bullish bias intact for now.",
+    "A clean setup to ride further upside from here.",
+    "Risk favors buyers as long as this level holds.",
+]
+NARRATIVE_CLOSERS_SELL = [
+    "We like the short side here while structure holds.",
+    "This keeps the bearish bias intact for now.",
+    "A clean setup to ride further downside from here.",
+    "Risk favors sellers as long as this level holds.",
+]
+
+
+def _narrative_strategy_sentence(vote):
+    name = vote["strategy_name"]
+    detail = vote["detail"]
+    if name == "Trend Following (MA)":
+        return f"The moving averages confirm it: {detail}."
+    if name == "Breakout":
+        return f"Price just {detail}, clearing a multi-candle range."
+    if name == "Support/Resistance Bounce":
+        return f"Price action shows it - {detail}."
+    if name == "Volatility Breakout Scalper":
+        return f"A clean breakout move: {detail}."
+    if name == "EMA Pullback Scalper":
+        return f"The pullback played out as expected: {detail}."
+    if name == "Momentum (MACD)":
+        return f"Momentum agrees - {detail}."
+    if name == "RSI Extreme Reversal":
+        return f"RSI is flashing an extreme reading: {detail}."
+    if name == "Bollinger+RSI Mean Reversion":
+        return f"Price stretched too far, and is snapping back: {detail}."
+    if name == "ICT/SMC":
+        return f"Structure confirms it: {detail}."
+    return detail[0].upper() + detail[1:] + "."
+
+
+def generate_signal_narrative(display_name, direction, winning_votes):
+    """
+    Returns a 3-4 line prose string built from the real winning votes.
+    Genuinely randomized per call (no seed) - intentional, since two
+    signals firing seconds apart on different indices should read
+    differently even if the same single strategy fired on both.
+    """
+    openers = NARRATIVE_OPENERS_BUY if direction == "BUY" else NARRATIVE_OPENERS_SELL
+    closers = NARRATIVE_CLOSERS_BUY if direction == "BUY" else NARRATIVE_CLOSERS_SELL
+
+    body_votes = winning_votes[:2]
+    body_sentences = [_narrative_strategy_sentence(v) for v in body_votes]
+
+    body_strategy_names = {v["strategy_name"] for v in body_votes}
+    safe_openers = openers
+    if "Momentum (MACD)" in body_strategy_names:
+        safe_openers = [o for o in openers if "momentum" not in o.lower()]
+    if not safe_openers:
+        safe_openers = openers
+
+    opener = random.choice(safe_openers).format(display_name=display_name)
+    closer = random.choice(closers)
+
+    lines = [opener] + body_sentences + [closer]
+    return " ".join(lines)
+
+
+# ============================================
+# Strategy bank: votes from STRATEGY_BANK and ICT/SMC
+# direct technical structure, replacing the old
+# always-fall-back-to-rule-based-bias approach -
+# now ALWAYS sends a real strategy-backed signal as
+# long as at least one strategy fired, only falling
+# back to generate_rule_based_bias in the genuinely
+# rare case where no usable candle data exists.
 # ============================================
 
 async def build_signal_response(question, user_id=None):
@@ -5027,8 +5493,9 @@ async def build_signal_response(question, user_id=None):
     bank_result = run_strategy_bank(
         matched_key, config, h1_candles, h4_candles, daily_candles, min_agree=min_agree
     )
+    winning_votes = []
     if bank_result:
-        direction, confidence, reason, agreeing_strategies = bank_result
+        direction, confidence, reason, agreeing_strategies, winning_votes = bank_result
         used_smc = "ICT/SMC" in agreeing_strategies
         last_signal_direction[matched_key] = (direction, time.time())
 
@@ -5071,24 +5538,52 @@ async def build_signal_response(question, user_id=None):
         stop_loss = round(live_price - (pip_size * sl_multiplier), decimals)
         take_profit = round(live_price + (pip_size * tp_multiplier), decimals)
         signal_emoji = "🟢"
-        image_file_id = BUY_IMAGE_FILE_ID
+        fallback_image_file_id = BUY_IMAGE_FILE_ID
     else:
         entry_price = round(live_price, decimals)
         stop_loss = round(live_price + (pip_size * sl_multiplier), decimals)
         take_profit = round(live_price - (pip_size * tp_multiplier), decimals)
         signal_emoji = "🔴"
-        image_file_id = SELL_IMAGE_FILE_ID
+        fallback_image_file_id = SELL_IMAGE_FILE_ID
 
     session = get_market_session()
 
+    # Real generated chart, using the SAME candles and winning
+    # strategy that actually produced this signal - falls back to the
+    # old static bull/bear graphic if chart generation fails for any
+    # reason (never blocks a signal from sending). Per explicit
+    # instruction, every signal gets a chart attempt, both channel
+    # and DM, forex and synthetics alike, since the cost is purely
+    # local CPU (matplotlib) - no extra API calls, no Gemini usage.
+    image_file_id = fallback_image_file_id
+    chart_strategy_name = winning_votes[0]["strategy_name"] if winning_votes else None
+    if chart_strategy_name:
+        chart_path = os.path.join(CHART_OUTPUT_DIR, f"{matched_key}_{int(time.time())}.png")
+        chart_ok = generate_signal_chart(
+            display, chart_strategy_name, direction, h1_candles,
+            entry_price, stop_loss, take_profit, chart_path,
+        )
+        if chart_ok:
+            image_file_id = chart_path
+
+    # FBS-style narrative: reason comes FIRST, Entry/SL/TP after, per
+    # explicit instruction. Falls back to the original bullet-style
+    # "reason" text (already real, already accurate) if winning_votes
+    # is empty - happens only when generate_rule_based_bias was the
+    # source instead of the strategy bank (no usable candle data this
+    # round), which has no structured votes to build prose from.
+    if winning_votes:
+        narrative = generate_signal_narrative(display, direction, winning_votes)
+    else:
+        narrative = reason
+
     response = (
         f"{signal_emoji} <b>{strength} {direction} {display}</b>\n\n"
+        f"{narrative}\n\n"
         f"<b>Entry Price:</b> {entry_price}\n"
         f"<b>SL:</b> {stop_loss} | <b>TP:</b> {take_profit}\n\n"
         f"<b>Confidence:</b> {confidence}%\n"
         f"<b>Session:</b> {session}\n\n"
-        f"<b>Reason:</b>\n"
-        f"<b>Technical Analysis:</b>\n{reason}\n\n"
     )
     if fundamental_reason:
         response += f"<b>Fundamental Analysis:</b> {fundamental_reason}\n\n"

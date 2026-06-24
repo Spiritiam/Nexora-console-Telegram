@@ -1578,7 +1578,37 @@ async def deriv_get_candles(symbol, granularity, count=60):
             if "error" in response:
                 print(f"[SYNTH] ticks_history error: {response['error'].get('message')}")
                 return None
-            candles = response.get("candles", [])
+            raw_candles = response.get("candles", [])
+            if not raw_candles:
+                return None
+
+            # Deriv returns open/high/low/close as STRINGS (e.g.
+            # "1.08243"), not floats - confirmed from the live API
+            # response shape. Every strategy in the bank does real
+            # arithmetic/comparisons on these fields (RSI, MACD,
+            # MA sums, range breakouts, etc.), and those either throw
+            # TypeError (caught and silently swallowed by the bank's
+            # per-strategy try/except) or, for simple < / > checks,
+            # silently do lexicographic STRING comparison instead of
+            # numeric comparison. This was making almost every
+            # synthetic strategy fail every round without ever
+            # surfacing an error to the channel - converting here,
+            # once, at the source, the same way get_candles_twelvedata
+            # already does for the forex/gold/crypto path.
+            candles = []
+            for c in raw_candles:
+                try:
+                    candles.append({
+                        "time": c.get("epoch"),
+                        "open": float(c["open"]),
+                        "high": float(c["high"]),
+                        "low": float(c["low"]),
+                        "close": float(c["close"]),
+                    })
+                except (KeyError, TypeError, ValueError) as e:
+                    print(f"[SYNTH] Skipping malformed candle {c}: {e}")
+                    continue
+
             return candles if candles else None
     except Exception as e:
         print(f"[SYNTH] Connection error: {e}")

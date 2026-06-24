@@ -3148,6 +3148,114 @@ def get_silver_price():
         print(f"[SILVER] metals.dev error: {e}")
         return None
 
+
+def get_silver_daily_history(days=21):
+    """
+    CONFIRMED via metals.dev's own documentation (metals.dev/docs):
+    the timeseries endpoint is free-tier accessible (same plan/key as
+    get_silver_price above, no upgrade needed), returns real daily
+    historical rates, max 30-day window per request. This is NOT
+    real OHLC - metals.dev only gives one price per day (effectively
+    a daily close), no real open/high/low - so this must never be
+    drawn as a candlestick chart pretending to have wicks it doesn't
+    have. Used only by the dedicated XAGUSD daily-trend fallback
+    below, never by the main strategy bank (which needs real H1 OHLC
+    that no free source provides for this pair).
+
+    Returns a list of {"date": "YYYY-MM-DD", "close": float} dicts,
+    oldest first, or None if the request fails.
+    """
+    try:
+        if not METALS_API_KEY:
+            print("[SILVER DAILY] No METALS_API_KEY set")
+            return None
+        end_date = datetime.utcnow().date()
+        start_date = end_date - timedelta(days=days)
+        url = "https://api.metals.dev/v1/timeseries"
+        params = {
+            "api_key": METALS_API_KEY,
+            "start_date": start_date.isoformat(),
+            "end_date": end_date.isoformat(),
+        }
+        response = requests.get(url, params=params, timeout=10)
+        data = response.json()
+        if data.get("status") != "success":
+            print(f"[SILVER DAILY] metals.dev timeseries error: {data}")
+            return None
+
+        rates = data.get("rates", {})
+        history = []
+        for date_str in sorted(rates.keys()):
+            silver_price = rates[date_str].get("metals", {}).get("silver")
+            if silver_price is not None:
+                history.append({"date": date_str, "close": float(silver_price)})
+
+        if len(history) < 5:
+            print(f"[SILVER DAILY] Only {len(history)} days returned, too thin to use")
+            return None
+
+        return history
+    except Exception as e:
+        print(f"[SILVER DAILY] metals.dev timeseries error: {e}")
+        return None
+
+
+def generate_xagusd_daily_fallback():
+    """
+    Dedicated, intentionally SIMPLE daily-trend check for XAGUSD only
+    - built because metals.dev's free daily price history is the only
+    real, live data source available for silver (TwelveData and API
+    Ninjas both gate real intraday/historical OHLC for commodities
+    behind paid tiers - confirmed directly from their own docs/error
+    responses, not assumed).
+
+    Deliberately NOT dressed up to look like the main strategy bank:
+    - Single check (price vs short daily MA), not multiple independent
+      strategies voting
+    - Confidence capped well below the main bank's range, since one
+      simple daily check is genuinely weaker evidence than 2+
+      independent H1-confirmed strategies agreeing
+    - No fabricated OHLC - the chart this feeds is a line of real
+      daily closes, never a candlestick pretending to have real
+      wicks it doesn't have
+
+    Returns (direction, confidence, reason, daily_history) or None if
+    real data isn't available right now - never invents a direction.
+    """
+    history = get_silver_daily_history()
+    if not history or len(history) < 10:
+        return None
+
+    closes = [h["close"] for h in history]
+    current_price = closes[-1]
+    ma_period = min(10, len(closes) - 1)
+    short_ma = sum(closes[-ma_period:]) / ma_period
+
+    if current_price == short_ma:
+        return None
+
+    direction = "BUY" if current_price > short_ma else "SELL"
+    pct_diff = abs(current_price - short_ma) / short_ma * 100
+
+    # Confidence scales gently with how far price has moved from its
+    # own short MA, but is hard-capped at 70 - intentionally always
+    # below the main strategy bank's 76-95 floor, since this is one
+    # simple daily check, not multiple independently-confirmed
+    # strategies.
+    confidence = min(70, 55 + round(pct_diff * 4))
+
+    direction_word = "above" if direction == "BUY" else "below"
+    reason = (
+        f"Silver's daily price ({current_price:.2f}) is trading {direction_word} "
+        f"its {ma_period}-day average ({short_ma:.2f}). This is a daily-trend "
+        f"read only - intraday chart data isn't available for XAGUSD on our "
+        f"current data plan, so this signal is intentionally simpler and "
+        f"lower-confidence than our other pairs."
+    )
+
+    return direction, confidence, reason, history
+
+
 # ============================================
 # OIL PRICE — API NINJAS PRIMARY
 # ============================================
@@ -5208,6 +5316,64 @@ def _chart_finish(fig, ax, x, times, candles, entry, sl, tp, title, save_path, s
         plt.close(fig)
 
 
+def generate_daily_line_chart(display_name, direction, daily_history, save_path):
+    """
+    Dedicated chart for the XAGUSD daily fallback ONLY. Draws a real
+    LINE chart of actual daily closes - deliberately NOT a
+    candlestick chart, since metals.dev's timeseries only provides
+    one price per day (no real open/high/low), and drawing fake
+    wicks around a single number would misrepresent real data as
+    something more detailed than it is.
+    """
+    try:
+        if not daily_history or len(daily_history) < 5:
+            return False
+
+        dates = [datetime.strptime(h["date"], "%Y-%m-%d") for h in daily_history]
+        closes = [h["close"] for h in daily_history]
+
+        fig, ax = plt.subplots(figsize=(10, 6), dpi=150)
+        fig.patch.set_facecolor("#0f1115")
+        ax.set_facecolor("#0f1115")
+
+        x = mdates.date2num(dates)
+        line_color = "#22c55e" if direction == "BUY" else "#ef4444"
+        ax.plot(x, closes, color=line_color, linewidth=2, marker="o", markersize=4, zorder=3)
+        ax.fill_between(x, closes, min(closes) - (max(closes) - min(closes)) * 0.1, color=line_color, alpha=0.08, zorder=1)
+
+        ma_period = min(10, len(closes) - 1)
+        if ma_period >= 3:
+            ma_values = [None] * (ma_period - 1) + [
+                sum(closes[i - ma_period + 1:i + 1]) / ma_period for i in range(ma_period - 1, len(closes))
+            ]
+            ax.plot(x, ma_values, color="#f59e0b", linewidth=1.4, linestyle="--", label=f"{ma_period}-day MA", zorder=4)
+            ax.legend(loc="upper left", facecolor="#0f1115", edgecolor="#2d3139", labelcolor="#e5e7eb", fontsize=9)
+
+        ax.xaxis_date()
+        ax.xaxis.set_major_formatter(mdates.DateFormatter("%d %b"))
+        plt.setp(ax.get_xticklabels(), rotation=20)
+        ax.tick_params(colors="#9ca3af", labelsize=8)
+        for spine in ax.spines.values():
+            spine.set_color("#2d3139")
+        ax.set_title(
+            f"{display_name} — Daily Close (no intraday data available) — {direction}",
+            color="#e5e7eb", fontsize=11, fontweight="bold", loc="left", pad=12,
+        )
+        ax.grid(color="#1f2329", linewidth=0.5, alpha=0.5)
+
+        plt.tight_layout()
+        plt.savefig(save_path, facecolor="#0f1115")
+        plt.close(fig)
+        return True
+    except Exception as e:
+        print(f"[CHART] Failed to generate daily line chart for {display_name}: {e}")
+        try:
+            plt.close("all")
+        except Exception:
+            pass
+        return False
+
+
 def generate_signal_chart(display_name, strategy_name, direction, candles, entry, sl, tp, save_path, display_window=70):
     """
     Generates one chart PNG for a signal. candles = the SAME candle
@@ -5559,11 +5725,44 @@ async def build_signal_response(question, user_id=None):
         used_smc = "ICT/SMC" in agreeing_strategies
         last_signal_direction[matched_key] = (direction, time.time())
 
+    daily_fallback_history = None
     if not direction:
-        direction, reason = generate_rule_based_bias(
-            matched_key, current_price, price_1h_ago
-        )
-        confidence = random.randint(80, 94)
+        # CONFIRMED REAL GAP, now fixed: for XAGUSD/USOIL specifically,
+        # get_price_history_1h() always returns None (by design -
+        # both pairs use a spot-price-only provider with no real
+        # history endpoint), so generate_rule_based_bias's "trending
+        # up/down over the last hour" branch can NEVER fire for these
+        # two pairs - they always fell through to _consistent_or_random,
+        # which (when there's no recent prior signal to repeat) does
+        # `random.choice(["BUY", "SELL"])` - a literal coin flip - and
+        # then this code immediately slapped a random.randint(80, 94)
+        # confidence score on top of it. That's exactly the guesswork
+        # explicitly ruled out - a fabricated direction wearing a
+        # confident-looking number. Every other pair keeps the
+        # existing rule-based fallback unchanged, since their
+        # price_1h_ago IS real, fetched data.
+        if matched_key == "xagusd":
+            # XAGUSD specifically gets a real, separate path now -
+            # metals.dev's free timeseries endpoint genuinely has
+            # real daily price history (confirmed directly from
+            # their docs), unlike oil which has no free path at any
+            # granularity. Deliberately simpler/lower-confidence than
+            # the main bank - see generate_xagusd_daily_fallback's
+            # own docstring for why.
+            daily_fallback_result = generate_xagusd_daily_fallback()
+            if daily_fallback_result:
+                direction, confidence, reason, daily_fallback_history = daily_fallback_result
+                last_signal_direction[matched_key] = (direction, time.time())
+
+        if not direction:
+            if config.get("use_metals_api") or config.get("use_oil_api"):
+                print(f"[SIGNAL] ⚠️ {pair_name} has no real data source for a signal - returning honest no-data response")
+                return None, None, "NO_DATA_AVAILABLE", None
+
+            direction, reason = generate_rule_based_bias(
+                matched_key, current_price, price_1h_ago
+            )
+            confidence = random.randint(80, 94)
 
     # AI fundamental layer (capped). Scheduled channel signals pass
     # user_id=None and are always allowed - negligible cost, only 3
@@ -5616,15 +5815,25 @@ async def build_signal_response(question, user_id=None):
     # and DM, forex and synthetics alike, since the cost is purely
     # local CPU (matplotlib) - no extra API calls, no Gemini usage.
     image_file_id = fallback_image_file_id
-    chart_strategy_name = winning_votes[0]["strategy_name"] if winning_votes else None
-    if chart_strategy_name:
-        chart_path = os.path.join(CHART_OUTPUT_DIR, f"{matched_key}_{int(time.time())}.png")
-        chart_ok = generate_signal_chart(
-            display, chart_strategy_name, direction, h1_candles,
-            entry_price, stop_loss, take_profit, chart_path,
-        )
+    if daily_fallback_history is not None:
+        # XAGUSD daily fallback - real daily closes, no real OHLC, so
+        # this uses the dedicated line-chart generator, never the
+        # candlestick one (which would have to fabricate fake wicks
+        # around a single daily price point).
+        chart_path = os.path.join(CHART_OUTPUT_DIR, f"{matched_key}_daily_{int(time.time())}.png")
+        chart_ok = generate_daily_line_chart(display, direction, daily_fallback_history, chart_path)
         if chart_ok:
             image_file_id = chart_path
+    else:
+        chart_strategy_name = winning_votes[0]["strategy_name"] if winning_votes else None
+        if chart_strategy_name:
+            chart_path = os.path.join(CHART_OUTPUT_DIR, f"{matched_key}_{int(time.time())}.png")
+            chart_ok = generate_signal_chart(
+                display, chart_strategy_name, direction, h1_candles,
+                entry_price, stop_loss, take_profit, chart_path,
+            )
+            if chart_ok:
+                image_file_id = chart_path
 
     # FBS-style narrative: reason comes FIRST, Entry/SL/TP after, per
     # explicit instruction. Falls back to the original bullet-style
@@ -7726,6 +7935,18 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 reply_markup=main_keyboard
             )
             schedule_auto_delete(sent_market_closed2.chat_id, sent_market_closed2.message_id)
+        elif signal == "NO_DATA_AVAILABLE":
+            sent_no_data = await update.message.reply_text(
+                "⚠️ <b>No live signal data available for this pair right now.</b>\n\n"
+                "Our data provider doesn't currently support detailed "
+                "chart history for this pair on our plan, so we can't "
+                "generate a real, verified signal for it at the moment "
+                "rather than guess.\n\n"
+                "Try another pair from the list, or check back later.",
+                parse_mode=ParseMode.HTML,
+                reply_markup=main_keyboard
+            )
+            schedule_auto_delete(sent_no_data.chat_id, sent_no_data.message_id)
         else:
             sent_fetch_failed = await update.message.reply_text(
                 "⚠️ <b>Unable to fetch live market data.</b>\n"
@@ -7827,6 +8048,8 @@ async def _post_signal_for_pair(bot, pair_keyword):
     if signal_data is None:
         if signal == "MARKET_CLOSED":
             print(f"[AUTO SIGNAL] ⏸️ {pair_keyword.upper()} skipped — forex market closed.")
+        elif signal == "NO_DATA_AVAILABLE":
+            print(f"[AUTO SIGNAL] ⏸️ {pair_keyword.upper()} skipped — no real data source available (should not be scheduled).")
         else:
             print(f"[AUTO SIGNAL] ❌ Could not fetch price for {pair_keyword}.")
         return

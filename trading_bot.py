@@ -145,7 +145,14 @@ MORNING_PAIR_BY_WEEKDAY = {
 
 EVENING_PAIR_BY_WEEKDAY = {
     0: "btcusd",  # Monday
-    1: "xagusd",  # Tuesday
+    1: "usoil",   # Tuesday - was xagusd; XAGUSD removed from channel
+                  # rotation entirely per explicit instruction (no
+                  # working candle data source - see get_candle_
+                  # symbol_candidates' docstring for the confirmed
+                  # plan-tier restrictions on both TwelveData and API
+                  # Ninjas). Still reachable via manual DM "Signal"
+                  # request (where it'll use the honest rule-based
+                  # fallback, no chart) - just never auto-posted.
     2: "usoil",   # Wednesday
     3: "btcusd",  # Thursday
     4: "usoil",   # Friday
@@ -3397,30 +3404,63 @@ def get_candles_twelvedata(symbol, interval, outputsize=60):
 
 def get_candle_symbol_candidates(config):
     """
-    Ordered candidate symbols to try for candle data. Oil mirrors
-    the same multi-symbol fallback already used for its live price
-    lookups in get_oil_price, since futures-style symbols aren't
-    guaranteed on every data plan. Every other pair (including
-    silver) just uses its existing td_symbol.
+    Ordered candidate symbols to try for candle data.
+
+    Oil: CONFIRMED via real Railway logs that "CL1!" 404s every
+    single time on this TwelveData plan ("**symbol** or **figi**
+    parameter is missing or invalid") - it is NOT a valid symbol
+    here, full stop, not a rate-limit or transient issue. Trying it
+    first wasted an API credit on a guaranteed failure before USOIL
+    (which can work) got a turn, and on an 8-credit-per-minute plan
+    that wasted attempt was directly contributing to the 429 "out of
+    API credits" errors seen immediately after. Dropped entirely -
+    going straight to USOIL, the symbol that's actually valid.
+
+    Silver does NOT get a fallback - CONFIRMED via the same logs that
+    XAG/USD candle data 404s with "available starting with the Grow
+    or Venture plan" - a plan-tier restriction, not a bad symbol, so
+    no alternate spelling would fix it.
     """
     if config.get("use_oil_api"):
-        return ["CL1!", "USOIL"]
+        return ["USOIL"]
     return [config.get("td_symbol", config["symbol"])]
 
 def get_cached_candles(pair_key, config, interval, outputsize=60):
-    cache_key = f"{pair_key}_{interval}"
+    """
+    CONFIRMED REAL BUG FIX: cache_key previously omitted outputsize
+    entirely (f"{pair_key}_{interval}"), so whichever call happened
+    to run FIRST for a given pair/interval silently decided what
+    every later caller got, regardless of how many candles THEY
+    asked for. Concretely: analyze_smc_structure (inside
+    run_strategy_bank) requests outputsize=60 for h1, while
+    build_signal_response's main signal generation requests
+    outputsize=210 for the same pair/interval - if the 60-candle
+    fetch ran first and got cached, the 210-candle request later in
+    the SAME call would silently receive the cached 60-candle list
+    instead, never actually fetching the deeper history it asked
+    for. strategy_trend_following's MA20/MA50 (and any other
+    strategy relying on a longer window) could end up running on
+    less data than intended, with no error or warning anywhere -
+    the bug was completely silent. Including outputsize in the cache
+    key means a 60-candle cache entry and a 210-candle cache entry
+    are now tracked as genuinely separate things, each fetched fresh
+    when first needed at that specific size.
+    """
+    cache_key = f"{pair_key}_{interval}_{outputsize}"
     now = time.time()
     ttl = CANDLE_CACHE_SECONDS.get(interval, 3600)
     cached = candle_cache.get(cache_key)
     if cached and (now - cached["timestamp"] < ttl):
         return cached["candles"]
 
-    for symbol in get_candle_symbol_candidates(config):
+    candidates = get_candle_symbol_candidates(config)
+    for symbol in candidates:
         candles = get_candles_twelvedata(symbol, interval, outputsize)
         if candles:
             candle_cache[cache_key] = {"candles": candles, "timestamp": now}
             return candles
 
+    print(f"[CANDLES] All symbol candidates failed for {pair_key} ({interval}, outputsize={outputsize}): tried {candidates}")
     return None
 
 def find_swing_points(candles, strength=2):

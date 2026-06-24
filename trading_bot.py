@@ -3159,7 +3159,7 @@ def get_silver_price():
         return None
 
 
-def get_silver_daily_history(days=21):
+def get_silver_daily_history(days=21, live_price=None):
     """
     CONFIRMED via metals.dev's own documentation (metals.dev/docs):
     the timeseries endpoint is free-tier accessible (same plan/key as
@@ -3171,6 +3171,26 @@ def get_silver_daily_history(days=21):
     have. Used only by the dedicated XAGUSD daily-trend fallback
     below, never by the main strategy bank (which needs real H1 OHLC
     that no free source provides for this pair).
+
+    CONFIRMED REAL ISSUE via a live API pull (not assumed): even when
+    end_date is explicitly set to TODAY, metals.dev's /timeseries
+    response simply never includes today's date - the most recent
+    entry is always yesterday's (or older). That's why the chart and
+    daily-trend reasoning were showing a stale ~61-65 range while the
+    live /latest spot price had already moved to ~57-58 - not a bug
+    in this function's parsing, a structural property of this
+    endpoint: it's always at least 1 day behind real-time, every
+    single request, regardless of what end_date is requested.
+
+    live_price: the SAME real, current spot price get_silver_price()
+    already fetches (passed in by the caller, not re-fetched here, to
+    avoid a redundant API call) - if provided, it's appended as
+    TODAY's entry, replacing the chart/checks' reliance on
+    /timeseries' inherently stale "most recent" day with the actual
+    current price. This is the fix for the real gap above: every
+    other day in the series is still genuinely historical /timeseries
+    data, only the final point becomes "right now," matching what the
+    Entry price in the same signal already shows.
 
     Returns a list of {"date": "YYYY-MM-DD", "close": float} dicts,
     oldest first, or None if the request fails.
@@ -3186,21 +3206,6 @@ def get_silver_daily_history(days=21):
             "api_key": METALS_API_KEY,
             "start_date": start_date.isoformat(),
             "end_date": end_date.isoformat(),
-            # Explicit currency/unit, matching get_silver_price's /latest
-            # call exactly - the LIKELY REAL CAUSE of a confirmed real
-            # mismatch (chart showed daily values ~61-74, true live
-            # spot via get_silver_price showed 57.42 at the same
-            # moment): CONFIRMED via a real raw /latest response pull
-            # that the actual root cause was get_silver_price reading
-            # metals.dev's unreliable plain "silver" field (57.42)
-            # instead of their accurate "lbma_silver" field (60.6,
-            # matching every independent real-world source) - now
-            # fixed there. This function's timeseries data was never
-            # actually wrong; its ~61-74 range already roughly
-            # matched real-world silver prices for those dates. Currency/
-            # unit are still pinned explicitly here regardless, since
-            # that's a real correctness improvement on its own even
-            # though it wasn't the actual cause of the mismatch.
             "currency": "USD",
             "unit": "toz",
         }
@@ -3243,6 +3248,24 @@ def get_silver_daily_history(days=21):
             f"[SILVER DAILY] Parsed {len(history)} days | "
             f"first={history[0]} | last={history[-1]}"
         )
+
+        # THE ACTUAL FIX, per explicit instruction: /timeseries never
+        # includes today's date (confirmed via a real live pull - the
+        # most recent entry is always yesterday or older), which made
+        # the chart and daily-trend reasoning anchor on an already-
+        # stale price while the signal's own Entry (from the real
+        # live get_silver_price() spot) had already moved on. If the
+        # caller passed the live spot price, append/replace today's
+        # entry with it - same real, current number the rest of the
+        # signal already uses, so the chart's last point and the
+        # signal's Entry price can never disagree again.
+        today_str = end_date.isoformat()
+        if live_price is not None:
+            if history[-1]["date"] == today_str:
+                history[-1]["close"] = float(live_price)
+            else:
+                history.append({"date": today_str, "close": float(live_price)})
+            print(f"[SILVER DAILY] Appended live spot as today ({today_str}): {live_price}")
 
         return history
     except Exception as e:
@@ -3317,7 +3340,7 @@ def _xagusd_check_breakout(closes, lookback=10):
     return None
 
 
-def generate_xagusd_daily_fallback():
+def generate_xagusd_daily_fallback(live_price=None):
     """
     Dedicated, intentionally SIMPLE daily-trend bank for XAGUSD only
     - built because metals.dev's free daily price history is the only
@@ -3338,6 +3361,17 @@ def generate_xagusd_daily_fallback():
     anything at all, exactly matching the old behavior's only None
     case (current_price == short_ma, a precise tie).
 
+    live_price: the real, current spot price (same number the rest of
+    the signal uses for Entry/SL/TP) - passed straight through to
+    get_silver_daily_history so its "today" entry is the actual
+    current price, not metals.dev's /timeseries endpoint's inherently
+    1+ day stale "most recent" entry (CONFIRMED via a real live pull:
+    even with end_date explicitly set to today, today's date never
+    appears in the response). Without this, the chart and the 3
+    checks below were silently reasoning about yesterday's price
+    while the signal's own Entry had already moved on - same number,
+    finally, everywhere in the signal.
+
     Deliberately NOT dressed up to look like the main strategy bank:
     - Only 3 simple checks computable from real daily closes alone,
       no RSI/MACD/Bollinger (those need period-tuning never validated
@@ -3355,7 +3389,7 @@ def generate_xagusd_daily_fallback():
     real data isn't available right now, or none of the 3 checks
     found anything - never invents a direction.
     """
-    history = get_silver_daily_history()
+    history = get_silver_daily_history(live_price=live_price)
     if not history or len(history) < 10:
         return None
 
@@ -5919,8 +5953,15 @@ async def build_signal_response(question, user_id=None):
             # their docs), unlike oil which has no free path at any
             # granularity. Deliberately simpler/lower-confidence than
             # the main bank - see generate_xagusd_daily_fallback's
-            # own docstring for why.
-            daily_fallback_result = generate_xagusd_daily_fallback()
+            # own docstring for why. live_price IS passed through now,
+            # per explicit instruction - CONFIRMED via a real live
+            # API pull that metals.dev's /timeseries never includes
+            # today's date (always 1+ day stale), which was silently
+            # anchoring the chart/reasoning to yesterday's price while
+            # Entry below used today's real one. Same live_price
+            # variable already used for Entry/SL/TP elsewhere in this
+            # function - not a second fetch, not a different number.
+            daily_fallback_result = generate_xagusd_daily_fallback(live_price=live_price)
             if daily_fallback_result:
                 direction, confidence, reason, daily_fallback_history = daily_fallback_result
                 last_signal_direction[matched_key] = (direction, time.time())

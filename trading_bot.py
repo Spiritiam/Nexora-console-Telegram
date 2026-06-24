@@ -4408,6 +4408,7 @@ def run_strategy_bank(pair_key, config, h1_candles, h4_candles, daily_candles, m
             continue
 
     if not votes:
+        print(f"[STRATEGY BANK] {pair_key} - no strategy cast any vote this round, falling back")
         return None
 
     buy_votes = [v for v in votes if v["direction"] == "BUY"]
@@ -4468,6 +4469,7 @@ async def run_strategy_bank_synthetic(index_key, config, h1_candles, h4_candles,
             continue
 
     if not votes:
+        print(f"[STRATEGY BANK SYNTH] {index_key} - no strategy cast any vote this round, falling back")
         return None
 
     buy_votes = [v for v in votes if v["direction"] == "BUY"]
@@ -4786,7 +4788,7 @@ async def build_signal_response(question, user_id=None):
     used_smc = False
     used_ai_layer = False
 
-    h1_candles = get_cached_candles(matched_key, config, "1h", outputsize=60)
+    h1_candles = get_cached_candles(matched_key, config, "1h", outputsize=210)
     h4_candles = get_cached_candles(matched_key, config, "4h", outputsize=60)
     daily_candles = get_cached_candles(matched_key, config, "1day", outputsize=10)
 

@@ -4645,6 +4645,23 @@ async def run_strategy_bank_synthetic(index_key, config, h1_candles, h4_candles,
             f"open={last_candle.get('open')} high={last_candle.get('high')} "
             f"low={last_candle.get('low')} close={last_candle.get('close')}"
         )
+    if h1_candles:
+        # Never previously checked - 5 of the 8 synthetic strategies
+        # (RSI extreme reversal, trend following, breakout, S/R
+        # bounce, MACD) vote on h1_candles, not m1_candles. If h1 data
+        # were stale, flat, or duplicated, those 5 would silently find
+        # nothing every round while the 3 m1-based strategies are the
+        # only ones that ever get a real shot - which would look
+        # exactly like what's been observed on r75/r100. Logging the
+        # last 3 h1 candles' closes plus first/last timestamps to
+        # check for staleness or repeated identical values directly.
+        h1_last3 = h1_candles[-3:]
+        h1_closes = [c.get("close") for c in h1_last3]
+        h1_times = [c.get("time") for c in h1_last3]
+        print(
+            f"[STRATEGY BANK SYNTH DIAG] {index_key} last 3 h1 closes: "
+            f"{h1_closes} | times: {h1_times}"
+        )
 
     for strategy_fn in SYNTHETIC_STRATEGY_BANK:
         try:

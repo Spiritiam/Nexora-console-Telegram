@@ -639,7 +639,9 @@ def log_channel_message(signal_id, chat_id, message_id):
             "message_id": message_id,
             "posted_at": datetime.utcnow().isoformat(),
         }
-        requests.post(url, headers=sb_headers(), json=payload, timeout=10)
+        response = requests.post(url, headers=sb_headers(), json=payload, timeout=10)
+        if response.status_code not in (200, 201):
+            print(f"[CHANNEL LOG] log_channel_message got {response.status_code}: {response.text}")
     except Exception as e:
         print(f"[CHANNEL LOG] log_channel_message error: {e}")
 
@@ -1349,7 +1351,18 @@ def set_low_balance_notified(user_id, notified):
         payload = {"low_balance_notified": notified}
         if notified:
             payload["low_balance_last_notified_at"] = datetime.utcnow().isoformat()
-        requests.patch(url, headers=sb_headers(), json=payload, timeout=10)
+        response = requests.patch(url, headers=sb_headers(), json=payload, timeout=10)
+        # CONFIRMED REAL RISK during full project audit: requests.patch
+        # does NOT raise on 4xx/5xx by default, and this previously
+        # never checked response.status_code at all - if Supabase
+        # rejects the payload (e.g. low_balance_last_notified_at
+        # column doesn't exist yet because the migration hasn't been
+        # run), the ENTIRE patch fails, including the pre-existing
+        # low_balance_notified field, with zero visibility anywhere.
+        # Logging non-2xx explicitly now so a missing migration shows
+        # up in Railway logs instead of silently doing nothing.
+        if response.status_code not in (200, 204):
+            print(f"[DERIV] set_low_balance_notified got {response.status_code}: {response.text}")
     except Exception as e:
         print(f"[DERIV] set_low_balance_notified error: {e}")
 
@@ -1394,10 +1407,12 @@ def set_token_invalid_notified(user_id, notified):
     """
     try:
         url = f"{SUPABASE_URL}/rest/v1/deriv_accounts?user_id=eq.{user_id}"
-        requests.patch(
+        response = requests.patch(
             url, headers=sb_headers(),
             json={"token_invalid_notified": notified}, timeout=10
         )
+        if response.status_code not in (200, 204):
+            print(f"[DERIV] set_token_invalid_notified got {response.status_code}: {response.text}")
     except Exception as e:
         print(f"[DERIV] set_token_invalid_notified error: {e}")
 
@@ -3839,24 +3854,26 @@ def get_candle_symbol_candidates(config):
     """
     Ordered candidate symbols to try for candle data.
 
-    Oil: NEITHER "CL1!" NOR "USOIL" work - both confirmed 404ing via
-    real Railway logs ("**symbol** or **figi** parameter is missing
-    or invalid"). Checked TwelveData's own commodities documentation
-    directly (twelvedata.com/commodities and twelvedata.com/forex):
-    their actual listed symbol for this instrument is "WTI/USD"
-    ("Crude Oil WTI Spot (WTI)"), following the same XXX/USD pattern
-    as XAU/USD and XAG/USD, which already work correctly elsewhere in
-    this file. Their own product pages state time_series access
-    starts from the Basic plan (lower than XAGUSD's Grow/Venture
-    requirement), so this has a real chance of working on this
-    account - but this is documentation-based, NOT yet confirmed
-    against a live API response. If "WTI/USD" also 404s, check the
-    real error message (plan-tier restriction vs bad symbol) before
-    trying anything else - don't guess a third symbol blind.
+    Oil: CONFIRMED DEAD END on this TwelveData plan, at every symbol
+    tried. "CL1!" and "USOIL" both 404 with "symbol or figi parameter
+    missing or invalid" (not valid symbols on this account at all).
+    "WTI/USD" - TwelveData's own documented symbol for this
+    instrument - was THEN tested live and got the SAME rejection
+    XAGUSD already had: "available starting with the Grow or Venture
+    plan". So oil has no free path on this plan at any symbol
+    spelling, same root cause as silver. No further oil symbol is
+    worth guessing - this needs a paid plan upgrade (TwelveData Grow/
+    Venture or an alternative provider), not more code. USOIL has no
+    fixed schedule slot for this reason; still reachable manually via
+    DM "Signal", where it returns the honest NO_DATA_AVAILABLE message.
 
-    Silver does NOT get a fallback - CONFIRMED via real logs that
-    XAG/USD candle data 404s with "available starting with the Grow
-    or Venture plan" - a plan-tier restriction, not a bad symbol.
+    Silver does NOT get a candle fallback either, for the identical
+    reason - CONFIRMED via real logs that XAG/USD candle data 404s
+    with "available starting with the Grow or Venture plan" - a plan-
+    tier restriction, not a bad symbol. (XAGUSD's LIVE PRICE still
+    works fine via metals.dev - get_silver_price/get_silver_daily_
+    history - this function only covers TwelveData's candle/OHLC
+    endpoint, a completely separate product from metals.dev.)
     """
     if config.get("use_oil_api"):
         return ["WTI/USD"]
@@ -8782,10 +8799,12 @@ async def purgedigests_command(update: Update, context: ContextTypes.DEFAULT_TYP
         # again on a future run.
         try:
             url = f"{SUPABASE_URL}/rest/v1/deriv_accounts?user_id=eq.{target_user_id}"
-            requests.patch(
+            response = requests.patch(
                 url, headers=sb_headers(),
                 json={"last_digest_message_id": None}, timeout=10
             )
+            if response.status_code not in (200, 204):
+                print(f"[PURGE DIGESTS] Clear got {response.status_code} for {target_user_id}: {response.text}")
         except Exception as e:
             print(f"[PURGE DIGESTS] Couldn't clear saved id for {target_user_id}: {e}")
 
@@ -9078,10 +9097,12 @@ def get_todays_auto_copy_failure_count(user_id):
 def save_last_digest_message_id(user_id, message_id):
     try:
         url = f"{SUPABASE_URL}/rest/v1/deriv_accounts?user_id=eq.{user_id}"
-        requests.patch(
+        response = requests.patch(
             url, headers=sb_headers(),
             json={"last_digest_message_id": message_id}, timeout=10
         )
+        if response.status_code not in (200, 204):
+            print(f"[AUTO-COPY DIGEST] save got {response.status_code}: {response.text}")
     except Exception as e:
         print(f"[AUTO-COPY DIGEST] save_last_digest_message_id error: {e}")
 

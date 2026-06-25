@@ -573,6 +573,39 @@ def log_signal(signal_data):
         print(f"[SIGNAL LOG] log_signal error: {e}")
         return None
 
+def log_channel_message(signal_id, chat_id, message_id):
+    """
+    CONFIRMED REAL GAP, now fixed: channel posts were never recorded
+    anywhere - no chat_id/message_id stored for any signal message
+    ever sent. When the "Get Your Own Signal" button turned out to
+    be broken on already-posted messages (a callback_data button
+    that can never open a chat), there was no way to find and fix
+    those old messages at all - Telegram bots cannot list/scan a
+    channel's history themselves, they can only act on a message ID
+    they already know. Going forward, every channel post's real
+    chat_id + message_id gets recorded against its signal_log row,
+    so editMessageReplyMarkup/editMessageCaption can actually target
+    a specific old message later if anything like this happens
+    again. Requires a channel_messages table (signal_id bigint,
+    chat_id bigint, message_id bigint) - add this table in Supabase
+    before this is useful; the call itself fails safely (logs and
+    returns) if the table doesn't exist yet, never blocks the post.
+    """
+    if not signal_id or not chat_id or not message_id:
+        return
+    try:
+        url = f"{SUPABASE_URL}/rest/v1/channel_messages"
+        payload = {
+            "signal_id": signal_id,
+            "chat_id": chat_id,
+            "message_id": message_id,
+            "posted_at": datetime.utcnow().isoformat(),
+        }
+        requests.post(url, headers=sb_headers(), json=payload, timeout=10)
+    except Exception as e:
+        print(f"[CHANNEL LOG] log_channel_message error: {e}")
+
+
 def attach_mt5_order_id(signal_id, order_id):
     """
     Links a placed MT5 order back onto its signal_log row, so the
@@ -8295,13 +8328,14 @@ async def _post_signal_for_pair(bot, pair_keyword):
                 else None
             )
 
-            await bot.send_photo(
+            sent_msg = await bot.send_photo(
                 chat_id=channel_id,
                 photo=image_file_id,
                 caption=signal,
                 parse_mode=ParseMode.HTML,
                 reply_markup=markup
             )
+            log_channel_message(signal_id, sent_msg.chat_id, sent_msg.message_id)
             print(
                 f"[AUTO SIGNAL] ✅ {pair_keyword.upper()} "
                 f"posted to {channel_id}"

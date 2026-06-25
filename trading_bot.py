@@ -767,7 +767,16 @@ async def process_due_auto_deletes(context: ContextTypes.DEFAULT_TYPE):
     retried forever).
     """
     try:
-        now_str = datetime.utcnow().isoformat()
+        # FIX: must be timezone-AWARE ("+00:00" suffix), not naive -
+        # delete_at is a timestamptz column, and comparing it against
+        # a naive "now" string here (no offset) is the one place in
+        # the whole codebase where that naive-datetime pattern
+        # actually breaks something: PostgREST/Postgres can't safely
+        # assume a bare timestamp string means UTC, so this lte.
+        # filter was silently failing to match rows that were
+        # genuinely due, leaving them stuck in the queue (and the
+        # original messages undeleted in Telegram) indefinitely.
+        now_str = datetime.utcnow().isoformat() + "+00:00"
         url = (
             f"{SUPABASE_URL}/rest/v1/auto_delete_queue_db"
             f"?delete_at=lte.{now_str}&select=id,chat_id,message_id"

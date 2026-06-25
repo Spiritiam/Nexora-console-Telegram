@@ -112,12 +112,19 @@ SL_HIT_IMAGE_FILE_ID = "AgACAgQAAxkBAAIBIWowI9Lxu93CIKFD5YSHFbJ8_MB-AAJBD2sbbT2B
 # ============================================
 # DAILY SCHEDULE (UTC)
 # Times are in UTC - "07:00 UTC" = 8AM Lagos,
-# "17:00 UTC" = 6PM Lagos, "11:00 UTC" = 12PM
-# Lagos, matching how the team actually thinks
-# about these slots.
+# "13:00 UTC" = 2PM Lagos, "19:00 UTC" = 8PM
+# Lagos, "11:00 UTC" = 12PM Lagos, matching how
+# the team actually thinks about these slots.
+# 3 daily forex/crypto slots per explicit
+# instruction: 8AM XAUUSD, 2PM GBPJPY, 8PM
+# BTCUSD (weekdays) - deliberately spaced apart
+# (8am/2pm/8pm, not clustered) since 2pm and the
+# OLD 6pm evening slot were judged too close
+# together ("too much noise").
 #
-# MORNING_PAIR_BY_WEEKDAY / EVENING_PAIR_BY_WEEKDAY
-# use Python's datetime.weekday() convention:
+# MORNING_PAIR_BY_WEEKDAY / MIDDAY_PAIR_BY_WEEKDAY
+# / EVENING_PAIR_BY_WEEKDAY use Python's
+# datetime.weekday() convention:
 # 0=Monday ... 6=Sunday. This is DELIBERATELY
 # different from PTB's run_daily `days` param
 # (which is cron-style, 0=Sunday...6=Saturday -
@@ -143,17 +150,33 @@ MORNING_PAIR_BY_WEEKDAY = {
     6: "btcusd",  # Sunday
 }
 
+# New 2pm UTC midday slot, per explicit instruction - GBPJPY every
+# weekday (real H1 data, same strength as the other working forex
+# pairs - NOT XAGUSD, which was explicitly ruled out for a daily slot
+# since its daily-trend fallback is intentionally the weakest signal
+# type in the bank). Forex is closed weekends, same pattern already
+# used for MORNING_PAIR_BY_WEEKDAY above - falls back to BTCUSD on
+# Sat/Sun since only BTCUSD and synthetics trade those days.
+MIDDAY_PAIR_BY_WEEKDAY = {
+    0: "gbpjpy",  # Monday
+    1: "gbpjpy",  # Tuesday
+    2: "gbpjpy",  # Wednesday
+    3: "gbpjpy",  # Thursday
+    4: "gbpjpy",  # Friday
+    5: "btcusd",  # Saturday - forex closed
+    6: "btcusd",  # Sunday - forex closed
+}
+
 EVENING_PAIR_BY_WEEKDAY = {
     0: "btcusd",  # Monday
-    1: "xagusd",  # Tuesday - USOIL removed (no working data source on
-                  # any plan tier - confirmed dead end, see
-                  # get_candle_symbol_candidates' docstring). XAGUSD
-                  # now has a real working daily-trend signal (metals.dev
-                  # lbma_silver-corrected live price + real daily
-                  # history), so it takes USOIL's place in the evening
-                  # rotation, sharing with BTCUSD per explicit instruction.
+    1: "btcusd",  # Tuesday - XAGUSD removed from this slot per explicit
+                  # instruction (moved BTCUSD here from 6pm to 8pm,
+                  # deliberately spaced apart from the new 2pm GBPJPY
+                  # slot "so it doesn't feel like too much noise").
+                  # XAGUSD no longer has any fixed daily/weekly channel
+                  # slot - still reachable via manual DM "Signal" only.
     2: "btcusd",  # Wednesday
-    3: "xagusd",  # Thursday
+    3: "btcusd",  # Thursday
     4: "btcusd",  # Friday
     5: None,      # Saturday - no evening forex/crypto slot, volatility only
     6: None,      # Sunday - no evening forex/crypto slot, volatility only
@@ -619,6 +642,35 @@ def log_channel_message(signal_id, chat_id, message_id):
         requests.post(url, headers=sb_headers(), json=payload, timeout=10)
     except Exception as e:
         print(f"[CHANNEL LOG] log_channel_message error: {e}")
+
+
+def get_last_channel_message(chat_id):
+    """
+    Looks up the most recently logged signal message for a given
+    channel, using the channel_messages table built alongside
+    log_channel_message above. Powers the "delete the previous signal
+    before posting a new one" behavior in _post_signal_for_pair, per
+    explicit instruction that 3 signals/day was starting to feel
+    spammy with old messages stacking up.
+
+    Returns (chat_id, message_id) or None if nothing's been logged
+    for this channel yet, or the table doesn't exist/lookup fails -
+    fails safe, never blocks the new message from sending.
+    """
+    try:
+        url = (
+            f"{SUPABASE_URL}/rest/v1/channel_messages"
+            f"?chat_id=eq.{chat_id}&select=chat_id,message_id"
+            f"&order=posted_at.desc&limit=1"
+        )
+        response = requests.get(url, headers=sb_headers(), timeout=10)
+        data = response.json()
+        if data:
+            return data[0]["chat_id"], data[0]["message_id"]
+        return None
+    except Exception as e:
+        print(f"[CHANNEL LOG] get_last_channel_message error: {e}")
+        return None
 
 
 def attach_mt5_order_id(signal_id, order_id):
@@ -8354,6 +8406,20 @@ async def _post_signal_for_pair(bot, pair_keyword):
 
     for channel_id in [CHANNEL_1_ID, CHANNEL_2_ID, CHANNEL_3_ID]:
         try:
+            # Delete this channel's previous signal message first, per
+            # explicit instruction - with 3 signals/day now (up from
+            # 2), old messages stacking up in the channel was starting
+            # to feel like spam. Best-effort: if the old message is
+            # already gone, too old to delete, or nothing's been
+            # logged yet for this channel, this fails silently and
+            # the new signal still posts normally either way.
+            prev = get_last_channel_message(channel_id)
+            if prev:
+                try:
+                    await bot.delete_message(chat_id=prev[0], message_id=prev[1])
+                except Exception as e:
+                    print(f"[AUTO SIGNAL] Couldn't delete previous message in {channel_id}: {e}")
+
             markup = (
                 get_channel_button()
                 if channel_id in (CHANNEL_1_ID, CHANNEL_3_ID)
@@ -8394,12 +8460,31 @@ async def post_morning_signal(context: ContextTypes.DEFAULT_TYPE):
         return
     await _post_signal_for_pair(context.bot, pair_keyword)
 
+async def post_midday_signal(context: ContextTypes.DEFAULT_TYPE):
+    """
+    Runs every day at 13:00 UTC (2PM Lagos) - new 3rd daily slot, per
+    explicit instruction. Looks up today's pair from
+    MIDDAY_PAIR_BY_WEEKDAY - GBPJPY on weekdays (real H1 data, same
+    strength as the bot's other working forex pairs - XAGUSD was
+    explicitly considered and ruled out for this slot since its
+    daily-trend fallback is intentionally the weakest signal type in
+    the bank), BTCUSD on weekends since forex is closed.
+    """
+    weekday = datetime.utcnow().weekday()  # 0=Monday ... 6=Sunday
+    pair_keyword = MIDDAY_PAIR_BY_WEEKDAY.get(weekday)
+    if not pair_keyword:
+        return
+    await _post_signal_for_pair(context.bot, pair_keyword)
+
 async def post_evening_signal(context: ContextTypes.DEFAULT_TYPE):
     """
-    Runs every day at 17:00 UTC (6PM Lagos). Looks up today's pair
-    from EVENING_PAIR_BY_WEEKDAY - None on Sat/Sun, since those days
-    only get the volatility-index slot in the evening, not a forex/
-    crypto signal.
+    Runs every day at 19:00 UTC (8PM Lagos) - moved from the previous
+    17:00 UTC (6PM Lagos) per explicit instruction, deliberately
+    spaced apart from the new 13:00 UTC (2PM Lagos) midday slot so the
+    two don't feel clustered together ("too much noise"). Looks up
+    today's pair from EVENING_PAIR_BY_WEEKDAY - None on Sat/Sun, since
+    those days only get the volatility-index slot in the evening, not
+    a forex/crypto signal.
     """
     weekday = datetime.utcnow().weekday()  # 0=Monday ... 6=Sunday
     pair_keyword = EVENING_PAIR_BY_WEEKDAY.get(weekday)
@@ -9179,8 +9264,17 @@ def main():
         job_kwargs={"misfire_grace_time": 300}
     )
     job_queue.run_daily(
+        post_midday_signal,
+        time=parse_time("13:00"),
+        name="midday_signal",
+        days=EVERY_DAY,
+        job_kwargs={"misfire_grace_time": 300}
+    )
+    job_queue.run_daily(
         post_evening_signal,
-        time=parse_time("17:00"),
+        time=parse_time("19:00"),  # moved from 17:00 per explicit
+                                    # instruction, to keep distance
+                                    # from the new 13:00 midday slot
         name="evening_signal",
         days=EVERY_DAY,
         job_kwargs={"misfire_grace_time": 300}

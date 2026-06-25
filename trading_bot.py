@@ -8541,6 +8541,53 @@ async def testsynth_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await _post_synthetic_signal_for_index(context.bot, index_key)
     await update.message.reply_text("Done - check the channel and tap Trade This Signal.")
 
+
+async def testsignal_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """
+    Forex/crypto equivalent of /testsynth above - same admin-only
+    gate, same pattern. Lets the admin fire one real signal through
+    _post_signal_for_pair (the actual function the channel_messages
+    logging fix lives in) on demand, rather than waiting for the
+    scheduled morning/evening job - per explicit instruction, so this
+    can be verified BEFORE today's schedule posts anything on its own.
+    """
+    user_id = str(update.message.from_user.id)
+
+    if not ADMIN_USER_ID or user_id != str(ADMIN_USER_ID):
+        return  # silently ignore - don't reveal this command to anyone else
+
+    args = context.args
+    if not args:
+        await update.message.reply_text(
+            "Usage: /testsignal xauusd | btcusd | usoil | xagusd | eurusd | etc."
+        )
+        return
+
+    pair_keyword = args[0].lower()
+    if pair_keyword not in PAIR_CONFIG:
+        await update.message.reply_text(
+            f"Unknown pair '{pair_keyword}'. Use one of: "
+            f"{', '.join(PAIR_CONFIG.keys())}"
+        )
+        return
+
+    pair_name = PAIR_CONFIG[pair_keyword].get("pair_name", pair_keyword.upper())
+    if has_open_signal_for_pair(pair_name):
+        await update.message.reply_text(
+            f"⚠️ {pair_name} already has an OPEN signal logged - "
+            f"_post_signal_for_pair will skip posting, nothing will "
+            f"appear in the channel. Close/clear that signal_log row "
+            f"first, or test a different pair."
+        )
+        return
+
+    await update.message.reply_text(f"Firing a fresh {pair_keyword.upper()} signal now...")
+    await _post_signal_for_pair(context.bot, pair_keyword)
+    await update.message.reply_text(
+        "Done - check the channel, tap Get Your Own Signal, and confirm "
+        "it opens the bot directly."
+    )
+
 # ============================================
 # PURGEDIGESTS (TEMPORARY - admin only)
 # One-time push-delete of every existing auto-
@@ -9023,6 +9070,7 @@ def main():
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("broadcast", broadcast_command))
     app.add_handler(CommandHandler("testsynth", testsynth_command))
+    app.add_handler(CommandHandler("testsignal", testsignal_command))
     app.add_handler(CommandHandler("purgedigests", purgedigests_command))
     app.add_handler(CallbackQueryHandler(handle_callback))
 

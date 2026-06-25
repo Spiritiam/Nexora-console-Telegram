@@ -200,10 +200,24 @@ main_keyboard = ReplyKeyboardMarkup(
 )
 
 def get_channel_button():
+    # CONFIRMED REAL BUG, same class already fixed once before for
+    # the "Trade This Signal" button (see start()'s chantrade_
+    # comment): callback_data buttons send an invisible ping back to
+    # the bot's server, they NEVER open a chat - and Telegram blocks
+    # bots from messaging a user who hasn't already started a DM with
+    # them, so the old channelcta callback handler's send_message
+    # call silently failed for anyone tapping this from the channel
+    # without ever having opened a DM first. That's exactly the
+    # "it just notifies, doesn't open the bot" symptom reported live.
+    # A url= deep link sidesteps this entirely - opening it IS the
+    # user starting the DM, no callback round-trip needed. No special
+    # payload branch needed in start() either - falling through to
+    # plain /start already runs the exact same follow-gate/welcome
+    # logic the old callback handler was duplicating by hand.
     return InlineKeyboardMarkup([
         [InlineKeyboardButton(
             "🤖 Get Your Own Signal",
-            callback_data="channelcta"
+            url=f"https://t.me/{BOT_USERNAME}?start=channelcta"
         )]
     ])
 

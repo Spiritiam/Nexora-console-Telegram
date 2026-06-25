@@ -1331,15 +1331,51 @@ def set_low_balance_notified(user_id, notified):
     minutes or hours earlier. Stored on deriv_accounts so it survives
     restarts and only actually changes when the balance episode
     itself starts or ends.
+
+    Also stamps low_balance_last_notified_at whenever notified=True -
+    CONFIRMED REAL ISSUE via real screenshots showing this warning
+    firing 3 times in one day (9:49, 10:50, 12:50) with 3 DIFFERENT
+    balance values ($0.61, $4.4, $3.36) - the balance was genuinely
+    oscillating above and below $5 multiple times that day, and the
+    existing notified flag correctly resets to False each time
+    balance recovers above $5 (working exactly as designed for
+    "tell once per low-balance EPISODE") - but per explicit
+    instruction, the real want is "tell at most once per CALENDAR
+    DAY, period", which the boolean flag alone can never express. See
+    should_send_low_balance_notification below for the actual gate.
     """
     try:
         url = f"{SUPABASE_URL}/rest/v1/deriv_accounts?user_id=eq.{user_id}"
-        requests.patch(
-            url, headers=sb_headers(),
-            json={"low_balance_notified": notified}, timeout=10
-        )
+        payload = {"low_balance_notified": notified}
+        if notified:
+            payload["low_balance_last_notified_at"] = datetime.utcnow().isoformat()
+        requests.patch(url, headers=sb_headers(), json=payload, timeout=10)
     except Exception as e:
         print(f"[DERIV] set_low_balance_notified error: {e}")
+
+
+def should_send_low_balance_notification(account):
+    """
+    THE ACTUAL FIX, per explicit instruction: max once per calendar
+    day (UTC), regardless of how many times balance crosses above/
+    below the $5 threshold that same day. Takes the account dict
+    already fetched this scan (no extra DB call) and checks
+    low_balance_last_notified_at against today's UTC date - if it's
+    missing, or from a previous day, sending is allowed; if it's
+    today already, sending is blocked even if low_balance_notified
+    itself is currently False (which it legitimately can be, since
+    balance recovering above $5 resets that flag independent of the
+    daily cap).
+    """
+    last_notified_at = account.get("low_balance_last_notified_at")
+    if not last_notified_at:
+        return True
+    try:
+        last_dt = datetime.fromisoformat(last_notified_at.replace("Z", "+00:00"))
+        return last_dt.date() < datetime.utcnow().date()
+    except Exception as e:
+        print(f"[DERIV] should_send_low_balance_notification parse error: {e}")
+        return True  # fail open - don't permanently silence a real warning over a parse hiccup
 
 def set_token_invalid_notified(user_id, notified):
     """
@@ -2505,7 +2541,7 @@ async def run_auto_copy_for_signal(bot, trade_context):
             )
 
             if stake is None:
-                if not account.get("low_balance_notified"):
+                if should_send_low_balance_notification(account):
                     await bot.send_message(
                         chat_id=int(user_id),
                         text=(
@@ -2515,7 +2551,9 @@ async def run_auto_copy_for_signal(bot, trade_context):
                             f"your Deriv account to resume auto-copy "
                             f"trades.\n\n"
                             f"<i>You won't get this reminder again "
-                            f"until your balance is back above $5.</i>"
+                            f"today, even if this happens again - "
+                            f"signals will keep being skipped "
+                            f"silently until then.</i>"
                         ),
                         parse_mode=ParseMode.HTML
                     )
@@ -2728,7 +2766,7 @@ async def run_auto_copy_scan(context: ContextTypes.DEFAULT_TYPE):
                 # somehow appeared twice in fresh_signals.
                 held_symbols.add(trade_context["symbol"])
 
-            if low_balance_hit and not account.get("low_balance_notified"):
+            if low_balance_hit and should_send_low_balance_notification(account):
                 await bot.send_message(
                     chat_id=int(user_id),
                     text=(
@@ -2738,7 +2776,7 @@ async def run_auto_copy_scan(context: ContextTypes.DEFAULT_TYPE):
                         f"your Deriv account to resume auto-copy "
                         f"trades.\n\n"
                         f"<i>You won't get this reminder again "
-                        f"until your balance is back above $5 - "
+                        f"today, even if this happens again - "
                         f"signals will keep being skipped "
                         f"silently until then.</i>"
                     ),
@@ -2878,7 +2916,7 @@ async def run_tickburst_auto_copy_scan(context: ContextTypes.DEFAULT_TYPE):
 
                 held_symbols.add(trade_context["symbol"])
 
-            if low_balance_hit and not account.get("low_balance_notified"):
+            if low_balance_hit and should_send_low_balance_notification(account):
                 await bot.send_message(
                     chat_id=int(user_id),
                     text=(
@@ -2888,7 +2926,7 @@ async def run_tickburst_auto_copy_scan(context: ContextTypes.DEFAULT_TYPE):
                         f"your Deriv account to resume auto-copy "
                         f"trades.\n\n"
                         f"<i>You won't get this reminder again "
-                        f"until your balance is back above $5 - "
+                        f"today, even if this happens again - "
                         f"signals will keep being skipped "
                         f"silently until then.</i>"
                     ),
@@ -8406,20 +8444,6 @@ async def _post_signal_for_pair(bot, pair_keyword):
 
     for channel_id in [CHANNEL_1_ID, CHANNEL_2_ID, CHANNEL_3_ID]:
         try:
-            # Delete this channel's previous signal message first, per
-            # explicit instruction - with 3 signals/day now (up from
-            # 2), old messages stacking up in the channel was starting
-            # to feel like spam. Best-effort: if the old message is
-            # already gone, too old to delete, or nothing's been
-            # logged yet for this channel, this fails silently and
-            # the new signal still posts normally either way.
-            prev = get_last_channel_message(channel_id)
-            if prev:
-                try:
-                    await bot.delete_message(chat_id=prev[0], message_id=prev[1])
-                except Exception as e:
-                    print(f"[AUTO SIGNAL] Couldn't delete previous message in {channel_id}: {e}")
-
             markup = (
                 get_channel_button()
                 if channel_id in (CHANNEL_1_ID, CHANNEL_3_ID)

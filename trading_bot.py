@@ -1648,24 +1648,71 @@ SYNTHETIC_ROTATION_ORDER = ["r10", "r25", "r50", "r75", "r100"]
 # entry yet. Requires a Supabase table: channel_signal_context_db
 # with RLS DISABLED (same as pending_trades_db - writes go through
 # the service-role key directly, not per-user Supabase auth).
-# Columns: index_key (text, primary key), symbol, contract_type,
-# direction, display (all text), multiplier, stake, risk, win (all
-# numeric), updated_at (timestamptz).
+#
+# CONFIRMED REAL BUG, found via direct user report with a real
+# screenshot: this table used to be keyed by bare index_key with
+# on_conflict=index_key (upsert), meaning every NEW signal for the
+# same index (e.g. r10) silently OVERWROTE the previous one's row.
+# Every "Trade This Signal" button ever posted for that index -
+# including ones from messages sent YESTERDAY - deep-linked to the
+# exact same lookup key, so tapping an old button would silently
+# execute whatever the MOST RECENT r10 signal's numbers were, not
+# the numbers shown in the message actually being tapped. The button
+# "worked" in the sense that it opened the bot and built a trade, but
+# it was attached to the wrong signal's data, with the gap GROWING
+# the longer that old message stayed un-superseded by a fresher one.
+#
+# Fixed: now keyed by a unique signal_key (index_key + the post
+# timestamp, e.g. "r10_1782350412") instead of bare index_key, so
+# every signal gets its own permanent row that's never overwritten
+# by a later one. The deep link itself now carries this same unique
+# signal_key, not just the index name - see _post_synthetic_signal_
+# for_index below. get() also now enforces a real 1-hour freshness
+# window (per explicit instruction) - a row older than that returns
+# None automatically, which reuses the EXISTING "this signal has
+# expired" UI path in start()/handle_callback without needing to
+# touch that part of the code at all.
+#
+# Columns: signal_key (text, PRIMARY KEY - NOT index_key anymore),
+# index_key (text, plain column now, not unique - kept for
+# reference/cleanup queries), symbol, contract_type, direction,
+# display (all text), multiplier, stake, risk, win (all numeric),
+# updated_at (timestamptz).
 
 class ChannelSignalContextStore:
     """Dict-like interface backed by Supabase, same pattern as PendingTradesStore."""
 
-    def get(self, index_key, default=None):
+    def get(self, signal_key, default=None):
         try:
             url = (
                 f"{SUPABASE_URL}/rest/v1/channel_signal_context_db"
-                f"?index_key=eq.{index_key}&select=*"
+                f"?signal_key=eq.{signal_key}&select=*"
             )
             response = requests.get(url, headers=sb_headers(), timeout=10)
             data = response.json()
             if not data:
                 return default
             row = data[0]
+
+            # 1-hour freshness window, per explicit instruction - a
+            # signal older than this is treated exactly like a
+            # missing row (returns default/None), which the caller
+            # already shows as "This signal has expired" - this is
+            # what actually closes the real bug: an old message's
+            # button can no longer silently execute fresh numbers,
+            # because past 1 hour it simply stops resolving to
+            # anything at all, frozen-stale data included.
+            updated_at = row.get("updated_at")
+            if updated_at:
+                try:
+                    updated_dt = datetime.fromisoformat(updated_at.replace("Z", "+00:00"))
+                    age_seconds = (datetime.utcnow() - updated_dt.replace(tzinfo=None)).total_seconds()
+                    if age_seconds > 3600:
+                        print(f"[CHANNEL SIGNAL CONTEXT] {signal_key} is {int(age_seconds)}s old, treating as expired")
+                        return default
+                except Exception as e:
+                    print(f"[CHANNEL SIGNAL CONTEXT] Couldn't parse updated_at for {signal_key}: {e}")
+
             return {
                 "symbol": row.get("symbol"),
                 "contract_type": row.get("contract_type"),
@@ -1680,11 +1727,12 @@ class ChannelSignalContextStore:
             print(f"[CHANNEL SIGNAL CONTEXT] get error: {e}")
             return default
 
-    def __setitem__(self, index_key, trade_context):
+    def __setitem__(self, signal_key, trade_context):
         try:
-            url = f"{SUPABASE_URL}/rest/v1/channel_signal_context_db?on_conflict=index_key"
+            url = f"{SUPABASE_URL}/rest/v1/channel_signal_context_db?on_conflict=signal_key"
             payload = {
-                "index_key": str(index_key),
+                "signal_key": str(signal_key),
+                "index_key": trade_context.get("index_key"),
                 "symbol": trade_context.get("symbol"),
                 "contract_type": trade_context.get("contract_type"),
                 "direction": trade_context.get("direction"),
@@ -7013,14 +7061,15 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     # initiated contact, so the tap did nothing visible. A url= deep
     # link sidesteps that since opening it IS the user starting the DM.
     if context.args and context.args[0].startswith("chantrade_"):
-        index_key = context.args[0].replace("chantrade_", "")
-        shared_context = channel_signal_context.get(index_key)
+        signal_key = context.args[0].replace("chantrade_", "")
+        shared_context = channel_signal_context.get(signal_key)
 
         if not shared_context:
             sent_expired_signal = await update.message.reply_text(
                 "⚠️ <b>This signal has expired.</b>\n\n"
-                "Request a fresh one by typing the index name "
-                "(e.g. R_100) in Signal mode.",
+                "Signals are only tradeable for 1 hour after they're "
+                "posted. Tap <b>📊 Signal</b> below to get a fresh, "
+                "live one instead.",
                 parse_mode=ParseMode.HTML,
                 reply_markup=main_keyboard
             )
@@ -7407,17 +7456,18 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     elif data.startswith("chantrade_"):
 
-        index_key = data.replace("chantrade_", "")
+        signal_key = data.replace("chantrade_", "")
         tapping_user_id = str(query.from_user.id)
 
-        shared_context = channel_signal_context.get(index_key)
+        shared_context = channel_signal_context.get(signal_key)
         if not shared_context:
             try:
                 await send_and_auto_delete(
                     context.bot, int(tapping_user_id),
                     "⚠️ <b>This signal has expired.</b>\n\n"
-                    "Request a fresh one by typing the index name "
-                    "(e.g. R_100) in Signal mode.",
+                    "Signals are only tradeable for 1 hour after "
+                    "they're posted. Tap 📊 Signal below to get a "
+                    "fresh, live one instead.",
                     parse_mode=ParseMode.HTML
                 )
             except Exception as e:
@@ -8553,7 +8603,19 @@ async def _post_synthetic_signal_for_index(bot, index_key):
         return
 
     signal_image_id, signal_message, trade_context = result
-    channel_signal_context[index_key] = trade_context
+
+    # Unique per-signal key, per explicit instruction - CONFIRMED REAL
+    # BUG (real user report + screenshot): the old bare index_key
+    # approach let every new signal for the same index silently
+    # overwrite the previous one's stored data, so an old message's
+    # "Trade This Signal" button (from hours or days earlier) could
+    # execute a completely different, newer signal's numbers without
+    # anyone knowing. This timestamp suffix gives every signal its
+    # own permanent, never-overwritten row - see ChannelSignalContext
+    # Store's docstring above for the full explanation.
+    signal_key = f"{index_key}_{int(time.time())}"
+    trade_context["index_key"] = index_key
+    channel_signal_context[signal_key] = trade_context
 
     for channel_id in [CHANNEL_1_ID, CHANNEL_2_ID, CHANNEL_3_ID]:
         try:
@@ -8565,7 +8627,7 @@ async def _post_synthetic_signal_for_index(bot, index_key):
                 reply_markup=InlineKeyboardMarkup([[
                     InlineKeyboardButton(
                         "🎯 Trade This Signal",
-                        url=f"https://t.me/{BOT_USERNAME}?start=chantrade_{index_key}"
+                        url=f"https://t.me/{BOT_USERNAME}?start=chantrade_{signal_key}"
                     )
                 ]])
             )

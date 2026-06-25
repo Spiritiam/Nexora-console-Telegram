@@ -227,6 +227,21 @@ def get_channel_button():
 
 user_modes = {}
 
+# user_id (str) -> (chat_id, message_id) of their most recent
+# "Welcome back... what would you like to do today?" message - per
+# explicit instruction, tapping a deep-link button (channelcta,
+# chantrade_) repeatedly was sending a fresh full welcome message
+# every time with the old one still sitting there, stacking up
+# duplicates in the chat. start() now deletes this before sending a
+# new one, so only ever one welcome message exists at a time per
+# user. Plain in-memory dict, not DB-backed - losing this on a
+# Railway restart is purely cosmetic (one old welcome message stays
+# on screen an extra time until the next /start cleans it up), never
+# a lost trade or signal, so the extra DB-table complexity pending_
+# trades/channel_signal_context needed for THEIR restart risk doesn't
+# apply here.
+last_welcome_message = {}
+
 # DB-backed for the same reason pending_trades_db/channel_signal_
 # context_db are: a plain in-memory dict here meant a Railway restart
 # between someone submitting a verification request and it being
@@ -6939,7 +6954,23 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
             return
 
     if is_verified(user_id):
-        await update.message.reply_text(
+        # Delete the previous welcome message first, if one exists -
+        # per explicit instruction, prevents repeated taps of a
+        # deep-link button (channelcta, chantrade_) or repeated manual
+        # /start calls from stacking up duplicate "what would you like
+        # to do today?" messages. Best-effort: if the old message was
+        # already deleted by the user, or is too old for the bot to
+        # delete (Telegram only allows deleting a bot's own messages,
+        # but only within certain limits), this fails silently and
+        # the new welcome message still sends normally either way.
+        prev = last_welcome_message.get(user_id)
+        if prev:
+            try:
+                await context.bot.delete_message(chat_id=prev[0], message_id=prev[1])
+            except Exception as e:
+                print(f"[START] Couldn't delete previous welcome message for {user_id}: {e}")
+
+        sent_welcome = await update.message.reply_text(
             f"👋 <b>Welcome back, {username}!</b>\n\n"
             f"✅ You're a <b>verified Nexora AI trader.</b>\n\n"
             f"━━━━━━━━━━━━━━━━━━━━━\n"
@@ -6953,6 +6984,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
             parse_mode=ParseMode.HTML,
             reply_markup=main_keyboard
         )
+        last_welcome_message[user_id] = (sent_welcome.chat_id, sent_welcome.message_id)
         return
 
     remaining = trial_remaining(user_id)

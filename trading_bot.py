@@ -8818,7 +8818,54 @@ async def testsignal_command(update: Update, context: ContextTypes.DEFAULT_TYPE)
     )
 
 # ============================================
-# PURGEDIGESTS (TEMPORARY - admin only)
+# WELCOME (admin only)
+# Posts the standard "Welcome to Nexora AI"
+# message to all 3 channels on demand, with the
+# same "Get Your Own Signal" deep-link button
+# (get_channel_button()) used elsewhere. Same
+# admin-only gate as the other test/admin
+# commands above.
+# ============================================
+
+WELCOME_CHANNEL_MESSAGE = (
+    "🚀 Welcome to Nexora AI\n\n"
+    "Your AI-powered trading assistant, available 24/7.\n\n"
+    "✅ Instant Trading Signals\n"
+    "📊 Smart Market Analysis\n"
+    "📈 Forex, Gold, Crypto & Indices\n"
+    "🧠 AI-Powered Trade Insights\n"
+    "⚡ Fast & Accurate Responses\n\n"
+    "Whether you’re a beginner or an experienced trader, Nexora AI is "
+    "here to help you make better trading decisions.\n\n"
+    "👇 Tap the button below to start chatting with Nexora AI."
+)
+
+
+async def welcome_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = str(update.message.from_user.id)
+
+    if not ADMIN_USER_ID or user_id != str(ADMIN_USER_ID):
+        return  # silently ignore - don't reveal this command to anyone else
+
+    sent, failed = 0, 0
+    for channel_id in [CHANNEL_1_ID, CHANNEL_2_ID, CHANNEL_3_ID]:
+        try:
+            await context.bot.send_message(
+                chat_id=channel_id,
+                text=WELCOME_CHANNEL_MESSAGE,
+                reply_markup=get_channel_button(),
+            )
+            sent += 1
+        except Exception as e:
+            failed += 1
+            print(f"[WELCOME] Failed for {channel_id}: {e}")
+
+    await update.message.reply_text(
+        f"Welcome message posted to {sent}/3 channels."
+        + (f" {failed} failed - check logs." if failed else "")
+    )
+
+
 # One-time push-delete of every existing auto-
 # copy digest message still sitting in chats -
 # the digest job itself is now permanently
@@ -9304,6 +9351,7 @@ def main():
     app.add_handler(CommandHandler("broadcast", broadcast_command))
     app.add_handler(CommandHandler("testsynth", testsynth_command))
     app.add_handler(CommandHandler("testsignal", testsignal_command))
+    app.add_handler(CommandHandler("welcome", welcome_command))
     app.add_handler(CommandHandler("purgedigests", purgedigests_command))
     app.add_handler(CallbackQueryHandler(handle_callback))
 

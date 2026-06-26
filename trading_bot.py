@@ -8829,7 +8829,7 @@ async def testsignal_command(update: Update, context: ContextTypes.DEFAULT_TYPE)
 
 WELCOME_CHANNEL_MESSAGE = (
     "🚀 <b>Welcome to Nexora AI</b>\n\n"
-    "Your AI-powered trading assistant, available 24/7.\n\n"
+    "Your <b>FREE</b> AI-powered trading assistant, available 24/7.\n\n"
     "✅ Instant Trading Signals\n"
     "📊 Smart Market Analysis\n"
     "📈 Forex, Gold, Crypto & Indices\n"

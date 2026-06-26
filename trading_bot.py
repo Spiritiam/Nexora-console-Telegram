@@ -112,15 +112,21 @@ SL_HIT_IMAGE_FILE_ID = "AgACAgQAAxkBAAIBIWowI9Lxu93CIKFD5YSHFbJ8_MB-AAJBD2sbbT2B
 # ============================================
 # DAILY SCHEDULE (UTC)
 # Times are in UTC - "07:00 UTC" = 8AM Lagos,
-# "13:00 UTC" = 2PM Lagos, "19:00 UTC" = 8PM
+# "13:00 UTC" = 2PM Lagos, "17:00 UTC" = 6PM
 # Lagos, "11:00 UTC" = 12PM Lagos, matching how
 # the team actually thinks about these slots.
-# 3 daily forex/crypto slots per explicit
-# instruction: 8AM XAUUSD, 2PM GBPJPY, 8PM
-# BTCUSD (weekdays) - deliberately spaced apart
-# (8am/2pm/8pm, not clustered) since 2pm and the
-# OLD 6pm evening slot were judged too close
-# together ("too much noise").
+# Per explicit instruction: 8AM XAUUSD every
+# weekday, 6PM BTCUSD every weekday, and a 2PM
+# midday slot that varies by day - EURUSD Monday,
+# GBPUSD Tuesday, GBPJPY Wednesday, a volatility/
+# synthetic index Thursday (see SYNTHETIC_SCHEDULE's
+# thursday_only entry), and nothing at all Friday.
+# GBPJPY alone was tried for every weekday first,
+# but found too slow/illiquid via real testing -
+# a JPY cross pair, computed from two legs rather
+# than quoted directly, unlike the majors now used
+# Mon/Tue. Weekends keep their own existing BTCUSD
+# morning/evening + synthetic pattern, untouched.
 #
 # MORNING_PAIR_BY_WEEKDAY / MIDDAY_PAIR_BY_WEEKDAY
 # / EVENING_PAIR_BY_WEEKDAY use Python's
@@ -136,8 +142,9 @@ SL_HIT_IMAGE_FILE_ID = "AgACAgQAAxkBAAIBIWowI9Lxu93CIKFD5YSHFbJ8_MB-AAJBD2sbbT2B
 # mechanism can't vary the pair by day, only
 # include/exclude whole days.
 #
-# A day with no evening pair (Sat/Sun) maps to
-# None - the job simply does nothing that slot.
+# A day with no pair for a given slot (e.g. midday
+# Thursday/Friday, evening Sat/Sun) maps to None -
+# the job simply does nothing that slot.
 # ============================================
 
 MORNING_PAIR_BY_WEEKDAY = {
@@ -150,19 +157,22 @@ MORNING_PAIR_BY_WEEKDAY = {
     6: "btcusd",  # Sunday
 }
 
-# New 2pm UTC midday slot, per explicit instruction - GBPJPY every
-# weekday (real H1 data, same strength as the other working forex
-# pairs - NOT XAGUSD, which was explicitly ruled out for a daily slot
-# since its daily-trend fallback is intentionally the weakest signal
-# type in the bank). Forex is closed weekends, same pattern already
-# used for MORNING_PAIR_BY_WEEKDAY above - falls back to BTCUSD on
-# Sat/Sun since only BTCUSD and synthetics trade those days.
+# 2pm UTC midday slot - per explicit instruction, a different forex
+# pair each weekday (GBPJPY alone was found too slow/illiquid via
+# real testing on TwelveData - a JPY cross pair, computed from two
+# legs rather than quoted directly, unlike the majors below). Thursday
+# maps to None here since that slot is now a volatility/synthetic
+# index post instead (see SYNTHETIC_SCHEDULE's thursday_only entry).
+# Friday maps to None - per explicit instruction, no midday post at
+# all that day. Forex is closed weekends, same pattern already used
+# for MORNING_PAIR_BY_WEEKDAY above - falls back to BTCUSD on Sat/Sun
+# since only BTCUSD and synthetics trade those days.
 MIDDAY_PAIR_BY_WEEKDAY = {
-    0: "gbpjpy",  # Monday
-    1: "gbpjpy",  # Tuesday
+    0: "eurusd",  # Monday
+    1: "gbpusd",  # Tuesday
     2: "gbpjpy",  # Wednesday
-    3: "gbpjpy",  # Thursday
-    4: "gbpjpy",  # Friday
+    3: None,      # Thursday - volatility/synthetic index instead, see SYNTHETIC_SCHEDULE
+    4: None,      # Friday - no midday post, per explicit instruction
     5: "btcusd",  # Saturday - forex closed
     6: "btcusd",  # Sunday - forex closed
 }
@@ -170,11 +180,9 @@ MIDDAY_PAIR_BY_WEEKDAY = {
 EVENING_PAIR_BY_WEEKDAY = {
     0: "btcusd",  # Monday
     1: "btcusd",  # Tuesday - XAGUSD removed from this slot per explicit
-                  # instruction (moved BTCUSD here from 6pm to 8pm,
-                  # deliberately spaced apart from the new 2pm GBPJPY
-                  # slot "so it doesn't feel like too much noise").
-                  # XAGUSD no longer has any fixed daily/weekly channel
-                  # slot - still reachable via manual DM "Signal" only.
+                  # instruction. XAGUSD no longer has any fixed daily/
+                  # weekly channel slot - still reachable via manual DM
+                  # "Signal" only.
     2: "btcusd",  # Wednesday
     3: "btcusd",  # Thursday
     4: "btcusd",  # Friday
@@ -187,11 +195,20 @@ DAILY_SCHEDULE = [
 ]
 
 # Synthetic index channel posts - rotates through all 5 indices.
-# Wednesday gets its own dedicated 12PM Lagos (11:00 UTC) slot in
-# addition to the existing weekend slots (Sat/Sun 6PM Lagos = 17:00
-# UTC) - so volatility indices post Wed/Sat/Sun, not every day.
+# Wednesday gets its own dedicated 12PM Lagos (11:00 UTC) slot, and
+# Thursday now gets the 2PM Lagos (13:00 UTC) midday slot instead of
+# a forex pair (per explicit instruction - MIDDAY_PAIR_BY_WEEKDAY
+# maps Thursday to None so post_midday_signal does nothing that day,
+# and this slot covers it instead), in addition to the existing
+# weekend slots (Sat/Sun 6PM Lagos = 17:00 UTC) - so volatility
+# indices post Wed/Thu/Sat/Sun, not every day. slot_number=1 on
+# Thursday (distinct from Wednesday's and the weekend's slot_number=0)
+# just to avoid ever landing on the exact same index as one of those
+# via get_rotation_key's day-of-year math, even though it's not on
+# the same calendar day as either.
 SYNTHETIC_SCHEDULE = [
     ("11:00", "wednesday_only", 0),
+    ("13:00", "thursday_only", 1),
     ("17:00", "weekend", 0),
 ]
 
@@ -3885,7 +3902,24 @@ def get_candles_twelvedata(symbol, interval, outputsize=60):
             f"?symbol={symbol}&interval={interval}&outputsize={outputsize}"
             f"&apikey={TWELVEDATA_API_KEY}"
         )
-        response = requests.get(url, timeout=10)
+        # FIX: retry once on a timeout before giving up. CONFIRMED
+        # real case via live logs - a single 10s read timeout on
+        # BTC/USD's 1h fetch made h1_candles None for that entire
+        # signal round, which cascaded into: most of STRATEGY_BANK
+        # unable to run (all need h1_candles), the signal falling
+        # back to ICT/SMC's lone vote, AND generate_signal_chart
+        # having no candles to draw - so the message fell back to
+        # the old static BUY/SELL graphic instead of a real chart,
+        # even though the signal itself still sent correctly. A
+        # second attempt with a longer timeout (20s) recovers most
+        # of these transient hiccups without changing anything else
+        # about how candle data flows through the rest of the bot.
+        try:
+            response = requests.get(url, timeout=10)
+        except requests.exceptions.Timeout:
+            print(f"[CANDLES] {symbol} {interval} timed out at 10s, retrying once with 20s...")
+            response = requests.get(url, timeout=20)
+
         data = response.json()
         values = data.get("values")
         if not values:
@@ -8562,13 +8596,13 @@ async def post_morning_signal(context: ContextTypes.DEFAULT_TYPE):
 
 async def post_midday_signal(context: ContextTypes.DEFAULT_TYPE):
     """
-    Runs every day at 13:00 UTC (2PM Lagos) - new 3rd daily slot, per
-    explicit instruction. Looks up today's pair from
-    MIDDAY_PAIR_BY_WEEKDAY - GBPJPY on weekdays (real H1 data, same
-    strength as the bot's other working forex pairs - XAGUSD was
-    explicitly considered and ruled out for this slot since its
-    daily-trend fallback is intentionally the weakest signal type in
-    the bank), BTCUSD on weekends since forex is closed.
+    Runs every day at 13:00 UTC (2PM Lagos). Looks up today's pair
+    from MIDDAY_PAIR_BY_WEEKDAY - a different forex major each
+    weekday (EURUSD Monday, GBPUSD Tuesday, GBPJPY Wednesday), no
+    post at all on Thursday (a volatility/synthetic index posts
+    instead that day - see SYNTHETIC_SCHEDULE's thursday_only entry)
+    or Friday (no midday post that day, per explicit instruction),
+    and BTCUSD on weekends since forex is closed.
     """
     weekday = datetime.utcnow().weekday()  # 0=Monday ... 6=Sunday
     pair_keyword = MIDDAY_PAIR_BY_WEEKDAY.get(weekday)
@@ -9396,6 +9430,7 @@ def main():
     WEEKEND_ONLY = (6, 0)            # Sat-Sun, cron-style
     EVERY_DAY = (0, 1, 2, 3, 4, 5, 6)
     WEDNESDAY_ONLY = (3,)            # cron-style: 3=Wednesday
+    THURSDAY_ONLY = (4,)             # cron-style: 4=Thursday
 
     for i, (utc_time, post_type, data) in enumerate(DAILY_SCHEDULE):
         if post_type == "news":
@@ -9404,6 +9439,7 @@ def main():
                 time=parse_time(utc_time),
                 name=f"news_{i}_{data}",
                 data=data,
+                days=WEEKDAYS_ONLY,  # per explicit instruction - no news post Sat/Sun
                 job_kwargs={"misfire_grace_time": 300}
             )
 
@@ -9438,9 +9474,7 @@ def main():
     )
     job_queue.run_daily(
         post_evening_signal,
-        time=parse_time("19:00"),  # moved from 17:00 per explicit
-                                    # instruction, to keep distance
-                                    # from the new 13:00 midday slot
+        time=parse_time("17:00"),  # 6PM Lagos, per explicit instruction
         name="evening_signal",
         days=EVERY_DAY,
         job_kwargs={"misfire_grace_time": 300}
@@ -9449,6 +9483,8 @@ def main():
     for i, (utc_time, schedule_type, slot_number) in enumerate(SYNTHETIC_SCHEDULE):
         if schedule_type == "wednesday_only":
             days = WEDNESDAY_ONLY
+        elif schedule_type == "thursday_only":
+            days = THURSDAY_ONLY
         elif schedule_type == "weekend":
             days = WEEKEND_ONLY
         else:

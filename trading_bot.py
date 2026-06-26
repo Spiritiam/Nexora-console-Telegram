@@ -8383,6 +8383,20 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 ])
             )
             schedule_auto_delete(sent_synth_signal.chat_id, sent_synth_signal.message_id)
+
+            # The signal above carries its own "Trade This Signal"
+            # inline button, and Telegram only allows ONE reply_markup
+            # per message - so it can't also carry main_keyboard (the
+            # static bottom Signal/Breakdown/Connect Deriv menu). Per
+            # explicit instruction, that menu should always stay
+            # visible, so this tiny follow-up message's only job is
+            # to re-attach it.
+            sent_keyboard_anchor = await context.bot.send_message(
+                chat_id=update.effective_chat.id,
+                text="👇",
+                reply_markup=main_keyboard
+            )
+            schedule_auto_delete(sent_keyboard_anchor.chat_id, sent_keyboard_anchor.message_id)
             return
 
     if not is_verified(user_id) and get_trial_count(user_id) >= FREE_TRIAL_LIMIT:
@@ -8435,7 +8449,8 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
             sent_signal = await update.message.reply_photo(
                 photo=image_file_id,
                 caption=signal,
-                parse_mode=ParseMode.HTML
+                parse_mode=ParseMode.HTML,
+                reply_markup=main_keyboard
             )
             schedule_auto_delete(sent_signal.chat_id, sent_signal.message_id)
 

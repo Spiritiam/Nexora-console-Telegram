@@ -265,6 +265,18 @@ user_modes = {}
 # apply here.
 last_welcome_message = {}
 
+# Tracks the most recent "Signal Mode Activated" / "Breakdown Mode
+# Activated" prompt per user, the same (chat_id, message_id) pattern
+# as last_welcome_message above. Per explicit instruction, this
+# prompt should NOT be deleted on a fixed timer - it should be
+# deleted the moment the user's next message produces ANY reply
+# (a real signal, an error, market closed, etc. - all count), since
+# at that point it's served its purpose. Plain in-memory dict for the
+# same reason as last_welcome_message: losing this on a restart is
+# purely cosmetic (the prompt just sits a little longer than usual),
+# never a lost trade or signal.
+last_mode_prompt_message = {}
+
 # DB-backed for the same reason pending_trades_db/channel_signal_
 # context_db are: a plain in-memory dict here meant a Railway restart
 # between someone submitting a verification request and it being
@@ -816,6 +828,46 @@ async def send_and_auto_delete(bot, chat_id, text, **kwargs):
     sent = await bot.send_message(chat_id=chat_id, text=text, **kwargs)
     schedule_auto_delete(sent.chat_id, sent.message_id)
     return sent
+
+async def delete_user_message(update: Update):
+    """
+    Deletes the user's own triggering message immediately - their
+    typed word/command that led to a bot reply (e.g. "signal",
+    "/start", "bitcoin"). Per explicit instruction: once the bot has
+    replied, the user's own prompt word has served its purpose and
+    shouldn't linger in the chat.
+
+    Only ever runs in private DMs - never groups/channels, since the
+    bot's flows here all assume a 1-on-1 chat and group messages
+    should never be touched by this. Best-effort: if Telegram refuses
+    (message already gone, too old to delete, etc.) this fails
+    silently and the calling handler continues completely normally -
+    this can never block or break the actual reply logic.
+    """
+    if update.effective_chat.type != "private":
+        return
+    try:
+        await update.message.delete()
+    except Exception as e:
+        print(f"[USER-MSG-DELETE] Couldn't delete user message: {e}")
+
+async def clear_mode_prompt(bot, user_id):
+    """
+    Deletes the stored "Signal/Breakdown Mode Activated" prompt for
+    this user, if one is on record, and removes it from
+    last_mode_prompt_message. Call this right before sending ANY new
+    reply once the user is in signal/breakdown mode - per explicit
+    instruction, the prompt should disappear the moment a new
+    response of any kind appears (real signal, error, market closed,
+    no data, etc. all count), not on a fixed timer. Best-effort: if
+    Telegram refuses (already gone, too old) this fails silently.
+    """
+    prev = last_mode_prompt_message.pop(user_id, None)
+    if prev:
+        try:
+            await bot.delete_message(chat_id=prev[0], message_id=prev[1])
+        except Exception as e:
+            print(f"[MODE-PROMPT] Couldn't delete prompt for {user_id}: {e}")
 
 def get_open_signals():
     try:
@@ -7059,6 +7111,8 @@ async def send_verification_gate(update):
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
+    await delete_user_message(update)
+
     user_id = str(update.message.from_user.id)
     username = update.message.from_user.username or "Trader"
 
@@ -7150,6 +7204,11 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
             reply_markup=main_keyboard
         )
         last_welcome_message[user_id] = (sent_welcome.chat_id, sent_welcome.message_id)
+        # Per explicit instruction: pure navigation/menu noise, not
+        # something to ever refer back to - fast-delete as a backstop
+        # in case the user never triggers another welcome message to
+        # replace this one via last_welcome_message above.
+        schedule_auto_delete(sent_welcome.chat_id, sent_welcome.message_id, hours=0.05)
         return
 
     remaining = trial_remaining(user_id)
@@ -7182,6 +7241,8 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
 # ============================================
 
 async def handle_buttons(update: Update, context: ContextTypes.DEFAULT_TYPE):
+
+    await delete_user_message(update)
 
     user_id = str(update.message.from_user.id)
     text = update.message.text.lower()
@@ -7271,7 +7332,8 @@ async def handle_buttons(update: Update, context: ContextTypes.DEFAULT_TYPE):
             parse_mode=ParseMode.HTML,
             reply_markup=main_keyboard
         )
-        schedule_auto_delete(sent_signal_mode.chat_id, sent_signal_mode.message_id)
+        schedule_auto_delete(sent_signal_mode.chat_id, sent_signal_mode.message_id)  # backstop only - normally cleared by clear_mode_prompt() the moment the next reply is sent
+        last_mode_prompt_message[user_id] = (sent_signal_mode.chat_id, sent_signal_mode.message_id)
         return
 
     if "breakdown" in text:
@@ -7287,7 +7349,8 @@ async def handle_buttons(update: Update, context: ContextTypes.DEFAULT_TYPE):
             parse_mode=ParseMode.HTML,
             reply_markup=main_keyboard
         )
-        schedule_auto_delete(sent_breakdown_mode.chat_id, sent_breakdown_mode.message_id)
+        schedule_auto_delete(sent_breakdown_mode.chat_id, sent_breakdown_mode.message_id)  # backstop only - normally cleared by clear_mode_prompt() the moment the next reply is sent
+        last_mode_prompt_message[user_id] = (sent_breakdown_mode.chat_id, sent_breakdown_mode.message_id)
         return
 
 # ============================================
@@ -7591,7 +7654,7 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 return
 
         if is_verified(user_id):
-            await context.bot.send_message(
+            sent_welcome2 = await context.bot.send_message(
                 chat_id=int(user_id),
                 text=(
                     f"👋 <b>Welcome back, {username}!</b>\n\n"
@@ -7608,6 +7671,9 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 parse_mode=ParseMode.HTML,
                 reply_markup=main_keyboard
             )
+            # Per explicit instruction: pure navigation/menu noise,
+            # fast-delete same as the other Welcome back occurrence.
+            schedule_auto_delete(sent_welcome2.chat_id, sent_welcome2.message_id, hours=0.05)
             return
 
         remaining = trial_remaining(user_id)
@@ -7990,6 +8056,8 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
         # but never should have reached that point.
         return
 
+    await delete_user_message(update)
+
     user_id = str(update.message.from_user.id)
     username = update.message.from_user.username or "Trader"
     message = update.message.text.strip()
@@ -8267,7 +8335,7 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 InlineKeyboardButton("✏️ Edit", callback_data=f"edittrade_{user_id}"),
             ]])
         )
-        schedule_auto_delete(sent_confirm.chat_id, sent_confirm.message_id)
+        schedule_auto_delete(sent_confirm.chat_id, sent_confirm.message_id, hours=0.05)  # one-time prompt, fast-delete per explicit instruction
         return
 
     mode = user_modes.get(user_id)
@@ -8278,6 +8346,7 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
     # Exness registration and has nothing to do with Deriv. Forex
     # pairs and Breakdown mode remain gated normally below.
     if mode == "signal":
+        await clear_mode_prompt(context.bot, user_id)
         synthetic_key = match_synthetic_key(message)
         if synthetic_key:
             wait_message = await update.message.reply_text(
@@ -8322,6 +8391,7 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     if mode == "signal":
+        await clear_mode_prompt(context.bot, user_id)
 
         requested_key = match_pair_key(message)
         if (
@@ -8419,6 +8489,7 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     if mode == "breakdown":
+        await clear_mode_prompt(context.bot, user_id)
 
         if not is_verified(user_id):
             count = increment_trial(user_id)

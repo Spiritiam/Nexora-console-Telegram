@@ -8828,11 +8828,12 @@ async def testsignal_command(update: Update, context: ContextTypes.DEFAULT_TYPE)
 # ============================================
 
 WELCOME_CHANNEL_MESSAGE = (
-    "🚀 Welcome to Nexora AI\n\n"
+    "🚀 <b>Welcome to Nexora AI</b>\n\n"
     "Your AI-powered trading assistant, available 24/7.\n\n"
     "✅ Instant Trading Signals\n"
     "📊 Smart Market Analysis\n"
     "📈 Forex, Gold, Crypto & Indices\n"
+    "🔗 Connect Deriv account for Auto & Manual Trades\n"
     "🧠 AI-Powered Trade Insights\n"
     "⚡ Fast & Accurate Responses\n\n"
     "Whether you’re a beginner or an experienced trader, Nexora AI is "
@@ -8853,6 +8854,7 @@ async def welcome_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await context.bot.send_message(
                 chat_id=channel_id,
                 text=WELCOME_CHANNEL_MESSAGE,
+                parse_mode=ParseMode.HTML,
                 reply_markup=get_channel_button(),
             )
             sent += 1

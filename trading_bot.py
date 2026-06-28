@@ -153,8 +153,8 @@ MORNING_PAIR_BY_WEEKDAY = {
     2: "xauusd",  # Wednesday
     3: "xauusd",  # Thursday
     4: "xauusd",  # Friday
-    5: "btcusd",  # Saturday
-    6: "btcusd",  # Sunday
+    5: None,      # Saturday - volatility/synthetic index instead, see SYNTHETIC_SCHEDULE's saturday_only entry
+    6: None,      # Sunday - no signals at all, per explicit instruction (Saturday alone is enough)
 }
 
 # 2pm UTC midday slot - per explicit instruction, a different forex
@@ -164,17 +164,17 @@ MORNING_PAIR_BY_WEEKDAY = {
 # maps to None here since that slot is now a volatility/synthetic
 # index post instead (see SYNTHETIC_SCHEDULE's thursday_only entry).
 # Friday maps to None - per explicit instruction, no midday post at
-# all that day. Forex is closed weekends, same pattern already used
-# for MORNING_PAIR_BY_WEEKDAY above - falls back to BTCUSD on Sat/Sun
-# since only BTCUSD and synthetics trade those days.
+# all that day. Saturday and Sunday also map to None - per explicit
+# instruction, Saturday's schedule is morning-synthetic + evening-
+# BTCUSD only (no midday post), and Sunday has no posts at all.
 MIDDAY_PAIR_BY_WEEKDAY = {
     0: "eurusd",  # Monday
     1: "gbpusd",  # Tuesday
     2: "gbpjpy",  # Wednesday
     3: None,      # Thursday - volatility/synthetic index instead, see SYNTHETIC_SCHEDULE
     4: None,      # Friday - no midday post, per explicit instruction
-    5: "btcusd",  # Saturday - forex closed
-    6: "btcusd",  # Sunday - forex closed
+    5: None,      # Saturday - no midday post, per explicit instruction
+    6: None,      # Sunday - no posts at all, per explicit instruction
 }
 
 EVENING_PAIR_BY_WEEKDAY = {
@@ -186,8 +186,9 @@ EVENING_PAIR_BY_WEEKDAY = {
     2: "btcusd",  # Wednesday
     3: "btcusd",  # Thursday
     4: "btcusd",  # Friday
-    5: None,      # Saturday - no evening forex/crypto slot, volatility only
-    6: None,      # Sunday - no evening forex/crypto slot, volatility only
+    5: "btcusd",  # Saturday - per explicit instruction: synthetic in the
+                  # morning, BTCUSD in the evening, no midday post.
+    6: None,      # Sunday - no posts at all, per explicit instruction
 }
 
 DAILY_SCHEDULE = [
@@ -196,20 +197,24 @@ DAILY_SCHEDULE = [
 
 # Synthetic index channel posts - rotates through all 5 indices.
 # Wednesday gets its own dedicated 12PM Lagos (11:00 UTC) slot, and
-# Thursday now gets the 2PM Lagos (13:00 UTC) midday slot instead of
-# a forex pair (per explicit instruction - MIDDAY_PAIR_BY_WEEKDAY
-# maps Thursday to None so post_midday_signal does nothing that day,
-# and this slot covers it instead), in addition to the existing
-# weekend slots (Sat/Sun 6PM Lagos = 17:00 UTC) - so volatility
-# indices post Wed/Thu/Sat/Sun, not every day. slot_number=1 on
-# Thursday (distinct from Wednesday's and the weekend's slot_number=0)
-# just to avoid ever landing on the exact same index as one of those
-# via get_rotation_key's day-of-year math, even though it's not on
-# the same calendar day as either.
+# Thursday gets the 2PM Lagos (13:00 UTC) midday slot instead of a
+# forex pair (per explicit instruction - MIDDAY_PAIR_BY_WEEKDAY maps
+# Thursday to None so post_midday_signal does nothing that day, and
+# this slot covers it instead). Saturday's morning slot (8AM Lagos =
+# 07:00 UTC) is ALSO now a synthetic post instead of BTCUSD, per
+# explicit instruction (Saturday's day shape is now: synthetic
+# morning, BTCUSD evening, nothing midday) - MORNING_PAIR_BY_WEEKDAY
+# maps Saturday to None so post_morning_signal does nothing that day,
+# and this slot covers it instead. Sunday has been removed entirely,
+# per explicit instruction ("Saturday is enough") - no synthetic post,
+# no forex/crypto post, nothing at all on Sundays now. slot_number
+# values are kept distinct across same-week slots purely so
+# get_rotation_key's day-of-year math never accidentally lands two
+# same-week posts on the identical index.
 SYNTHETIC_SCHEDULE = [
     ("11:00", "wednesday_only", 0),
     ("13:00", "thursday_only", 1),
-    ("17:00", "weekend", 0),
+    ("07:00", "saturday_only", 2),
 ]
 
 # ============================================
@@ -2068,7 +2073,16 @@ async def detect_tick_burst(index_key, config):
     return direction, tick_count, threshold
 
 async def get_cached_synthetic_candles(index_key, symbol, granularity_label, granularity_seconds, count=60):
-    cache_key = f"{index_key}_{granularity_label}"
+    # FIX: cache_key must include `count` - same exact bug class
+    # already fixed once before for forex candles (get_cached_candles'
+    # outputsize fix elsewhere in this file). Without it, two
+    # different callers requesting different candle counts for the
+    # same index+granularity (e.g. 60 vs 210) would silently share
+    # one cache entry, and whichever one ran first decides what every
+    # later caller actually receives that round - never visibly
+    # erroring, just quietly handing back fewer (or more) candles
+    # than what was actually asked for.
+    cache_key = f"{index_key}_{granularity_label}_{count}"
     now = time.time()
     ttl = SYNTHETIC_CANDLE_CACHE_SECONDS.get(granularity_label, 3600)
     cached = synthetic_candle_cache.get(cache_key)
@@ -2173,7 +2187,22 @@ async def build_synthetic_signal_response(index_key, min_agree=2):
         return None
 
     symbol = config["symbol"]
-    h1_candles = await get_cached_synthetic_candles(index_key, symbol, "1h", 3600, 60)
+    # h1 outputsize raised from 60 to 210, per explicit instruction -
+    # CONFIRMED REAL ASYMMETRY: forex/crypto's run_strategy_bank
+    # fetches 210 h1 candles (build_signal_response), but synthetics
+    # only ever fetched 60 here, despite running several of the SAME
+    # strategies (Trend Following, MACD, RSI, etc.) that genuinely
+    # need a healthy warm-up window to produce trustworthy values -
+    # a 26-period EMA (inside calculate_macd) barely stabilizes with
+    # only 60 candles total, making fresh MACD crossovers and other
+    # longer-lookback patterns structurally rarer to detect reliably
+    # on synthetics than on forex/crypto, on top of these strategies
+    # already being deliberately strict by design. 210 candles costs
+    # nothing extra functionally (analyze_timeframe/the strategy bank
+    # have no upper bound, only a len>=15/40/etc floor) - this just
+    # gives every h1-based strategy the same real warm-up room
+    # forex/crypto signals already get.
+    h1_candles = await get_cached_synthetic_candles(index_key, symbol, "1h", 3600, 210)
     h4_candles = await get_cached_synthetic_candles(index_key, symbol, "4h", 14400, 60)
     daily_candles = await get_cached_synthetic_candles(index_key, symbol, "1day", 86400, 10)
     m1_candles = await get_cached_synthetic_candles(index_key, symbol, "1m", 60, 60)
@@ -2716,7 +2745,11 @@ async def run_auto_copy_scan(context: ContextTypes.DEFAULT_TYPE):
     fresh_signals = {}
     for index_key, config in SYNTHETIC_CONFIG.items():
         symbol = config["symbol"]
-        h1_candles = await get_cached_synthetic_candles(index_key, symbol, "1h", 3600, 60)
+        # Same 60 -> 210 fix as build_synthetic_signal_response above,
+        # applied here too for consistency - this scan runs the exact
+        # same strategy bank on the exact same kind of data, and real
+        # auto-copy trades depend on it.
+        h1_candles = await get_cached_synthetic_candles(index_key, symbol, "1h", 3600, 210)
         h4_candles = await get_cached_synthetic_candles(index_key, symbol, "4h", 14400, 60)
         daily_candles = await get_cached_synthetic_candles(index_key, symbol, "1day", 86400, 10)
         m1_candles = await get_cached_synthetic_candles(index_key, symbol, "1m", 60, 60)
@@ -9431,6 +9464,7 @@ def main():
     EVERY_DAY = (0, 1, 2, 3, 4, 5, 6)
     WEDNESDAY_ONLY = (3,)            # cron-style: 3=Wednesday
     THURSDAY_ONLY = (4,)             # cron-style: 4=Thursday
+    SATURDAY_ONLY = (6,)             # cron-style: 6=Saturday
 
     for i, (utc_time, post_type, data) in enumerate(DAILY_SCHEDULE):
         if post_type == "news":
@@ -9485,6 +9519,8 @@ def main():
             days = WEDNESDAY_ONLY
         elif schedule_type == "thursday_only":
             days = THURSDAY_ONLY
+        elif schedule_type == "saturday_only":
+            days = SATURDAY_ONLY
         elif schedule_type == "weekend":
             days = WEEKEND_ONLY
         else:

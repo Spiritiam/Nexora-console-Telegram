@@ -9377,7 +9377,7 @@ async def post_weekly_report(context: ContextTypes.DEFAULT_TYPE):
 
     report = (
         f"📊 <b>WEEKLY PERFORMANCE REPORT</b>\n"
-        f"<i>#SpiritFX — {date_range}</i>\n\n"
+        f"<i>#NexoraAI — {date_range}</i>\n\n"
         f"━━━━━━━━━━━━━━━━━━━━━\n\n"
         f"<b>Total Signals Issued:</b> {total}\n\n"
         f"✅ <b>Take Profit Hit:</b> {tp_hit}\n"

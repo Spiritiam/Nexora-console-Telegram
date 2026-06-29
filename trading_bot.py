@@ -6288,10 +6288,17 @@ async def build_signal_response(question, user_id=None):
 
     # SL/TP pip multiplier: 3x/6x (still a 2:1 ratio) for every pair
     # EXCEPT XAUUSD, which uses a tighter 2x/4x so trades resolve
-    # faster instead of stalling open for as long - this is
-    # deliberately a per-pair override, not a global change, since
-    # every other pair's existing 150/300-pip-equivalent distance is
-    # untouched.
+    # faster instead of stalling open for as long. EURUSD and GBPUSD
+    # were considered for the same tighter override, per explicit
+    # instruction - but both are confirmed slow-moving pairs (only
+    # ~50-100 real pips of movement across a full day), and the
+    # requested 30 SL / 60 TP real pips for them already equals this
+    # existing 3x/6x default exactly, so no override is needed for
+    # either - adding one would just duplicate the default for no
+    # reason. GBPJPY was checked the same way earlier for the same
+    # reason. This is deliberately a per-pair override, not a global
+    # change, since every other pair's existing 150/300-pip-
+    # equivalent distance is untouched.
     if matched_key == "xauusd":
         sl_multiplier, tp_multiplier = 2, 4
     else:

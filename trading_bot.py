@@ -6777,6 +6777,29 @@ async def post_news(context: ContextTypes.DEFAULT_TYPE):
     summary = await generate_news_summary(article, session_type)
     summary = clean_text(summary)
 
+    # FIX: skip posting entirely if the AI summary step itself
+    # failed - CONFIRMED REAL CASE via a live screenshot showing
+    # "AI server busy." posted to all 3 channels as the actual
+    # caption, since fetch_market_news() above had genuinely
+    # succeeded (a real article WAS found), but generate_news_summary
+    # -> ask_gemini -> ask_openrouter then BOTH failed that round,
+    # and ask_openrouter's literal fallback string ("AI server
+    # busy.", "AI service unavailable.", or "AI servers
+    # unavailable.") was returned and used as the real summary text
+    # with no check anywhere that it wasn't genuine content. This
+    # mirrors the existing "if article is None: return" skip just
+    # above - a failed AI call should behave the same way a failed
+    # news fetch already does, never publish a placeholder/error
+    # string as if it were real market commentary.
+    KNOWN_AI_FAILURE_STRINGS = (
+        "⚠️ AI service unavailable.",
+        "⚠️ AI server busy.",
+        "⚠️ AI servers unavailable.",
+    )
+    if summary.strip() in KNOWN_AI_FAILURE_STRINGS:
+        print(f"[NEWS] AI summary generation failed ('{summary.strip()}') - skipping this post entirely rather than publish it as content.")
+        return
+
     calendar = fetch_economic_calendar()
     if calendar:
         summary += calendar
@@ -6915,14 +6938,47 @@ async def get_mt5_trade_outcome(position_id):
             position_id=str(position_id)
         )
 
+        # FIX: CONFIRMED REAL CRASH via live logs - "'str' object has
+        # no attribute 'get'" repeating for every single linked order,
+        # every sweep, for hours. get_deals_by_position's items were
+        # being assumed to always be plain dicts and called with
+        # .get() unconditionally - but at least one item in the real
+        # response isn't a dict (could be a model/object instance
+        # this SDK version returns instead of a plain dict, or some
+        # other non-dict entry mixed into the list). This single bad
+        # item was enough to throw inside the generator expression
+        # below and get caught by the outer except, meaning this
+        # function NEVER successfully determined an outcome for ANY
+        # trade while this was happening - silently keeping every
+        # signal/auto-copy-trade row stuck as OPEN regardless of
+        # whether mt5_order_id was correctly saved or not. Each item
+        # is now type-checked before .get() is ever called on it -
+        # dicts use .get() as before, objects with an entryType
+        # attribute use getattr as a fallback, anything else is
+        # skipped and logged so the real shape can be seen if this
+        # happens again, rather than crashing the whole lookup.
+        def _deal_entry_type(d):
+            if isinstance(d, dict):
+                return d.get("entryType")
+            return getattr(d, "entryType", None)
+
+        def _deal_profit(d):
+            if isinstance(d, dict):
+                return d.get("profit", 0)
+            return getattr(d, "profit", 0)
+
+        unrecognized = [d for d in deals if not isinstance(d, dict) and not hasattr(d, "entryType")]
+        if unrecognized:
+            print(f"[MT5 OUTCOME] {position_id}: {len(unrecognized)} unrecognized deal item(s), sample: {unrecognized[0]!r}")
+
         closing_deal = next(
-            (d for d in deals if d.get("entryType") == "DEAL_ENTRY_OUT"),
+            (d for d in deals if _deal_entry_type(d) == "DEAL_ENTRY_OUT"),
             None
         )
         if closing_deal is None:
             return "OPEN", None
 
-        profit = closing_deal.get("profit", 0)
+        profit = _deal_profit(closing_deal)
         print(
             f"[MT5 OUTCOME] Position {position_id} closed — "
             f"profit: {profit}"

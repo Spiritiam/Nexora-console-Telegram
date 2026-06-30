@@ -6938,6 +6938,24 @@ async def get_mt5_trade_outcome(position_id):
             position_id=str(position_id)
         )
 
+        # FIX #2: CONFIRMED REAL ISSUE via live logs after the first
+        # fix below - "2 unrecognized deal item(s), sample: 'deals'".
+        # That sample being the literal string 'deals' is a strong,
+        # specific signal: get_deals_by_position via this SDK's RPC
+        # connection is returning a DICT wrapping the real list under
+        # a "deals" key (e.g. {"deals": [...], "synchronizing": ...}),
+        # not the bare array the REST API docs describe - a common
+        # pattern for SDK wrapper methods that add metadata around the
+        # raw REST response. Iterating that dict directly (the
+        # previous behavior) iterates its KEYS, which is exactly why
+        # the string "deals" itself showed up as a fake "deal item".
+        # Unwrapping here before any per-item logic runs, while still
+        # falling back to treating the response as already a plain
+        # list if it isn't a dict (keeps this working either way,
+        # rather than assuming one specific shape again).
+        if isinstance(deals, dict):
+            deals = deals.get("deals", [])
+
         # FIX: CONFIRMED REAL CRASH via live logs - "'str' object has
         # no attribute 'get'" repeating for every single linked order,
         # every sweep, for hours. get_deals_by_position's items were
@@ -6969,7 +6987,7 @@ async def get_mt5_trade_outcome(position_id):
 
         unrecognized = [d for d in deals if not isinstance(d, dict) and not hasattr(d, "entryType")]
         if unrecognized:
-            print(f"[MT5 OUTCOME] {position_id}: {len(unrecognized)} unrecognized deal item(s), sample: {unrecognized[0]!r}")
+            print(f"[MT5 OUTCOME] {position_id}: {len(unrecognized)} unrecognized deal item(s) AFTER unwrap, sample: {unrecognized[0]!r} | full deals type: {type(deals)!r}")
 
         closing_deal = next(
             (d for d in deals if _deal_entry_type(d) == "DEAL_ENTRY_OUT"),

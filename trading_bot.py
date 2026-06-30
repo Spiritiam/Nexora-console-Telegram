@@ -6332,8 +6332,6 @@ async def build_signal_response(question, user_id=None):
     #   2x/4x is just literally written out again here.
     if matched_key == "xauusd":
         sl_multiplier, tp_multiplier = 2, 4
-    elif matched_key == "btcusd":
-        sl_multiplier, tp_multiplier = 0.3025, 0.605
     elif matched_key in ("gbpusd", "eurusd", "audusd", "usdcad", "usdjpy", "usdchf", "nzdusd"):
         sl_multiplier, tp_multiplier = 1.8, 3.6
     elif matched_key in ("usoil", "xagusd"):
@@ -6916,7 +6914,24 @@ async def place_mt5_trade(signal_data):
         if response.status_code in [200, 201]:
             result = response.json()
             order_id = result.get("orderId", "unknown")
-            print(f"[MT5] ✅ Trade placed — Order ID: {order_id}")
+            if order_id == "unknown":
+                # FIX: CONFIRMED REAL ISSUE via live logs - a 200/201
+                # response without a real "orderId" field was being
+                # silently logged as a SUCCESS ("Trade placed - Order
+                # ID: unknown"), with the actual response body
+                # discarded entirely. This meant a request that
+                # technically got a 2xx status but didn't actually
+                # place a real trade (e.g. a different field name in
+                # the response, a partial/rejected fill, or some
+                # other MetaApi-side issue) looked identical to a
+                # genuine success in the logs, with zero way to tell
+                # the two apart after the fact. Logging the full raw
+                # response now whenever this happens, so the real
+                # field name/shape/error can be seen directly instead
+                # of guessed at.
+                print(f"[MT5] ⚠️ Trade response had no real orderId - full raw response: {result!r}")
+            else:
+                print(f"[MT5] ✅ Trade placed — Order ID: {order_id}")
             return order_id
         else:
             print(f"[MT5] ❌ Trade failed: {response.status_code}")

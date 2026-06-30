@@ -383,15 +383,36 @@ SIGNAL_CONSISTENCY_SECONDS = 3600  # 1 hour
 
 # ============================================
 # PRICE + HISTORY CACHE (NEW)
-# Caches live price and 1h-ago price per pair
-# for up to 1 hour. This means at most ~13
-# price API calls per hour total, no matter
-# how many users ask - this is what lets the
-# system scale to thousands of users for free.
+# Caches live price and 1h-ago price per pair.
+#
+# CORRECTION, per explicit instruction: this was
+# previously 3600s (1 hour) - CONFIRMED REAL BUG
+# via live logs: a price cached for up to an hour
+# was being used as the "Entry Price" shown in a
+# signal, while the actual MT5 fill (whether
+# automatic seconds later, or manual minutes/
+# hours later) used the REAL current price -
+# causing the SL/TP's realized risk:reward to
+# drift from the intended ratio (sometimes
+# severely, e.g. 1:1 or worse instead of 1:2), and
+# in one confirmed case, the broker outright
+# REJECTED the trade with TRADE_RETCODE_INVALID_
+# STOPS (10016) because the stale-price-based SL/
+# TP no longer made sense relative to where price
+# had actually moved to. Two identical signals 39
+# minutes apart confirmed the exact same cached
+# price (4032.10) was being reused, real-world
+# proof the cache was the cause, not normal market
+# movement. 60s keeps almost all of the original
+# scaling benefit (a burst of users requesting the
+# same pair within the same minute still only
+# costs one real API call) while keeping the price
+# genuinely fresh for any reasonable signal-to-
+# execution gap.
 # ============================================
 
 price_cache = {}
-PRICE_CACHE_SECONDS = 3600  # 1 hour
+PRICE_CACHE_SECONDS = 60  # was 3600 (1 hour) - see correction above
 
 # ============================================
 # AI BIAS USAGE LIMITS (NEW)

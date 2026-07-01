@@ -6833,27 +6833,38 @@ async def post_news(context: ContextTypes.DEFAULT_TYPE):
     summary = await generate_news_summary(article, session_type)
     summary = clean_text(summary)
 
-    # FIX: skip posting entirely if the AI summary step itself
-    # failed - CONFIRMED REAL CASE via a live screenshot showing
-    # "AI server busy." posted to all 3 channels as the actual
-    # caption, since fetch_market_news() above had genuinely
-    # succeeded (a real article WAS found), but generate_news_summary
-    # -> ask_gemini -> ask_openrouter then BOTH failed that round,
-    # and ask_openrouter's literal fallback string ("AI server
-    # busy.", "AI service unavailable.", or "AI servers
-    # unavailable.") was returned and used as the real summary text
-    # with no check anywhere that it wasn't genuine content. This
-    # mirrors the existing "if article is None: return" skip just
-    # above - a failed AI call should behave the same way a failed
-    # news fetch already does, never publish a placeholder/error
-    # string as if it were real market commentary.
+    # FIX: single 60-second retry before giving up entirely, per
+    # explicit instruction - CONFIRMED REAL CASE via live logs: both
+    # AI providers failed for one specific 7AM run, but the exact
+    # same underlying pipeline succeeded again on its own just ~16
+    # minutes later (a different, unrelated call) - meaning this was
+    # a brief, transient double-failure, not a sustained outage. One
+    # retry after a short wait gives a real second chance to recover
+    # from exactly this kind of brief hiccup, rather than losing the
+    # whole slot to a momentary blip. Only retries ONCE - if the
+    # second attempt also fails, this falls through to the existing
+    # skip-the-post behavior below exactly as before, so a genuinely
+    # sustained outage still fails safely rather than retrying forever.
     KNOWN_AI_FAILURE_STRINGS = (
         "⚠️ AI service unavailable.",
         "⚠️ AI server busy.",
         "⚠️ AI servers unavailable.",
     )
     if summary.strip() in KNOWN_AI_FAILURE_STRINGS:
-        print(f"[NEWS] AI summary generation failed ('{summary.strip()}') - skipping this post entirely rather than publish it as content.")
+        print(f"[NEWS] AI summary generation failed ('{summary.strip()}') - waiting 60s then retrying once...")
+        await asyncio.sleep(60)
+        summary = await generate_news_summary(article, session_type)
+        summary = clean_text(summary)
+
+    # Skip posting entirely if the retry above ALSO failed - a
+    # failed AI call should behave the same way a failed news fetch
+    # already does (see "if article is None: return" earlier), never
+    # publish a placeholder/error string as if it were real market
+    # commentary. Only reached after the one retry above has already
+    # had its chance, so this is the genuine "still broken after
+    # trying twice" case, not a first-attempt overreaction.
+    if summary.strip() in KNOWN_AI_FAILURE_STRINGS:
+        print(f"[NEWS] AI summary generation failed again after retry ('{summary.strip()}') - skipping this post entirely rather than publish it as content.")
         return
 
     calendar = fetch_economic_calendar()

@@ -5173,6 +5173,80 @@ def strategy_volatility_breakout_scalper(pair_key, config, h1_candles, h4_candle
 
     return None
 
+def strategy_fibonacci_retracement(pair_key, config, h1_candles, h4_candles, daily_candles, m1_candles=None):
+    """
+    Per explicit instruction, added on all pairs (both forex/crypto
+    and synthetic - note the m1_candles parameter, unused here, exists
+    only so this function can be shared into SYNTHETIC_STRATEGY_BANK
+    via run_strategy_bank_synthetic's dispatch, which checks for that
+    parameter name to decide which candle set to pass in; this
+    strategy always uses h1_candles regardless).
+
+    Uses the most recent genuine swing high and swing low
+    (find_swing_points - the same real fractal detection already used
+    elsewhere in this file, e.g. detect_bos_choch, detect_premium_
+    discount) to build real retracement levels, never a fabricated or
+    guessed range.
+
+    BUY: the broader swing is bullish (the low came before the high),
+    price has pulled back into the 38.2%-61.8% retracement zone of
+    that up-move, and the current candle shows a bullish reaction
+    (closes in the upper half of its own range) - a real bounce off
+    the zone, not just price sitting inside it. SELL is the mirror
+    case on a bearish swing (high before low, pullback up into the
+    zone, bearish reaction candle).
+
+    Requires the two most recent swings to actually be one high and
+    one low (not two highs or two lows in a row, which would mean no
+    clean single impulse leg exists to retrace from) - returns None
+    rather than guessing if that's not the case.
+    """
+    if not h1_candles or len(h1_candles) < 20:
+        return None
+
+    swings = find_swing_points(h1_candles, strength=2)
+    if len(swings) < 2:
+        return None
+
+    last_two = swings[-2:]
+    types = {s["type"] for s in last_two}
+    if len(types) != 2:
+        return None  # both the same type (two highs or two lows) - no single clean leg to retrace
+
+    swing_low = next(s for s in last_two if s["type"] == "low")
+    swing_high = next(s for s in last_two if s["type"] == "high")
+    leg_range = swing_high["price"] - swing_low["price"]
+    if leg_range <= 0:
+        return None
+
+    fib_618 = swing_high["price"] - (leg_range * 0.618)
+    fib_382 = swing_high["price"] - (leg_range * 0.382)
+    zone_low, zone_high = min(fib_618, fib_382), max(fib_618, fib_382)
+
+    last = h1_candles[-1]
+    current_price = last["close"]
+    candle_range = last["high"] - last["low"]
+    if candle_range == 0 or not (zone_low <= current_price <= zone_high):
+        return None
+
+    closed_upper_half = (last["close"] - last["low"]) / candle_range >= 0.5
+    bullish_leg = swing_low["index"] < swing_high["index"]
+
+    if bullish_leg and closed_upper_half:
+        return {
+            "strategy_name": "Fibonacci Retracement",
+            "direction": "BUY",
+            "detail": f"pulled back into the 38.2-61.8% retracement zone ({zone_low:.2f}-{zone_high:.2f}) of the recent up-move and bounced",
+        }
+    if not bullish_leg and not closed_upper_half:
+        return {
+            "strategy_name": "Fibonacci Retracement",
+            "direction": "SELL",
+            "detail": f"pulled back into the 38.2-61.8% retracement zone ({zone_low:.2f}-{zone_high:.2f}) of the recent down-move and rejected",
+        }
+
+    return None
+
 STRATEGY_BANK = [
     strategy_rsi_extreme_reversal,
     strategy_unicorn_model,
@@ -5182,6 +5256,7 @@ STRATEGY_BANK = [
     strategy_breakout,
     strategy_support_resistance_bounce,
     strategy_momentum_macd,
+    strategy_fibonacci_retracement,
     strategy_volume_profile_poc,  # diagnostic only right now, always returns None - see docstring
 ]
 
@@ -5201,6 +5276,7 @@ SYNTHETIC_STRATEGY_BANK = [
     strategy_breakout,
     strategy_support_resistance_bounce,
     strategy_momentum_macd,
+    strategy_fibonacci_retracement,
     strategy_bollinger_rsi_mean_reversion,
     strategy_ema_pullback_scalper,
     strategy_volatility_breakout_scalper,
@@ -5240,14 +5316,19 @@ def run_strategy_bank(pair_key, config, h1_candles, h4_candles, daily_candles, m
     """
     votes = []
 
-    smc_result = analyze_smc_structure(pair_key, config)
-    if smc_result:
-        smc_direction, smc_confidence, smc_reason, _ = smc_result
-        votes.append({
-            "strategy_name": "ICT/SMC",
-            "direction": smc_direction,
-            "detail": _shorten_for_bullet(smc_reason),
-        })
+    # ICT/SMC restricted to XAUUSD only, per explicit instruction -
+    # confirmed reliable specifically on gold, but not on other
+    # pairs. Every other strategy below still runs for every pair
+    # unchanged; this only gates the one call to analyze_smc_structure.
+    if pair_key == "xauusd":
+        smc_result = analyze_smc_structure(pair_key, config)
+        if smc_result:
+            smc_direction, smc_confidence, smc_reason, _ = smc_result
+            votes.append({
+                "strategy_name": "ICT/SMC",
+                "direction": smc_direction,
+                "detail": _shorten_for_bullet(smc_reason),
+            })
 
     for strategy_fn in STRATEGY_BANK:
         try:

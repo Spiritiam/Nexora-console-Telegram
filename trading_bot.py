@@ -5918,6 +5918,18 @@ def generate_signal_chart(display_name, strategy_name, direction, candles, entry
     """
     try:
         if not candles or len(candles) < 5:
+            # FIX: this early exit was completely silent before -
+            # CONFIRMED REAL CASE via live logs: a real signal
+            # (btcusd -> SELL, 1 agreeing: ICT/SMC) correctly reached
+            # this function, but fell back to the static SELL banner
+            # image with ZERO log output anywhere (no [CANDLES], no
+            # [CHART], nothing) - meaning h1_candles was apparently
+            # None or too short by the time this ran, but there was
+            # no trace of that anywhere to diagnose it from. Logging
+            # here now so this exact scenario is visible going
+            # forward, rather than looking like nothing was even
+            # attempted.
+            print(f"[CHART] {display_name}/{strategy_name}: no usable candles ({len(candles) if candles else 0} given), falling back to static image")
             return False
 
         needs_subpanel = strategy_name in ("RSI Extreme Reversal", "Bollinger+RSI Mean Reversion", "Momentum (MACD)")

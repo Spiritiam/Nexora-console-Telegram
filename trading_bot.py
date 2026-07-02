@@ -6432,20 +6432,17 @@ async def build_signal_response(question, user_id=None):
     #            correctly in case that data-source gap is closed
     #            later. XAGUSD DOES reach this via its dedicated
     #            daily-trend fallback, so this is live for XAGUSD now.
-    #   XAUUSD CORRECTION: reverted back to the ORIGINAL 2x/4x, per
-    #   explicit instruction after a real signal screenshot was
-    #   checked against actual $ P&L at the user's real 0.1 lot size -
-    #   $100 SL / $200 TP at 0.1 lot (contract size 100oz/lot) is a
-    #   $10/$20 real price move, which is exactly what 2x/4x produces
-    #   (pip_size=5.0 * 2 / pip_value=0.01 = 1000 "pips" = $10 here).
-    #   The earlier 0.2x/0.4x change was based on a misread of "100
-    #   pips SL / 200 pips TP" as the SAME unit convention as the
-    #   forex pairs below - it wasn't; XAUUSD's real target was
-    #   always the original $100/$200 P&L distance, confirmed by the
-    #   user's actual MT5 trade. Genuinely needs NO override at all -
-    #   2x/4x is just literally written out again here.
+    #   XAUUSD UPDATE: widened to 150 SL / 300 TP real pips (0.3x/0.6x),
+    #   per explicit instruction - gold has been unusually volatile
+    #   lately and hitting the tighter 100/200 (2x/4x) SL repeatedly,
+    #   confirmed via a real live losing trade screenshot. Verified by
+    #   calculation: pip_size=5.0 * 0.3 / pip_value=0.01 = 150 pips
+    #   (\$15 real price move -> \$150 P&L at 0.1 lot), * 0.6 = 300 pips
+    #   (\$30 -> \$300 P&L at 0.1 lot) - same 1:2 ratio as before, just
+    #   a wider buffer so normal gold volatility has more room before
+    #   triggering SL.
     if matched_key == "xauusd":
-        sl_multiplier, tp_multiplier = 2, 4
+        sl_multiplier, tp_multiplier = 0.3, 0.6
     elif matched_key in ("gbpusd", "eurusd", "audusd", "usdcad", "usdjpy", "usdchf", "nzdusd"):
         sl_multiplier, tp_multiplier = 1.8, 3.6
     elif matched_key in ("usoil", "xagusd"):

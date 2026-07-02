@@ -5257,6 +5257,7 @@ STRATEGY_BANK = [
     strategy_support_resistance_bounce,
     strategy_momentum_macd,
     strategy_fibonacci_retracement,
+    strategy_ema_pullback_scalper,  # per explicit instruction - already existed for synthetics only, now also runs on forex/crypto (falls back to h1_candles since m1_candles is never passed here)
     strategy_volume_profile_poc,  # diagnostic only right now, always returns None - see docstring
 ]
 

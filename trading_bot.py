@@ -6926,38 +6926,49 @@ async def post_news(context: ContextTypes.DEFAULT_TYPE):
     summary = await generate_news_summary(article, session_type)
     summary = clean_text(summary)
 
-    # FIX: single 60-second retry before giving up entirely, per
-    # explicit instruction - CONFIRMED REAL CASE via live logs: both
-    # AI providers failed for one specific 7AM run, but the exact
-    # same underlying pipeline succeeded again on its own just ~16
-    # minutes later (a different, unrelated call) - meaning this was
-    # a brief, transient double-failure, not a sustained outage. One
-    # retry after a short wait gives a real second chance to recover
-    # from exactly this kind of brief hiccup, rather than losing the
-    # whole slot to a momentary blip. Only retries ONCE - if the
-    # second attempt also fails, this falls through to the existing
-    # skip-the-post behavior below exactly as before, so a genuinely
-    # sustained outage still fails safely rather than retrying forever.
+    # FIX: up to TWO retries before giving up entirely, per explicit
+    # instruction. CONFIRMED LIKELY CAUSE, not just a random outage -
+    # both real failures seen in logs landed within seconds of the
+    # exact same daily 06:00 UTC trigger, on two separate days. Per
+    # Gemini's own published free-tier limits, Flash sits around 15
+    # requests/minute (a ROLLING window, not a fixed clock minute) -
+    # this bot also fires other Gemini calls around the same moments
+    # (AI bias for scheduled forex/crypto signals, DM signal bias,
+    # breakdowns), so a burst of concurrent activity right at the
+    # scheduled slot can plausibly exhaust the RPM window, not the
+    # (much later, 08:00 UTC) daily quota. ask_gemini's own existing
+    # 429 retry is only a 10s gap - not always enough for a genuinely
+    # busy RPM window to clear. Waiting longer between attempts here
+    # (90s, then 180s) gives real additional time for that window to
+    # reset, rather than repeating into the same still-busy window.
+    # Still hard-capped at 2 retries (3 attempts total) - if all three
+    # fail, this falls through to the existing skip-the-post behavior
+    # below exactly as before, so a genuinely sustained outage still
+    # fails safely rather than retrying forever.
     KNOWN_AI_FAILURE_STRINGS = (
         "⚠️ AI service unavailable.",
         "⚠️ AI server busy.",
         "⚠️ AI servers unavailable.",
     )
-    if summary.strip() in KNOWN_AI_FAILURE_STRINGS:
-        print(f"[NEWS] AI summary generation failed ('{summary.strip()}') - waiting 60s then retrying once...")
-        await asyncio.sleep(60)
+    retry_waits = [90, 180]
+    for attempt_number, wait_seconds in enumerate(retry_waits, start=2):
+        if summary.strip() not in KNOWN_AI_FAILURE_STRINGS:
+            break
+        print(f"[NEWS] AI summary generation failed ('{summary.strip()}') - waiting {wait_seconds}s then retrying (attempt {attempt_number}/3)...")
+        await asyncio.sleep(wait_seconds)
         summary = await generate_news_summary(article, session_type)
         summary = clean_text(summary)
 
-    # Skip posting entirely if the retry above ALSO failed - a
+    # Skip posting entirely if every retry above ALSO failed - a
     # failed AI call should behave the same way a failed news fetch
     # already does (see "if article is None: return" earlier), never
     # publish a placeholder/error string as if it were real market
-    # commentary. Only reached after the one retry above has already
-    # had its chance, so this is the genuine "still broken after
-    # trying twice" case, not a first-attempt overreaction.
+    # commentary. Only reached after all retries above have already
+    # had their chance, so this is the genuine "still broken after
+    # trying three times, over several minutes" case, not a
+    # first-attempt overreaction.
     if summary.strip() in KNOWN_AI_FAILURE_STRINGS:
-        print(f"[NEWS] AI summary generation failed again after retry ('{summary.strip()}') - skipping this post entirely rather than publish it as content.")
+        print(f"[NEWS] AI summary generation failed on all 3 attempts ('{summary.strip()}') - skipping this post entirely rather than publish it as content.")
         return
 
     calendar = fetch_economic_calendar()

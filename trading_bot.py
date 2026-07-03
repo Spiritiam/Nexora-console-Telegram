@@ -6906,8 +6906,29 @@ async def post_news(context: ContextTypes.DEFAULT_TYPE):
     print(f"[NEWS] Posting {session_type} news at {now}")
 
     article = fetch_market_news()
+
+    # FIX: retry the article fetch itself before giving up, per
+    # explicit instruction after 3 separate real occurrences over 3
+    # days - CONFIRMED via live logs this is a genuinely different
+    # failure point than the AI-summary retry already in place
+    # (which only helps once an article IS found). All 3 providers
+    # (GNews, TheNewsAPI, Alpha Vantage) failed together at the exact
+    # scheduled 06:00 UTC moment each time, but the SAME chain
+    # succeeded again on its own just ~2 minutes later in the same
+    # logs - a real, brief, simultaneous collision (likely a
+    # transient network blip at that shared moment), not any single
+    # provider being genuinely down. Two retries, 60s apart, mirrors
+    # that real observed recovery window rather than guessing.
+    article_retry_waits = [60, 60]
+    for attempt_number, wait_seconds in enumerate(article_retry_waits, start=2):
+        if article is not None:
+            break
+        print(f"[NEWS] No article found from any source - waiting {wait_seconds}s then retrying (attempt {attempt_number}/3)...")
+        await asyncio.sleep(wait_seconds)
+        article = fetch_market_news()
+
     if article is None:
-        print("[NEWS] No article found from any source. Skipping.")
+        print("[NEWS] No article found from any source after 3 attempts. Skipping.")
         return
 
     headline = article.get("title", "financial market news trading")

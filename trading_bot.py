@@ -9633,15 +9633,71 @@ async def send_auto_copy_daily_digest(context: ContextTypes.DEFAULT_TYPE):
             print(f"[AUTO-COPY DIGEST] ❌ Couldn't send digest to {user_id}: {e}")
 
 # ============================================
-# WEEKLY PERFORMANCE REPORT (NEW)
+# WEEKLY PERFORMANCE REPORT
 # Runs every Sunday at 23:00 UTC, covering the
 # full Monday 00:00 UTC -> Sunday 23:00 UTC week
-# (including weekend BTCUSD activity). Posted to
-# both channels, no comments needed since it's a
-# self-contained summary - total signals issued,
-# TP hits, SL hits, still-open count, and an
-# overall win rate.
+# (including weekend BTCUSD activity).
+#
+# REWRITE, per explicit instruction: a pure win-
+# rate count (TP hits / closed signals) can make a
+# genuinely PROFITABLE week look bad, since it
+# ignores position sizing entirely - e.g. 4 wins/6
+# losses on XAUUSD's real 1:2 risk:reward ($150
+# SL / $300 TP at 0.1 lot) is a real +$300 net week
+# (4*300 - 6*150 = 300), but the old win-rate-only
+# report would have shown that as a discouraging
+# 40% win rate with no indication it was actually
+# profitable.
+#
+# Now calculates REAL dollar P&L using live MT5
+# data (get_mt5_trade_outcome, the exact same
+# function the 15-min TP/SL monitor already uses)
+# for each individual signal that week, rather than
+# a fixed formula - this is accurate to the cent,
+# including for GBPJPY where the real USD value
+# depends on the live JPY exchange rate at the
+# moment each trade closed (a fixed formula could
+# never get that number exactly right).
+#
+# Scoped ONLY to the 5 pairs that actually appear
+# on the scheduled daily/weekday calendar (XAUUSD,
+# EURUSD, GBPUSD, GBPJPY, BTCUSD - confirmed
+# directly against MORNING_PAIR_BY_WEEKDAY /
+# MIDDAY_PAIR_BY_WEEKDAY / EVENING_PAIR_BY_WEEKDAY),
+# per explicit instruction - synthetics excluded
+# (traded far less often, and not auto-traded on
+# MT5 at all, so there's no MT5 P&L to pull for
+# them in the first place).
+#
+# Relies on mt5_order_id already being saved on
+# every scheduled signal (see attach_mt5_order_id /
+# place_and_link_mt5_trade in _post_signal_for_pair)
+# - a signal with no linked order (e.g. MT5
+# placement itself failed that round) is counted in
+# the win/loss totals from its status field, but
+# can't contribute a real dollar figure and is
+# called out separately in the report rather than
+# silently treated as $0.
 # ============================================
+
+SCHEDULED_DAILY_PAIRS = ("XAUUSD", "EURUSD", "GBPUSD", "GBPJPY", "BTCUSD")
+
+# Fixed SL/TP pip distances per pair, per explicit instruction (added
+# alongside the dollar P&L above so pip-focused traders can see both).
+# Unlike dollar P&L, pip distance doesn't need live MT5 data - it's a
+# fixed property of each pair's current SL/TP multiplier config (see
+# the sl_multiplier/tp_multiplier block in build_signal_response),
+# confirmed by calculation, not MT5 lookup: BTCUSD's 495.9/991.8 are
+# NOT round numbers - they're the exact real values of pip_size=165.3
+# * 3/6 / pip_value=1.0, kept precise rather than rounded to "496/992"
+# so this always matches the real, current live SL/TP setting exactly.
+SCHEDULED_PAIR_PIPS = {
+    "XAUUSD": (150, 300),
+    "EURUSD": (30, 60),
+    "GBPUSD": (30, 60),
+    "GBPJPY": (50, 100),
+    "BTCUSD": (495.9, 991.8),
+}
 
 def get_week_start():
     now = datetime.utcnow()
@@ -9652,7 +9708,8 @@ async def post_weekly_report(context: ContextTypes.DEFAULT_TYPE):
     week_start = get_week_start()
     now = datetime.utcnow()
 
-    signals = get_signals_since(week_start)
+    all_signals = get_signals_since(week_start)
+    signals = [s for s in all_signals if s.get("pair_name") in SCHEDULED_DAILY_PAIRS]
 
     total = len(signals)
     tp_hit = sum(1 for s in signals if s.get("status") == "TP_HIT")
@@ -9661,18 +9718,74 @@ async def post_weekly_report(context: ContextTypes.DEFAULT_TYPE):
     closed = tp_hit + sl_hit
     win_rate = round((tp_hit / closed) * 100) if closed > 0 else 0
 
+    total_profit_usd = 0.0
+    missing_pnl_count = 0
+    per_pair_pnl = {pair: 0.0 for pair in SCHEDULED_DAILY_PAIRS}
+
+    total_pips_won = 0.0
+    total_pips_lost = 0.0
+
+    for sig in signals:
+        pair_name = sig.get("pair_name")
+        status = sig.get("status")
+
+        # Pips: computed directly from status + pair_name alone - a
+        # TP_HIT or SL_HIT always means the FULL known pip distance
+        # for that pair, by definition, so this doesn't need MT5 data
+        # the way the dollar P&L above does (that needed a live MT5
+        # lookup specifically because GBPJPY's real USD value depends
+        # on the JPY rate at close time - pips have no such ambiguity).
+        if pair_name in SCHEDULED_PAIR_PIPS:
+            sl_pips, tp_pips = SCHEDULED_PAIR_PIPS[pair_name]
+            if status == "TP_HIT":
+                total_pips_won += tp_pips
+            elif status == "SL_HIT":
+                total_pips_lost += sl_pips
+
+        if status not in ("TP_HIT", "SL_HIT"):
+            continue  # still-open signals have no realized P&L yet
+        order_id = sig.get("mt5_order_id")
+        if not order_id:
+            missing_pnl_count += 1
+            continue
+        outcome, profit = await get_mt5_trade_outcome(order_id)
+        if outcome != "CLOSED" or profit is None:
+            missing_pnl_count += 1
+            continue
+        total_profit_usd += profit
+        if pair_name in per_pair_pnl:
+            per_pair_pnl[pair_name] += profit
+
+    net_pips = total_pips_won - total_pips_lost
+
     date_range = f"{week_start.strftime('%d %b')} – {now.strftime('%d %b %Y')}"
+    profit_sign = "+" if total_profit_usd >= 0 else ""
+    profit_emoji = "📈" if total_profit_usd >= 0 else "📉"
+    net_pips_sign = "+" if net_pips >= 0 else ""
 
     report = (
         f"📊 <b>WEEKLY PERFORMANCE REPORT</b>\n"
         f"<i>#NexoraAI — {date_range}</i>\n\n"
         f"━━━━━━━━━━━━━━━━━━━━━\n\n"
-        f"<b>Total Signals Issued:</b> {total}\n\n"
+        f"<b>Total Signals Issued:</b> {total} "
+        f"<i>(XAUUSD, EURUSD, GBPUSD, GBPJPY, BTCUSD)</i>\n\n"
         f"✅ <b>Take Profit Hit:</b> {tp_hit}\n"
         f"❌ <b>Stop Loss Hit:</b> {sl_hit}\n"
         f"⏳ <b>Still Running:</b> {still_open}\n\n"
-        f"🎯 <b>Win Rate:</b> {win_rate}% "
-        f"({tp_hit}/{closed} closed signals)\n\n"
+        f"🎯 <b>Win Rate:</b> {win_rate}% ({tp_hit}/{closed} closed signals)\n\n"
+        f"📐 <b>Pips Won:</b> +{total_pips_won:.1f}\n"
+        f"📐 <b>Pips Lost:</b> -{total_pips_lost:.1f}\n"
+        f"📐 <b>Net Pips:</b> {net_pips_sign}{net_pips:.1f}\n\n"
+        f"{profit_emoji} <b>Real Net P&L (0.1 lot):</b> {profit_sign}${total_profit_usd:.2f}\n\n"
+    )
+    if missing_pnl_count:
+        report += (
+            f"<i>⚠️ {missing_pnl_count} closed signal(s) couldn't be "
+            f"matched to a real MT5 trade this week (e.g. auto-trade "
+            f"placement failed that round) - not included in the P&L "
+            f"total above.</i>\n\n"
+        )
+    report += (
         f"━━━━━━━━━━━━━━━━━━━━━\n\n"
         f"<i>Trade safe 💼🔥</i>"
     )

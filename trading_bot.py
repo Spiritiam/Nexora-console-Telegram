@@ -6442,8 +6442,22 @@ async def build_signal_response(question, user_id=None):
     #   (\$30 -> \$300 P&L at 0.1 lot) - same 1:2 ratio as before, just
     #   a wider buffer so normal gold volatility has more room before
     #   triggering SL.
+    # XAUUSD CORRECTION #2: CONFIRMED REAL BUG via a live trade
+    # screenshot showing SL hit at only -$20.40 instead of the
+    # intended -$150. Root cause: when this was set to "150 pips SL /
+    # 300 pips TP", the multiplier (0.3/0.6) was calculated using
+    # this bot's INTERNAL pip-counting convention (price_move /
+    # pip_value=0.01), where each "pip" = just $0.01 of price
+    # movement - NOT the same "pip" unit used when the ORIGINAL
+    # $100/$200 target was set and verified (where 2x/4x = a $10
+    # price move was confirmed as "100 pips" in a real trading sense,
+    # i.e. 1 real pip = $0.10 price move on gold, not $0.01). 150
+    # real pips in that original, correct sense = a $15 price move =
+    # $150 P&L at 0.1 lot, which needs multiplier 3.0 (pip_size=5.0 *
+    # 3.0 = $15), not 0.3. Verified: 3.0/6.0 -> $15/$30 price move ->
+    # $150/$300 P&L at 0.1 lot, exactly matching the real target.
     if matched_key == "xauusd":
-        sl_multiplier, tp_multiplier = 0.3, 0.6
+        sl_multiplier, tp_multiplier = 3.0, 6.0
     elif matched_key in ("gbpusd", "eurusd", "audusd", "usdcad", "usdjpy", "usdchf", "nzdusd"):
         sl_multiplier, tp_multiplier = 1.8, 3.6
     elif matched_key in ("usoil", "xagusd"):

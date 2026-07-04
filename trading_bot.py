@@ -2252,12 +2252,44 @@ async def build_synthetic_signal_response(index_key, min_agree=2):
         emoji = "🔴"
         fallback_image_file_id = SELL_IMAGE_FILE_ID
 
+    # ENTRY/SL/TP AS REAL PRICE LEVELS - per explicit instruction,
+    # reversing the earlier "dollar-only, no price levels" design.
+    # Deriv's multiplier contracts DO let you derive an exact trigger
+    # price from stake/risk/win/multiplier, since P&L = stake *
+    # multiplier * (price_change / entry_price). Solving that for
+    # price at P&L = +win or -risk gives the literal price at which
+    # Deriv's own limit_order.take_profit / stop_loss actually fires -
+    # these are the SAME numbers already sent to deriv_execute_
+    # multiplier_trade, just expressed as price instead of dollars,
+    # so they cannot drift out of sync with what really executes.
+    # Entry price uses the most recent candle close available (m1 if
+    # fetched, else h1) - the closest thing to "right now" we have.
+    entry_price = None
+    if m1_candles:
+        entry_price = m1_candles[-1]["close"]
+    elif h1_candles:
+        entry_price = h1_candles[-1]["close"]
+
+    sl_price = tp_price = None
+    stake_for_levels = DEFAULT_SYNTHETIC_STAKE
+    risk_for_levels = DEFAULT_RISK
+    win_for_levels = DEFAULT_WIN
+    multiplier = config["default_multiplier"]
+
+    if entry_price is not None and stake_for_levels and multiplier:
+        risk_frac = risk_for_levels / (stake_for_levels * multiplier)
+        win_frac = win_for_levels / (stake_for_levels * multiplier)
+        if direction == "BUY":
+            sl_price = entry_price * (1 - risk_frac)
+            tp_price = entry_price * (1 + win_frac)
+        else:
+            sl_price = entry_price * (1 + risk_frac)
+            tp_price = entry_price * (1 - win_frac)
+
     # Real generated chart from the SAME candles the winning strategy
-    # used. Synthetics have no price-based Entry/SL/TP today (stake/
-    # risk/target are dollar amounts, not index price levels - drawing
-    # them as horizontal price lines would be meaningless/wrong), so
-    # entry/sl/tp are passed as None - generate_signal_chart already
-    # handles that by simply not drawing those lines.
+    # used. Entry/SL/TP now passed as real derived price levels (see
+    # above) instead of None, so the chart draws them exactly like
+    # forex/crypto charts do.
     image_file_id = fallback_image_file_id
     chart_strategy_name = winning_votes[0]["strategy_name"] if winning_votes else None
     if chart_strategy_name:
@@ -2265,7 +2297,7 @@ async def build_synthetic_signal_response(index_key, min_agree=2):
         chart_path = os.path.join(CHART_OUTPUT_DIR, f"{index_key}_{int(time.time())}.png")
         chart_ok = generate_signal_chart(
             config["display"], chart_strategy_name, direction, chart_candles,
-            None, None, None, chart_path,
+            entry_price, sl_price, tp_price, chart_path,
         )
         if chart_ok:
             image_file_id = chart_path
@@ -2277,10 +2309,19 @@ async def build_synthetic_signal_response(index_key, min_agree=2):
     # prose built from the same real winning_votes).
     narrative = generate_signal_narrative(config["display"], direction, winning_votes)
 
+    entry_sl_tp_block = ""
+    if entry_price is not None and sl_price is not None and tp_price is not None:
+        entry_sl_tp_block = (
+            f"<b>Entry Price:</b> {entry_price:.2f}\n"
+            f"<b>SL:</b> {sl_price:.2f} | <b>TP:</b> {tp_price:.2f}\n"
+            f"<i>(shown for ${stake_for_levels} stake — scales with whichever tier you pick below)</i>\n\n"
+        )
+
     message = (
         f"{emoji} <b>STRONG {direction} {config['display']}</b> ⚡\n\n"
         f"<b>Confidence:</b> {confidence}%\n\n"
         f"{narrative}\n\n"
+        f"{entry_sl_tp_block}"
         f"<b>Suggested:</b> ${DEFAULT_SYNTHETIC_STAKE} stake | "
         f"Risk ${DEFAULT_RISK} → Target ${DEFAULT_WIN}\n"
         f"<i>(Stake and risk/target are adjustable before you confirm)</i>\n\n"
@@ -2297,6 +2338,9 @@ async def build_synthetic_signal_response(index_key, min_agree=2):
         "stake": DEFAULT_SYNTHETIC_STAKE,
         "risk": DEFAULT_RISK,
         "win": DEFAULT_WIN,
+        "entry_price": entry_price,
+        "sl_price": sl_price,
+        "tp_price": tp_price,
     }
 
     return image_file_id, message, trade_context
@@ -6028,28 +6072,47 @@ def generate_signal_chart(display_name, strategy_name, direction, candles, entry
         macd_full = signal_full = None
         bb_upper = bb_middle = bb_lower = None
 
-        if strategy_name == "Trend Following (MA)" and len(candles) >= 50:
-            def sma(period):
-                return [None] * (period - 1) + [
-                    sum(closes[i - period + 1:i + 1]) / period for i in range(period - 1, len(closes))
-                ]
-            ma20, ma50 = sma(20), sma(50)
+        if strategy_name == "Trend Following (MA)":
+            if len(candles) >= 50:
+                def sma(period):
+                    return [None] * (period - 1) + [
+                        sum(closes[i - period + 1:i + 1]) / period for i in range(period - 1, len(closes))
+                    ]
+                ma20, ma50 = sma(20), sma(50)
+            else:
+                # DIAGNOSTIC LOGGING - per explicit instruction. Before
+                # this, a strategy name could win, get titled correctly
+                # at the top of the chart, and silently skip its own
+                # overlay with zero trace anywhere if the candle count
+                # came up short of its own threshold - the only
+                # existing log fired solely on near-total candle
+                # absence (<5), not this "just barely not enough" case.
+                print(f"[CHART] {display_name}/{strategy_name}: only {len(candles)} candles, need 50+ - MA overlay skipped")
 
-        elif strategy_name == "EMA Pullback Scalper" and len(candles) >= 55:
-            ema20_raw = calculate_ema_series(candles, 20)
-            ema50_raw = calculate_ema_series(candles, 50)
-            ema20 = [None] * (len(candles) - len(ema20_raw)) + list(ema20_raw)
-            ema50 = [None] * (len(candles) - len(ema50_raw)) + list(ema50_raw)
+        elif strategy_name == "EMA Pullback Scalper":
+            if len(candles) >= 55:
+                ema20_raw = calculate_ema_series(candles, 20)
+                ema50_raw = calculate_ema_series(candles, 50)
+                ema20 = [None] * (len(candles) - len(ema20_raw)) + list(ema20_raw)
+                ema50 = [None] * (len(candles) - len(ema50_raw)) + list(ema50_raw)
+            else:
+                print(f"[CHART] {display_name}/{strategy_name}: only {len(candles)} candles, need 55+ - EMA overlay skipped")
 
-        elif strategy_name == "Breakout" and len(candles) >= 30:
-            consolidation = candles[-11:-1]
-            range_high = max(c["high"] for c in consolidation)
-            range_low = min(c["low"] for c in consolidation)
-            consolidation_box = (range_low, range_high)
+        elif strategy_name == "Breakout":
+            if len(candles) >= 30:
+                consolidation = candles[-11:-1]
+                range_high = max(c["high"] for c in consolidation)
+                range_low = min(c["low"] for c in consolidation)
+                consolidation_box = (range_low, range_high)
+            else:
+                print(f"[CHART] {display_name}/{strategy_name}: only {len(candles)} candles, need 30+ - box overlay skipped")
 
-        elif strategy_name == "Volatility Breakout Scalper" and len(candles) >= 11:
-            prior_10 = candles[-11:-1]
-            breakout_lines = (max(c["high"] for c in prior_10), min(c["low"] for c in prior_10))
+        elif strategy_name == "Volatility Breakout Scalper":
+            if len(candles) >= 11:
+                prior_10 = candles[-11:-1]
+                breakout_lines = (max(c["high"] for c in prior_10), min(c["low"] for c in prior_10))
+            else:
+                print(f"[CHART] {display_name}/{strategy_name}: only {len(candles)} candles, need 11+ - breakout lines skipped")
 
         elif strategy_name == "Support/Resistance Bounce":
             sr_level = candles[-1]["low"] if direction == "BUY" else candles[-1]["high"]

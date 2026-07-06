@@ -436,11 +436,30 @@ AI_BIAS_GLOBAL_DAILY_LIMIT = 1000
 
 NEWS_RELEVANT_KEYWORDS = [
     "forex", "currency", "currencies", "dollar", "euro", "pound",
-    "sterling", "yen", "usd", "eur", "gbp", "jpy", "fed", "federal reserve",
+    "sterling", "yen", "usd", "eur", "gbp", "jpy", "chf", "franc",
+    "aud", "cad", "nzd", "fed", "federal reserve",
     "ecb", "european central bank", "bank of england", "boe",
-    "bank of japan", "boj", "interest rate", "rate hike", "rate cut",
+    "bank of japan", "boj", "swiss national bank", "snb",
+    "interest rate", "rate hike", "rate cut",
     "inflation", "cpi", "nonfarm payroll", "nfp", "gdp", "central bank",
     "bitcoin", "btc", "crypto", "cryptocurrency",
+    "gold", "xau", "xauusd",
+]
+
+# Per explicit instruction - only MAJOR currencies move the market for
+# this audience (USD, EUR, GBP, JPY, CHF, AUD, CAD, NZD), plus Gold
+# and BTC. A minor/exotic currency headline (e.g. Rupee, Rand, Lira)
+# can still slip past the keyword list above just because it happens
+# to mention "USD" in passing ("Rupee slips vs USD") - this exclusion
+# list hard-blocks those regardless of any major-currency keyword
+# also present, since the article's actual SUBJECT is the minor
+# currency, not something a major-pair/gold/BTC trader can act on.
+NEWS_EXCLUDED_MINOR_CURRENCY_KEYWORDS = [
+    "rupee", "inr", "rand", "zar", "lira", "peso", "mxn", "ringgit",
+    "myr", "baht", "thb", "won", "krw", "yuan", "rmb", "renminbi", "cny",
+    "naira", "ngn", "shekel", "ils", "dirham", "aed", "riyal", "sar",
+    "rouble", "ruble", "rub", "zloty", "pln", "forint", "huf",
+    "koruna", "czk", "rupiah", "idr", "dong", "vnd", "taka", "bdt",
 ]
 
 def is_news_relevant(title, description):
@@ -451,8 +470,19 @@ def is_news_relevant(title, description):
     "XETR:3A9" slipping through, unrelated to forex or Bitcoin at
     all). re.escape handles keywords with spaces (e.g. "interest
     rate") safely inside the word-boundary pattern.
+
+    Minor/exotic currency exclusion runs FIRST and wins even if a
+    major-currency keyword also matches - per explicit instruction,
+    an article about the Rupee, Rand, Lira etc. isn't something a
+    major-pair/gold/BTC trader can act on, regardless of it mentioning
+    "USD" or "dollar" in the same breath.
     """
     text = f"{title} {description}".lower()
+    if any(
+        re.search(rf"\b{re.escape(keyword)}\b", text)
+        for keyword in NEWS_EXCLUDED_MINOR_CURRENCY_KEYWORDS
+    ):
+        return False
     return any(
         re.search(rf"\b{re.escape(keyword)}\b", text)
         for keyword in NEWS_RELEVANT_KEYWORDS
@@ -6941,7 +6971,10 @@ async def generate_news_summary(article, session_type):
 
     prompt = f"""
 You are Nexora AI, a professional financial news analyst.
-Write a VERY SHORT market news post for a Telegram trading channel.
+Write a VERY SHORT market news post for a Telegram trading channel of
+forex, gold, and Bitcoin traders. They only care about instruments
+they can actually trade - never a minor/exotic currency, never a
+vague phrase like "global markets".
 
 SESSION: {session_label}
 NEWS HEADLINE: {title}
@@ -6951,24 +6984,31 @@ SOURCE: {source}
 FORMAT EXACTLY LIKE THIS — NO EXCEPTIONS:
 {session_label}
 
-🔹 [One line news item 1] — likely [Bullish/Bearish/Neutral] for [pair]
+🔹 [One line news item 1] — [Bullish/Bearish] for [instrument], [direct BUY/SELL read]
 
-🔹 [One line news item 2] — likely [Bullish/Bearish/Neutral] for [pair]
+🔹 [One line news item 2] — [Bullish/Bearish] for [instrument], [direct BUY/SELL read]
 
 STRICT RULES:
 - Maximum 2 bullet points ONLY
-- Each bullet point MAX 20 words INCLUDING the sentiment tag
-- [pair] must be a real forex pair or BTC/USD this news actually
-  affects (e.g. EUR/USD, GBP/USD, XAU/USD, BTC/USD) - never invent
-  a pair the news doesn't relate to
-- State Bullish/Bearish/Neutral based on what the news itself
-  implies, not a guess - if direction genuinely isn't clear from
-  the details given, say Neutral rather than forcing a direction
+- Each bullet point MAX 25 words INCLUDING the sentiment tag and BUY/SELL read
+- [instrument] MUST be one of exactly these - never anything else,
+  never a minor/exotic currency (e.g. Rupee, Rand, Lira, Naira),
+  never a vague phrase like "global markets" or "risk sentiment":
+  the Dollar, EUR/USD, GBP/USD, USD/JPY, USD/CHF, AUD/USD, USD/CAD,
+  NZD/USD, Gold (XAU/USD), BTC/USD
+- Every bullet must end with a direct actionable read a trader can
+  act on immediately, e.g. "— Bullish for the Dollar, favors selling
+  Gold here" or "— Bearish for the Dollar, BTC/USD may see upside"
+- State Bullish/Bearish based on what the news itself implies, not a
+  guess - only use Neutral if truly no directional read is possible
+  for one of the instruments above, and even then still name which
+  instrument it's neutral for
+- If the news doesn't clearly relate to ANY of the instruments listed
+  above, respond with exactly: SKIP
 - No long sentences, no paragraphs
 - No markdown symbols like ** or ##
 - No hashtags
-- Make each point punchy and impactful
-- Focus on what matters most to forex, gold, and Bitcoin traders
+- Make each point punchy, direct, and immediately actionable
 """
     return await ask_gemini(prompt)
 
@@ -7065,6 +7105,15 @@ async def post_news(context: ContextTypes.DEFAULT_TYPE):
     # first-attempt overreaction.
     if summary.strip() in KNOWN_AI_FAILURE_STRINGS:
         print(f"[NEWS] AI summary generation failed on all 3 attempts ('{summary.strip()}') - skipping this post entirely rather than publish it as content.")
+        return
+
+    # The prompt now returns exactly "SKIP" when an article passed the
+    # keyword filter but still isn't genuinely about a major currency,
+    # Gold, or BTC (e.g. an exotic-currency story where "usd"/"dollar"
+    # only appeared incidentally) - per explicit instruction, this
+    # must never get posted literally as if "SKIP" were real content.
+    if summary.strip().upper() == "SKIP":
+        print(f"[NEWS] AI judged article ('{article.get('title', '')}') not relevant to major FX/Gold/BTC - skipping this post.")
         return
 
     calendar = fetch_economic_calendar()

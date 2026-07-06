@@ -9836,7 +9836,14 @@ async def post_weekly_report(context: ContextTypes.DEFAULT_TYPE):
     net_pips = total_pips_won - total_pips_lost
 
     date_range = f"{week_start.strftime('%d %b')} – {now.strftime('%d %b %Y')}"
-    profit_sign = "+" if total_profit_usd >= 0 else ""
+    # Sign placed BEFORE the $ (e.g. "-$218.96", "+$218.96") instead of
+    # between $ and the digits - per explicit instruction, the old
+    # "${total_profit_usd:.2f}" let Python's own negative formatting
+    # land the minus sign after the $ (e.g. "$-218.96"), which read
+    # as ambiguous/misleading to subscribers. abs() + explicit sign
+    # in front of $ removes that ambiguity entirely.
+    profit_sign = "-" if total_profit_usd < 0 else "+"
+    profit_abs = abs(total_profit_usd)
     profit_emoji = "📈" if total_profit_usd >= 0 else "📉"
     net_pips_sign = "+" if net_pips >= 0 else ""
 
@@ -9853,14 +9860,19 @@ async def post_weekly_report(context: ContextTypes.DEFAULT_TYPE):
         f"📐 <b>Pips Won:</b> +{total_pips_won:.1f}\n"
         f"📐 <b>Pips Lost:</b> -{total_pips_lost:.1f}\n"
         f"📐 <b>Net Pips:</b> {net_pips_sign}{net_pips:.1f}\n\n"
-        f"{profit_emoji} <b>Real Net P&L (0.1 lot):</b> {profit_sign}${total_profit_usd:.2f}\n\n"
+        f"{profit_emoji} <b>Real Net P&L (0.1 lot):</b> {profit_sign}${profit_abs:.2f}\n\n"
     )
+    # NOTE: the missing_pnl_count warning ("N closed signal(s) couldn't
+    # be matched to a real MT5 trade...") is deliberately NOT included
+    # in the public report anymore - per explicit instruction, that's
+    # internal diagnostic info subscribers shouldn't see. It's still
+    # logged to console below so the info isn't lost, just not public.
     if missing_pnl_count:
-        report += (
-            f"<i>⚠️ {missing_pnl_count} closed signal(s) couldn't be "
+        print(
+            f"[WEEKLY REPORT] ⚠️ {missing_pnl_count} closed signal(s) couldn't be "
             f"matched to a real MT5 trade this week (e.g. auto-trade "
-            f"placement failed that round) - not included in the P&L "
-            f"total above.</i>\n\n"
+            f"placement failed that round) - excluded from P&L total, "
+            f"not shown in public report."
         )
     report += (
         f"━━━━━━━━━━━━━━━━━━━━━\n\n"

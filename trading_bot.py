@@ -1564,19 +1564,47 @@ SYNTHETIC_CONFIG = {
     # the actual accepted set is {400, 1000, 2000, 3000, 4000} - 100
     # was wrong, just like the earlier 150 guess was wrong. Using 400
     # here (the lowest confirmed-valid value, least leveraged) rather
-    # than guessing again. R_10/R_25/R_50/R_100 are UNCONFIRMED still
-    # - left at 100 for now, but deriv_execute_multiplier_trade has a
-    # safety net: if Deriv rejects whatever value is sent, it parses
-    # the real accepted list straight out of Deriv's own error message
-    # and retries once with the lowest valid value, so trades on the
-    # unconfirmed indices still go through correctly even before each
-    # is individually tested and hardcoded the same way R_75 just was.
-    "r10": {"symbol": "R_10", "display": "Volatility 10 Index", "default_multiplier": 100},
-    "r25": {"symbol": "R_25", "display": "Volatility 25 Index", "default_multiplier": 100},
-    "r50": {"symbol": "R_50", "display": "Volatility 50 Index", "default_multiplier": 100},
+    # than guessing again.
+    #
+    # IMPORTANT - per explicit instruction, R_75's floor of 400 is a
+    # HARD Deriv-side constraint, not something any config value here
+    # can lower. In a multiplier contract, max possible loss is capped
+    # at the stake itself, which mathematically caps the widest
+    # possible stop distance at exactly 1/multiplier of price -
+    # regardless of stake size or dollar risk chosen. At x400 that's
+    # 0.25% price movement, full stop, even risking the entire stake.
+    # Volatility 75 routinely moves more than that from ordinary
+    # noise, which was confirmed as the real driver of auto-copy's
+    # poor win rate (real Deriv trade history showed ~17% win rate
+    # against a required ~33% breakeven at the intended 1:2 R:R).
+    # R_75 has been pulled out of auto-copy entirely below (see
+    # run_auto_copy_for_signal/run_auto_copy_scan) rather than left
+    # in with a stop distance that can never survive normal noise.
+    #
+    # R_10/R_25/R_50/R_100 are still UNCONFIRMED - lowered the guess
+    # here from 100 to 20 to test for a wider, more survivable stop
+    # distance. This is safe to test live: deriv_execute_multiplier_
+    # trade's proposal step catches a rejected guess BEFORE any real
+    # money moves, and auto-retries with Deriv's own real lowest
+    # valid value straight out of the rejection error - same
+    # mechanism that already confirmed R_75's true floor above.
+    "r10": {"symbol": "R_10", "display": "Volatility 10 Index", "default_multiplier": 20},
+    "r25": {"symbol": "R_25", "display": "Volatility 25 Index", "default_multiplier": 20},
+    "r50": {"symbol": "R_50", "display": "Volatility 50 Index", "default_multiplier": 20},
     "r75": {"symbol": "R_75", "display": "Volatility 75 Index", "default_multiplier": 400},
-    "r100": {"symbol": "R_100", "display": "Volatility 100 Index", "default_multiplier": 100},
+    "r100": {"symbol": "R_100", "display": "Volatility 100 Index", "default_multiplier": 20},
 }
+
+# Indices excluded from auto-copy specifically - per explicit
+# instruction, R_75's Deriv-enforced multiplier floor (400) caps the
+# widest possible stop distance at 0.25% of price, mathematically,
+# regardless of stake or dollar risk chosen. That's too tight to
+# survive Volatility 75's normal noise, which real trade history
+# confirmed as the actual driver of auto-copy's poor win rate. The
+# channel signal and manual "Trade This Signal" flow are UNCHANGED -
+# this only stops it from being silently auto-traded for every
+# opted-in user.
+AUTO_COPY_EXCLUDED_INDICES = {"r75"}
 
 SYNTHETIC_ALIASES = {
     "r10": ["r10", "r_10", "r 10", "volatility 10", "volatility10", "vol 10", "vol10", "v10"],
@@ -2839,6 +2867,13 @@ async def run_auto_copy_scan(context: ContextTypes.DEFAULT_TYPE):
     # the market doesn't change per-user, so this is computed once.
     fresh_signals = {}
     for index_key, config in SYNTHETIC_CONFIG.items():
+        # Same AUTO_COPY_EXCLUDED_INDICES check as run_auto_copy_for_
+        # signal above - this scan builds its own independent signal
+        # list every 30 minutes, so skipping it there alone would NOT
+        # have stopped this loop from still auto-trading R_75 through
+        # this separate path.
+        if index_key in AUTO_COPY_EXCLUDED_INDICES:
+            continue
         symbol = config["symbol"]
         # Same 60 -> 210 fix as build_synthetic_signal_response above,
         # applied here too for consistency - this scan runs the exact
@@ -9129,7 +9164,19 @@ async def _post_synthetic_signal_for_index(bot, index_key):
     # the loop above, same double-fire mistake already fixed once for
     # MT5 placement. Background task so a slow/large auto-copy run
     # never delays the channel post itself.
-    asyncio.create_task(run_auto_copy_for_signal(bot, trade_context))
+    #
+    # AUTO_COPY_EXCLUDED_INDICES check - per explicit instruction,
+    # R_75's Deriv-enforced x400 multiplier floor caps the widest
+    # possible stop distance at 0.25% of price no matter the stake or
+    # dollar risk chosen, which real trade history confirmed as the
+    # actual driver of auto-copy's poor win rate. This ONLY skips
+    # automatic execution - the channel post above and the manual
+    # "Trade This Signal" button are both unaffected, so anyone who
+    # wants to accept that risk themselves still can.
+    if index_key not in AUTO_COPY_EXCLUDED_INDICES:
+        asyncio.create_task(run_auto_copy_for_signal(bot, trade_context))
+    else:
+        print(f"[AUTO-COPY] Skipping auto-copy for {index_key.upper()} - excluded (Deriv multiplier floor too tight for a survivable stop)")
 
 async def post_auto_synthetic_signal(context: ContextTypes.DEFAULT_TYPE):
     slot_number = context.job.data

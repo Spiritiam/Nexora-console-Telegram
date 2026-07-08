@@ -115,18 +115,19 @@ SL_HIT_IMAGE_FILE_ID = "AgACAgQAAxkBAAIBIWowI9Lxu93CIKFD5YSHFbJ8_MB-AAJBD2sbbT2B
 # "13:00 UTC" = 2PM Lagos, "17:00 UTC" = 6PM
 # Lagos, "11:00 UTC" = 12PM Lagos, matching how
 # the team actually thinks about these slots.
-# Per explicit instruction: 8AM XAUUSD every
-# weekday, 6PM BTCUSD every weekday, and a 2PM
-# midday slot that varies by day - EURUSD Monday,
-# GBPUSD Tuesday, GBPJPY Wednesday, a volatility/
-# synthetic index Thursday (see SYNTHETIC_SCHEDULE's
-# thursday_only entry), and nothing at all Friday.
-# GBPJPY alone was tried for every weekday first,
-# but found too slow/illiquid via real testing -
-# a JPY cross pair, computed from two legs rather
-# than quoted directly, unlike the majors now used
-# Mon/Tue. Weekends keep their own existing BTCUSD
-# morning/evening + synthetic pattern, untouched.
+# Per explicit instruction (schedule rebuilt
+# 2026-07-08): 8AM XAUUSD every weekday, 12PM
+# GBPJPY every weekday Monday-Thursday, 12PM
+# synthetic index Friday only (see SYNTHETIC_
+# SCHEDULE's friday_only entry), and 6PM BTCUSD
+# every weekday. NOTE - this reverses an earlier
+# real-testing finding that GBPJPY alone every
+# weekday was too slow/illiquid on TwelveData; if
+# that issue resurfaces, it wasn't fixed, just
+# knowingly re-accepted per this later explicit
+# instruction. Weekends keep their own existing
+# BTCUSD morning/evening + synthetic pattern,
+# untouched.
 #
 # MORNING_PAIR_BY_WEEKDAY / MIDDAY_PAIR_BY_WEEKDAY
 # / EVENING_PAIR_BY_WEEKDAY use Python's
@@ -157,22 +158,19 @@ MORNING_PAIR_BY_WEEKDAY = {
     6: None,      # Sunday - no signals at all, per explicit instruction (Saturday alone is enough)
 }
 
-# 2pm UTC midday slot - per explicit instruction, a different forex
-# pair each weekday (GBPJPY alone was found too slow/illiquid via
-# real testing on TwelveData - a JPY cross pair, computed from two
-# legs rather than quoted directly, unlike the majors below). Thursday
-# maps to None here since that slot is now a volatility/synthetic
-# index post instead (see SYNTHETIC_SCHEDULE's thursday_only entry).
-# Friday maps to None - per explicit instruction, no midday post at
-# all that day. Saturday and Sunday also map to None - per explicit
-# instruction, Saturday's schedule is morning-synthetic + evening-
-# BTCUSD only (no midday post), and Sunday has no posts at all.
+# 11:00 UTC / 12PM Lagos midday slot - per explicit instruction,
+# GBPJPY now runs every weekday Monday-Thursday (replacing the old
+# "different major each day" rotation entirely). Friday maps to None
+# here since that slot is now a synthetic index post instead (see
+# SYNTHETIC_SCHEDULE's friday_only entry below). Saturday and Sunday
+# also map to None - Saturday's schedule is morning-synthetic +
+# evening-BTCUSD only (no midday post), and Sunday has no posts at all.
 MIDDAY_PAIR_BY_WEEKDAY = {
-    0: "eurusd",  # Monday
-    1: "gbpusd",  # Tuesday
+    0: "gbpjpy",  # Monday
+    1: "gbpjpy",  # Tuesday
     2: "gbpjpy",  # Wednesday
-    3: None,      # Thursday - volatility/synthetic index instead, see SYNTHETIC_SCHEDULE
-    4: None,      # Friday - no midday post, per explicit instruction
+    3: "gbpjpy",  # Thursday
+    4: None,      # Friday - synthetic index instead, see SYNTHETIC_SCHEDULE
     5: None,      # Saturday - no midday post, per explicit instruction
     6: None,      # Sunday - no posts at all, per explicit instruction
 }
@@ -196,25 +194,24 @@ DAILY_SCHEDULE = [
 ]
 
 # Synthetic index channel posts - rotates through all 5 indices.
-# Wednesday gets its own dedicated 12PM Lagos (11:00 UTC) slot, and
-# Thursday gets the 2PM Lagos (13:00 UTC) midday slot instead of a
-# forex pair (per explicit instruction - MIDDAY_PAIR_BY_WEEKDAY maps
-# Thursday to None so post_midday_signal does nothing that day, and
-# this slot covers it instead). Saturday's morning slot (8AM Lagos =
-# 07:00 UTC) is ALSO now a synthetic post instead of BTCUSD, per
-# explicit instruction (Saturday's day shape is now: synthetic
-# morning, BTCUSD evening, nothing midday) - MORNING_PAIR_BY_WEEKDAY
-# maps Saturday to None so post_morning_signal does nothing that day,
-# and this slot covers it instead. Sunday has been removed entirely,
-# per explicit instruction ("Saturday is enough") - no synthetic post,
-# no forex/crypto post, nothing at all on Sundays now. slot_number
-# values are kept distinct across same-week slots purely so
-# get_rotation_key's day-of-year math never accidentally lands two
-# same-week posts on the identical index.
+# Per explicit instruction (schedule rebuilt 2026-07-08, corrected
+# same day): Friday gets the 12PM Lagos (11:00 UTC) slot instead of a
+# forex pair - this lands at the same time the midday job itself now
+# runs, which is fine since MIDDAY_PAIR_BY_WEEKDAY maps Friday to None
+# (post_midday_signal does nothing that day, so there's no collision
+# at 11:00 UTC on Fridays). GBPJPY covers Monday-Thursday at this same
+# 12PM slot instead (see MIDDAY_PAIR_BY_WEEKDAY). Saturday's morning
+# slot (8AM Lagos = 07:00 UTC) is UNCHANGED - still a synthetic post
+# instead of BTCUSD (Saturday's day shape stays: synthetic morning,
+# BTCUSD evening at 6PM Lagos via EVENING_PAIR_BY_WEEKDAY, nothing
+# midday). Sunday still has nothing at all. slot_number values are
+# kept distinct across these two remaining same-week slots purely so
+# get_rotation_key's day-of-year math never accidentally lands both
+# on the identical index in the same week - not persisted anywhere,
+# safe to renumber.
 SYNTHETIC_SCHEDULE = [
-    ("11:00", "wednesday_only", 0),
-    ("13:00", "thursday_only", 1),
-    ("07:00", "saturday_only", 2),
+    ("11:00", "friday_only", 0),
+    ("07:00", "saturday_only", 1),
 ]
 
 # ============================================
@@ -10048,8 +10045,7 @@ def main():
     WEEKDAYS_ONLY = (1, 2, 3, 4, 5)  # Mon-Fri, cron-style
     WEEKEND_ONLY = (6, 0)            # Sat-Sun, cron-style
     EVERY_DAY = (0, 1, 2, 3, 4, 5, 6)
-    WEDNESDAY_ONLY = (3,)            # cron-style: 3=Wednesday
-    THURSDAY_ONLY = (4,)             # cron-style: 4=Thursday
+    FRIDAY_ONLY = (5,)               # cron-style: 5=Friday
     SATURDAY_ONLY = (6,)             # cron-style: 6=Saturday
 
     for i, (utc_time, post_type, data) in enumerate(DAILY_SCHEDULE):
@@ -10087,7 +10083,7 @@ def main():
     )
     job_queue.run_daily(
         post_midday_signal,
-        time=parse_time("13:00"),
+        time=parse_time("11:00"),  # 12PM Lagos, per explicit instruction (schedule rebuilt 2026-07-08)
         name="midday_signal",
         days=EVERY_DAY,
         job_kwargs={"misfire_grace_time": 300}
@@ -10101,10 +10097,8 @@ def main():
     )
 
     for i, (utc_time, schedule_type, slot_number) in enumerate(SYNTHETIC_SCHEDULE):
-        if schedule_type == "wednesday_only":
-            days = WEDNESDAY_ONLY
-        elif schedule_type == "thursday_only":
-            days = THURSDAY_ONLY
+        if schedule_type == "friday_only":
+            days = FRIDAY_ONLY
         elif schedule_type == "saturday_only":
             days = SATURDAY_ONLY
         elif schedule_type == "weekend":
@@ -10212,7 +10206,12 @@ def main():
         weekend_note = "" if data == "btcusd" else " (weekdays only)"
         print(f"  {emoji} {utc_time} UTC — {data.upper()}{weekend_note}")
     for utc_time, schedule_type, slot_number in SYNTHETIC_SCHEDULE:
-        note = "weekdays only" if schedule_type == "weekday" else "weekends only"
+        note = {
+            "friday_only": "Fridays only",
+            "saturday_only": "Saturdays only",
+            "weekend": "weekends only",
+            "weekday": "weekdays only",
+        }.get(schedule_type, schedule_type)
         print(f"  ⚡ {utc_time} UTC — SYNTHETIC ROTATION ({note}, slot {slot_number})")
     print("  🔁 TP/SL monitor — every 15 minutes")
     print("  📊 23:00 UTC Sunday — WEEKLY REPORT")

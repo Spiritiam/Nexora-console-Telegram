@@ -5741,8 +5741,53 @@ def parse_fundamental_response(text):
     except Exception:
         return None
 
+# Per-pair relevance keywords for the fundamental analysis context -
+# per explicit instruction, after a real confirmed bug: a cached
+# Bitcoin/rate-cut article was handed to the AI as "context" for a
+# GOLD signal, and instead of correctly saying FUNDAMENTAL: NONE (as
+# the prompt already instructs it to when there's no real connection),
+# it forced a confusing, hallucinated-feeling bridge between the two
+# ("Interest rate cut expectations favoring Bitcoin are a risk to the
+# XAUUSD SELL call"). Rather than trusting the LLM to always self-
+# police this correctly, the article is now filtered for relevance
+# BEFORE it ever reaches the prompt - an irrelevant article is treated
+# exactly like "no article available", so the model is never tempted
+# to force a connection that isn't genuinely there in the first place.
+PAIR_RELEVANCE_KEYWORDS = {
+    "xauusd": ["gold", "xau", "fed", "federal reserve", "interest rate", "rate cut", "rate hike", "inflation", "dollar", "usd", "treasury yield", "real yield"],
+    "xagusd": ["silver", "xag", "gold", "fed", "federal reserve", "interest rate", "rate cut", "rate hike", "inflation", "dollar", "usd"],
+    "btcusd": ["bitcoin", "btc", "crypto", "cryptocurrency"],
+    "eurusd": ["euro", "eur", "ecb", "european central bank", "dollar", "usd", "fed", "federal reserve"],
+    "gbpusd": ["pound", "sterling", "gbp", "bank of england", "boe", "dollar", "usd", "fed"],
+    "gbpjpy": ["pound", "sterling", "gbp", "bank of england", "boe", "yen", "jpy", "bank of japan", "boj"],
+    "usdjpy": ["yen", "jpy", "bank of japan", "boj", "dollar", "usd", "fed", "federal reserve"],
+    "usdcad": ["loonie", "cad", "canadian dollar", "oil", "dollar", "usd", "fed"],
+    "usdchf": ["franc", "chf", "swiss", "snb", "dollar", "usd", "fed"],
+    "audusd": ["aussie", "aud", "australian dollar", "rba", "dollar", "usd", "fed"],
+    "nzdusd": ["kiwi", "nzd", "rbnz", "dollar", "usd", "fed"],
+}
+
+def is_article_relevant_to_pair(article, pair_name):
+    """
+    True only if the article's title/description contains at least one
+    keyword genuinely tied to this specific pair's currencies/asset -
+    NOT a general "is this forex-related at all" check. A Bitcoin
+    article is real financial news, but it has zero of gold's keywords
+    in it, so it correctly returns False for an XAUUSD signal even
+    though it would (correctly) return True for a BTCUSD one.
+    """
+    if not article or not article.get("title"):
+        return False
+    keywords = PAIR_RELEVANCE_KEYWORDS.get(pair_name.lower().replace("/", ""))
+    if not keywords:
+        return True  # no keyword list defined for this pair - don't block, fall through to the AI's own judgment
+    text = f"{article.get('title', '')} {article.get('description', '')}".lower()
+    return any(kw in text for kw in keywords)
+
 async def generate_fundamental_context(pair_name, direction):
     article = get_cached_news_context()
+    if not is_article_relevant_to_pair(article, pair_name):
+        article = None
     calendar_events = get_relevant_calendar_events(pair_name)
 
     context_lines = []

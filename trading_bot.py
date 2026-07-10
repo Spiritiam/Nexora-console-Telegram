@@ -754,6 +754,13 @@ def attach_mt5_order_id(signal_id, order_id):
     column on signal_log.
     """
     if not signal_id or not order_id:
+        # Per explicit instruction - this used to return with ZERO log
+        # output, meaning a failed real trade placement (place_mt5_
+        # trade returning None) left no trace anywhere, indistinguishable
+        # from a routine no-op. Logging it now so a genuine placement
+        # failure is visible instead of silently falling through to the
+        # weaker price-inference fallback in check_open_signals.
+        print(f"[SIGNAL LOG] ⚠️ Skipping link for signal {signal_id} - no order_id (trade placement likely failed).")
         return
     try:
         url = f"{SUPABASE_URL}/rest/v1/signal_log?id=eq.{signal_id}"

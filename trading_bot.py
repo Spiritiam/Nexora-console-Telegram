@@ -7054,6 +7054,39 @@ async def post_news(context: ContextTypes.DEFAULT_TYPE):
     now = datetime.utcnow().strftime('%H:%M UTC')
     print(f"[NEWS] Posting {session_type} news at {now}")
 
+    # Fetched EARLY and independently of the article pipeline below -
+    # per explicit instruction, after finding that high-impact calendar
+    # events (e.g. FOMC) were being silently lost any time the article
+    # fetch failed or the AI judged the article irrelevant, EVEN THOUGH
+    # fetch_economic_calendar() itself doesn't depend on any news
+    # article or AI call at all - it's a separate, independent feed.
+    # The old code only ever appended calendar text onto a SUCCESSFUL
+    # article summary, so a bad article day meant a bad calendar day
+    # too, with zero relationship between the two failures.
+    calendar = fetch_economic_calendar()
+
+    async def post_calendar_only(reason: str):
+        """
+        Fallback path - posts high-impact calendar events (if any) on
+        their own, with no article/image, whenever the article
+        pipeline below can't produce a real post. Skips silently (like
+        before) only if there's ALSO no calendar content, so a day
+        with neither a usable article nor any high-impact calendar
+        event still posts nothing - never inventing filler content.
+        """
+        if not calendar:
+            print(f"[NEWS] {reason} - no calendar events either, skipping this post entirely.")
+            return
+        text = f"📆 <b>MARKET CALENDAR — {session_type.upper()}</b>{calendar}"
+        for channel_id in [CHANNEL_1_ID, CHANNEL_2_ID, CHANNEL_3_ID]:
+            try:
+                await context.bot.send_message(
+                    chat_id=channel_id, text=text, parse_mode=ParseMode.HTML,
+                )
+                print(f"[NEWS] ✅ calendar-only post sent to {channel_id} ({reason})")
+            except Exception as e:
+                print(f"[NEWS] ⚠️ calendar-only post failed for {channel_id}: {e}")
+
     article = fetch_market_news()
 
     # FIX: retry the article fetch itself before giving up, per
@@ -7077,7 +7110,8 @@ async def post_news(context: ContextTypes.DEFAULT_TYPE):
         article = fetch_market_news()
 
     if article is None:
-        print("[NEWS] No article found from any source after 3 attempts. Skipping.")
+        print("[NEWS] No article found from any source after 3 attempts.")
+        await post_calendar_only("no article found")
         return
 
     headline = article.get("title", "financial market news trading")
@@ -7136,7 +7170,8 @@ async def post_news(context: ContextTypes.DEFAULT_TYPE):
     # trying three times, over several minutes" case, not a
     # first-attempt overreaction.
     if summary.strip() in KNOWN_AI_FAILURE_STRINGS:
-        print(f"[NEWS] AI summary generation failed on all 3 attempts ('{summary.strip()}') - skipping this post entirely rather than publish it as content.")
+        print(f"[NEWS] AI summary generation failed on all 3 attempts ('{summary.strip()}').")
+        await post_calendar_only("AI summary failed")
         return
 
     # The prompt now returns exactly "SKIP" when an article passed the
@@ -7145,10 +7180,10 @@ async def post_news(context: ContextTypes.DEFAULT_TYPE):
     # only appeared incidentally) - per explicit instruction, this
     # must never get posted literally as if "SKIP" were real content.
     if summary.strip().upper() == "SKIP":
-        print(f"[NEWS] AI judged article ('{article.get('title', '')}') not relevant to major FX/Gold/BTC - skipping this post.")
+        print(f"[NEWS] AI judged article ('{article.get('title', '')}') not relevant to major FX/Gold/BTC.")
+        await post_calendar_only("article judged not relevant")
         return
 
-    calendar = fetch_economic_calendar()
     if calendar:
         summary += calendar
 
@@ -7280,7 +7315,60 @@ async def place_mt5_trade(signal_data):
 # monitor sweep.
 # ============================================
 
-async def get_mt5_trade_outcome(position_id):
+async def has_real_open_mt5_position(mt5_symbol):
+    """
+    True if the connected MT5 account has ANY currently open position on
+    this symbol RIGHT NOW, regardless of who opened it - the bot itself,
+    or a trade placed manually. Per explicit instruction, after a real
+    confirmed regression: has_open_signal_for_pair only ever checks our
+    OWN internal signal_log table, which only gets a row when THE BOT
+    posts a signal - a manually-placed trade never touches that table
+    at all, so the bot had no way of knowing one was live and posted a
+    fresh scheduled signal on top of it (confirmed live: a manual BTCUSD
+    BUY + the bot's own scheduled BTCUSD SELL open simultaneously).
+    This checks the account's REAL live position list instead, so it
+    catches a position no matter who placed it.
+
+    Tolerant of broker symbol suffixes (e.g. mt5_symbol "BTCUSDm" vs a
+    position reporting "BTCUSD" or "BTCUSDm.raw") by matching on
+    whichever string is the prefix of the other, uppercased - avoids a
+    silent false negative if the broker's exact suffix ever changes.
+
+    Returns False (does NOT block) on any lookup failure - same
+    fail-safe philosophy as has_open_signal_for_pair's own except
+    block: an unreachable MetaAPI account should never silently stall
+    the whole schedule forever.
+    """
+    if not METAAPI_TOKEN or not METAAPI_ACCOUNT_ID or not mt5_symbol:
+        return False
+    try:
+        api = MetaApi(token=METAAPI_TOKEN)
+        account = await api.metatrader_account_api.get_account(
+            account_id=METAAPI_ACCOUNT_ID
+        )
+        connection = account.get_rpc_connection()
+        await connection.connect()
+        await connection.wait_synchronized()
+
+        positions = await connection.get_positions()
+        # Same dict-wrapping gotcha already confirmed once for
+        # get_deals_by_position on this exact SDK - defensively
+        # unwrapped here too rather than assuming it can't recur.
+        if isinstance(positions, dict):
+            positions = positions.get("positions", [])
+
+        target = mt5_symbol.upper()
+        for pos in positions:
+            pos_symbol = (pos.get("symbol") if isinstance(pos, dict) else None) or ""
+            pos_symbol = pos_symbol.upper()
+            if pos_symbol and (pos_symbol.startswith(target) or target.startswith(pos_symbol)):
+                return True
+        return False
+    except Exception as e:
+        print(f"[MT5 POSITION CHECK] has_real_open_mt5_position error for {mt5_symbol}: {e}")
+        return False
+
+
     """
     Returns ('CLOSED', profit) if the position has closed (TP, SL, or
     manual), ('OPEN', None) if it's still running, or (None, None) if
@@ -9013,6 +9101,21 @@ async def _post_signal_for_pair(bot, pair_keyword):
         print(
             f"[AUTO SIGNAL] ⏸️ {pair_keyword.upper()} skipped — a "
             f"previous {pair_name} signal hasn't closed yet."
+        )
+        return
+
+    # Catches a position REGARDLESS of who opened it - the bot's own
+    # prior signal (already covered above via signal_log) OR a trade
+    # placed manually, which never touches signal_log at all. Per
+    # explicit instruction, after a real confirmed regression where a
+    # manually-placed BTCUSD trade didn't stop the bot's own scheduled
+    # BTCUSD signal from firing on top of it.
+    mt5_symbol = PAIR_CONFIG.get(pair_keyword, {}).get("mt5_symbol")
+    if mt5_symbol and await has_real_open_mt5_position(mt5_symbol):
+        print(
+            f"[AUTO SIGNAL] ⏸️ {pair_keyword.upper()} skipped — the "
+            f"account already has a live {mt5_symbol} position open "
+            f"(placed manually or otherwise), regardless of signal_log."
         )
         return
 

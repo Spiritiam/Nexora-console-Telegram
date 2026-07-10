@@ -5784,9 +5784,44 @@ def is_article_relevant_to_pair(article, pair_name):
     text = f"{article.get('title', '')} {article.get('description', '')}".lower()
     return any(kw in text for kw in keywords)
 
+# Per explicit instruction, after a SECOND real confirmed instance of
+# the same underlying problem: an article about "Applied Digital" (a
+# single company whose business is hosting Bitcoin miners) correctly
+# passed the pair-keyword check above (it genuinely does mention
+# "bitcoin", and the pair IS BTCUSD) - but the article is single-
+# company EQUITY/business news, not something that actually drives
+# Bitcoin's real spot price the way a Fed decision, ETF flow, or
+# halving event would. The AI again forced a shaky "risk" framing
+# instead of recognizing this isn't genuine macro context. Keyword-
+# matching the right ASSET isn't enough - this also has to exclude the
+# wrong KIND of news, regardless of which pair it happens to mention.
+COMPANY_SPECIFIC_INDICATORS = [
+    "inc.", "inc ", " corp", "corporation", " ltd.", " ltd ",
+    "shares of", "share price", "stock price", "nasdaq:", "nyse:",
+    "quarterly earnings", "earnings report", "q1 earnings", "q2 earnings",
+    "q3 earnings", "q4 earnings", "reliance on", "revenue from",
+    "hosting business", "data center company", "ipo", "stock surged",
+    "stock fell", "shares surged", "shares fell", "shares rose",
+]
+
+def is_company_specific_news(article):
+    """
+    True if the article reads as single-company equity/business news
+    (a specific firm's stock, earnings, revenue model, hosting
+    contracts, etc.) rather than genuine macro/market-moving context
+    for a currency or crypto PRICE. This check runs regardless of
+    which pair's keywords the article also happens to match - a
+    company-specific story doesn't become valid fundamental context
+    just because it mentions the right asset in passing.
+    """
+    if not article or not article.get("title"):
+        return False
+    text = f"{article.get('title', '')} {article.get('description', '')}".lower()
+    return any(indicator in text for indicator in COMPANY_SPECIFIC_INDICATORS)
+
 async def generate_fundamental_context(pair_name, direction):
     article = get_cached_news_context()
-    if not is_article_relevant_to_pair(article, pair_name):
+    if not is_article_relevant_to_pair(article, pair_name) or is_company_specific_news(article):
         article = None
     calendar_events = get_relevant_calendar_events(pair_name)
 
@@ -5812,14 +5847,21 @@ information below - do not invent any other news, data or events.
 
 The technical analysis for {pair_name} already calls a {direction}.
 If the information above has a genuine, meaningful connection to
-{pair_name}, write ONE sentence explaining how it relates to this
-{direction} call. If they support it, say so plainly. If they point
-the other way, frame it as a brief risk/caveat to be aware of - do
-NOT state a competing directional recommendation of your own.
+{pair_name}'s actual PRICE (a macro driver like a rate decision, ETF
+flow, inflation data, central bank action, or similar), write ONE
+sentence explaining how it relates to this {direction} call. If they
+support it, say so plainly. If they point the other way, frame it as
+a brief risk/caveat to be aware of - do NOT state a competing
+directional recommendation of your own.
 
-If the information above has NO real connection to {pair_name} -
-respond with exactly: FUNDAMENTAL: NONE
-Do not force a connection that isn't genuinely there.
+NOT a genuine connection - respond FUNDAMENTAL: NONE for things like:
+- A single company's stock, earnings, or business model (e.g. a
+  hosting/mining company's revenue risk) - this doesn't move the
+  actual spot price of a currency or crypto asset.
+- Any connection that only works by mentioning the same word (e.g.
+  "bitcoin") without a real causal link to price direction.
+Do not force a connection that isn't genuinely there, even if it
+sounds plausible on the surface.
 
 Respond in EXACTLY this format, nothing else, no markdown:
 FUNDAMENTAL: [one sentence, max 18 words] OR FUNDAMENTAL: NONE

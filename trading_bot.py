@@ -115,19 +115,24 @@ SL_HIT_IMAGE_FILE_ID = "AgACAgQAAxkBAAIBIWowI9Lxu93CIKFD5YSHFbJ8_MB-AAJBD2sbbT2B
 # "13:00 UTC" = 2PM Lagos, "17:00 UTC" = 6PM
 # Lagos, "11:00 UTC" = 12PM Lagos, matching how
 # the team actually thinks about these slots.
-# Per explicit instruction (schedule rebuilt
-# 2026-07-08): 8AM XAUUSD every weekday, 12PM
-# GBPJPY every weekday Monday-Thursday, 12PM
-# synthetic index Friday only (see SYNTHETIC_
-# SCHEDULE's friday_only entry), and 6PM BTCUSD
-# every weekday. NOTE - this reverses an earlier
+# Per explicit instruction (schedule rebuilt again
+# 2026-07-11): weekdays (Mon-Fri) now carry ONLY
+# XAUUSD (8AM), GBPJPY (12PM, Monday-Thursday
+# only), and BTCUSD (6PM) - NO synthetic index
+# post on any weekday anymore (the old Friday 12PM
+# synthetic slot is removed). Saturday keeps its
+# existing synthetic-morning (8AM) + BTCUSD-evening
+# (6PM) pattern, untouched. Sunday now gets a
+# single synthetic post at 2PM (see SYNTHETIC_
+# SCHEDULE's sunday_only entry) - safe to add
+# since synthetic signals never touch signal_log,
+# so this has zero effect on the weekly performance
+# report's stats. NOTE - the GBPJPY-every-weekday
+# change (made 2026-07-08) reverses an earlier
 # real-testing finding that GBPJPY alone every
 # weekday was too slow/illiquid on TwelveData; if
 # that issue resurfaces, it wasn't fixed, just
-# knowingly re-accepted per this later explicit
-# instruction. Weekends keep their own existing
-# BTCUSD morning/evening + synthetic pattern,
-# untouched.
+# knowingly re-accepted per that instruction.
 #
 # MORNING_PAIR_BY_WEEKDAY / MIDDAY_PAIR_BY_WEEKDAY
 # / EVENING_PAIR_BY_WEEKDAY use Python's
@@ -155,24 +160,26 @@ MORNING_PAIR_BY_WEEKDAY = {
     3: "xauusd",  # Thursday
     4: "xauusd",  # Friday
     5: None,      # Saturday - volatility/synthetic index instead, see SYNTHETIC_SCHEDULE's saturday_only entry
-    6: None,      # Sunday - no signals at all, per explicit instruction (Saturday alone is enough)
+    6: None,      # Sunday - no MORNING post (Sunday's only post is the 2PM synthetic, see SYNTHETIC_SCHEDULE's sunday_only entry)
 }
 
 # 11:00 UTC / 12PM Lagos midday slot - per explicit instruction,
 # GBPJPY now runs every weekday Monday-Thursday (replacing the old
 # "different major each day" rotation entirely). Friday maps to None
-# here since that slot is now a synthetic index post instead (see
-# SYNTHETIC_SCHEDULE's friday_only entry below). Saturday and Sunday
-# also map to None - Saturday's schedule is morning-synthetic +
-# evening-BTCUSD only (no midday post), and Sunday has no posts at all.
+# here since Friday now has NO midday post at all (the old Friday
+# synthetic slot at this same time was removed - see SYNTHETIC_
+# SCHEDULE, which now only fires Saturday morning and Sunday
+# afternoon). Saturday and Sunday also map to None here - Saturday's
+# schedule is morning-synthetic + evening-BTCUSD only, and Sunday's
+# is a single 2PM synthetic post only, neither has a midday slot.
 MIDDAY_PAIR_BY_WEEKDAY = {
     0: "gbpjpy",  # Monday
     1: "gbpjpy",  # Tuesday
     2: "gbpjpy",  # Wednesday
     3: "gbpjpy",  # Thursday
-    4: None,      # Friday - synthetic index instead, see SYNTHETIC_SCHEDULE
+    4: None,      # Friday - no midday post at all, per explicit instruction
     5: None,      # Saturday - no midday post, per explicit instruction
-    6: None,      # Sunday - no posts at all, per explicit instruction
+    6: None,      # Sunday - no midday post (Sunday's only post is the 2PM synthetic)
 }
 
 EVENING_PAIR_BY_WEEKDAY = {
@@ -194,24 +201,27 @@ DAILY_SCHEDULE = [
 ]
 
 # Synthetic index channel posts - rotates through all 5 indices.
-# Per explicit instruction (schedule rebuilt 2026-07-08, corrected
-# same day): Friday gets the 12PM Lagos (11:00 UTC) slot instead of a
-# forex pair - this lands at the same time the midday job itself now
-# runs, which is fine since MIDDAY_PAIR_BY_WEEKDAY maps Friday to None
-# (post_midday_signal does nothing that day, so there's no collision
-# at 11:00 UTC on Fridays). GBPJPY covers Monday-Thursday at this same
-# 12PM slot instead (see MIDDAY_PAIR_BY_WEEKDAY). Saturday's morning
-# slot (8AM Lagos = 07:00 UTC) is UNCHANGED - still a synthetic post
-# instead of BTCUSD (Saturday's day shape stays: synthetic morning,
-# BTCUSD evening at 6PM Lagos via EVENING_PAIR_BY_WEEKDAY, nothing
-# midday). Sunday still has nothing at all. slot_number values are
-# kept distinct across these two remaining same-week slots purely so
+# Per explicit instruction (schedule rebuilt again 2026-07-11):
+# weekdays (Monday-Friday) no longer carry ANY synthetic post at all -
+# only XAUUSD (morning), GBPJPY (Monday-Thursday midday, see
+# MIDDAY_PAIR_BY_WEEKDAY), and BTCUSD (evening) run Mon-Fri now. The
+# old Friday 12PM synthetic slot is REMOVED. Saturday's morning slot
+# (8AM Lagos = 07:00 UTC) is UNCHANGED - still a synthetic post
+# instead of BTCUSD, with BTCUSD still running that same evening at
+# 6PM Lagos via EVENING_PAIR_BY_WEEKDAY. Sunday now gets a NEW slot -
+# a single synthetic post at 2PM Lagos (13:00 UTC) - per explicit
+# instruction, safe to add because the weekly performance report
+# only ever counts signal_log rows (XAUUSD/EURUSD/GBPUSD/GBPJPY/
+# BTCUSD), and synthetic signals never touch signal_log at all (they
+# use their own separate chart/auto-copy path) - so this Sunday post
+# has zero effect on those stats. slot_number values are kept
+# distinct across these two remaining weekly slots purely so
 # get_rotation_key's day-of-year math never accidentally lands both
 # on the identical index in the same week - not persisted anywhere,
 # safe to renumber.
 SYNTHETIC_SCHEDULE = [
-    ("11:00", "friday_only", 0),
-    ("07:00", "saturday_only", 1),
+    ("07:00", "saturday_only", 0),
+    ("13:00", "sunday_only", 1),
 ]
 
 # ============================================
@@ -2333,20 +2343,31 @@ async def build_synthetic_signal_response(index_key, min_agree=2):
         entry_price = h1_candles[-1]["close"]
 
     sl_price = tp_price = None
-    stake_for_levels = DEFAULT_SYNTHETIC_STAKE
-    risk_for_levels = DEFAULT_RISK
-    win_for_levels = DEFAULT_WIN
     multiplier = config["default_multiplier"]
 
-    if entry_price is not None and stake_for_levels and multiplier:
-        risk_frac = risk_for_levels / (stake_for_levels * multiplier)
-        win_frac = win_for_levels / (stake_for_levels * multiplier)
-        if direction == "BUY":
-            sl_price = entry_price * (1 - risk_frac)
-            tp_price = entry_price * (1 + win_frac)
-        else:
-            sl_price = entry_price * (1 + risk_frac)
-            tp_price = entry_price * (1 - win_frac)
+    # Per explicit instruction: ALL synthetic indices now use a real
+    # technical distance (average true range of the last 14 h1
+    # candles, SL at 1.5x, TP at 3x for a 1:2 risk:reward) instead of
+    # the dollar/multiplier-derived formula. The dollar formula never
+    # actually drove real execution anyway - Deriv's own multiplier
+    # trade uses the risk/win dollar amounts directly (see
+    # deriv_execute_multiplier_trade), never these displayed price
+    # levels - so there's no execution-accuracy reason to keep it,
+    # and it was mathematically incapable of a meaningful distance on
+    # any index with a high forced multiplier floor (R_75 confirmed
+    # live: 0.075%/0.15% vs R_25's healthy 1.5%/3.0% on the same
+    # formula). A single consistent technical method now applies to
+    # every index, with no exposed explanation on the signal itself.
+    if entry_price is not None and h1_candles and len(h1_candles) >= 15:
+        recent = h1_candles[-14:]
+        atr_proxy = sum(c["high"] - c["low"] for c in recent) / len(recent)
+        if atr_proxy > 0:
+            if direction == "BUY":
+                sl_price = entry_price - (atr_proxy * 1.5)
+                tp_price = entry_price + (atr_proxy * 3.0)
+            else:
+                sl_price = entry_price + (atr_proxy * 1.5)
+                tp_price = entry_price - (atr_proxy * 3.0)
 
     # Real generated chart from the SAME candles the winning strategy
     # used. Entry/SL/TP now passed as real derived price levels (see
@@ -2375,8 +2396,7 @@ async def build_synthetic_signal_response(index_key, min_agree=2):
     if entry_price is not None and sl_price is not None and tp_price is not None:
         entry_sl_tp_block = (
             f"<b>Entry Price:</b> {entry_price:.2f}\n"
-            f"<b>SL:</b> {sl_price:.2f} | <b>TP:</b> {tp_price:.2f}\n"
-            f"<i>(shown for ${stake_for_levels} stake — scales with whichever tier you pick below)</i>\n\n"
+            f"<b>SL:</b> {sl_price:.2f} | <b>TP:</b> {tp_price:.2f}\n\n"
         )
 
     message = (
@@ -6444,7 +6464,10 @@ def _narrative_strategy_sentence(vote):
     name = vote["strategy_name"]
     detail = vote["detail"]
     if name == "Trend Following (MA)":
-        return f"The moving averages confirm it: {detail}."
+        if vote["direction"] == "BUY":
+            return "Price is trading above both the 20MA and 50MA — a bullish setup."
+        else:
+            return "Price is trading below both the 20MA and 50MA — a bearish setup."
     if name == "Breakout":
         return f"Price just {detail}, clearing a multi-candle range."
     if name == "Support/Resistance Bounce":
@@ -6452,7 +6475,10 @@ def _narrative_strategy_sentence(vote):
     if name == "Volatility Breakout Scalper":
         return f"A clean breakout move: {detail}."
     if name == "EMA Pullback Scalper":
-        return f"The pullback played out as expected: {detail}."
+        if vote["direction"] == "BUY":
+            return "Price pulled back and bounced off the short-term average — a bullish continuation setup."
+        else:
+            return "Price pulled back and rejected the short-term average — a bearish continuation setup."
     if name == "Momentum (MACD)":
         return f"Momentum agrees - {detail}."
     if name == "RSI Extreme Reversal":
@@ -6466,29 +6492,17 @@ def _narrative_strategy_sentence(vote):
 
 def generate_signal_narrative(display_name, direction, winning_votes):
     """
-    Returns a 3-4 line prose string built from the real winning votes.
-    Genuinely randomized per call (no seed) - intentional, since two
-    signals firing seconds apart on different indices should read
-    differently even if the same single strategy fired on both.
+    Returns ONE short, explanatory sentence stating the real technical
+    reason for the trade - per explicit instruction. Uses the short
+    per-strategy lead-in phrase (_narrative_strategy_sentence, e.g.
+    "The moving averages confirm it: ...") so the raw numbers still
+    read naturally instead of starting cold with data, but drops the
+    randomized opener/closer flavor text that used to surround it -
+    that was too much information on the signal itself.
     """
-    openers = NARRATIVE_OPENERS_BUY if direction == "BUY" else NARRATIVE_OPENERS_SELL
-    closers = NARRATIVE_CLOSERS_BUY if direction == "BUY" else NARRATIVE_CLOSERS_SELL
-
-    body_votes = winning_votes[:2]
-    body_sentences = [_narrative_strategy_sentence(v) for v in body_votes]
-
-    body_strategy_names = {v["strategy_name"] for v in body_votes}
-    safe_openers = openers
-    if "Momentum (MACD)" in body_strategy_names:
-        safe_openers = [o for o in openers if "momentum" not in o.lower()]
-    if not safe_openers:
-        safe_openers = openers
-
-    opener = random.choice(safe_openers).format(display_name=display_name)
-    closer = random.choice(closers)
-
-    lines = [opener] + body_sentences + [closer]
-    return " ".join(lines)
+    if not winning_votes:
+        return f"{display_name} {direction.lower()} signal."
+    return _narrative_strategy_sentence(winning_votes[0])
 
 
 # ============================================
@@ -10242,8 +10256,8 @@ def main():
     WEEKDAYS_ONLY = (1, 2, 3, 4, 5)  # Mon-Fri, cron-style
     WEEKEND_ONLY = (6, 0)            # Sat-Sun, cron-style
     EVERY_DAY = (0, 1, 2, 3, 4, 5, 6)
-    FRIDAY_ONLY = (5,)               # cron-style: 5=Friday
     SATURDAY_ONLY = (6,)             # cron-style: 6=Saturday
+    SUNDAY_ONLY = (0,)               # cron-style: 0=Sunday
 
     for i, (utc_time, post_type, data) in enumerate(DAILY_SCHEDULE):
         if post_type == "news":
@@ -10294,8 +10308,8 @@ def main():
     )
 
     for i, (utc_time, schedule_type, slot_number) in enumerate(SYNTHETIC_SCHEDULE):
-        if schedule_type == "friday_only":
-            days = FRIDAY_ONLY
+        if schedule_type == "sunday_only":
+            days = SUNDAY_ONLY
         elif schedule_type == "saturday_only":
             days = SATURDAY_ONLY
         elif schedule_type == "weekend":
@@ -10404,7 +10418,7 @@ def main():
         print(f"  {emoji} {utc_time} UTC — {data.upper()}{weekend_note}")
     for utc_time, schedule_type, slot_number in SYNTHETIC_SCHEDULE:
         note = {
-            "friday_only": "Fridays only",
+            "sunday_only": "Sundays only",
             "saturday_only": "Saturdays only",
             "weekend": "weekends only",
             "weekday": "weekdays only",

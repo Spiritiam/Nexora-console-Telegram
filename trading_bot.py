@@ -5891,11 +5891,22 @@ information below - do not invent any other news, data or events.
 The technical analysis for {pair_name} already calls a {direction}.
 If the information above has a genuine, meaningful connection to
 {pair_name}'s actual PRICE (a macro driver like a rate decision, ETF
-flow, inflation data, central bank action, or similar), write ONE
-sentence explaining how it relates to this {direction} call. If they
-support it, say so plainly. If they point the other way, frame it as
-a brief risk/caveat to be aware of - do NOT state a competing
-directional recommendation of your own.
+flow, inflation data, central bank action, or similar) AND it
+genuinely SUPPORTS this {direction} call, write ONE sentence
+explaining how it relates to this {direction} call, THEN end with a
+short, plain closing clause stating what it means for this trade -
+e.g. "This favors buyers." / "This favors sellers." A newbie should
+never have to work out for themselves whether the reasoning is good
+news for this specific trade - always say it plainly at the end.
+
+IMPORTANT - per explicit instruction: the fundamental analysis must
+NEVER conflict with the signal's own direction. If the information
+above points the OTHER way from this {direction} call (bearish news
+under a BUY call, or bullish news under a SELL call), do NOT show it
+at all, even framed as a caution or risk to be aware of - respond
+FUNDAMENTAL: NONE instead. A subscriber should never see a BUY
+signal paired with a reason to be bearish, or vice versa - two
+conflicting messages in the same signal is worse than showing none.
 
 NOT a genuine connection - respond FUNDAMENTAL: NONE for things like:
 - A single company's stock, earnings, or business model (e.g. a
@@ -5907,23 +5918,33 @@ Do not force a connection that isn't genuinely there, even if it
 sounds plausible on the surface.
 
 Respond in EXACTLY this format, nothing else, no markdown:
-FUNDAMENTAL: [one sentence, max 18 words] OR FUNDAMENTAL: NONE
+FUNDAMENTAL: [one sentence + closing clause, max 24 words] OR FUNDAMENTAL: NONE
 """
     else:
         prompt = f"""
 You are a forex/macro analyst. No specific real-time news or
 calendar data is available right now. The technical analysis for
 {pair_name} already calls a {direction}. If you can give genuinely
-useful general macro context relevant to this pair and direction,
+useful general macro context that SUPPORTS this pair and direction,
 write ONE sentence, making clear it's a general pattern rather than
-a specific current event. Do not state a competing directional
-recommendation of your own.
+a specific current event, THEN end with a short, plain closing
+clause stating what it means for this trade - e.g. "This favors
+buyers." / "This favors sellers." A newbie should never have to work
+out for themselves whether the reasoning is good news for this
+specific trade.
+
+IMPORTANT - per explicit instruction: never provide context that
+conflicts with the signal's own direction, even framed as a caution
+or risk. If the only genuinely relevant context you can think of
+points the OTHER way from this {direction} call, respond
+FUNDAMENTAL: NONE instead - a subscriber should never see a BUY
+signal paired with a reason to be bearish, or vice versa.
 
 If you have nothing genuinely useful to add, respond with exactly:
 FUNDAMENTAL: NONE
 
 Respond in EXACTLY this format, nothing else, no markdown:
-FUNDAMENTAL: [one sentence, max 18 words] OR FUNDAMENTAL: NONE
+FUNDAMENTAL: [one sentence + closing clause, max 24 words] OR FUNDAMENTAL: NONE
 """
 
     try:

@@ -451,6 +451,8 @@ NEWS_RELEVANT_KEYWORDS = [
     "inflation", "cpi", "nonfarm payroll", "nfp", "gdp", "central bank",
     "bitcoin", "btc", "crypto", "cryptocurrency",
     "gold", "xau", "xauusd",
+    "usoil", "oil price", "oil prices", "crude oil", "crude", "opec",
+    "wti", "brent crude",
 ]
 
 # Per explicit instruction - only MAJOR currencies move the market for
@@ -4866,6 +4868,21 @@ def strategy_trend_following(pair_key, config, h1_candles, h4_candles, daily_can
     forex's behavior in any meaningful way (210 candles is still
     plenty for a 20/50 pair, and the same bullish/bearish alignment
     logic applies either way).
+
+    EXTENSION FILTER: per explicit instruction, after a real signal
+    (XAUUSD SELL, live) confirmed this exact failure mode - the raw
+    alignment check fires immediately on a sharp breakaway candle,
+    entering right at the most extended point of the move, which is
+    exactly where a bounce back toward the average is most likely -
+    that live signal got stopped out by a retracement before the
+    trend resumed. Now requires price to be within 2x a recent
+    volatility proxy (average true range of the last 14 candles) of
+    the 20MA before firing - an already-extended move (price far from
+    its own 20MA, since the MA lags and hasn't caught up yet) is
+    skipped for now rather than chased, and the strategy will
+    naturally fire on a later candle once price pulls back closer to
+    the average or the average catches up - a genuinely safer entry,
+    without duplicating EMA Pullback Scalper's own separate pattern.
     """
     if not h1_candles or len(h1_candles) < 50:
         return None
@@ -4874,6 +4891,12 @@ def strategy_trend_following(pair_key, config, h1_candles, h4_candles, daily_can
     ma20 = sum(closes[-20:]) / 20
     ma50 = sum(closes[-50:]) / 50
     current_price = closes[-1]
+
+    recent = h1_candles[-14:]
+    atr_proxy = sum(c["high"] - c["low"] for c in recent) / len(recent)
+    distance_from_ma20 = abs(current_price - ma20)
+    if atr_proxy > 0 and distance_from_ma20 > (atr_proxy * 2.0):
+        return None
 
     if current_price > ma20 > ma50:
         return {
@@ -5808,6 +5831,7 @@ PAIR_RELEVANCE_KEYWORDS = {
     "usdchf": ["franc", "chf", "swiss", "snb", "dollar", "usd", "fed"],
     "audusd": ["aussie", "aud", "australian dollar", "rba", "dollar", "usd", "fed"],
     "nzdusd": ["kiwi", "nzd", "rbnz", "dollar", "usd", "fed"],
+    "usoil": ["usoil", "oil price", "oil prices", "crude oil", "crude", "opec", "wti", "brent crude", "dollar", "usd"],
 }
 
 def is_article_relevant_to_pair(article, pair_name):
@@ -6877,9 +6901,25 @@ def format_breakdown(text):
 # NEWS FETCHER — GNEWS PRIMARY
 # ============================================
 
-def fetch_news_gnews():
+def fetch_news_gnews_pool():
+    """
+    Returns the full LIST of qualifying articles, not a single pick -
+    per explicit instruction, after finding that gold/BTC dominated
+    the daily news post far more than USD/EUR/GBP/JPY/oil ever did,
+    despite all being technically allowed by NEWS_RELEVANT_KEYWORDS.
+    Root cause: the old fetch_market_news tried GNews FIRST and only
+    moved to TheNewsAPI/Alpha Vantage if GNews found NOTHING at all -
+    a strict waterfall. GNews's own query pulls from a broad general
+    "business" category, which naturally skews toward whatever's
+    globally trending day-to-day (commonly gold/crypto), while Alpha
+    Vantage's dedicated forex/macro query rarely got a turn since
+    GNews almost always found *something*. Returning the full pool
+    here (instead of picking immediately) lets fetch_market_news
+    combine all three sources into ONE shared random draw, so no
+    single source's own topic bias can dominate by default.
+    """
     if not GNEWS_API_KEY:
-        return None
+        return []
     try:
         url = (
             f"https://gnews.io/api/v4/top-headlines"
@@ -6893,26 +6933,27 @@ def fetch_news_gnews():
             if a.get("image") and a.get("title") and a.get("description")
             and is_news_relevant(a.get("title", ""), a.get("description", ""))
         ]
-        if not articles:
-            return None
-        article = random.choice(articles)
-        return {
-            "title": article.get("title", ""),
-            "description": article.get("description", ""),
-            "image": article.get("image", ""),
-            "source": article.get("source", {}).get("name", "GNews"),
-        }
+        return [
+            {
+                "title": a.get("title", ""),
+                "description": a.get("description", ""),
+                "image": a.get("image", ""),
+                "source": a.get("source", {}).get("name", "GNews"),
+            }
+            for a in articles
+        ]
     except Exception as e:
         print(f"[GNEWS] Error: {e}")
-        return None
+        return []
 
 # ============================================
 # NEWS FETCHER — THENEWSAPI FALLBACK
 # ============================================
 
-def fetch_news_thenewsapi():
+def fetch_news_thenewsapi_pool():
+    """Returns the full LIST of qualifying articles - see fetch_news_gnews_pool's docstring for why."""
     if not THENEWS_API_KEY:
-        return None
+        return []
     try:
         url = (
             f"https://api.thenewsapi.com/v1/news/top"
@@ -6926,27 +6967,28 @@ def fetch_news_thenewsapi():
             if a.get("image_url") and a.get("title") and a.get("description")
             and is_news_relevant(a.get("title", ""), a.get("description", ""))
         ]
-        if not articles:
-            return None
-        article = random.choice(articles)
-        return {
-            "title": article.get("title", ""),
-            "description": article.get("description", ""),
-            "image": article.get("image_url", ""),
-            "source": article.get("source", "TheNewsAPI"),
-        }
+        return [
+            {
+                "title": a.get("title", ""),
+                "description": a.get("description", ""),
+                "image": a.get("image_url", ""),
+                "source": a.get("source", "TheNewsAPI"),
+            }
+            for a in articles
+        ]
     except Exception as e:
         print(f"[THENEWSAPI] Error: {e}")
-        return None
+        return []
 
 # ============================================
 # NEWS FETCHER — ALPHA VANTAGE
 # Third fallback, forex/macro/crypto topics
 # ============================================
 
-def fetch_news_alphavantage():
+def fetch_news_alphavantage_pool():
+    """Returns the full LIST of qualifying articles - see fetch_news_gnews_pool's docstring for why."""
     if not ALPHA_VANTAGE_API_KEY:
-        return None
+        return []
     try:
         url = (
             f"https://www.alphavantage.co/query"
@@ -6962,40 +7004,46 @@ def fetch_news_alphavantage():
             if a.get("banner_image") and a.get("title") and a.get("summary")
             and is_news_relevant(a.get("title", ""), a.get("summary", ""))
         ]
-        if not articles:
-            return None
-        article = random.choice(articles)
-        return {
-            "title": article.get("title", ""),
-            "description": article.get("summary", ""),
-            "image": article.get("banner_image", ""),
-            "source": article.get("source", "Alpha Vantage"),
-        }
+        return [
+            {
+                "title": a.get("title", ""),
+                "description": a.get("summary", ""),
+                "image": a.get("banner_image", ""),
+                "source": a.get("source", "Alpha Vantage"),
+            }
+            for a in articles
+        ]
     except Exception as e:
         print(f"[ALPHAVANTAGE NEWS] Error: {e}")
-        return None
+        return []
 
 # ============================================
 # NEWS FETCHER — COMBINED
 # ============================================
 
 def fetch_market_news():
-    article = fetch_news_gnews()
-    if article:
-        print("[NEWS] ✅ GNews article found")
-        return article
-    print("[NEWS] GNews failed, trying TheNewsAPI...")
-    article = fetch_news_thenewsapi()
-    if article:
-        print("[NEWS] ✅ TheNewsAPI article found")
-        return article
-    print("[NEWS] TheNewsAPI failed, trying Alpha Vantage...")
-    article = fetch_news_alphavantage()
-    if article:
-        print("[NEWS] ✅ Alpha Vantage article found")
-        return article
-    print("[NEWS] All news APIs failed or no relevant forex/BTC news today.")
-    return None
+    # Combines ALL THREE sources into one shared pool, then draws
+    # randomly from that combined set - per explicit instruction,
+    # after finding gold/BTC dominated the daily post far more than
+    # USD/EUR/GBP/JPY/oil, even though all are technically eligible.
+    # The old strict waterfall (GNews first, only fall through if it
+    # found NOTHING) let GNews's own general "business" category bias
+    # win by default every time it found anything at all, never
+    # giving Alpha Vantage's more forex-focused query a real turn.
+    # Each source still degrades gracefully to an empty list on its
+    # own failure (missing key, API error), so a single source being
+    # down never blocks the other two from contributing.
+    combined_pool = (
+        fetch_news_gnews_pool()
+        + fetch_news_thenewsapi_pool()
+        + fetch_news_alphavantage_pool()
+    )
+    if not combined_pool:
+        print("[NEWS] All news APIs failed or no relevant forex/BTC/oil news today.")
+        return None
+    article = random.choice(combined_pool)
+    print(f"[NEWS] ✅ Article selected from a combined pool of {len(combined_pool)} qualifying articles ({article.get('source', 'unknown')})")
+    return article
 
 # ============================================
 # ECONOMIC CALENDAR — FOREX FACTORY

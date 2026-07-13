@@ -6797,37 +6797,52 @@ async def build_signal_response(question, user_id=None):
         if chart_ok:
             image_file_id = chart_path
     else:
-        chart_strategy_name = winning_votes[0]["strategy_name"] if winning_votes else None
-        if chart_strategy_name:
-            chart_path = os.path.join(CHART_OUTPUT_DIR, f"{matched_key}_{int(time.time())}.png")
-            chart_ok = generate_signal_chart(
-                display, chart_strategy_name, direction, h1_candles,
-                entry_price, stop_loss, take_profit, chart_path,
-            )
-            if not chart_ok:
-                # RETRY: per explicit instruction, after a real
-                # occurrence of a DM signal falling back to the static
-                # branded graphic instead of a real chart. Chart
-                # generation is pure local rendering (matplotlib) on
-                # real candles - no AI, no extra API cost - so a retry
-                # is genuinely free aside from a short delay. Re-fetches
-                # candles fresh rather than just re-running the same
-                # render on the same data: get_cached_candles only
-                # caches on SUCCESS, so if the first attempt's candle
-                # fetch itself came back thin/empty (a transient data-
-                # provider hiccup), this retry has a real chance of
-                # getting a fuller set the second time, not just
-                # deterministically repeating the same failure.
-                print(f"[CHART] {display}/{chart_strategy_name}: first attempt failed, retrying once with a fresh candle fetch...")
-                time.sleep(2)
-                retry_candles = get_cached_candles(matched_key, config, "1h", outputsize=210)
-                if retry_candles:
-                    chart_ok = generate_signal_chart(
-                        display, chart_strategy_name, direction, retry_candles,
-                        entry_price, stop_loss, take_profit, chart_path,
-                    )
-            if chart_ok:
-                image_file_id = chart_path
+        # Per explicit instruction, after a real confirmed gap: this
+        # used to gate chart generation ENTIRELY behind having a real
+        # winning strategy vote - if the signal came from the zero-
+        # strategy fallback (generate_rule_based_bias, e.g. "Price
+        # trending downward over the last hour"), chart_strategy_name
+        # was always None, so the whole chart-generation block
+        # (including the retry added for exactly this kind of issue)
+        # never even ran - it went straight to the generic branded
+        # image every time, regardless of whether a real chart could
+        # have been drawn. There ARE still real candles, a real entry,
+        # and real SL/TP in this case - only a NAMED strategy is
+        # missing - so this now always attempts a real chart, using a
+        # generic "Momentum" label (no strategy-specific overlay logic
+        # matches that name, so generate_signal_chart just skips the
+        # overlay step and still draws the base candlestick chart +
+        # entry/SL/TP lines, exactly like every other chart).
+        chart_strategy_name = winning_votes[0]["strategy_name"] if winning_votes else "Momentum"
+        chart_path = os.path.join(CHART_OUTPUT_DIR, f"{matched_key}_{int(time.time())}.png")
+        chart_ok = generate_signal_chart(
+            display, chart_strategy_name, direction, h1_candles,
+            entry_price, stop_loss, take_profit, chart_path,
+        )
+        if not chart_ok:
+            # RETRY: per explicit instruction, after a real
+            # occurrence of a DM signal falling back to the static
+            # branded graphic instead of a real chart. Chart
+            # generation is pure local rendering (matplotlib) on
+            # real candles - no AI, no extra API cost - so a retry
+            # is genuinely free aside from a short delay. Re-fetches
+            # candles fresh rather than just re-running the same
+            # render on the same data: get_cached_candles only
+            # caches on SUCCESS, so if the first attempt's candle
+            # fetch itself came back thin/empty (a transient data-
+            # provider hiccup), this retry has a real chance of
+            # getting a fuller set the second time, not just
+            # deterministically repeating the same failure.
+            print(f"[CHART] {display}/{chart_strategy_name}: first attempt failed, retrying once with a fresh candle fetch...")
+            time.sleep(2)
+            retry_candles = get_cached_candles(matched_key, config, "1h", outputsize=210)
+            if retry_candles:
+                chart_ok = generate_signal_chart(
+                    display, chart_strategy_name, direction, retry_candles,
+                    entry_price, stop_loss, take_profit, chart_path,
+                )
+        if chart_ok:
+            image_file_id = chart_path
 
     # FBS-style narrative: reason comes FIRST, Entry/SL/TP after, per
     # explicit instruction. Falls back to the original bullet-style
@@ -7530,6 +7545,59 @@ async def place_mt5_trade(signal_data):
 # monitor sweep.
 # ============================================
 
+# Per explicit instruction, after a real confirmed issue found live:
+# has_real_open_mt5_position and get_mt5_trade_outcome EACH used to
+# open a brand new MetaApi client + websocket connection + fresh
+# subscribe attempt on EVERY SINGLE CALL, rather than reusing one.
+# Since these now run often (every scheduled/manual signal, every
+# open-signal check, every weekly report), that meant many near-
+# simultaneous fresh subscribe attempts hitting the SAME single
+# account in a short window - confirmed directly in Railway logs as
+# repeated "Failed to subscribe... not connected to broker yet" and
+# MetaAPI's own TooManyRequestsException ("trying to access too many
+# unexisting or undeployed trading accounts"). place_mt5_trade itself
+# was NEVER affected by this - it uses a plain REST call, no
+# websocket subscription at all, which is why real trades kept
+# placing successfully throughout. This module-level cache holds ONE
+# shared, persistent connection instead, reused across every call.
+_SHARED_MT5_CONNECTION = {"connection": None}
+
+async def get_shared_mt5_connection():
+    """
+    Returns the shared, persistent MetaAPI RPC connection, creating
+    and subscribing it once on first use and reusing it on every
+    subsequent call - rather than a fresh connect+subscribe every
+    time. Returns None if it cannot be created/reused at all (caller
+    treats that as "lookup unavailable right now", same fail-safe
+    behavior as before).
+    """
+    if _SHARED_MT5_CONNECTION["connection"] is not None:
+        return _SHARED_MT5_CONNECTION["connection"]
+    try:
+        api = MetaApi(token=METAAPI_TOKEN)
+        account = await api.metatrader_account_api.get_account(
+            account_id=METAAPI_ACCOUNT_ID
+        )
+        connection = account.get_rpc_connection()
+        await connection.connect()
+        await connection.wait_synchronized()
+        _SHARED_MT5_CONNECTION["connection"] = connection
+        print("[MT5 SHARED CONNECTION] ✅ New shared connection established and cached.")
+        return connection
+    except Exception as e:
+        print(f"[MT5 SHARED CONNECTION] Failed to establish shared connection: {e}")
+        return None
+
+
+def _reset_shared_mt5_connection():
+    """
+    Clears the cached connection so the NEXT call rebuilds it fresh,
+    rather than staying permanently stuck reusing a connection that
+    just failed/went stale.
+    """
+    _SHARED_MT5_CONNECTION["connection"] = None
+
+
 async def has_real_open_mt5_position(mt5_symbol):
     """
     True if the connected MT5 account has ANY currently open position on
@@ -7557,13 +7625,9 @@ async def has_real_open_mt5_position(mt5_symbol):
     if not METAAPI_TOKEN or not METAAPI_ACCOUNT_ID or not mt5_symbol:
         return False
     try:
-        api = MetaApi(token=METAAPI_TOKEN)
-        account = await api.metatrader_account_api.get_account(
-            account_id=METAAPI_ACCOUNT_ID
-        )
-        connection = account.get_rpc_connection()
-        await connection.connect()
-        await connection.wait_synchronized()
+        connection = await get_shared_mt5_connection()
+        if connection is None:
+            return False
 
         positions = await connection.get_positions()
         # Same dict-wrapping gotcha already confirmed once for
@@ -7581,6 +7645,7 @@ async def has_real_open_mt5_position(mt5_symbol):
         return False
     except Exception as e:
         print(f"[MT5 POSITION CHECK] has_real_open_mt5_position error for {mt5_symbol}: {e}")
+        _reset_shared_mt5_connection()
         return False
 
 
@@ -7595,13 +7660,9 @@ async def get_mt5_trade_outcome(position_id):
     if not METAAPI_TOKEN or not METAAPI_ACCOUNT_ID or not position_id:
         return None, None
     try:
-        api = MetaApi(token=METAAPI_TOKEN)
-        account = await api.metatrader_account_api.get_account(
-            account_id=METAAPI_ACCOUNT_ID
-        )
-        connection = account.get_rpc_connection()
-        await connection.connect()
-        await connection.wait_synchronized()
+        connection = await get_shared_mt5_connection()
+        if connection is None:
+            return None, None
 
         deals = await connection.get_deals_by_position(
             position_id=str(position_id)
@@ -7674,6 +7735,7 @@ async def get_mt5_trade_outcome(position_id):
 
     except Exception as e:
         print(f"[MT5 OUTCOME] ❌ Lookup failed for {position_id}: {e}")
+        _reset_shared_mt5_connection()
         return None, None
 
 # ============================================

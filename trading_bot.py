@@ -2382,6 +2382,22 @@ async def build_synthetic_signal_response(index_key, min_agree=2):
             config["display"], chart_strategy_name, direction, chart_candles,
             entry_price, sl_price, tp_price, chart_path,
         )
+        if not chart_ok:
+            # RETRY: same reasoning as the forex/crypto path - chart
+            # generation is pure local rendering, no AI/API cost, so a
+            # retry with freshly re-fetched candles is cheap insurance
+            # against a transient data hiccup on the first attempt.
+            print(f"[CHART] {config['display']}/{chart_strategy_name}: first attempt failed, retrying once with a fresh candle fetch...")
+            time.sleep(2)
+            if chart_strategy_name in M1_BASED_STRATEGIES:
+                retry_candles = await get_cached_synthetic_candles(index_key, symbol, "1m", 60, 60)
+            else:
+                retry_candles = await get_cached_synthetic_candles(index_key, symbol, "1h", 3600, 210)
+            if retry_candles:
+                chart_ok = generate_signal_chart(
+                    config["display"], chart_strategy_name, direction, retry_candles,
+                    entry_price, sl_price, tp_price, chart_path,
+                )
         if chart_ok:
             image_file_id = chart_path
 
@@ -6743,6 +6759,28 @@ async def build_signal_response(question, user_id=None):
                 display, chart_strategy_name, direction, h1_candles,
                 entry_price, stop_loss, take_profit, chart_path,
             )
+            if not chart_ok:
+                # RETRY: per explicit instruction, after a real
+                # occurrence of a DM signal falling back to the static
+                # branded graphic instead of a real chart. Chart
+                # generation is pure local rendering (matplotlib) on
+                # real candles - no AI, no extra API cost - so a retry
+                # is genuinely free aside from a short delay. Re-fetches
+                # candles fresh rather than just re-running the same
+                # render on the same data: get_cached_candles only
+                # caches on SUCCESS, so if the first attempt's candle
+                # fetch itself came back thin/empty (a transient data-
+                # provider hiccup), this retry has a real chance of
+                # getting a fuller set the second time, not just
+                # deterministically repeating the same failure.
+                print(f"[CHART] {display}/{chart_strategy_name}: first attempt failed, retrying once with a fresh candle fetch...")
+                time.sleep(2)
+                retry_candles = get_cached_candles(matched_key, config, "1h", outputsize=210)
+                if retry_candles:
+                    chart_ok = generate_signal_chart(
+                        display, chart_strategy_name, direction, retry_candles,
+                        entry_price, stop_loss, take_profit, chart_path,
+                    )
             if chart_ok:
                 image_file_id = chart_path
 

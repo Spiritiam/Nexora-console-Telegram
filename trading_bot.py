@@ -7477,6 +7477,7 @@ async def has_real_open_mt5_position(mt5_symbol):
         return False
 
 
+async def get_mt5_trade_outcome(position_id):
     """
     Returns ('CLOSED', profit) if the position has closed (TP, SL, or
     manual), ('OPEN', None) if it's still running, or (None, None) if

@@ -8285,20 +8285,47 @@ async def get_shared_mt5_connection():
     time. Returns None if it cannot be created/reused at all (caller
     treats that as "lookup unavailable right now", same fail-safe
     behavior as before).
+
+    HARD TIMEOUT ADDED per explicit instruction, after a real
+    confirmed incident: an entire day of scheduled signals and news
+    posts silently failed to fire (while manual /signal requests kept
+    working fine), traced back to "tp_sl_monitor... skipped: maximum
+    number of running instances reached" appearing in the logs -
+    proof a PREVIOUS run of a job using this exact connection was
+    still stuck running when its next scheduled run came due. If
+    MetaAPI's own client HANGS instead of raising promptly when an
+    account is disconnected/disabled (as opposed to the TimeoutException
+    it does sometimes raise), the previous code had nothing forcing
+    it to give up - a hang here could tie up a scheduler worker
+    indefinitely, and enough of those hanging at once (MetaAPI here,
+    Deriv elsewhere) can saturate the whole job queue's worker pool,
+    blocking brand new scheduled jobs from ever getting a slot to
+    even start - while interactive commands, which run through a
+    separate path, keep working the whole time. Wrapping the whole
+    connect sequence in asyncio.wait_for guarantees this ALWAYS gives
+    up within 15 seconds no matter what MetaAPI's client does
+    internally, freeing the calling job promptly either way.
     """
     if _SHARED_MT5_CONNECTION["connection"] is not None:
         return _SHARED_MT5_CONNECTION["connection"]
     try:
-        api = MetaApi(token=METAAPI_TOKEN)
-        account = await api.metatrader_account_api.get_account(
-            account_id=METAAPI_ACCOUNT_ID
-        )
-        connection = account.get_rpc_connection()
-        await connection.connect()
-        await connection.wait_synchronized()
+        async def _connect():
+            api = MetaApi(token=METAAPI_TOKEN)
+            account = await api.metatrader_account_api.get_account(
+                account_id=METAAPI_ACCOUNT_ID
+            )
+            connection = account.get_rpc_connection()
+            await connection.connect()
+            await connection.wait_synchronized()
+            return connection
+
+        connection = await asyncio.wait_for(_connect(), timeout=15)
         _SHARED_MT5_CONNECTION["connection"] = connection
         print("[MT5 SHARED CONNECTION] ✅ New shared connection established and cached.")
         return connection
+    except asyncio.TimeoutError:
+        print("[MT5 SHARED CONNECTION] ❌ Timed out after 15s - MetaAPI account likely disconnected/disabled. Giving up for now rather than hanging.")
+        return None
     except Exception as e:
         print(f"[MT5 SHARED CONNECTION] Failed to establish shared connection: {e}")
         return None
@@ -8344,7 +8371,7 @@ async def has_real_open_mt5_position(mt5_symbol):
         if connection is None:
             return False
 
-        positions = await connection.get_positions()
+        positions = await asyncio.wait_for(connection.get_positions(), timeout=15)
         # Same dict-wrapping gotcha already confirmed once for
         # get_deals_by_position on this exact SDK - defensively
         # unwrapped here too rather than assuming it can't recur.
@@ -8379,8 +8406,9 @@ async def get_mt5_trade_outcome(position_id):
         if connection is None:
             return None, None
 
-        deals = await connection.get_deals_by_position(
-            position_id=str(position_id)
+        deals = await asyncio.wait_for(
+            connection.get_deals_by_position(position_id=str(position_id)),
+            timeout=15
         )
 
         # FIX #2: CONFIRMED REAL ISSUE via live logs after the first

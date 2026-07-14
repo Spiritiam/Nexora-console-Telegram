@@ -7660,6 +7660,8 @@ def get_todays_high_impact_events():
                 "forecast": event.get("forecast", ""),
                 "previous": event.get("previous", ""),
                 "actual": event.get("actual", ""),
+                "event_dt_utc": time_utc,  # raw ISO string, kept for the 30-min-before notification check
+                "event_key": f"{today_str}_{currency}_{event.get('title', '')}",
             })
 
         return events[:8]  # a reasonable cap on how many buttons to show
@@ -7669,11 +7671,23 @@ def get_todays_high_impact_events():
         return []
 
 
-# Temporary per-user cache of today's event list, so a button tap
-# (which can only carry a short index in its callback_data) can look
-# the full event details back up. Cleared/rebuilt each time the News
-# button is tapped - not meant to persist across restarts.
-NEWS_EVENT_CACHE = {}
+# Single SHARED list of today's high-impact events, not per-user -
+# per explicit instruction, since the events themselves are the same
+# for everyone (today's real calendar, not personalized). Used both
+# by the manual "News Calendar" tap AND the proactive 30-minutes-
+# before notification (see check_upcoming_high_impact_news below), so
+# a "Know the Direction" button works correctly no matter who taps it
+# - a per-user cache wouldn't work for a broadcast recipient who never
+# tapped anything themselves. Rebuilt fresh each time either path
+# runs - not meant to persist across restarts.
+GLOBAL_NEWS_EVENTS = []
+
+# Tracks which events have already triggered their 30-minutes-before
+# notification today, so the every-5-minutes check job doesn't send
+# the same alert multiple times as it keeps re-scanning. Keyed by
+# each event's own event_key (date+currency+title), so it naturally
+# resets itself day to day without needing an explicit clear.
+NOTIFIED_EVENTS_TODAY = set()
 
 
 async def generate_currency_direction(event):
@@ -7716,6 +7730,89 @@ REASON: [one sentence, max 20 words, plain and beginner-friendly]
     except Exception as e:
         print(f"[NEWS CALL] AI direction judgment failed: {e}")
         return None, None
+
+
+async def check_upcoming_high_impact_news(context: ContextTypes.DEFAULT_TYPE):
+    """
+    Runs every 5 minutes. Notifies every known user AND all 3
+    channels roughly 30 minutes before a high-impact USD/EUR/GBP/JPY
+    event, with a "Know the Direction" button that triggers the same
+    fundamentals-first call as tapping News Calendar manually. Per
+    explicit instruction. Uses a 25-30 minute WINDOW rather than an
+    exact 30 (since this job only checks every 5 minutes, an exact
+    match would miss most events entirely), and NOTIFIED_EVENTS_TODAY
+    guards against sending the same alert twice as the job keeps
+    re-scanning through that window.
+
+    Reuses get_all_known_user_ids() + the same rate-limited send loop
+    already proven safe in _run_broadcast, rather than inventing a
+    new one - sending to potentially many users needs that same
+    ~20/sec pacing to stay safely under Telegram's rate limits.
+    """
+    global GLOBAL_NEWS_EVENTS
+    events = get_todays_high_impact_events()
+    GLOBAL_NEWS_EVENTS = events
+    if not events:
+        return
+
+    now = datetime.utcnow()
+    bot = context.bot
+
+    for idx, event in enumerate(events):
+        event_key = event["event_key"]
+        if event_key in NOTIFIED_EVENTS_TODAY:
+            continue
+
+        raw_dt = event.get("event_dt_utc", "")
+        if not raw_dt or "T" not in raw_dt:
+            continue
+        try:
+            event_time = datetime.strptime(raw_dt[:16], "%Y-%m-%dT%H:%M")
+        except Exception:
+            continue
+
+        minutes_until = (event_time - now).total_seconds() / 60
+        if not (25 <= minutes_until <= 30):
+            continue
+
+        NOTIFIED_EVENTS_TODAY.add(event_key)
+        flag = {"USD": "🇺🇸", "EUR": "🇪🇺", "GBP": "🇬🇧", "JPY": "🇯🇵"}.get(event["currency"], "🌍")
+
+        alert_text = (
+            f"⏰ <b>High-impact news in ~30 minutes</b>\n\n"
+            f"{flag} <b>{event['title']}</b> ({event['currency']})\n"
+            f"Time: {event['time_str']} GMT+1\n\n"
+            f"Tap below to see the likely direction before it drops:"
+        )
+        alert_markup = InlineKeyboardMarkup([[
+            InlineKeyboardButton("🔍 Know the Direction", callback_data=f"newsevent_{idx}")
+        ]])
+
+        print(f"[NEWS ALERT] Notifying for upcoming event: {event['title']} ({event['currency']})")
+
+        for channel_id in [CHANNEL_1_ID, CHANNEL_2_ID, CHANNEL_3_ID]:
+            try:
+                await bot.send_message(
+                    chat_id=channel_id, text=alert_text,
+                    parse_mode=ParseMode.HTML, reply_markup=alert_markup
+                )
+            except Exception as e:
+                print(f"[NEWS ALERT] Channel post failed for {channel_id}: {e}")
+
+        user_ids = await get_all_known_user_ids()
+        sent = failed = 0
+        for uid in user_ids:
+            try:
+                await bot.send_message(
+                    chat_id=int(uid), text=alert_text,
+                    parse_mode=ParseMode.HTML, reply_markup=alert_markup
+                )
+                sent += 1
+            except Exception:
+                failed += 1
+            await asyncio.sleep(0.05)  # ~20/sec, same safe pacing as _run_broadcast
+
+        print(f"[NEWS ALERT] Done — sent {sent}, failed {failed}")
 
 # ============================================
 # FUNDAMENTAL GROUNDING DATA (NEW)
@@ -8740,35 +8837,16 @@ async def handle_buttons(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     if "news" in text:
-        events = get_todays_high_impact_events()
-        if not events:
-            sent_no_news = await update.message.reply_text(
-                "📰 <b>No high-impact news events left today.</b>\n\n"
-                "Check back tomorrow morning, or tap Signal for a "
-                "live technical read right now.",
-                parse_mode=ParseMode.HTML,
-                reply_markup=main_keyboard
-            )
-            schedule_auto_delete(sent_no_news.chat_id, sent_no_news.message_id)
-            return
-
-        NEWS_EVENT_CACHE[user_id] = events
-        buttons = []
-        for i, event in enumerate(events):
-            flag = {"USD": "🇺🇸", "EUR": "🇪🇺", "GBP": "🇬🇧", "JPY": "🇯🇵"}.get(event["currency"], "🌍")
-            label = f"{flag} {event['title'][:40]}"
-            if event["time_str"]:
-                label += f" ({event['time_str']})"
-            buttons.append([InlineKeyboardButton(label, callback_data=f"newsevent_{i}")])
-
-        sent_news_list = await update.message.reply_text(
-            "📰 <b>Today's High-Impact News</b>\n\n"
-            "Tap any event below for a direct BUY/SELL call, "
-            "fundamentals-first:",
+        sent_news_menu = await update.message.reply_text(
+            "📰 <b>News</b>\n\n"
+            "What would you like?",
             parse_mode=ParseMode.HTML,
-            reply_markup=InlineKeyboardMarkup(buttons)
+            reply_markup=InlineKeyboardMarkup([
+                [InlineKeyboardButton("📅 News Calendar", callback_data="newsmenu_calendar")],
+                [InlineKeyboardButton("📚 News Breakdown", callback_data="newsmenu_breakdown")],
+            ])
         )
-        schedule_auto_delete(sent_news_list.chat_id, sent_news_list.message_id)
+        schedule_auto_delete(sent_news_menu.chat_id, sent_news_menu.message_id)
         return
 
 # ============================================
@@ -8780,6 +8858,56 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
     data = query.data
+
+    if data.startswith("newsmenu_"):
+        user_id = str(query.from_user.id)
+        choice = data.replace("newsmenu_", "")
+
+        if choice == "calendar":
+            events = get_todays_high_impact_events()
+            if not events:
+                await query.message.edit_text(
+                    "📅 <b>No high-impact USD, EUR, GBP, or JPY news "
+                    "scheduled for the rest of today.</b>\n\n"
+                    "Try <b>News Breakdown</b> instead for a live read "
+                    "on any specific pair or currency you're curious about.",
+                    parse_mode=ParseMode.HTML
+                )
+                return
+
+            global GLOBAL_NEWS_EVENTS
+            GLOBAL_NEWS_EVENTS = events
+            today_display = datetime.utcnow().strftime("%A, %d %B %Y")
+            buttons = []
+            for i, event in enumerate(events):
+                flag = {"USD": "🇺🇸", "EUR": "🇪🇺", "GBP": "🇬🇧", "JPY": "🇯🇵"}.get(event["currency"], "🌍")
+                label = f"{flag} {event['title'][:40]}"
+                if event["time_str"]:
+                    label += f" ({event['time_str']} GMT+1)"
+                buttons.append([InlineKeyboardButton(label, callback_data=f"newsevent_{i}")])
+
+            await query.message.edit_text(
+                f"📅 <b>High-Impact News — {today_display}</b>\n\n"
+                f"Tap any event below for a direct BUY/SELL call, "
+                f"fundamentals-first:",
+                parse_mode=ParseMode.HTML,
+                reply_markup=InlineKeyboardMarkup(buttons)
+            )
+            return
+
+        elif choice == "breakdown":
+            user_modes[user_id] = "breakdown"
+            await query.message.edit_text(
+                "📚 <b>News Breakdown Mode Activated</b>\n\n"
+                "Now type your market question below.\n\n"
+                "<b>Examples:</b>\n"
+                "• Analyze gold market today\n"
+                "• BTCUSD outlook\n"
+                "• GBPJPY market analysis\n"
+                "• What is happening with oil today?",
+                parse_mode=ParseMode.HTML
+            )
+            return
 
     if data.startswith("newsevent_"):
         user_id = str(query.from_user.id)
@@ -8793,8 +8921,7 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
         try:
             idx = int(data.replace("newsevent_", ""))
-            events = NEWS_EVENT_CACHE.get(user_id, [])
-            event = events[idx]
+            event = GLOBAL_NEWS_EVENTS[idx]
         except (ValueError, IndexError):
             await query.message.reply_text(
                 "⚠️ This news list has expired - tap 📰 News again for a fresh list.",
@@ -8826,16 +8953,25 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         # strategy vote - fundamentals still drive the call either
         # way (per explicit instruction), but this is surfaced
         # transparently rather than silently blended in.
+        # Confidence % tied to real technical agreement - not an AI-
+        # invented number, per explicit instruction, matching how
+        # every other confidence figure in this bot is grounded in
+        # something concrete (agreeing strategy votes) rather than an
+        # unverifiable guess. 65% fundamentals-only (no technical read
+        # available), 80% if technicals agree, 50% if they disagree.
+        confidence = 65
         technical_note = "ℹ️ No clear technical read right now — this is a fundamentals-only call."
         try:
             _, technical_direction, _, technical_signal_data = await build_signal_response(pair_key, user_id=None)
             if technical_direction == final_direction and technical_signal_data:
+                confidence = 80
                 technical_note = (
                     f"✅ Technicals agree — Entry: {technical_signal_data.get('entry_price')} | "
                     f"SL: {technical_signal_data.get('stop_loss')} | "
                     f"TP: {technical_signal_data.get('take_profit')}"
                 )
             elif technical_direction and technical_direction != final_direction:
+                confidence = 50
                 technical_note = (
                     f"⚠️ Technicals currently read {technical_direction} — "
                     f"this is a fundamentals-only call, trade with extra caution."
@@ -8847,7 +8983,8 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         response = (
             f"📰 <b>{event['title']}</b> ({event['currency']})\n\n"
             f"<b>Fundamental read:</b> {ai_reason}\n\n"
-            f"{emoji} <b>DIRECT CALL: {final_direction} {pair_display}</b>\n\n"
+            f"{emoji} <b>DIRECT CALL: {final_direction} {pair_display}</b>\n"
+            f"<b>Confidence:</b> {confidence}%\n\n"
             f"{technical_note}\n\n"
             f"<i>Trade safe 💼🔥</i>"
         )
@@ -9978,6 +10115,49 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 parse_mode=ParseMode.HTML
             )
             schedule_auto_delete(sent_fetch_failed.chat_id, sent_fetch_failed.message_id)
+        return
+
+    if mode == "breakdown":
+
+        if not is_verified(user_id):
+            count = increment_trial(user_id)
+            if count > FREE_TRIAL_LIMIT:
+                user_modes[user_id] = "awaiting_email"
+                await send_verification_gate(update)
+                return
+
+        wait_message = await update.message.reply_text(
+            "🧠 <b>Nexora AI preparing market breakdown...</b>",
+            parse_mode=ParseMode.HTML
+        )
+
+        response = await generate_breakdown(message)
+        response = clean_text(response)
+        response = format_breakdown(response)
+
+        await wait_message.edit_text(
+            response,
+            parse_mode=ParseMode.HTML
+        )
+        schedule_auto_delete(wait_message.chat_id, wait_message.message_id)
+
+        if not is_verified(user_id):
+            remaining = trial_remaining(user_id)
+            if remaining > 0:
+                sent_trial_notice = await update.message.reply_text(
+                    f"⚡ <b>You have {remaining} free trial "
+                    f"signal(s) remaining.</b>\n\n"
+                    f"Verify your Exness account for "
+                    f"<b>unlimited access!</b>\n\n"
+                    f"📊 <b>Signal</b> — Get a live trading signal\n"
+                    f"📰 <b>News</b> — Get a direct call on high-impact news",
+                    parse_mode=ParseMode.HTML,
+                    reply_markup=main_keyboard
+                )
+                schedule_auto_delete(sent_trial_notice.chat_id, sent_trial_notice.message_id)
+            else:
+                user_modes[user_id] = "awaiting_email"
+                await send_verification_gate(update)
         return
 
     sent_fallback = await update.message.reply_text(
@@ -11194,6 +11374,17 @@ def main():
         interval=1800,
         first=120,
         name="auto_copy_scan"
+    )
+
+    # High-impact news alert - checks every 5 minutes for any USD/
+    # EUR/GBP/JPY high-impact event landing in ~30 minutes, notifying
+    # every known user and all 3 channels with a "Know the Direction"
+    # button. Per explicit instruction.
+    job_queue.run_repeating(
+        check_upcoming_high_impact_news,
+        interval=300,
+        first=30,
+        name="high_impact_news_alert"
     )
 
     # Tick Burst auto-copy scan - DISABLED per explicit instruction

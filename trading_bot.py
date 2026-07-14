@@ -1,6 +1,7 @@
 import os
 import asyncio
 import random
+import math
 import requests
 import re
 import json
@@ -2771,6 +2772,268 @@ def get_auto_copy_trade_amounts(account, trade_context, balance):
 
     return None, None, None, None
 
+# ============================================
+# ACCUMULATION ZONE STRATEGY (NEW)
+# Direct port of SpiritFX_Accumulation_Zone_EA.mq5's core logic - per
+# explicit instruction, wired for the SILENT AUTO-TRADE path on
+# synthetics ONLY (see run_accumulation_zone_auto_trade below). Never
+# touches the channel post, the manual /signal DM flow, or
+# SYNTHETIC_STRATEGY_BANK - those are all untouched and keep using
+# the existing 9-strategy bank exactly as before.
+#
+# CONCEPT: measures realized volatility via an EWMA of squared log
+# returns, then z-scores that volatility against its own longer-run
+# distribution. A sustained LOW z-score (volatility compressing)
+# marks an "accumulation zone." Once the zone ends (volatility
+# normalizes, confirmed over 2 bars) and it was long enough (30+
+# bars) with low enough net drift (a real sideways coil, not a
+# stealth trend), a fixed-range volume profile gets built over that
+# zone - POC (highest-volume price) and Value Area High/Low (the 70%-
+# of-volume range around it). The strategy then watches for the
+# FIRST candle that closes outside the Value Area - a genuine
+# breakout - and fires once, matching the EA's own "fires once, then
+# stops waiting" behavior rather than re-signaling every bar price
+# stays broken out.
+# ============================================
+
+ACCUM_ZONE_FAST_LEN = 20
+ACCUM_ZONE_ENTER_Z = 1.25
+ACCUM_ZONE_EXIT_Z = 0.50
+ACCUM_ZONE_EXIT_BARS = 2
+ACCUM_ZONE_MIN_BARS = 30
+ACCUM_ZONE_MAX_BARS = 300
+ACCUM_ZONE_MAX_DRIFT = 0.25
+ACCUM_ZONE_DIST_LEN = 200
+ACCUM_ZONE_ROWS = 48
+ACCUM_ZONE_VA_PCT = 70.0
+ACCUM_ZONE_ATR_PERIOD = 14
+ACCUM_ZONE_SL_ATR_MULT = 1.5
+ACCUM_ZONE_TP_ATR_MULT = 3.0
+
+
+def _accum_zone_alpha(length):
+    return 2.0 / (length + 1.0)
+
+
+def _accum_zone_true_range(candles, i):
+    high = candles[i]["high"]
+    low = candles[i]["low"]
+    prev_close = candles[i - 1]["close"]
+    return max(high - low, abs(high - prev_close), abs(low - prev_close))
+
+
+def _accum_zone_atr(candles, period=ACCUM_ZONE_ATR_PERIOD):
+    if len(candles) < period + 1:
+        return None
+    trs = [_accum_zone_true_range(candles, i) for i in range(len(candles) - period, len(candles))]
+    return sum(trs) / len(trs)
+
+
+def _accum_zone_build_profile(zone_bars):
+    """
+    Fixed-range volume profile over a finalized zone - direct port of
+    the EA's FinalizeProfile() binning/POC/Value-Area logic.
+    zone_bars is a list of (high, low, volume) tuples for the zone's
+    candles. Returns (vah, val, poc).
+    """
+    highs = [b[0] for b in zone_bars]
+    lows = [b[1] for b in zone_bars]
+    lo, hi = min(lows), max(highs)
+    if hi <= lo:
+        return lo, lo, lo
+
+    step = (hi - lo) / ACCUM_ZONE_ROWS
+    if step <= 0:
+        return lo, lo, lo
+
+    bin_vol = [0.0] * ACCUM_ZONE_ROWS
+    for bh, bl, bv in zone_bars:
+        br = bh - bl
+        if br <= step * 0.01:
+            px = min(hi - step * 0.5, max(lo + step * 0.5, (bh + bl) * 0.5))
+            idx = int((px - lo) / step)
+            idx = max(0, min(ACCUM_ZONE_ROWS - 1, idx))
+            bin_vol[idx] += bv
+        else:
+            for b in range(ACCUM_ZONE_ROWS):
+                bin_lo = lo + b * step
+                bin_hi = bin_lo + step
+                overlap = max(0.0, min(bh, bin_hi) - max(bl, bin_lo))
+                if overlap > 0:
+                    bin_vol[b] += bv * (overlap / br)
+
+    max_v = max(bin_vol) if bin_vol else 0
+    total_v = sum(bin_vol)
+    poc_idx = bin_vol.index(max_v) if max_v > 0 else 0
+    poc = lo + (poc_idx + 0.5) * step
+
+    target = total_v * (ACCUM_ZONE_VA_PCT / 100.0)
+    cum = bin_vol[poc_idx] if max_v > 0 else 0.0
+    left = right = poc_idx
+    while cum < target and (left > 0 or right < ACCUM_ZONE_ROWS - 1):
+        v_left = bin_vol[left - 1] if left > 0 else -1.0
+        v_right = bin_vol[right + 1] if right < ACCUM_ZONE_ROWS - 1 else -1.0
+        if v_right > v_left:
+            right += 1
+            cum += v_right
+        else:
+            left -= 1
+            cum += v_left
+
+    val_price = lo + left * step
+    vah_price = lo + (right + 1) * step
+    return vah_price, val_price, poc
+
+
+def detect_accumulation_zone_breakout(candles):
+    """
+    STATEFUL BY NATURE, run STATELESSLY here: unlike this bot's other
+    strategies (single-snapshot checks against the latest indicator
+    values), this one is inherently about a zone building up bar-by-
+    bar over real history. Since nothing here persists state between
+    calls, this replays the ENTIRE supplied candle window fresh every
+    time - matching what the EA's own WarmupHistory() does on attach.
+    Needs a genuinely large window (300+ M1 candles minimum) for the
+    200-bar volatility baseline (ACCUM_ZONE_DIST_LEN) to mean
+    anything - called with a short window, the baseline is under-
+    trained. Accepted tradeoff of running this on M1 for frequent
+    entries, per explicit instruction - not a bug.
+
+    Assumes candles are ordered OLDEST -> NEWEST (candles[-1] = most
+    recently closed bar), matching every other candle list already
+    used throughout this file. Volume is used if present, else
+    treated as an equal weight of 1.0 per bar - Deriv synthetic index
+    candles don't reliably carry real tick volume, so this falls back
+    to an equal-weighted "time at price" profile rather than skipping
+    volume-profile logic altogether.
+
+    Returns None if no FRESH breakout is happening on the very last
+    candle (nothing to act on right now), or a dict with direction/
+    entry_price/stop_loss/take_profit/poc/vah/val/atr if one is.
+    """
+    n = len(candles)
+    if n < ACCUM_ZONE_DIST_LEN + ACCUM_ZONE_MIN_BARS:
+        return None
+
+    closes = [c["close"] for c in candles]
+
+    ema_var = 0.0
+    stats_init = False
+    m1 = m2 = 0.0
+
+    zone_active = False
+    zone_bars = []
+    zone_sum_r = 0.0
+    zone_sum_abs_r = 0.0
+    zone_exit_count = 0
+
+    last_vah = last_val = last_poc = None
+    waiting_breakout = False
+    breakout_bar_index = None
+    breakout_direction = None
+
+    eps = 1e-10
+
+    for i in range(1, n):
+        c0 = closes[i]
+        c1 = closes[i - 1]
+        if c1 <= 0:
+            continue
+        lr = math.log(c0 / c1)
+
+        alpha_fast = _accum_zone_alpha(ACCUM_ZONE_FAST_LEN)
+        ema_var = (lr * lr) if not stats_init else (alpha_fast * (lr * lr) + (1.0 - alpha_fast) * ema_var)
+
+        vol = math.sqrt(max(ema_var, 0.0))
+        log_vol = math.log(vol + eps)
+
+        alpha_dist = _accum_zone_alpha(ACCUM_ZONE_DIST_LEN)
+        if not stats_init:
+            m1 = log_vol
+            m2 = log_vol * log_vol
+            stats_init = True
+        else:
+            m1 = alpha_dist * log_vol + (1.0 - alpha_dist) * m1
+            m2 = alpha_dist * (log_vol * log_vol) + (1.0 - alpha_dist) * m2
+
+        sigma = math.sqrt(max(m2 - m1 * m1, eps))
+        z = (log_vol - m1) / sigma
+
+        low_now = z <= -ACCUM_ZONE_ENTER_Z
+        high_now = z >= -ACCUM_ZONE_EXIT_Z
+
+        bar_high = candles[i]["high"]
+        bar_low = candles[i]["low"]
+        bar_vol = candles[i].get("volume") or 1.0
+
+        if not zone_active:
+            if low_now:
+                zone_active = True
+                zone_bars = [(bar_high, bar_low, bar_vol)]
+                zone_sum_r = lr
+                zone_sum_abs_r = abs(lr)
+                zone_exit_count = 0
+        else:
+            zone_bars.append((bar_high, bar_low, bar_vol))
+            zone_sum_r += lr
+            zone_sum_abs_r += abs(lr)
+            zone_exit_count = zone_exit_count + 1 if high_now else 0
+
+            exit_by_confirm = zone_exit_count >= ACCUM_ZONE_EXIT_BARS
+            exit_by_max = len(zone_bars) >= ACCUM_ZONE_MAX_BARS
+
+            if exit_by_confirm or exit_by_max:
+                if exit_by_confirm and len(zone_bars) > ACCUM_ZONE_EXIT_BARS:
+                    zone_bars = zone_bars[:-ACCUM_ZONE_EXIT_BARS]
+                drift = (abs(zone_sum_r) / max(zone_sum_abs_r, eps)) if zone_sum_abs_r > 0 else 0
+                if len(zone_bars) >= ACCUM_ZONE_MIN_BARS and drift <= ACCUM_ZONE_MAX_DRIFT:
+                    vah, val, poc = _accum_zone_build_profile(zone_bars)
+                    last_vah, last_val, last_poc = vah, val, poc
+                    waiting_breakout = True
+                zone_active = False
+
+        if waiting_breakout and last_vah is not None:
+            if c0 > last_vah:
+                breakout_bar_index = i
+                breakout_direction = "BUY"
+                waiting_breakout = False
+            elif c0 < last_val:
+                breakout_bar_index = i
+                breakout_direction = "SELL"
+                waiting_breakout = False
+
+    # Only a FRESH breakout counts - happening on the very last candle
+    # in this window, not several bars ago (which the previous call
+    # would already have seen and acted on) - avoids repeat re-fires
+    # the same way the EA's own waiting_breakout=False after firing
+    # once does.
+    if breakout_bar_index != n - 1:
+        return None
+
+    atr = _accum_zone_atr(candles, ACCUM_ZONE_ATR_PERIOD)
+    if not atr or atr <= 0:
+        return None
+
+    entry_price = closes[-1]
+    if breakout_direction == "BUY":
+        stop_loss = entry_price - atr * ACCUM_ZONE_SL_ATR_MULT
+        take_profit = entry_price + atr * ACCUM_ZONE_TP_ATR_MULT
+    else:
+        stop_loss = entry_price + atr * ACCUM_ZONE_SL_ATR_MULT
+        take_profit = entry_price - atr * ACCUM_ZONE_TP_ATR_MULT
+
+    return {
+        "direction": breakout_direction,
+        "entry_price": entry_price,
+        "stop_loss": stop_loss,
+        "take_profit": take_profit,
+        "poc": last_poc,
+        "vah": last_vah,
+        "val": last_val,
+        "atr": atr,
+    }
+
+
 async def run_auto_copy_for_signal(bot, trade_context):
     """
     Fires the same signal's trade automatically for every user with
@@ -3230,6 +3493,183 @@ async def run_tickburst_auto_copy_scan(context: ContextTypes.DEFAULT_TYPE):
 
         except Exception as e:
             print(f"[TICKBURST AUTO-COPY] ❌ Unexpected error for {user_id}: {e}")
+            continue
+
+# ============================================
+# ACCUMULATION ZONE AUTO-COPY SCAN (NEW)
+# Per explicit instruction: wires detect_accumulation_zone_breakout
+# into the SAME silent auto-trade pipeline as Tick Burst above (same
+# no-stacking checks across both the live socket read AND the DB-
+# backed table, balance stepdown, success/failure logging into the
+# same auto_copy_trades/auto_copy_failures tables and daily digest) -
+# only the SIGNAL SOURCE differs. Runs every 1 minute, matching the
+# M1 timeframe the strategy was explicitly asked to run on for
+# frequent entries.
+#
+# Scoped to auto-copy only, per explicit instruction - the channel
+# post and manual /signal DM flow are both untouched, still using
+# the existing 9-strategy SYNTHETIC_STRATEGY_BANK exactly as before.
+#
+# Uses the SAME existing $ stake/risk/win framework as every other
+# auto-copy strategy (get_auto_copy_trade_amounts / DEFAULT_RISK /
+# DEFAULT_WIN), NOT a per-trade dollar amount derived from the
+# strategy's own real ATR-based stop distance - matching the exact
+# precedent already established for Tick Burst, for consistency
+# across every auto-copy strategy rather than inventing a second,
+# divergent financial-math model for just this one. The real ATR-
+# based stop_loss/take_profit/poc/vah/val this strategy computes are
+# logged for visibility only, not sent to Deriv directly.
+#
+# UNLIKE Tick Burst, this DOES skip AUTO_COPY_EXCLUDED_INDICES (R_75)
+# - a judgment call, not from explicit instruction: this strategy's
+# own real stop is derived from actual market structure (an ATR-based
+# technical distance), and R_75's confirmed Deriv-enforced x400
+# multiplier floor caps ANY representable stop at 0.25% of price
+# regardless of stake - a structural mismatch for a strategy whose
+# whole edge depends on giving the stop real room, unlike Tick Burst's
+# inherently fast/tight scalping style which tolerates that ceiling
+# fine. Worth revisiting if real results suggest otherwise.
+# ============================================
+
+ACCUM_ZONE_M1_CANDLE_COUNT = 300  # ACCUM_ZONE_DIST_LEN (200) + ACCUM_ZONE_MIN_BARS (30) + real margin
+
+async def run_accumulation_zone_auto_trade(context: ContextTypes.DEFAULT_TYPE):
+    accounts = get_all_auto_copy_accounts()
+    if not accounts:
+        return
+
+    print(f"[ACCUM ZONE AUTO-COPY] Running for {len(accounts)} opted-in account(s)")
+    bot = context.bot
+
+    # One structure check per index per minute, shared across every
+    # user below - same reasoning as every other auto-copy scan.
+    fresh_signals = {}
+    for index_key, config in SYNTHETIC_CONFIG.items():
+        if index_key in AUTO_COPY_EXCLUDED_INDICES:
+            continue
+        symbol = config["symbol"]
+        m1_candles = await get_cached_synthetic_candles(
+            index_key, symbol, "1m", 60, ACCUM_ZONE_M1_CANDLE_COUNT
+        )
+        if not m1_candles:
+            continue
+        result = detect_accumulation_zone_breakout(m1_candles)
+        if not result:
+            continue
+
+        direction = result["direction"]
+        contract_type = "MULTUP" if direction == "BUY" else "MULTDOWN"
+        print(
+            f"[ACCUM ZONE AUTO-COPY] {index_key.upper()} {direction} breakout - "
+            f"entry {result['entry_price']:.4f}, real ATR-based SL {result['stop_loss']:.4f} / "
+            f"TP {result['take_profit']:.4f} (POC {result['poc']:.4f}, VAH {result['vah']:.4f}, "
+            f"VAL {result['val']:.4f}) - executing with the standard $ stake/risk/win framework"
+        )
+        fresh_signals[index_key] = {
+            "index_key": index_key,
+            "symbol": config["symbol"],
+            "display": config["display"],
+            "direction": direction,
+            "contract_type": contract_type,
+            "multiplier": config["default_multiplier"],
+            "risk": DEFAULT_RISK,
+            "win": DEFAULT_WIN,
+        }
+
+    if not fresh_signals:
+        return  # no fresh breakout on any index this minute - normal, not an error
+
+    for account in accounts:
+        user_id = account.get("user_id")
+        token = account.get("api_token")
+        if not user_id or not token:
+            continue
+
+        try:
+            snapshot = await deriv_fetch_account_snapshot(token)
+            if not snapshot or snapshot.get("balance") is None:
+                print(f"[ACCUM ZONE AUTO-COPY] Couldn't read account for {user_id}, skipping this round")
+                continue
+
+            balance = snapshot["balance"]
+            held_symbols = {
+                c.get("symbol") for c in snapshot.get("open_contracts", [])
+                if c.get("symbol")
+            }
+
+            low_balance_hit = False
+
+            for index_key, trade_context in fresh_signals.items():
+                # Same dual no-stacking check as every other auto-copy
+                # scan - both the live socket read AND the DB-backed
+                # table must agree nothing's already open on this
+                # index for this user. This also means Accumulation
+                # Zone, Tick Burst, and ICT/SMC auto-copy all correctly
+                # see EACH OTHER's open positions (same shared
+                # auto_copy_trades table and held_symbols source) -
+                # never two strategies stacking positions on the same
+                # index for the same user.
+                if trade_context["symbol"] in held_symbols:
+                    continue
+                if has_open_auto_copy_trade(user_id, trade_context["symbol"]):
+                    continue
+
+                stake, risk, win, was_reduced = get_auto_copy_trade_amounts(
+                    account, trade_context, balance
+                )
+
+                if stake is None:
+                    low_balance_hit = True
+                    continue
+
+                buy_data, error = await deriv_execute_multiplier_trade(
+                    token,
+                    trade_context["symbol"],
+                    trade_context["contract_type"],
+                    trade_context["multiplier"],
+                    stake, risk, win,
+                )
+
+                if error:
+                    log_auto_copy_failure(
+                        user_id, trade_context["symbol"],
+                        friendly_trade_error(error, auto_copy_context=True)
+                    )
+                    continue
+
+                if account.get("low_balance_notified"):
+                    set_low_balance_notified(user_id, False)
+                    account["low_balance_notified"] = False
+
+                contract_id = buy_data.get("contract_id", "—")
+
+                log_auto_copy_trade(
+                    user_id, trade_context["symbol"], contract_id,
+                    trade_context["direction"], stake, risk, win
+                )
+
+                held_symbols.add(trade_context["symbol"])
+
+            if low_balance_hit and should_send_low_balance_notification(account):
+                await bot.send_message(
+                    chat_id=int(user_id),
+                    text=(
+                        f"⚠️ <b>Auto-copy paused — balance too low.</b>\n\n"
+                        f"Your balance (${balance}) is too low even "
+                        f"for the smallest stake tier ($5). Top up "
+                        f"your Deriv account to resume auto-copy "
+                        f"trades.\n\n"
+                        f"<i>You won't get this reminder again "
+                        f"today, even if this happens again - "
+                        f"signals will keep being skipped "
+                        f"silently until then.</i>"
+                    ),
+                    parse_mode=ParseMode.HTML
+                )
+                set_low_balance_notified(user_id, True)
+
+        except Exception as e:
+            print(f"[ACCUM ZONE AUTO-COPY] ❌ Unexpected error for {user_id}: {e}")
             continue
 
 # ============================================
@@ -7762,7 +8202,7 @@ async def ask_gemini(prompt):
         result = response.json()
         return result["candidates"][0]["content"]["parts"][0]["text"]
     except Exception as e:
-        print(f"Gemini Error: {e}")
+        print(f"[NEWS AI] Gemini failed ({e}), trying OpenRouter...")
         return await ask_openrouter(prompt)
 
 # ============================================
@@ -9374,67 +9814,84 @@ async def _post_signal_for_pair(bot, pair_keyword):
 
     print(f"[AUTO SIGNAL] {pair_keyword.upper()} firing at {now}")
 
-    pair_name = PAIR_CONFIG.get(pair_keyword, {}).get("pair_name", pair_keyword.upper())
-    if has_open_signal_for_pair(pair_name):
-        print(
-            f"[AUTO SIGNAL] ⏸️ {pair_keyword.upper()} skipped — a "
-            f"previous {pair_name} signal hasn't closed yet."
-        )
-        return
-
-    # Catches a position REGARDLESS of who opened it - the bot's own
-    # prior signal (already covered above via signal_log) OR a trade
-    # placed manually, which never touches signal_log at all. Per
-    # explicit instruction, after a real confirmed regression where a
-    # manually-placed BTCUSD trade didn't stop the bot's own scheduled
-    # BTCUSD signal from firing on top of it.
-    mt5_symbol = PAIR_CONFIG.get(pair_keyword, {}).get("mt5_symbol")
-    if mt5_symbol and await has_real_open_mt5_position(mt5_symbol):
-        print(
-            f"[AUTO SIGNAL] ⏸️ {pair_keyword.upper()} skipped — the "
-            f"account already has a live {mt5_symbol} position open "
-            f"(placed manually or otherwise), regardless of signal_log."
-        )
-        return
-
-    image_file_id, direction, signal, signal_data = (
-        await build_signal_response(pair_keyword, user_id=None)
-    )
-
-    if signal_data is None:
-        if signal == "MARKET_CLOSED":
-            print(f"[AUTO SIGNAL] ⏸️ {pair_keyword.upper()} skipped — forex market closed.")
-        elif signal == "NO_DATA_AVAILABLE":
-            print(f"[AUTO SIGNAL] ⏸️ {pair_keyword.upper()} skipped — no real data source available (should not be scheduled).")
-        else:
-            print(f"[AUTO SIGNAL] ❌ Could not fetch price for {pair_keyword}.")
-        return
-
-    signal_id = log_signal(signal_data)
-
-    for channel_id in [CHANNEL_1_ID, CHANNEL_2_ID, CHANNEL_3_ID]:
-        try:
-            markup = (
-                get_channel_button()
-                if channel_id in (CHANNEL_1_ID, CHANNEL_3_ID)
-                else None
-            )
-
-            sent_msg = await bot.send_photo(
-                chat_id=channel_id,
-                photo=image_file_id,
-                caption=signal,
-                parse_mode=ParseMode.HTML,
-                reply_markup=markup
-            )
-            log_channel_message(signal_id, sent_msg.chat_id, sent_msg.message_id)
+    try:
+        pair_name = PAIR_CONFIG.get(pair_keyword, {}).get("pair_name", pair_keyword.upper())
+        if has_open_signal_for_pair(pair_name):
             print(
-                f"[AUTO SIGNAL] ✅ {pair_keyword.upper()} "
-                f"posted to {channel_id}"
+                f"[AUTO SIGNAL] ⏸️ {pair_keyword.upper()} skipped — a "
+                f"previous {pair_name} signal hasn't closed yet."
             )
+            return
 
-        except Exception as e:
-            print(f"[AUTO SIGNAL] ❌ Failed for {channel_id}: {e}")
+        # Catches a position REGARDLESS of who opened it - the bot's own
+        # prior signal (already covered above via signal_log) OR a trade
+        # placed manually, which never touches signal_log at all. Per
+        # explicit instruction, after a real confirmed regression where a
+        # manually-placed BTCUSD trade didn't stop the bot's own scheduled
+        # BTCUSD signal from firing on top of it.
+        mt5_symbol = PAIR_CONFIG.get(pair_keyword, {}).get("mt5_symbol")
+        if mt5_symbol and await has_real_open_mt5_position(mt5_symbol):
+            print(
+                f"[AUTO SIGNAL] ⏸️ {pair_keyword.upper()} skipped — the "
+                f"account already has a live {mt5_symbol} position open "
+                f"(placed manually or otherwise), regardless of signal_log."
+            )
+            return
+
+        image_file_id, direction, signal, signal_data = (
+            await build_signal_response(pair_keyword, user_id=None)
+        )
+
+        if signal_data is None:
+            if signal == "MARKET_CLOSED":
+                print(f"[AUTO SIGNAL] ⏸️ {pair_keyword.upper()} skipped — forex market closed.")
+            elif signal == "NO_DATA_AVAILABLE":
+                print(f"[AUTO SIGNAL] ⏸️ {pair_keyword.upper()} skipped — no real data source available (should not be scheduled).")
+            else:
+                print(f"[AUTO SIGNAL] ❌ Could not fetch price for {pair_keyword}.")
+            return
+
+        signal_id = log_signal(signal_data)
+
+        for channel_id in [CHANNEL_1_ID, CHANNEL_2_ID, CHANNEL_3_ID]:
+            try:
+                markup = (
+                    get_channel_button()
+                    if channel_id in (CHANNEL_1_ID, CHANNEL_3_ID)
+                    else None
+                )
+
+                sent_msg = await bot.send_photo(
+                    chat_id=channel_id,
+                    photo=image_file_id,
+                    caption=signal,
+                    parse_mode=ParseMode.HTML,
+                    reply_markup=markup
+                )
+                log_channel_message(signal_id, sent_msg.chat_id, sent_msg.message_id)
+                print(
+                    f"[AUTO SIGNAL] ✅ {pair_keyword.upper()} "
+                    f"posted to {channel_id}"
+                )
+
+            except Exception as e:
+                print(f"[AUTO SIGNAL] ❌ Failed for {channel_id}: {e}")
+    except Exception as e:
+        # CATCH-ALL: per explicit instruction, after a real incident
+        # where a screenshot of this exact job's logs cut off right
+        # after the "firing at..." line with no way to tell what
+        # happened next. Every ANTICIPATED skip reason above already
+        # had clear logging - what was missing was a guarantee for
+        # the UNANTICIPATED case: if anything inside build_signal_
+        # response (or anywhere else in this block) throws for a
+        # reason not already handled, this now prints ONE unmistakable
+        # final line naming the pair and the real exception, instead
+        # of relying on the job scheduler's own generic traceback dump
+        # (which is exactly the kind of thing that's easy to scroll
+        # past or crop out of a screenshot). This does not change
+        # WHETHER a crash can happen - only guarantees it is never
+        # silent or ambiguous when it does.
+        print(f"[AUTO SIGNAL] ❌ CRASHED for {pair_keyword.upper()}: {e}")
 
     # Placed exactly once per signal, regardless of how many
     # channels it's posted to - this used to fire once per channel
@@ -10552,6 +11009,24 @@ def main():
     #     interval=60,
     #     first=30,
     #     name="tickburst_auto_copy_scan"
+    # )
+
+    # Accumulation Zone auto-copy scan (NEW) - LEFT DISABLED for now,
+    # pending explicit confirmation. Built exactly per instruction
+    # (M1 timeframe, auto-copy only), but reusing the SAME $ stake/
+    # risk/win execution framework as Tick Burst above - the strategy
+    # that was disabled after causing real account losses. Not
+    # necessarily the same outcome (this strategy's own logic is
+    # unrelated to Tick Burst's), but the EXECUTION MODEL is
+    # identical, and that's worth a real go-ahead before real money
+    # touches it, not an assumption this job should just start
+    # running because the code compiles cleanly.
+    #
+    # job_queue.run_repeating(
+    #     run_accumulation_zone_auto_trade,
+    #     interval=60,
+    #     first=30,
+    #     name="accumulation_zone_auto_trade"
     # )
 
     # Auto-copy daily digest - PERMANENTLY DISABLED per explicit

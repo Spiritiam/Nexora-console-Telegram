@@ -442,6 +442,17 @@ AI_BIAS_GLOBAL_DAILY_LIMIT = 1000
 # is allowed through, no general business news.
 # ============================================
 
+# Shared across every AI-retry path (daily news, News Breakdown,
+# News Calendar's currency judgment) - promoted to module level so
+# there's one single source of truth for "what does a failed AI call
+# look like", rather than duplicate copies in each function risking
+# drifting out of sync if a new failure string is ever added.
+KNOWN_AI_FAILURE_STRINGS = (
+    "⚠️ AI service unavailable.",
+    "⚠️ AI server busy.",
+    "⚠️ AI servers unavailable.",
+)
+
 NEWS_RELEVANT_KEYWORDS = [
     "forex", "currency", "currencies", "dollar", "euro", "pound",
     "sterling", "yen", "usd", "eur", "gbp", "jpy", "chf", "franc",
@@ -7720,6 +7731,19 @@ REASON: [one sentence, max 20 words, plain and beginner-friendly]
 """
     try:
         result = await ask_gemini(prompt)
+
+        # Same retry-with-backoff resilience as the daily news post
+        # and News Breakdown - per explicit instruction, so a single
+        # unlucky moment where both Gemini and OpenRouter are briefly
+        # busy doesn't just fail this call outright.
+        retry_waits = [15, 30]
+        for attempt_number, wait_seconds in enumerate(retry_waits, start=2):
+            if result.strip() not in KNOWN_AI_FAILURE_STRINGS:
+                break
+            print(f"[NEWS CALL] AI direction judgment failed ('{result.strip()}') - waiting {wait_seconds}s then retrying (attempt {attempt_number}/3)...")
+            await asyncio.sleep(wait_seconds)
+            result = await ask_gemini(prompt)
+
         direction_match = re.search(r"DIRECTION:\s*(BULLISH|BEARISH)", result, re.IGNORECASE)
         reason_match = re.search(r"REASON:\s*(.+)", result)
         if not direction_match:
@@ -7788,12 +7812,25 @@ async def check_upcoming_high_impact_news(context: ContextTypes.DEFAULT_TYPE):
             InlineKeyboardButton("🔍 Know the Direction", callback_data=f"newsevent_{idx}")
         ]])
 
+        # AI-generated illustration, per explicit instruction - same
+        # pollinations.ai pattern already used for the daily news
+        # post, so this alert doesn't land as plain text alone.
+        image_prompt = (
+            f"professional financial news illustration: {event['currency']} "
+            f"{event['title']}, cinematic digital art, dramatic lighting, high quality"
+        )
+        image_url = (
+            f"https://image.pollinations.ai/prompt/"
+            f"{requests.utils.quote(image_prompt)}"
+            f"?width=800&height=450&nologo=true"
+        )
+
         print(f"[NEWS ALERT] Notifying for upcoming event: {event['title']} ({event['currency']})")
 
         for channel_id in [CHANNEL_1_ID, CHANNEL_2_ID, CHANNEL_3_ID]:
             try:
-                await bot.send_message(
-                    chat_id=channel_id, text=alert_text,
+                await bot.send_photo(
+                    chat_id=channel_id, photo=image_url, caption=alert_text,
                     parse_mode=ParseMode.HTML, reply_markup=alert_markup
                 )
             except Exception as e:
@@ -7803,8 +7840,8 @@ async def check_upcoming_high_impact_news(context: ContextTypes.DEFAULT_TYPE):
         sent = failed = 0
         for uid in user_ids:
             try:
-                await bot.send_message(
-                    chat_id=int(uid), text=alert_text,
+                await bot.send_photo(
+                    chat_id=int(uid), photo=image_url, caption=alert_text,
                     parse_mode=ParseMode.HTML, reply_markup=alert_markup
                 )
                 sent += 1
@@ -8060,11 +8097,6 @@ async def post_news(context: ContextTypes.DEFAULT_TYPE):
     # fail, this falls through to the existing skip-the-post behavior
     # below exactly as before, so a genuinely sustained outage still
     # fails safely rather than retrying forever.
-    KNOWN_AI_FAILURE_STRINGS = (
-        "⚠️ AI service unavailable.",
-        "⚠️ AI server busy.",
-        "⚠️ AI servers unavailable.",
-    )
     retry_waits = [90, 180]
     for attempt_number, wait_seconds in enumerate(retry_waits, start=2):
         if summary.strip() not in KNOWN_AI_FAILURE_STRINGS:
@@ -10132,6 +10164,20 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
 
         response = await generate_breakdown(message)
+
+        # Same retry-with-backoff resilience already used for the
+        # daily news post - per explicit instruction, after finding
+        # this call previously had ZERO retry, showing the raw
+        # "AI server busy" failure directly on the first unlucky
+        # moment both Gemini and OpenRouter were briefly busy.
+        breakdown_retry_waits = [15, 30]
+        for attempt_number, wait_seconds in enumerate(breakdown_retry_waits, start=2):
+            if response.strip() not in KNOWN_AI_FAILURE_STRINGS:
+                break
+            print(f"[BREAKDOWN] AI generation failed ('{response.strip()}') - waiting {wait_seconds}s then retrying (attempt {attempt_number}/3)...")
+            await asyncio.sleep(wait_seconds)
+            response = await generate_breakdown(message)
+
         response = clean_text(response)
         response = format_breakdown(response)
 

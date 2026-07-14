@@ -246,7 +246,7 @@ OPENROUTER_URL = "https://openrouter.ai/api/v1/chat/completions"
 # ============================================
 
 main_keyboard = ReplyKeyboardMarkup(
-    [["📊 Signal", "📚 Breakdown", "🔗 Connect Deriv"]],
+    [["📊 Signal", "📰 News", "🔗 Connect Deriv"]],
     resize_keyboard=True,
     is_persistent=True,
     one_time_keyboard=False
@@ -7572,6 +7572,152 @@ def fetch_economic_calendar():
         return None
 
 # ============================================
+# NEWS-DRIVEN DIRECT CALL FEATURE (NEW)
+# Replaces the old Breakdown button/flow, per
+# explicit instruction. Old Breakdown asked the AI
+# to freely invent an entire "Technical Analysis"
+# and trade idea (entry/SL/TP) from nothing but a
+# live price - no real candles, no strategy bank,
+# a real gap this replacement closes.
+#
+# Design: user taps a specific high-impact news
+# event -> AI judges ONLY whether that event is
+# bullish/bearish for the event's OWN currency (a
+# narrow, constrained question) -> this code (not
+# the AI) deterministically maps that into a BUY/
+# SELL call on a specific tradeable pair, since the
+# same "currency bullish" reading points different
+# directions depending on whether that currency is
+# the BASE or QUOTE side of the chosen pair (e.g.
+# USD is the quote currency in XAU/USD, so USD
+# strength means XAUUSD SELLS, not buys) - per
+# explicit instruction, this mechanical inversion is
+# handled in code, not left for the AI to get wrong.
+# The pair's REAL existing technical strategy vote
+# is then checked too (fundamentals still drive the
+# call either way, per explicit instruction, but the
+# technical read is surfaced transparently either
+# way rather than silently blended in).
+# ============================================
+
+CURRENCY_PAIR_MAP = {
+    # inverted=True means the event's currency is the QUOTE currency
+    # in the mapped pair (e.g. USD in XAU/USD, JPY in USD/JPY) - the
+    # naive "bullish=BUY" reading has to be flipped. inverted=False
+    # means the event's currency is the BASE currency (e.g. EUR in
+    # EUR/USD) - bullish maps directly to BUY, no flip needed.
+    "USD": {"pair_key": "xauusd", "inverted": True},
+    "EUR": {"pair_key": "eurusd", "inverted": False},
+    "GBP": {"pair_key": "gbpusd", "inverted": False},
+    "JPY": {"pair_key": "usdjpy", "inverted": True},
+}
+
+def get_todays_high_impact_events():
+    """
+    Same real Forex Factory feed as fetch_economic_calendar, but
+    returns the RAW structured event list (title/currency/time/
+    forecast/previous/actual) instead of pre-formatted text - needed
+    so each event can be shown as its own tappable button and looked
+    up again individually once tapped. Scoped to the same USD/EUR/
+    GBP/JPY currencies as the daily calendar post, since those are
+    the only ones with a mapped pair above.
+    """
+    try:
+        today = datetime.utcnow()
+        today_str = today.strftime("%Y-%m-%d")
+
+        url = "https://nfs.faireconomy.media/ff_calendar_thisweek.json"
+        response = requests.get(url, timeout=10)
+        data = response.json()
+        if not data:
+            return []
+
+        events = []
+        for event in data:
+            event_date = event.get("date", "")[:10]
+            if event_date != today_str:
+                continue
+            if event.get("impact", "").lower() != "high":
+                continue
+            currency = event.get("currency", "")
+            if currency not in CURRENCY_PAIR_MAP:
+                continue
+
+            time_utc = event.get("date", "")
+            time_str = ""
+            if time_utc and "T" in time_utc:
+                try:
+                    dt = datetime.strptime(time_utc[:16], "%Y-%m-%dT%H:%M")
+                    lagos_hour = (dt.hour + 1) % 24
+                    time_str = f"{lagos_hour:02d}:{dt.minute:02d}"
+                except Exception:
+                    time_str = ""
+
+            events.append({
+                "title": event.get("title", ""),
+                "currency": currency,
+                "time_str": time_str,
+                "forecast": event.get("forecast", ""),
+                "previous": event.get("previous", ""),
+                "actual": event.get("actual", ""),
+            })
+
+        return events[:8]  # a reasonable cap on how many buttons to show
+
+    except Exception as e:
+        print(f"[NEWS CALL] Error fetching events: {e}")
+        return []
+
+
+# Temporary per-user cache of today's event list, so a button tap
+# (which can only carry a short index in its callback_data) can look
+# the full event details back up. Cleared/rebuilt each time the News
+# button is tapped - not meant to persist across restarts.
+NEWS_EVENT_CACHE = {}
+
+
+async def generate_currency_direction(event):
+    """
+    Constrained AI call: judges ONLY whether this specific event's
+    likely result is bullish or bearish for the event's OWN currency,
+    with one sentence of reasoning. Does NOT pick a pair or a BUY/SELL
+    call itself - see the module docstring above for why that
+    mechanical step is deliberately kept in code, not left to the AI.
+    Returns (direction, reasoning) where direction is "BULLISH" or
+    "BEARISH", or (None, None) on failure.
+    """
+    forecast_line = f"Forecast: {event['forecast']}" if event.get("forecast") else ""
+    previous_line = f"Previous: {event['previous']}" if event.get("previous") else ""
+    actual_line = f"Actual: {event['actual']}" if event.get("actual") else ""
+    data_lines = "\n".join(l for l in [forecast_line, previous_line, actual_line] if l)
+
+    prompt = f"""
+You are a forex fundamental analyst. Judge ONLY whether this news
+event is likely BULLISH or BEARISH for its own currency - nothing
+else, no pair, no trade call.
+
+EVENT: {event['title']}
+CURRENCY: {event['currency']}
+{data_lines}
+
+Respond in EXACTLY this format, nothing else, no markdown:
+DIRECTION: BULLISH or BEARISH
+REASON: [one sentence, max 20 words, plain and beginner-friendly]
+"""
+    try:
+        result = await ask_gemini(prompt)
+        direction_match = re.search(r"DIRECTION:\s*(BULLISH|BEARISH)", result, re.IGNORECASE)
+        reason_match = re.search(r"REASON:\s*(.+)", result)
+        if not direction_match:
+            return None, None
+        direction = direction_match.group(1).upper()
+        reason = reason_match.group(1).strip() if reason_match else ""
+        return direction, reason
+    except Exception as e:
+        print(f"[NEWS CALL] AI direction judgment failed: {e}")
+        return None, None
+
+# ============================================
 # FUNDAMENTAL GROUNDING DATA (NEW)
 # Real news + real calendar data for the AI
 # fundamental layer to reason from, instead of
@@ -8461,7 +8607,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
             f"👇 <b>What would you like to do today?</b>\n"
             f"━━━━━━━━━━━━━━━━━━━━━\n\n"
             f"📊 <b>Signal</b> — Get a live trading signal right now\n\n"
-            f"📚 <b>Breakdown</b> — Get a full AI market analysis\n\n"
+            f"📰 <b>News</b> — Get a direct call on high-impact news\n\n"
             f"🔗 <b>Connect Deriv</b> — Link your Deriv account to trade "
             f"signals directly, manually or fully automatic\n\n"
             f"<i>All three buttons are at the bottom of your screen 👇</i>",
@@ -8484,7 +8630,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
             f"👇 <b>TAP ONE OF THE OPTIONS BELOW TO START:</b>\n"
             f"━━━━━━━━━━━━━━━━━━━━━\n\n"
             f"📊 <b>Signal</b> — Get a live trading signal right now\n\n"
-            f"📚 <b>Breakdown</b> — Get a full AI market analysis\n\n"
+            f"📰 <b>News</b> — Get a direct call on high-impact news\n\n"
             f"🔗 <b>Connect Deriv</b> — Link your Deriv account to trade "
             f"signals directly, manually or fully automatic\n\n"
             f"<i>All three buttons are at the bottom of your screen 👇</i>",
@@ -8593,20 +8739,36 @@ async def handle_buttons(update: Update, context: ContextTypes.DEFAULT_TYPE):
         schedule_auto_delete(sent_signal_mode.chat_id, sent_signal_mode.message_id)
         return
 
-    if "breakdown" in text:
-        user_modes[user_id] = "breakdown"
-        sent_breakdown_mode = await update.message.reply_text(
-            "📚 <b>Breakdown Mode Activated</b>\n\n"
-            "Now type your market question below.\n\n"
-            "<b>Examples:</b>\n"
-            "• Analyze gold market today\n"
-            "• BTCUSD outlook\n"
-            "• GBPJPY market analysis\n"
-            "• What is happening with oil today?",
+    if "news" in text:
+        events = get_todays_high_impact_events()
+        if not events:
+            sent_no_news = await update.message.reply_text(
+                "📰 <b>No high-impact news events left today.</b>\n\n"
+                "Check back tomorrow morning, or tap Signal for a "
+                "live technical read right now.",
+                parse_mode=ParseMode.HTML,
+                reply_markup=main_keyboard
+            )
+            schedule_auto_delete(sent_no_news.chat_id, sent_no_news.message_id)
+            return
+
+        NEWS_EVENT_CACHE[user_id] = events
+        buttons = []
+        for i, event in enumerate(events):
+            flag = {"USD": "🇺🇸", "EUR": "🇪🇺", "GBP": "🇬🇧", "JPY": "🇯🇵"}.get(event["currency"], "🌍")
+            label = f"{flag} {event['title'][:40]}"
+            if event["time_str"]:
+                label += f" ({event['time_str']})"
+            buttons.append([InlineKeyboardButton(label, callback_data=f"newsevent_{i}")])
+
+        sent_news_list = await update.message.reply_text(
+            "📰 <b>Today's High-Impact News</b>\n\n"
+            "Tap any event below for a direct BUY/SELL call, "
+            "fundamentals-first:",
             parse_mode=ParseMode.HTML,
-            reply_markup=main_keyboard
+            reply_markup=InlineKeyboardMarkup(buttons)
         )
-        schedule_auto_delete(sent_breakdown_mode.chat_id, sent_breakdown_mode.message_id)
+        schedule_auto_delete(sent_news_list.chat_id, sent_news_list.message_id)
         return
 
 # ============================================
@@ -8618,6 +8780,87 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
     data = query.data
+
+    if data.startswith("newsevent_"):
+        user_id = str(query.from_user.id)
+
+        if not is_verified(user_id):
+            count = increment_trial(user_id)
+            if count > FREE_TRIAL_LIMIT:
+                user_modes[user_id] = "awaiting_email"
+                await send_verification_gate(update)
+                return
+
+        try:
+            idx = int(data.replace("newsevent_", ""))
+            events = NEWS_EVENT_CACHE.get(user_id, [])
+            event = events[idx]
+        except (ValueError, IndexError):
+            await query.message.reply_text(
+                "⚠️ This news list has expired - tap 📰 News again for a fresh list.",
+                parse_mode=ParseMode.HTML
+            )
+            return
+
+        wait_message = await query.message.reply_text(
+            "🧠 <b>Nexora AI reading the news...</b>",
+            parse_mode=ParseMode.HTML
+        )
+
+        ai_direction, ai_reason = await generate_currency_direction(event)
+        if not ai_direction:
+            await wait_message.edit_text(
+                "⚠️ Couldn't get a clear read on this event right now - try again shortly.",
+                parse_mode=ParseMode.HTML
+            )
+            return
+
+        mapping = CURRENCY_PAIR_MAP[event["currency"]]
+        pair_key = mapping["pair_key"]
+        inverted = mapping["inverted"]
+        final_direction = "BUY" if (ai_direction == "BULLISH") != inverted else "SELL"
+        pair_config = PAIR_CONFIG[pair_key]
+        pair_display = pair_config["display"]
+
+        # Cross-check against the pair's REAL existing technical
+        # strategy vote - fundamentals still drive the call either
+        # way (per explicit instruction), but this is surfaced
+        # transparently rather than silently blended in.
+        technical_note = "ℹ️ No clear technical read right now — this is a fundamentals-only call."
+        try:
+            _, technical_direction, _, technical_signal_data = await build_signal_response(pair_key, user_id=None)
+            if technical_direction == final_direction and technical_signal_data:
+                technical_note = (
+                    f"✅ Technicals agree — Entry: {technical_signal_data.get('entry_price')} | "
+                    f"SL: {technical_signal_data.get('stop_loss')} | "
+                    f"TP: {technical_signal_data.get('take_profit')}"
+                )
+            elif technical_direction and technical_direction != final_direction:
+                technical_note = (
+                    f"⚠️ Technicals currently read {technical_direction} — "
+                    f"this is a fundamentals-only call, trade with extra caution."
+                )
+        except Exception as e:
+            print(f"[NEWS CALL] Technical cross-check failed: {e}")
+
+        emoji = "🟢" if final_direction == "BUY" else "🔴"
+        response = (
+            f"📰 <b>{event['title']}</b> ({event['currency']})\n\n"
+            f"<b>Fundamental read:</b> {ai_reason}\n\n"
+            f"{emoji} <b>DIRECT CALL: {final_direction} {pair_display}</b>\n\n"
+            f"{technical_note}\n\n"
+            f"<i>Trade safe 💼🔥</i>"
+        )
+
+        await wait_message.edit_text(response, parse_mode=ParseMode.HTML)
+        schedule_auto_delete(wait_message.chat_id, wait_message.message_id)
+
+        if not is_verified(user_id):
+            remaining = trial_remaining(user_id)
+            if remaining <= 0:
+                user_modes[user_id] = "awaiting_email"
+                await send_verification_gate(update)
+        return
 
     if data.startswith("approve_"):
 
@@ -8652,7 +8895,7 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
                         "You now have <b>unlimited access</b> to:\n\n"
                         "📊 <b>Live Trading Signals</b> — Real-time "
                         "signals on Gold, Bitcoin, Oil, Forex and more\n\n"
-                        "📚 <b>AI Market Breakdowns</b> — Deep analysis "
+                        "📰 <b>News-Driven Calls</b> — Direct BUY/SELL calls "
                         "on any pair you ask about\n\n"
                         "📈 <b>Technical Analysis</b> — Professional "
                         "grade insights powered by AI\n\n"
@@ -8684,7 +8927,7 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
                         "You now have <b>unlimited access</b> to:\n\n"
                         "📊 <b>Live Trading Signals</b> — Real-time "
                         "signals on Gold, Bitcoin, Oil, Forex and more\n\n"
-                        "📚 <b>AI Market Breakdowns</b> — Deep analysis "
+                        "📰 <b>News-Driven Calls</b> — Direct BUY/SELL calls "
                         "on any pair you ask about\n\n"
                         "📈 <b>Technical Analysis</b> — Professional "
                         "grade insights powered by AI"
@@ -8701,7 +8944,7 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     "━━━━━━━━━━━━━━━━━━━━━\n\n"
                     "👇 <b>TAP AN OPTION BELOW TO GET STARTED:</b>\n\n"
                     "📊 <b>Signal</b> — Get a live trading signal\n\n"
-                    "📚 <b>Breakdown</b> — Get a full market analysis"
+                    "📰 <b>News</b> — Get a direct call on high-impact news"
                 ),
                 parse_mode=ParseMode.HTML,
                 reply_markup=main_keyboard
@@ -8919,7 +9162,7 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     f"👇 <b>What would you like to do today?</b>\n"
                     f"━━━━━━━━━━━━━━━━━━━━━\n\n"
                     f"📊 <b>Signal</b> — Get a live trading signal right now\n\n"
-                    f"📚 <b>Breakdown</b> — Get a full AI market analysis\n\n"
+                    f"📰 <b>News</b> — Get a direct call on high-impact news\n\n"
                     f"🔗 <b>Connect Deriv</b> — Link your Deriv account to trade "
                     f"signals directly, manually or fully automatic\n\n"
                     f"<i>All three buttons are at the bottom of your screen 👇</i>"
@@ -8943,7 +9186,7 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     f"👇 <b>TAP ONE OF THE OPTIONS BELOW TO START:</b>\n"
                     f"━━━━━━━━━━━━━━━━━━━━━\n\n"
                     f"📊 <b>Signal</b> — Get a live trading signal right now\n\n"
-                    f"📚 <b>Breakdown</b> — Get a full AI market analysis\n\n"
+                    f"📰 <b>News</b> — Get a direct call on high-impact news\n\n"
                     f"🔗 <b>Connect Deriv</b> — Link your Deriv account to trade "
                     f"signals directly, manually or fully automatic\n\n"
                     f"<i>All three buttons are at the bottom of your screen 👇</i>"
@@ -9038,7 +9281,7 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 f"👇 <b>TAP ONE OF THE OPTIONS BELOW TO START:</b>\n"
                 f"━━━━━━━━━━━━━━━━━━━━━\n\n"
                 f"📊 <b>Signal</b> — Get a live trading signal right now\n\n"
-                f"📚 <b>Breakdown</b> — Get a full AI market analysis\n\n"
+                f"📰 <b>News</b> — Get a direct call on high-impact news\n\n"
                 f"🔗 <b>Connect Deriv</b> — Link your Deriv account to trade "
                 f"signals directly, manually or fully automatic\n\n"
                 f"<i>All three buttons are at the bottom of your screen 👇</i>"
@@ -9697,7 +9940,7 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
                         f"Verify your Exness account for "
                         f"<b>unlimited access!</b>\n\n"
                         f"📊 <b>Signal</b> — Get another signal\n"
-                        f"📚 <b>Breakdown</b> — Get a market analysis",
+                        f"📰 <b>News</b> — Get a direct call on high-impact news",
                         parse_mode=ParseMode.HTML,
                         reply_markup=main_keyboard
                     )
@@ -9737,53 +9980,10 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
             schedule_auto_delete(sent_fetch_failed.chat_id, sent_fetch_failed.message_id)
         return
 
-    if mode == "breakdown":
-
-        if not is_verified(user_id):
-            count = increment_trial(user_id)
-            if count > FREE_TRIAL_LIMIT:
-                user_modes[user_id] = "awaiting_email"
-                await send_verification_gate(update)
-                return
-
-        wait_message = await update.message.reply_text(
-            "🧠 <b>Nexora AI preparing market breakdown...</b>",
-            parse_mode=ParseMode.HTML
-        )
-
-        response = await generate_breakdown(message)
-        response = clean_text(response)
-        response = format_breakdown(response)
-
-        await wait_message.edit_text(
-            response,
-            parse_mode=ParseMode.HTML
-        )
-        schedule_auto_delete(wait_message.chat_id, wait_message.message_id)
-
-        if not is_verified(user_id):
-            remaining = trial_remaining(user_id)
-            if remaining > 0:
-                sent_trial_notice = await update.message.reply_text(
-                    f"⚡ <b>You have {remaining} free trial "
-                    f"signal(s) remaining.</b>\n\n"
-                    f"Verify your Exness account for "
-                    f"<b>unlimited access!</b>\n\n"
-                    f"📊 <b>Signal</b> — Get a live trading signal\n"
-                    f"📚 <b>Breakdown</b> — Get a market analysis",
-                    parse_mode=ParseMode.HTML,
-                    reply_markup=main_keyboard
-                )
-                schedule_auto_delete(sent_trial_notice.chat_id, sent_trial_notice.message_id)
-            else:
-                user_modes[user_id] = "awaiting_email"
-                await send_verification_gate(update)
-        return
-
     sent_fallback = await update.message.reply_text(
         "👇 <b>Here's what you can do:</b>\n\n"
         "📊 <b>Signal</b> — Get a live trading signal right now\n\n"
-        "📚 <b>Breakdown</b> — Get a full AI market analysis\n\n"
+        "📰 <b>News</b> — Get a direct call on high-impact news\n\n"
         "<i>Both buttons are right at the bottom of your screen!</i>",
         parse_mode=ParseMode.HTML,
         reply_markup=main_keyboard
@@ -10848,7 +11048,7 @@ def main():
     app.add_handler(
         MessageHandler(
             filters.Regex(
-                "^(📊 Signal|📚 Breakdown|🔗 Connect Deriv|signal|breakdown|connect deriv)$"
+                "^(📊 Signal|📰 News|🔗 Connect Deriv|signal|news|connect deriv)$"
             ),
             handle_buttons
         )

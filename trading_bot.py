@@ -12221,6 +12221,17 @@ async def catch_up_missed_signals(app):
     except Exception as e:
         print(f"[STARTUP] ⚠️ Couldn't reset menu button: {e}")
 
+    try:
+        await app.bot.set_my_description(
+            description=(
+                "📊 Free real-time forex & gold signals ⚡ AI chart analysis "
+                "🤖 MT5 & Deriv AutoCopy — join thousands of traders"
+            )
+        )
+        print("[STARTUP] ✅ Bot description set.")
+    except Exception as e:
+        print(f"[STARTUP] ⚠️ Couldn't set bot description: {e}")
+
     now = datetime.utcnow()
     today_weekday = now.weekday()
 

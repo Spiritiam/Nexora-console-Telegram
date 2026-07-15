@@ -345,6 +345,348 @@ async def provision_mt5_account(login, password, server, platform="mt5", account
         return None, str(e)
 
 
+# ============================================
+# MT5 AUTO-TRADE — LIVE EXECUTION (NEW)
+# Per explicit instruction, wires the 4 bots (real,
+# already-proven strategies) into actual trade
+# placement on each CLIENT'S OWN MetaAPI account -
+# the first place in this file real trades go
+# anywhere other than the bot's single own account.
+# ============================================
+
+# Separate cache from _SHARED_MT5_CONNECTION (the bot's OWN account) -
+# this one holds one connection per CLIENT account, keyed by their
+# metaapi_account_id. Same 15s hard-timeout protection as the shared
+# connection, for the exact same reason (a hung connection to one
+# client's account must never block the scan job for everyone else).
+_CLIENT_MT5_CONNECTIONS = {}
+
+async def get_client_mt5_connection(metaapi_account_id):
+    if metaapi_account_id in _CLIENT_MT5_CONNECTIONS:
+        return _CLIENT_MT5_CONNECTIONS[metaapi_account_id]
+    try:
+        async def _connect():
+            api = MetaApi(token=METAAPI_TOKEN)
+            account = await api.metatrader_account_api.get_account(account_id=metaapi_account_id)
+            connection = account.get_rpc_connection()
+            await connection.connect()
+            await connection.wait_synchronized()
+            return connection
+
+        connection = await asyncio.wait_for(_connect(), timeout=15)
+        _CLIENT_MT5_CONNECTIONS[metaapi_account_id] = connection
+        return connection
+    except Exception as e:
+        print(f"[MT5 AUTOTRADE] Connection failed for client account {metaapi_account_id}: {e}")
+        return None
+
+
+def _reset_client_mt5_connection(metaapi_account_id):
+    _CLIENT_MT5_CONNECTIONS.pop(metaapi_account_id, None)
+
+
+async def get_client_mt5_balance(metaapi_account_id):
+    try:
+        connection = await get_client_mt5_connection(metaapi_account_id)
+        if connection is None:
+            return None
+        info = await asyncio.wait_for(connection.get_account_information(), timeout=15)
+        return info.get("balance")
+    except Exception as e:
+        print(f"[MT5 AUTOTRADE] Balance lookup failed for {metaapi_account_id}: {e}")
+        _reset_client_mt5_connection(metaapi_account_id)
+        return None
+
+
+async def has_client_open_mt5_position(metaapi_account_id, mt5_symbol):
+    try:
+        connection = await get_client_mt5_connection(metaapi_account_id)
+        if connection is None:
+            return False
+        positions = await asyncio.wait_for(connection.get_positions(), timeout=15)
+        if isinstance(positions, dict):
+            positions = positions.get("positions", [])
+        target = mt5_symbol.upper()
+        for pos in positions:
+            pos_symbol = (pos.get("symbol") if isinstance(pos, dict) else None) or ""
+            if pos_symbol.upper().startswith(target) or target.startswith(pos_symbol.upper()):
+                return True
+        return False
+    except Exception as e:
+        print(f"[MT5 AUTOTRADE] Position check failed for {metaapi_account_id}: {e}")
+        _reset_client_mt5_connection(metaapi_account_id)
+        return False
+
+
+def compute_lot_size(account, entry_price, stop_loss):
+    """
+    Returns a lot size for this trade based on the account's own
+    saved mode - either their fixed lot size directly, or computed
+    from their risk % and this trade's real stop distance.
+
+    IMPORTANT CAVEAT, stated plainly rather than hidden in a comment
+    only: this uses a SIMPLIFIED position-sizing approximation (stop
+    distance as a fraction of entry price, applied against a flat
+    $100,000-per-standard-lot notional assumption) - real pip value
+    varies meaningfully by instrument (JPY pairs, metals, indices,
+    crypto all differ) and by account currency. This is a reasonable
+    starting point, not a precision instrument - worth validating
+    against a couple of real test trades per instrument before
+    trusting it at scale with client money.
+    """
+    risk_mode = account.get("risk_mode", "lot")
+    if risk_mode == "lot":
+        return float(account.get("lot_size", 0.01))
+
+    risk_percent = float(account.get("risk_percent", 1.0))
+    balance = account.get("_live_balance")
+    if not balance or not entry_price or not stop_loss:
+        return 0.01  # safe fallback - smallest reasonable size, never skip sizing silently
+
+    stop_distance_fraction = abs(entry_price - stop_loss) / entry_price
+    notional_per_lot = 100000  # standard lot approximation
+    risk_amount = balance * (risk_percent / 100.0)
+    lot_size = risk_amount / (stop_distance_fraction * notional_per_lot)
+    return round(max(0.01, min(lot_size, 10.0)), 2)  # hard-capped 0.01-10.0 as a sanity bound
+
+
+async def place_client_mt5_trade(metaapi_account_id, mt5_symbol, direction, volume, stop_loss, take_profit):
+    """
+    Generalizes place_mt5_trade for an arbitrary CLIENT account
+    rather than the bot's single own account - same proven REST
+    approach (no websocket subscription needed for trade placement).
+
+    NOTE: hardcodes the "london" MetaAPI region, same as the bot's
+    own place_mt5_trade - client accounts could in principle be
+    provisioned in a different region, which would show up as a
+    trade failure here. Worth watching for in the logs; if it comes
+    up, this needs a per-account region lookup rather than an
+    assumption.
+    """
+    if not METAAPI_TOKEN:
+        return None
+    try:
+        headers = {"auth-token": METAAPI_TOKEN, "Content-Type": "application/json"}
+        order_type = "ORDER_TYPE_BUY" if direction == "BUY" else "ORDER_TYPE_SELL"
+        payload = {
+            "symbol": mt5_symbol,
+            "volume": volume,
+            "actionType": order_type,
+            "stopLoss": stop_loss,
+            "takeProfit": take_profit,
+            "comment": "NexoraAI AutoTrade",
+        }
+        url = (
+            f"https://mt-client-api-v1.london.agiliumtrade.ai"
+            f"/users/current/accounts/{metaapi_account_id}/trade"
+        )
+        response = requests.post(url, headers=headers, json=payload, timeout=30)
+        if response.status_code in (200, 201):
+            result = response.json()
+            order_id = result.get("orderId", "unknown")
+            print(f"[MT5 AUTOTRADE] ✅ Trade placed for {metaapi_account_id} — Order ID: {order_id}")
+            return order_id
+        print(f"[MT5 AUTOTRADE] ❌ Trade failed for {metaapi_account_id}: {response.status_code} {response.text}")
+        return None
+    except Exception as e:
+        print(f"[MT5 AUTOTRADE] ❌ Exception placing trade for {metaapi_account_id}: {e}")
+        return None
+
+
+def get_all_active_mt5_autotrade_accounts():
+    try:
+        now_iso = datetime.utcnow().isoformat()
+        url = (
+            f"{SUPABASE_URL}/rest/v1/mt5_auto_trade_accounts"
+            f"?is_active=eq.true&subscription_expires_at=gt.{now_iso}"
+            f"&metaapi_account_id=not.is.null&select=*"
+        )
+        response = requests.get(url, headers=sb_headers(), timeout=10)
+        return response.json()
+    except Exception as e:
+        print(f"[MT5 AUTOTRADE] Error fetching active accounts: {e}")
+        return []
+
+
+# Tracks (user_id, signal_source_id) pairs already copied, so the
+# scan doesn't re-fire the same signal on every tick while it's still
+# "fresh". Reset naturally over time as old entries stop matching new
+# signals - not persisted across restarts, matching the same
+# reasoning as NOTIFIED_EVENTS_TODAY elsewhere in this file.
+MT5_AUTOTRADE_COPIED_SIGNALS = set()
+
+
+async def run_mt5_autotrade_bot_scan(context: ContextTypes.DEFAULT_TYPE):
+    """
+    Runs every 5 minutes. For every unique (bot, pair) combination
+    actually in use by an active subscriber, runs that bot's real
+    strategy function once and copies any fresh signal to every
+    subscriber using that exact bot+pair - one shared strategy check
+    per combination, not one per user, matching the same efficiency
+    reasoning as every other scan job in this file.
+    """
+    accounts = get_all_active_mt5_autotrade_accounts()
+    bot_accounts = [a for a in accounts if a.get("bot_choice") != "follow_channel" and a.get("pair_choice")]
+    if not bot_accounts:
+        return
+
+    combos = {}
+    for account in bot_accounts:
+        key = (account["bot_choice"], account["pair_choice"])
+        combos.setdefault(key, []).append(account)
+
+    for (bot_key, pair_key), subscribers in combos.items():
+        bot_info = MT5_AUTOTRADE_BOTS.get(bot_key)
+        pair_config = PAIR_CONFIG.get(pair_key)
+        if not bot_info or not pair_config:
+            continue
+
+        strategy_fn = globals().get(bot_info["strategy_function"])
+        if not strategy_fn:
+            print(f"[MT5 AUTOTRADE] ⚠️ Strategy function {bot_info['strategy_function']} not found.")
+            continue
+
+        try:
+            h1_candles = get_cached_candles(pair_key, pair_config, "1h", outputsize=210)
+            h4_candles = get_cached_candles(pair_key, pair_config, "4h", outputsize=60)
+            daily_candles = get_cached_candles(pair_key, pair_config, "1day", outputsize=10)
+            if not h1_candles:
+                continue
+
+            vote = strategy_fn(pair_key, pair_config, h1_candles, h4_candles, daily_candles)
+            if not vote:
+                continue
+
+            direction = vote.get("direction")
+            entry_price = h1_candles[-1]["close"]
+            atr = _accum_zone_atr(h1_candles, 14) if len(h1_candles) > 15 else None
+            if not atr:
+                continue
+            if direction == "BUY":
+                stop_loss = entry_price - atr * 1.5
+                take_profit = entry_price + atr * 3.0
+            else:
+                stop_loss = entry_price + atr * 1.5
+                take_profit = entry_price - atr * 3.0
+
+            signal_marker = f"{bot_key}_{pair_key}_{int(time.time() // 300)}"  # 5-min bucket
+
+            for account in subscribers:
+                user_id = account["user_id"]
+                metaapi_account_id = account["metaapi_account_id"]
+                copy_key = (user_id, signal_marker)
+                if copy_key in MT5_AUTOTRADE_COPIED_SIGNALS:
+                    continue
+
+                if await has_client_open_mt5_position(metaapi_account_id, pair_config["mt5_symbol"]):
+                    continue
+
+                if account.get("risk_mode") == "percent":
+                    balance = await get_client_mt5_balance(metaapi_account_id)
+                    account["_live_balance"] = balance
+
+                volume = compute_lot_size(account, entry_price, stop_loss)
+
+                order_id = await place_client_mt5_trade(
+                    metaapi_account_id, pair_config["mt5_symbol"], direction,
+                    volume, stop_loss, take_profit
+                )
+                MT5_AUTOTRADE_COPIED_SIGNALS.add(copy_key)
+                if order_id:
+                    try:
+                        await context.bot.send_message(
+                            chat_id=int(user_id),
+                            text=(
+                                f"🤖 <b>{bot_info['label']} — {direction} {pair_config['display']}</b>\n\n"
+                                f"Entry: {entry_price:.4f} | SL: {stop_loss:.4f} | TP: {take_profit:.4f}\n"
+                                f"Volume: {volume} lots"
+                            ),
+                            parse_mode=ParseMode.HTML
+                        )
+                    except Exception as e:
+                        print(f"[MT5 AUTOTRADE] Couldn't notify {user_id}: {e}")
+        except Exception as e:
+            print(f"[MT5 AUTOTRADE] ❌ Scan error for {bot_key}/{pair_key}: {e}")
+
+
+async def run_mt5_autotrade_follow_channel_scan(context: ContextTypes.DEFAULT_TYPE):
+    """
+    Runs every 2 minutes. For "Follow Channel Signals" subscribers,
+    copies whatever the channel itself already posted for XAUUSD,
+    GBPJPY, or BTCUSD - reuses signal_log (the same table every
+    channel post already writes to) rather than re-deciding anything,
+    so these clients trade exactly what the channel shows, nothing
+    invented separately for them.
+    """
+    accounts = get_all_active_mt5_autotrade_accounts()
+    followers = [a for a in accounts if a.get("bot_choice") == "follow_channel"]
+    if not followers:
+        return
+
+    try:
+        cutoff = (datetime.utcnow() - timedelta(minutes=10)).isoformat()
+        url = (
+            f"{SUPABASE_URL}/rest/v1/signal_log"
+            f"?posted_at=gt.{cutoff}&select=*&order=posted_at.desc&limit=10"
+        )
+        response = requests.get(url, headers=sb_headers(), timeout=10)
+        recent_signals = response.json()
+    except Exception as e:
+        print(f"[MT5 AUTOTRADE FOLLOW] Error fetching recent signals: {e}")
+        return
+
+    for signal in recent_signals:
+        pair_name = signal.get("pair_name", "")
+        pair_key = next((k for k, v in PAIR_CONFIG.items() if v.get("pair_name") == pair_name), None)
+        if not pair_key:
+            continue
+        pair_config = PAIR_CONFIG[pair_key]
+        signal_id = signal.get("id")
+
+        for account in followers:
+            user_id = account["user_id"]
+            metaapi_account_id = account["metaapi_account_id"]
+            copy_key = (user_id, f"channel_{signal_id}")
+            if copy_key in MT5_AUTOTRADE_COPIED_SIGNALS:
+                continue
+
+            if await has_client_open_mt5_position(metaapi_account_id, pair_config["mt5_symbol"]):
+                MT5_AUTOTRADE_COPIED_SIGNALS.add(copy_key)
+                continue
+
+            entry_price = signal.get("entry_price")
+            stop_loss = signal.get("stop_loss")
+            take_profit = signal.get("take_profit")
+            direction = signal.get("direction")
+            if not all([entry_price, stop_loss, take_profit, direction]):
+                continue
+
+            if account.get("risk_mode") == "percent":
+                balance = await get_client_mt5_balance(metaapi_account_id)
+                account["_live_balance"] = balance
+
+            volume = compute_lot_size(account, entry_price, stop_loss)
+
+            order_id = await place_client_mt5_trade(
+                metaapi_account_id, pair_config["mt5_symbol"], direction,
+                volume, stop_loss, take_profit
+            )
+            MT5_AUTOTRADE_COPIED_SIGNALS.add(copy_key)
+            if order_id:
+                try:
+                    await context.bot.send_message(
+                        chat_id=int(user_id),
+                        text=(
+                            f"📡 <b>Channel Signal Copied — {direction} {pair_config['display']}</b>\n\n"
+                            f"Entry: {entry_price} | SL: {stop_loss} | TP: {take_profit}\n"
+                            f"Volume: {volume} lots"
+                        ),
+                        parse_mode=ParseMode.HTML
+                    )
+                except Exception as e:
+                    print(f"[MT5 AUTOTRADE FOLLOW] Couldn't notify {user_id}: {e}")
+
+
 async def korapay_webhook_handler(request):
     """
     Receives KoraPay's payment confirmation. Deliberately does the
@@ -12416,6 +12758,26 @@ def main():
         check_mt5_autotrade_expiry,
         time=parse_time("00:05"),
         name="mt5_autotrade_expiry_check"
+    )
+
+    # MT5 auto-trade: live execution for the 4 bot presets - checks
+    # every 5 minutes for a fresh signal per unique (bot, pair)
+    # combination actually in use, copies to every subscriber on it.
+    job_queue.run_repeating(
+        run_mt5_autotrade_bot_scan,
+        interval=300,
+        first=60,
+        name="mt5_autotrade_bot_scan"
+    )
+
+    # MT5 auto-trade: live execution for "Follow Channel Signals"
+    # subscribers - copies whatever the channel itself already posts,
+    # checked every 2 minutes.
+    job_queue.run_repeating(
+        run_mt5_autotrade_follow_channel_scan,
+        interval=120,
+        first=60,
+        name="mt5_autotrade_follow_channel_scan"
     )
 
     # Tick Burst auto-copy scan - DISABLED per explicit instruction

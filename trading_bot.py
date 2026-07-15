@@ -366,7 +366,14 @@ def run_korapay_webhook_server():
     webhook_app.router.add_post("/korapay-webhook", korapay_webhook_handler)
     port = int(os.getenv("PORT", 8080))
     print(f"[KORAPAY WEBHOOK] Starting webhook server on port {port}...")
-    web.run_app(webhook_app, host="0.0.0.0", port=port, print=None)
+    # handle_signals=False - CONFIRMED REAL CRASH via live logs:
+    # aiohttp's run_app() tries to register a SIGINT handler by
+    # default (for graceful Ctrl-C shutdown), but Python only allows
+    # signal handlers to be set from the main thread - and this
+    # deliberately runs in a background thread (see docstring above).
+    # Without this, the whole thread crashed with "set_wakeup_fd only
+    # works in main thread of the main interpreter" every time.
+    web.run_app(webhook_app, host="0.0.0.0", port=port, print=None, handle_signals=False)
 
 
 async def check_mt5_autotrade_expiry(context: ContextTypes.DEFAULT_TYPE):

@@ -9452,7 +9452,7 @@ def clean_text(text):
 # ============================================
 
 async def send_verification_gate(update):
-    await update.message.reply_text(
+    await update.effective_message.reply_text(
         "🔐 <b>You've used your 3 FREE trial signals!</b>\n\n"
         "Hope you loved what you saw! 🔥\n\n"
         "To continue enjoying <b>UNLIMITED FREE signals</b>, "
@@ -9730,7 +9730,10 @@ async def handle_buttons(update: Update, context: ContextTypes.DEFAULT_TYPE):
             "account, automatically, using the same technical strategy "
             "already powering your signals — no need to manually "
             "watch charts or place trades yourself.\n\n"
-            f"💵 <b>Price:</b> {MT5_AUTOTRADE_DISPLAY_PRICE}\n\n"
+            f"💵 <b>Price:</b> {MT5_AUTOTRADE_DISPLAY_PRICE}\n"
+            f"<i>Covers your dedicated MT5 connection, server uptime, "
+            f"and continuous strategy execution — running for you "
+            f"around the clock, not just a one-time signal.</i>\n\n"
             "📈 <b>Why auto-trade?</b> Markets move fast, and the best "
             "setups don't always happen when you're free to act on "
             "them. Auto-trading lets you stay in the market on your "
@@ -9917,10 +9920,11 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await query.message.edit_text(
                 "🔒 <b>Exness Auto-Trade requires a verified Exness "
                 "account first.</b>\n\n"
-                "Verify your Exness account (see the onboarding steps) "
-                "before subscribing to auto-trading.",
+                "One quick step below 👇",
                 parse_mode=ParseMode.HTML
             )
+            user_modes[user_id] = "awaiting_email"
+            await send_verification_gate(update)
             return
 
         account = get_mt5_autotrade_account(user_id)
@@ -10211,6 +10215,8 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
                         "on any pair you ask about\n\n"
                         "📈 <b>Technical Analysis</b> — Professional "
                         "grade insights powered by AI\n\n"
+                        "🤖 <b>Exness Auto-Trade</b> — Subscribe to auto-trade "
+                        "directly on your own Exness MT5/MT4 account\n\n"
                         "━━━━━━━━━━━━━━━━━━━━━\n"
                         "🔐 <b>EXCLUSIVE — INNER CIRCLE ACCESS</b>\n"
                         "━━━━━━━━━━━━━━━━━━━━━\n\n"
@@ -10242,7 +10248,9 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
                         "📰 <b>News-Driven Calls</b> — Direct BUY/SELL calls "
                         "on any pair you ask about\n\n"
                         "📈 <b>Technical Analysis</b> — Professional "
-                        "grade insights powered by AI"
+                        "grade insights powered by AI\n\n"
+                        "🤖 <b>Exness Auto-Trade</b> — Subscribe to auto-trade "
+                        "directly on your own Exness MT5/MT4 account"
                     ),
                     parse_mode=ParseMode.HTML,
                 )
@@ -12041,6 +12049,49 @@ async def purgedigests_command(update: Update, context: ContextTypes.DEFAULT_TYP
         f"48h bot-delete window)."
     )
 
+async def mt5revenue_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """
+    Admin-only report on THIS bot's MT5 Auto-Trade revenue
+    specifically (from korapay_transactions) - has no visibility into
+    any other business using the same KoraPay account, since that
+    data lives in systems this bot doesn't touch.
+    """
+    user_id = str(update.message.from_user.id)
+    if not ADMIN_USER_ID or user_id != str(ADMIN_USER_ID):
+        return
+
+    try:
+        url = f"{SUPABASE_URL}/rest/v1/korapay_transactions?status=eq.success&select=*&order=confirmed_at.desc"
+        response = requests.get(url, headers=sb_headers(), timeout=10)
+        transactions = response.json()
+    except Exception as e:
+        await update.message.reply_text(f"⚠️ Couldn't fetch revenue data: {e}")
+        return
+
+    if not transactions:
+        await update.message.reply_text("📊 No confirmed MT5 Auto-Trade payments yet.")
+        return
+
+    total = sum(float(t.get("amount", 0)) for t in transactions)
+    currency = transactions[0].get("currency", MT5_AUTOTRADE_CURRENCY)
+    count = len(transactions)
+
+    recent_lines = []
+    for t in transactions[:10]:
+        confirmed = (t.get("confirmed_at") or "")[:16].replace("T", " ")
+        recent_lines.append(f"• {t.get('user_id')} — {t.get('amount')} {t.get('currency')} ({confirmed})")
+
+    await update.message.reply_text(
+        f"📊 <b>MT5 Auto-Trade Revenue</b>\n\n"
+        f"Total collected: <b>{total:,.2f} {currency}</b>\n"
+        f"Confirmed payments: <b>{count}</b>\n\n"
+        f"<b>Most recent 10:</b>\n" + "\n".join(recent_lines) + "\n\n"
+        f"<i>This covers MT5 Auto-Trade only - no visibility into any "
+        f"other business on the same KoraPay account.</i>",
+        parse_mode=ParseMode.HTML
+    )
+
+
 async def broadcast_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = str(update.message.from_user.id)
 
@@ -12583,6 +12634,7 @@ def main():
 
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("broadcast", broadcast_command))
+    app.add_handler(CommandHandler("mt5revenue", mt5revenue_command))
     app.add_handler(CommandHandler("testsynth", testsynth_command))
     app.add_handler(CommandHandler("testsignal", testsignal_command))
     app.add_handler(CommandHandler("welcome", welcome_command))

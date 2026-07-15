@@ -106,6 +106,38 @@ MT5_AUTOTRADE_CURRENCY = "USD"
 
 MT5_SUBSCRIPTION_DAYS = 30
 
+# 4 bot presets for Exness Auto-Trade, per explicit instruction -
+# built from REAL, already-proven strategies live in this bot (not
+# invented), split 2 aggressive / 2 conservative. Used only for
+# clients who choose "Pick a Bot" instead of following the channel's
+# own signals as-is.
+MT5_AUTOTRADE_BOTS = {
+    "aggressive_scalper": {
+        "label": "🐆 Aggressive Scalper",
+        "strategy_function": "strategy_ema_pullback_scalper",
+        "description": "Fast, frequent entries on short-term pullbacks.",
+    },
+    "aggressive_breakout": {
+        "label": "⚡ Aggressive Breakout",
+        "strategy_function": "strategy_volatility_breakout_scalper",
+        "description": "Fires on sharp volatility expansions.",
+    },
+    "conservative_trend": {
+        "label": "🛡️ Conservative Trend",
+        "strategy_function": "strategy_trend_following",
+        "description": "Slower, higher-conviction trend-following entries.",
+    },
+    "conservative_structure": {
+        "label": "🏛️ Conservative Structure",
+        "strategy_function": "strategy_support_resistance_bounce",
+        "description": "Patient, level-based support/resistance entries.",
+    },
+}
+
+# Curated subset of PAIR_CONFIG for bot trading - not all 12 pairs,
+# to keep the choice simple and recognizable.
+MT5_AUTOTRADE_PAIRS = ["xauusd", "gbpjpy", "btcusd", "eurusd", "gbpusd", "usdjpy"]
+
 _fernet = Fernet(CREDENTIAL_ENCRYPTION_KEY.encode()) if CREDENTIAL_ENCRYPTION_KEY else None
 
 def encrypt_credential(plain_text):
@@ -9360,7 +9392,7 @@ async def handle_buttons(update: Update, context: ContextTypes.DEFAULT_TYPE):
             "Ready to continue?",
             parse_mode=ParseMode.HTML,
             reply_markup=InlineKeyboardMarkup([
-                [InlineKeyboardButton("➡️ Continue", callback_data="mt5auto_continue")]
+                [InlineKeyboardButton("➡️ Continue", callback_data="mt5auto_start")]
             ])
         )
         schedule_auto_delete(sent_info.chat_id, sent_info.message_id)
@@ -9375,6 +9407,156 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
     data = query.data
+
+    if data == "mt5auto_start":
+        user_id = str(query.from_user.id)
+        account = get_mt5_autotrade_account(user_id)
+        now = datetime.utcnow()
+        expiry = None
+        if account and account.get("subscription_expires_at"):
+            try:
+                expiry = datetime.fromisoformat(
+                    account["subscription_expires_at"].replace("Z", "+00:00")
+                ).replace(tzinfo=None)
+            except Exception:
+                expiry = None
+        already_active = (
+            account and expiry is not None and now < expiry
+            and account.get("metaapi_account_id")
+        )
+        if already_active:
+            # Already fully set up - no need to walk through bot/pair/
+            # lot-risk selection again, just show current status.
+            days_left = (expiry - now).days
+            risk_mode = account.get("risk_mode", "lot")
+            risk_display = (
+                f"{account.get('lot_size', 0.01)} lots"
+                if risk_mode == "lot"
+                else f"{account.get('risk_percent', 1.0)}% risk"
+            )
+            bot_choice = account.get("bot_choice", "follow_channel")
+            bot_label = (
+                "Following channel signals" if bot_choice == "follow_channel"
+                else MT5_AUTOTRADE_BOTS.get(bot_choice, {}).get("label", bot_choice)
+            )
+            await query.message.edit_text(
+                f"🤖 <b>Exness Auto-Trade — Active</b>\n\n"
+                f"Subscription: {days_left} day(s) left\n"
+                f"Mode: {bot_label}"
+                + (f" on {account.get('pair_choice', '').upper()}" if account.get("pair_choice") else "")
+                + f"\nRisk: {risk_display}\n\n"
+                f"Waiting on the trading strategy to be wired in before "
+                f"real trades begin - infrastructure is ready.",
+                parse_mode=ParseMode.HTML,
+                reply_markup=InlineKeyboardMarkup([
+                    [InlineKeyboardButton("⚙️ Change lot size / risk %", callback_data="mt5settings_change")],
+                ])
+            )
+            return
+
+        mt5_signup_state[user_id] = {"flow": "presetup"}
+        await query.message.edit_text(
+            "🤖 <b>How should Exness Auto-Trade decide your trades?</b>\n\n"
+            "📡 <b>Follow Channel Signals</b> — auto-copies whatever "
+            "the main channel already posts (XAUUSD, GBPJPY, BTCUSD, etc).\n\n"
+            "🎯 <b>Pick a Bot</b> — choose one of 4 dedicated strategy "
+            "bots and one specific pair for it to trade.",
+            parse_mode=ParseMode.HTML,
+            reply_markup=InlineKeyboardMarkup([
+                [InlineKeyboardButton("📡 Follow Channel Signals", callback_data="mt5auto_follow_channel")],
+                [InlineKeyboardButton("🎯 Pick a Bot", callback_data="mt5auto_choose_bot")],
+            ])
+        )
+        return
+
+    if data == "mt5auto_follow_channel":
+        user_id = str(query.from_user.id)
+        if user_id not in mt5_signup_state:
+            mt5_signup_state[user_id] = {"flow": "presetup"}
+        mt5_signup_state[user_id]["bot_choice"] = "follow_channel"
+        mt5_signup_state[user_id]["pair_choice"] = None
+        await query.message.edit_text(
+            "📏 <b>Choose how trades should be sized:</b>",
+            parse_mode=ParseMode.HTML,
+            reply_markup=InlineKeyboardMarkup([
+                [InlineKeyboardButton("📏 Fixed lot size", callback_data="mt5auto_mode_lot")],
+                [InlineKeyboardButton("📊 Risk %", callback_data="mt5auto_mode_risk")],
+            ])
+        )
+        return
+
+    if data == "mt5auto_choose_bot":
+        user_id = str(query.from_user.id)
+        buttons = [
+            [InlineKeyboardButton(bot["label"], callback_data=f"mt5auto_bot_{key}")]
+            for key, bot in MT5_AUTOTRADE_BOTS.items()
+        ]
+        await query.message.edit_text(
+            "🎯 <b>Choose a bot:</b>\n\n" + "\n".join(
+                f"{bot['label']} — {bot['description']}" for bot in MT5_AUTOTRADE_BOTS.values()
+            ),
+            parse_mode=ParseMode.HTML,
+            reply_markup=InlineKeyboardMarkup(buttons)
+        )
+        return
+
+    if data.startswith("mt5auto_bot_"):
+        user_id = str(query.from_user.id)
+        bot_key = data.replace("mt5auto_bot_", "")
+        if bot_key not in MT5_AUTOTRADE_BOTS:
+            return
+        if user_id not in mt5_signup_state:
+            mt5_signup_state[user_id] = {"flow": "presetup"}
+        mt5_signup_state[user_id]["bot_choice"] = bot_key
+
+        buttons = [
+            [InlineKeyboardButton(PAIR_CONFIG[p]["display"], callback_data=f"mt5auto_pair_{p}")]
+            for p in MT5_AUTOTRADE_PAIRS
+        ]
+        await query.message.edit_text(
+            f"✅ {MT5_AUTOTRADE_BOTS[bot_key]['label']} selected.\n\n"
+            f"📌 <b>Now choose which pair to trade it on:</b>",
+            parse_mode=ParseMode.HTML,
+            reply_markup=InlineKeyboardMarkup(buttons)
+        )
+        return
+
+    if data.startswith("mt5auto_pair_"):
+        user_id = str(query.from_user.id)
+        pair_key = data.replace("mt5auto_pair_", "")
+        if pair_key not in MT5_AUTOTRADE_PAIRS:
+            return
+        if user_id not in mt5_signup_state:
+            mt5_signup_state[user_id] = {"flow": "presetup"}
+        mt5_signup_state[user_id]["pair_choice"] = pair_key
+        await query.message.edit_text(
+            f"✅ {PAIR_CONFIG[pair_key]['display']} selected.\n\n"
+            f"📏 <b>Choose how trades should be sized:</b>",
+            parse_mode=ParseMode.HTML,
+            reply_markup=InlineKeyboardMarkup([
+                [InlineKeyboardButton("📏 Fixed lot size", callback_data="mt5auto_mode_lot")],
+                [InlineKeyboardButton("📊 Risk %", callback_data="mt5auto_mode_risk")],
+            ])
+        )
+        return
+
+    if data == "mt5auto_mode_lot":
+        user_id = str(query.from_user.id)
+        user_modes[user_id] = "mt5_awaiting_lot_value"
+        await query.message.edit_text(
+            "📏 Send your desired <b>lot size</b> (e.g. 0.01):",
+            parse_mode=ParseMode.HTML
+        )
+        return
+
+    if data == "mt5auto_mode_risk":
+        user_id = str(query.from_user.id)
+        user_modes[user_id] = "mt5_awaiting_risk_value"
+        await query.message.edit_text(
+            "📊 Send your desired <b>risk %</b> per trade (e.g. 1 for 1%):",
+            parse_mode=ParseMode.HTML
+        )
+        return
 
     if data == "mt5auto_continue":
         user_id = str(query.from_user.id)
@@ -9414,10 +9596,26 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 )
                 return
             log_korapay_transaction(reference, user_id, MT5_AUTOTRADE_MONTHLY_FEE, MT5_AUTOTRADE_CURRENCY)
+
+            # Persist the bot/pair/lot-risk choices NOW, before payment
+            # confirms - per explicit instruction, these are collected
+            # BEFORE payment, so they must survive until the KoraPay
+            # webhook + process_confirmed_korapay_payments job actually
+            # activates the subscription (which happens independently,
+            # possibly minutes later).
+            signup = mt5_signup_state.get(user_id, {})
+            upsert_mt5_autotrade_account(user_id, {
+                "bot_choice": signup.get("bot_choice", "follow_channel"),
+                "pair_choice": signup.get("pair_choice"),
+                "risk_mode": signup.get("risk_mode", "lot"),
+                "lot_size": signup.get("lot_size", 0.01),
+                "risk_percent": signup.get("risk_percent", 1.0),
+            })
+
             await query.message.edit_text(
                 f"🤖 <b>Exness Auto-Trade — {MT5_SUBSCRIPTION_DAYS}-day subscription</b>\n\n"
-                f"Tap below to pay. Your MT5 connection and settings "
-                f"will unlock automatically once payment is confirmed.",
+                f"Tap below to pay. Your MT5 connection will unlock "
+                f"automatically once payment is confirmed.",
                 parse_mode=ParseMode.HTML,
                 reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("💳 Pay Now", url=checkout_url)]])
             )
@@ -10842,8 +11040,35 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
             sent_bad_lot = await update.message.reply_text("⚠️ Please send a number, e.g. 0.01")
             schedule_auto_delete(sent_bad_lot.chat_id, sent_bad_lot.message_id)
             return
-        upsert_mt5_autotrade_account(user_id, {"risk_mode": "lot", "lot_size": lot_size})
         user_modes[user_id] = None
+
+        if mt5_signup_state.get(user_id, {}).get("flow") == "presetup":
+            # Pre-payment setup flow - store the choice and move to the
+            # final "ready to pay" step, rather than saving to the DB
+            # yet (the account may not even exist for this user until
+            # payment succeeds).
+            mt5_signup_state[user_id]["risk_mode"] = "lot"
+            mt5_signup_state[user_id]["lot_size"] = lot_size
+            signup = mt5_signup_state[user_id]
+            bot_choice = signup.get("bot_choice", "follow_channel")
+            summary = (
+                "📡 Following Channel Signals" if bot_choice == "follow_channel"
+                else f"{MT5_AUTOTRADE_BOTS[bot_choice]['label']} on {PAIR_CONFIG[signup['pair_choice']]['display']}"
+            )
+            sent_ready = await update.message.reply_text(
+                f"✅ <b>Setup complete:</b>\n\n"
+                f"{summary}\n"
+                f"Lot size: {lot_size}\n\n"
+                f"Tap below to pay and unlock your MT5 connection:",
+                parse_mode=ParseMode.HTML,
+                reply_markup=InlineKeyboardMarkup([
+                    [InlineKeyboardButton("➡️ Continue to Payment", callback_data="mt5auto_continue")]
+                ])
+            )
+            schedule_auto_delete(sent_ready.chat_id, sent_ready.message_id)
+            return
+
+        upsert_mt5_autotrade_account(user_id, {"risk_mode": "lot", "lot_size": lot_size})
         sent_lot_saved = await update.message.reply_text(
             f"✅ Lot size set to <b>{lot_size}</b> per trade.",
             parse_mode=ParseMode.HTML, reply_markup=main_keyboard
@@ -10858,8 +11083,31 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
             sent_bad_risk = await update.message.reply_text("⚠️ Please send a number, e.g. 1 for 1%")
             schedule_auto_delete(sent_bad_risk.chat_id, sent_bad_risk.message_id)
             return
-        upsert_mt5_autotrade_account(user_id, {"risk_mode": "percent", "risk_percent": risk_percent})
         user_modes[user_id] = None
+
+        if mt5_signup_state.get(user_id, {}).get("flow") == "presetup":
+            mt5_signup_state[user_id]["risk_mode"] = "percent"
+            mt5_signup_state[user_id]["risk_percent"] = risk_percent
+            signup = mt5_signup_state[user_id]
+            bot_choice = signup.get("bot_choice", "follow_channel")
+            summary = (
+                "📡 Following Channel Signals" if bot_choice == "follow_channel"
+                else f"{MT5_AUTOTRADE_BOTS[bot_choice]['label']} on {PAIR_CONFIG[signup['pair_choice']]['display']}"
+            )
+            sent_ready = await update.message.reply_text(
+                f"✅ <b>Setup complete:</b>\n\n"
+                f"{summary}\n"
+                f"Risk: {risk_percent}%\n\n"
+                f"Tap below to pay and unlock your MT5 connection:",
+                parse_mode=ParseMode.HTML,
+                reply_markup=InlineKeyboardMarkup([
+                    [InlineKeyboardButton("➡️ Continue to Payment", callback_data="mt5auto_continue")]
+                ])
+            )
+            schedule_auto_delete(sent_ready.chat_id, sent_ready.message_id)
+            return
+
+        upsert_mt5_autotrade_account(user_id, {"risk_mode": "percent", "risk_percent": risk_percent})
         sent_risk_saved = await update.message.reply_text(
             f"✅ Risk set to <b>{risk_percent}%</b> per trade.",
             parse_mode=ParseMode.HTML, reply_markup=main_keyboard

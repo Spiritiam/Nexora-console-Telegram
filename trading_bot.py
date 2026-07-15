@@ -101,8 +101,19 @@ KORAPAY_WEBHOOK_URL = os.getenv("KORAPAY_WEBHOOK_URL")
 # (50 = $50.00, not $0.50 or $5000). Worth a $1 test charge before
 # taking real payments, just to be certain before this touches real
 # client money.
-MT5_AUTOTRADE_MONTHLY_FEE = 50
-MT5_AUTOTRADE_CURRENCY = "USD"
+# $50/month is the price shown to users everywhere - kept as a clean,
+# stable USD reference figure. The ACTUAL charge sent to KoraPay is
+# in NGN instead (USD checkout wasn't enabled on this KoraPay
+# account), converted at a real, current rate as of mid-July 2026
+# (~₦1,380/$1, confirmed via live search, not from memory - exchange
+# rates move daily). NEEDS PERIODIC MANUAL UPDATING - this is a
+# snapshot rate, not a live lookup, so it will drift out of sync with
+# the true $50 value over time. Revisit every few weeks, or ask to
+# wire in a live FX API call at charge-time for a more precise,
+# always-current conversion if that drift becomes noticeable.
+MT5_AUTOTRADE_DISPLAY_PRICE = "$50/month"
+MT5_AUTOTRADE_MONTHLY_FEE = 69000
+MT5_AUTOTRADE_CURRENCY = "NGN"
 
 MT5_SUBSCRIPTION_DAYS = 30
 
@@ -9719,8 +9730,7 @@ async def handle_buttons(update: Update, context: ContextTypes.DEFAULT_TYPE):
             "account, automatically, using the same technical strategy "
             "already powering your signals — no need to manually "
             "watch charts or place trades yourself.\n\n"
-            f"💵 <b>Price:</b> ${MT5_AUTOTRADE_MONTHLY_FEE}/month "
-            f"({MT5_AUTOTRADE_CURRENCY})\n\n"
+            f"💵 <b>Price:</b> {MT5_AUTOTRADE_DISPLAY_PRICE}\n\n"
             "📈 <b>Why auto-trade?</b> Markets move fast, and the best "
             "setups don't always happen when you're free to act on "
             "them. Auto-trading lets you stay in the market on your "

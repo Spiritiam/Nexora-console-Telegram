@@ -6446,10 +6446,10 @@ def generate_rule_based_bias(pair_key, current_price, price_1h_ago):
     if price_1h_ago is not None and current_price is not None:
         if current_price > price_1h_ago:
             direction = "BUY"
-            reason = "Price trending upward over the last hour."
+            reason = "Potential buy setup spotted."
         elif current_price < price_1h_ago:
             direction = "SELL"
-            reason = "Price trending downward over the last hour."
+            reason = "Potential sell setup spotted."
         else:
             direction, reason = _consistent_or_random(pair_key)
     else:
@@ -6465,9 +6465,9 @@ def _consistent_or_random(pair_key):
     if pair_key and pair_key in last_signal_direction:
         prev_direction, prev_time = last_signal_direction[pair_key]
         if now - prev_time < SIGNAL_CONSISTENCY_SECONDS:
-            return prev_direction, "Maintaining recent price trend bias."
+            return prev_direction, "Potential " + ("buy" if prev_direction == "BUY" else "sell") + " setup spotted."
     direction = random.choice(["BUY", "SELL"])
-    return direction, "Early price trend showing initial directional bias."
+    return direction, "Potential " + ("buy" if direction == "BUY" else "sell") + " setup spotted."
 
 # ============================================
 # SIGNAL BUILDER

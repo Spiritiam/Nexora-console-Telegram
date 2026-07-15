@@ -29,6 +29,8 @@ from telegram import (
     ReplyKeyboardMarkup,
     InlineKeyboardButton,
     InlineKeyboardMarkup,
+    MenuButtonCommands,
+    BotCommand,
 )
 
 from telegram.ext import (
@@ -9491,6 +9493,30 @@ async def send_verification_gate(update):
 # START COMMAND
 # ============================================
 
+async def send_and_pin_start_button(bot, chat_id):
+    """
+    Sends a big, obvious "Main Menu" button and pins it - the closest
+    controllable substitute for Telegram's native blue Start button,
+    which can't be forced to reappear via bot code once a chat has
+    already been started before. Pinned messages sit at the top of
+    the chat, hard to miss even after scrolling - though pin state
+    surviving a full "Clear History" isn't 100% guaranteed across
+    every Telegram client version, this is the most robust option
+    actually available through the Bot API.
+    """
+    try:
+        sent = await bot.send_message(
+            chat_id=chat_id,
+            text="👇 Tap anytime to open the main menu:",
+            reply_markup=InlineKeyboardMarkup([
+                [InlineKeyboardButton("🚀 START / MAIN MENU", callback_data="show_main_menu")]
+            ])
+        )
+        await bot.pin_chat_message(chat_id=chat_id, message_id=sent.message_id, disable_notification=True)
+    except Exception as e:
+        print(f"[PIN] Couldn't send/pin start button for {chat_id}: {e}")
+
+
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     user_id = str(update.message.from_user.id)
@@ -9586,6 +9612,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
             reply_markup=main_keyboard
         )
         last_welcome_message[user_id] = (sent_welcome.chat_id, sent_welcome.message_id)
+        await send_and_pin_start_button(context.bot, update.effective_chat.id)
         return
 
     remaining = trial_remaining(user_id)
@@ -9608,10 +9635,12 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
             parse_mode=ParseMode.HTML,
             reply_markup=main_keyboard
         )
+        await send_and_pin_start_button(context.bot, update.effective_chat.id)
         return
 
     user_modes[user_id] = "awaiting_email"
     await send_verification_gate(update)
+    await send_and_pin_start_button(context.bot, update.effective_chat.id)
 
 # ============================================
 # HANDLE BUTTONS
@@ -9762,6 +9791,23 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
     data = query.data
+
+    if data == "show_main_menu":
+        user_id = str(query.from_user.id)
+        if is_verified(user_id):
+            await query.message.reply_text(
+                "👇 <b>What would you like to do today?</b>",
+                parse_mode=ParseMode.HTML,
+                reply_markup=main_keyboard
+            )
+        else:
+            await query.message.reply_text(
+                "👇 <b>Tap Signal below for a free trial, or verify "
+                "your Exness account for full access.</b>",
+                parse_mode=ParseMode.HTML,
+                reply_markup=main_keyboard
+            )
+        return
 
     if data == "mt5auto_start":
         user_id = str(query.from_user.id)
@@ -10492,6 +10538,7 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 parse_mode=ParseMode.HTML,
                 reply_markup=main_keyboard
             )
+            await send_and_pin_start_button(context.bot, update.effective_chat.id)
             return
 
         remaining = trial_remaining(user_id)
@@ -12190,6 +12237,21 @@ def try_claim_catchup_lock(pair_name):
         return False  # fail safe — if the lock can't be confirmed, don't risk a duplicate
 
 async def catch_up_missed_signals(app):
+    # Per explicit instruction - a persistent Menu Button (next to the
+    # message box) so non-technical users always have something
+    # tappable to get going, even with zero messages in the chat
+    # (e.g. right after clearing history) - unlike the 4-button
+    # keyboard, which technically needs at least one bot message to
+    # attach to and can't be shown with a completely empty chat.
+    try:
+        await app.bot.set_my_commands([
+            BotCommand("start", "Get started / show the main menu"),
+        ])
+        await app.bot.set_chat_menu_button(menu_button=MenuButtonCommands())
+        print("[STARTUP] ✅ Persistent menu button configured.")
+    except Exception as e:
+        print(f"[STARTUP] ⚠️ Couldn't set menu button: {e}")
+
     now = datetime.utcnow()
     today_weekday = now.weekday()
 

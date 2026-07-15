@@ -3,3 +3,5 @@ requests
 websockets
 metaapi-cloud-sdk
 matplotlib
+cryptography
+aiohttp

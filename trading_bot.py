@@ -9194,7 +9194,9 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
             f"📰 <b>News</b> — Get a direct call on high-impact news\n\n"
             f"🔗 <b>Connect Deriv</b> — Link your Deriv account to trade "
             f"signals directly, manually or fully automatic\n\n"
-            f"<i>All three buttons are at the bottom of your screen 👇</i>",
+            f"🤖 <b>Exness Auto-Trade</b> — Subscribe to auto-trade "
+            f"directly on your own Exness MT5/MT4 account\n\n"
+            f"<i>All four buttons are at the bottom of your screen 👇</i>",
             parse_mode=ParseMode.HTML,
             reply_markup=main_keyboard
         )
@@ -9337,15 +9339,54 @@ async def handle_buttons(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     if "exness auto-trade" in text:
+        sent_info = await update.message.reply_text(
+            "🤖 <b>Exness Auto-Trade</b>\n\n"
+            "Let Nexora AI trade directly on your own Exness MT5/MT4 "
+            "account, automatically, using the same technical strategy "
+            "already powering your signals — no need to manually "
+            "watch charts or place trades yourself.\n\n"
+            f"💵 <b>Price:</b> ${MT5_AUTOTRADE_MONTHLY_FEE}/month "
+            f"({MT5_AUTOTRADE_CURRENCY})\n\n"
+            "📈 <b>Why auto-trade?</b> Markets move fast, and the best "
+            "setups don't always happen when you're free to act on "
+            "them. Auto-trading lets you stay in the market on your "
+            "own terms — your own lot size, your own risk %, executed "
+            "the moment a real setup appears.\n\n"
+            "⚠️ <b>Disclaimer:</b> Trading involves real risk. Past "
+            "performance is not a guarantee of future results, and "
+            "you can lose money. Only subscribe with funds you can "
+            "afford to risk, and never with borrowed money.\n\n"
+            "━━━━━━━━━━━━━━━━━━━━━\n"
+            "Ready to continue?",
+            parse_mode=ParseMode.HTML,
+            reply_markup=InlineKeyboardMarkup([
+                [InlineKeyboardButton("➡️ Continue", callback_data="mt5auto_continue")]
+            ])
+        )
+        schedule_auto_delete(sent_info.chat_id, sent_info.message_id)
+        return
+
+# ============================================
+# CALLBACK HANDLER — APPROVE / REJECT
+# ============================================
+
+async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+
+    query = update.callback_query
+    await query.answer()
+    data = query.data
+
+    if data == "mt5auto_continue":
+        user_id = str(query.from_user.id)
+
         if not is_verified(user_id):
-            sent_not_verified = await update.message.reply_text(
-                "🔒 <b>Exness Auto-Trade requires a verified Exness account first.</b>\n\n"
+            await query.message.edit_text(
+                "🔒 <b>Exness Auto-Trade requires a verified Exness "
+                "account first.</b>\n\n"
                 "Verify your Exness account (see the onboarding steps) "
                 "before subscribing to auto-trading.",
-                parse_mode=ParseMode.HTML,
-                reply_markup=main_keyboard
+                parse_mode=ParseMode.HTML
             )
-            schedule_auto_delete(sent_not_verified.chat_id, sent_not_verified.message_id)
             return
 
         account = get_mt5_autotrade_account(user_id)
@@ -9366,32 +9407,30 @@ async def handle_buttons(update: Update, context: ContextTypes.DEFAULT_TYPE):
             reference = f"MT5AUTO-{user_id}-{int(time.time())}"
             checkout_url = await korapay_initialize_charge(user_id, email or f"{user_id}@nexoraai.temp", reference)
             if not checkout_url:
-                sent_payment_error = await update.message.reply_text(
-                    "⚠️ <b>Couldn't start the payment right now.</b> Please try again shortly.",
+                await query.message.edit_text(
+                    "⚠️ <b>Couldn't start the payment right now.</b> "
+                    "Please try again shortly.",
                     parse_mode=ParseMode.HTML
                 )
-                schedule_auto_delete(sent_payment_error.chat_id, sent_payment_error.message_id)
                 return
             log_korapay_transaction(reference, user_id, MT5_AUTOTRADE_MONTHLY_FEE, MT5_AUTOTRADE_CURRENCY)
-            sent_pay = await update.message.reply_text(
+            await query.message.edit_text(
                 f"🤖 <b>Exness Auto-Trade — {MT5_SUBSCRIPTION_DAYS}-day subscription</b>\n\n"
                 f"Tap below to pay. Your MT5 connection and settings "
                 f"will unlock automatically once payment is confirmed.",
                 parse_mode=ParseMode.HTML,
                 reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("💳 Pay Now", url=checkout_url)]])
             )
-            schedule_auto_delete(sent_pay.chat_id, sent_pay.message_id)
             return
 
         if not account.get("metaapi_account_id"):
             user_modes[user_id] = "mt5_awaiting_account_number"
-            sent_connect = await update.message.reply_text(
+            await query.message.edit_text(
                 "✅ <b>Subscription active.</b>\n\n"
                 "Now let's connect your Exness MT5/MT4 account.\n\n"
                 "Send your <b>account number</b>:",
                 parse_mode=ParseMode.HTML
             )
-            schedule_auto_delete(sent_connect.chat_id, sent_connect.message_id)
             return
 
         days_left = (expiry - now).days
@@ -9401,7 +9440,7 @@ async def handle_buttons(update: Update, context: ContextTypes.DEFAULT_TYPE):
             if risk_mode == "lot"
             else f"{account.get('risk_percent', 1.0)}% risk"
         )
-        sent_status = await update.message.reply_text(
+        await query.message.edit_text(
             f"🤖 <b>Exness Auto-Trade — Active</b>\n\n"
             f"Subscription: {days_left} day(s) left\n"
             f"MT5 account: connected\n"
@@ -9413,18 +9452,7 @@ async def handle_buttons(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 [InlineKeyboardButton("⚙️ Change lot size / risk %", callback_data="mt5settings_change")],
             ])
         )
-        schedule_auto_delete(sent_status.chat_id, sent_status.message_id)
         return
-
-# ============================================
-# CALLBACK HANDLER — APPROVE / REJECT
-# ============================================
-
-async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
-
-    query = update.callback_query
-    await query.answer()
-    data = query.data
 
     if data == "mt5settings_change":
         user_id = str(query.from_user.id)
@@ -9899,7 +9927,9 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     f"📰 <b>News</b> — Get a direct call on high-impact news\n\n"
                     f"🔗 <b>Connect Deriv</b> — Link your Deriv account to trade "
                     f"signals directly, manually or fully automatic\n\n"
-                    f"<i>All three buttons are at the bottom of your screen 👇</i>"
+                    f"🤖 <b>Exness Auto-Trade</b> — Subscribe to auto-trade "
+                    f"directly on your own Exness MT5/MT4 account\n\n"
+                    f"<i>All four buttons are at the bottom of your screen 👇</i>"
                 ),
                 parse_mode=ParseMode.HTML,
                 reply_markup=main_keyboard

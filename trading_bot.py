@@ -2,6 +2,9 @@ import os
 import asyncio
 import random
 import math
+import hmac
+import hashlib
+import threading
 import requests
 import re
 import json
@@ -15,6 +18,8 @@ import matplotlib.dates as mdates
 from matplotlib.patches import Rectangle
 
 from metaapi_cloud_sdk import MetaApi
+from cryptography.fernet import Fernet
+from aiohttp import web
 
 from datetime import datetime, timedelta
 from pathlib import Path
@@ -63,6 +68,401 @@ ADMIN_USER_ID = os.getenv("ADMIN_USER_ID")  # restricts /broadcast to this Teleg
 
 METAAPI_TOKEN = os.getenv("METAAPI_TOKEN")
 METAAPI_ACCOUNT_ID = os.getenv("METAAPI_ACCOUNT_ID")
+
+# ============================================
+# MT5 AUTO-TRADE (NEW) - Exness auto-trading for
+# verified, subscribed clients. Per explicit
+# instruction: separate from the bot's own single
+# MT5 account above - each client connects THEIR
+# OWN MT5/MT4 login via MetaAPI, gated behind BOTH
+# being a verified Exness client AND having an
+# active paid KoraPay subscription.
+# ============================================
+
+# Never hardcode real secrets in this file - both of these must be
+# set as Railway environment variables, matching every other secret
+# already used throughout this bot (METAAPI_TOKEN, GEMINI_API_KEY, etc).
+KORAPAY_SECRET_KEY = os.getenv("KORAPAY_SECRET_KEY")
+CREDENTIAL_ENCRYPTION_KEY = os.getenv("CREDENTIAL_ENCRYPTION_KEY")
+
+KORAPAY_BASE_URL = "https://api.korapay.com/merchant/api/v1"
+
+# Set this AFTER exposing this Railway service publicly (Settings ->
+# Networking -> Generate Domain), e.g.
+# "https://your-service.up.railway.app/korapay-webhook" - KoraPay
+# needs a real, internet-reachable URL to send payment confirmations
+# to. This bot has never needed a public HTTP endpoint before now.
+KORAPAY_WEBHOOK_URL = os.getenv("KORAPAY_WEBHOOK_URL")
+
+# $50/month, confirmed by SpiritFX. NOTE: KoraPay's documented amount
+# format for NGN/GHS/KES is the currency's own base unit (e.g. 50000
+# means ₦50,000, not kobo) - USD wasn't explicitly confirmed either
+# way in their docs, so this assumes the same base-unit convention
+# (50 = $50.00, not $0.50 or $5000). Worth a $1 test charge before
+# taking real payments, just to be certain before this touches real
+# client money.
+MT5_AUTOTRADE_MONTHLY_FEE = 50
+MT5_AUTOTRADE_CURRENCY = "USD"
+
+MT5_SUBSCRIPTION_DAYS = 30
+
+_fernet = Fernet(CREDENTIAL_ENCRYPTION_KEY.encode()) if CREDENTIAL_ENCRYPTION_KEY else None
+
+def encrypt_credential(plain_text):
+    """
+    Encrypts a raw MT5/MT4 password before it ever touches Supabase -
+    per explicit instruction, real broker passwords must never be
+    stored in plain text. Raises clearly if the encryption key isn't
+    configured, rather than silently storing something unsafe.
+    """
+    if not _fernet:
+        raise RuntimeError("CREDENTIAL_ENCRYPTION_KEY not configured - cannot safely store this password.")
+    return _fernet.encrypt(plain_text.encode()).decode()
+
+def decrypt_credential(encrypted_text):
+    """
+    Decrypts a stored MT5/MT4 password - only ever called transiently,
+    right when actually needed to (re)provision a MetaAPI account,
+    never logged or displayed anywhere.
+    """
+    if not _fernet:
+        raise RuntimeError("CREDENTIAL_ENCRYPTION_KEY not configured - cannot decrypt stored password.")
+    return _fernet.decrypt(encrypted_text.encode()).decode()
+
+
+async def korapay_initialize_charge(user_id, email, reference):
+    """
+    Starts a KoraPay payment for the MT5 auto-trade subscription.
+    Returns the checkout_url to send the user, or None on failure.
+    Confirmed against KoraPay's current live documentation
+    (developers.korapay.com/docs/checkout-redirect) - server-side
+    "Initialize Charge" endpoint, since a Telegram bot has no browser
+    context for the JS-widget "Checkout Standard" flow.
+    """
+    if not KORAPAY_SECRET_KEY:
+        print("[KORAPAY] KORAPAY_SECRET_KEY not configured.")
+        return None
+    if not MT5_AUTOTRADE_MONTHLY_FEE:
+        print("[KORAPAY] MT5_AUTOTRADE_MONTHLY_FEE not set yet - waiting on the real price from SpiritFX.")
+        return None
+    try:
+        response = requests.post(
+            f"{KORAPAY_BASE_URL}/charges/initialize",
+            headers={"Authorization": f"Bearer {KORAPAY_SECRET_KEY}"},
+            json={
+                "amount": MT5_AUTOTRADE_MONTHLY_FEE,
+                "currency": MT5_AUTOTRADE_CURRENCY,
+                "reference": reference,
+                "customer": {"email": email, "name": str(user_id)},
+                "notification_url": KORAPAY_WEBHOOK_URL,
+            },
+            timeout=15,
+        )
+        data = response.json()
+        if data.get("status") and data.get("data", {}).get("checkout_url"):
+            return data["data"]["checkout_url"]
+        print(f"[KORAPAY] Charge init failed: {data}")
+        return None
+    except Exception as e:
+        print(f"[KORAPAY] Charge init error: {e}")
+        return None
+
+
+def verify_korapay_signature(data_dict, signature_header):
+    """
+    Confirms a webhook genuinely came from KoraPay, per their
+    documented scheme (developers.korapay.com/docs/webhooks) - an
+    HMAC-SHA256 of the JSON-encoded `data` object, signed with the
+    same secret key, compared against the x-korapay-signature header.
+    NEVER trust a webhook without this check - anyone could otherwise
+    POST a fake "payment successful" straight to this endpoint.
+
+    NOTE: re-serializes the parsed `data` dict compactly rather than
+    using raw request bytes. This matches KoraPay's own JSON.stringify
+    approach in the overwhelming majority of cases (Python's json
+    module preserves key order from parsing, same as JS), but if
+    signature checks ever mysteriously fail in production, the first
+    thing to check is exact byte-for-byte reconstruction here.
+    """
+    if not KORAPAY_SECRET_KEY or not signature_header:
+        return False
+    computed = hmac.new(
+        KORAPAY_SECRET_KEY.encode(),
+        json.dumps(data_dict, separators=(",", ":")).encode(),
+        hashlib.sha256,
+    ).hexdigest()
+    return hmac.compare_digest(computed, signature_header)
+
+
+def log_korapay_transaction(reference, user_id, amount, currency):
+    try:
+        url = f"{SUPABASE_URL}/rest/v1/korapay_transactions"
+        requests.post(url, headers=sb_headers(), json={
+            "reference": reference, "user_id": user_id,
+            "amount": amount, "currency": currency, "status": "pending"
+        }, timeout=10)
+    except Exception as e:
+        print(f"[KORAPAY DB] log_korapay_transaction error: {e}")
+
+
+def get_unprocessed_confirmed_transactions():
+    try:
+        url = (
+            f"{SUPABASE_URL}/rest/v1/korapay_transactions"
+            f"?status=eq.success&processed=eq.false&select=*"
+        )
+        response = requests.get(url, headers=sb_headers(), timeout=10)
+        return response.json()
+    except Exception as e:
+        print(f"[KORAPAY DB] get_unprocessed_confirmed_transactions error: {e}")
+        return []
+
+
+def mark_korapay_transaction_processed(reference):
+    try:
+        url = f"{SUPABASE_URL}/rest/v1/korapay_transactions?reference=eq.{reference}"
+        requests.patch(url, headers=sb_headers(), json={"processed": True}, timeout=10)
+    except Exception as e:
+        print(f"[KORAPAY DB] mark_korapay_transaction_processed error: {e}")
+
+
+def get_mt5_autotrade_account(user_id):
+    try:
+        url = f"{SUPABASE_URL}/rest/v1/mt5_auto_trade_accounts?user_id=eq.{user_id}&select=*"
+        response = requests.get(url, headers=sb_headers(), timeout=10)
+        data = response.json()
+        return data[0] if data else None
+    except Exception as e:
+        print(f"[MT5 AUTOTRADE DB] get_mt5_autotrade_account error: {e}")
+        return None
+
+
+def upsert_mt5_autotrade_account(user_id, fields):
+    try:
+        url = f"{SUPABASE_URL}/rest/v1/mt5_auto_trade_accounts"
+        payload = {**fields, "user_id": user_id}
+        requests.post(
+            url,
+            headers={**sb_headers(), "Prefer": "resolution=merge-duplicates"},
+            json=payload, timeout=10
+        )
+    except Exception as e:
+        print(f"[MT5 AUTOTRADE DB] upsert_mt5_autotrade_account error: {e}")
+
+
+def is_mt5_autotrade_active(user_id):
+    """
+    The BOTH-gates check, per explicit instruction: verified Exness
+    client AND currently subscribed (not expired) AND has a connected
+    MetaAPI account - all three, not just one.
+    """
+    if not is_verified(user_id):
+        return False
+    account = get_mt5_autotrade_account(user_id)
+    if not account or not account.get("metaapi_account_id"):
+        return False
+    expires_at = account.get("subscription_expires_at")
+    if not expires_at:
+        return False
+    try:
+        expiry = datetime.fromisoformat(expires_at.replace("Z", "+00:00")).replace(tzinfo=None)
+        return datetime.utcnow() < expiry
+    except Exception:
+        return False
+
+
+async def provision_mt5_account(login, password, server, platform="mt5", account_name=None):
+    """
+    Creates a NEW MetaAPI-managed trading account for a CLIENT'S OWN
+    MT5/MT4 login, using the SAME single METAAPI_TOKEN already used
+    for the bot's own account - MetaAPI supports managing many
+    separate accounts under one token, each identified by its own
+    returned account_id. Confirmed against MetaAPI's current live
+    documentation (metaapi.cloud/docs/provisioning/api/account/
+    createAccount) - omitting provisioningProfileId lets MetaAPI
+    auto-detect Exness's broker settings automatically.
+
+    Returns (account_id, error_message). Handles the documented
+    "Automatic broker settings detection is in progress" response by
+    waiting and retrying up to 3 times before giving up, rather than
+    treating it as an outright failure on the first try.
+    """
+    try:
+        api = MetaApi(token=METAAPI_TOKEN)
+        payload = {
+            "login": login,
+            "password": password,
+            "name": account_name or f"Client {login}",
+            "server": server,
+            "platform": platform,
+            "keywords": ["Exness"],
+        }
+        for attempt in range(3):
+            try:
+                account = await api.metatrader_account_api.create_account(payload)
+                return account.id, None
+            except Exception as e:
+                msg = str(e)
+                if "retry" in msg.lower() and attempt < 2:
+                    print(f"[MT5 PROVISION] Broker detection in progress, waiting 60s (attempt {attempt + 1}/3)...")
+                    await asyncio.sleep(60)
+                    continue
+                return None, msg
+        return None, "Broker settings detection timed out after 3 attempts."
+    except Exception as e:
+        return None, str(e)
+
+
+async def korapay_webhook_handler(request):
+    """
+    Receives KoraPay's payment confirmation. Deliberately does the
+    MINIMUM here - verify the signature, update the database - and
+    nothing else. Never calls the Telegram bot directly from this
+    handler (it runs in its own thread/event loop, separate from the
+    bot's own - see run_korapay_webhook_server's docstring). The
+    actual user notification and subscription activation happens
+    separately, in process_confirmed_korapay_payments, which runs on
+    the bot's own proven event loop via job_queue.
+    """
+    try:
+        payload = await request.json()
+    except Exception:
+        return web.Response(status=400, text="bad request")
+
+    signature = request.headers.get("x-korapay-signature", "")
+    data = payload.get("data", {})
+    if not verify_korapay_signature(data, signature):
+        print("[KORAPAY WEBHOOK] ❌ Signature verification failed - ignoring, possible spoofed request.")
+        return web.Response(status=401, text="invalid signature")
+
+    if payload.get("event") == "charge.success":
+        reference = data.get("reference") or data.get("payment_reference")
+        print(f"[KORAPAY WEBHOOK] ✅ Payment confirmed for reference {reference}")
+        try:
+            url = f"{SUPABASE_URL}/rest/v1/korapay_transactions?reference=eq.{reference}"
+            requests.patch(url, headers=sb_headers(), json={
+                "status": "success",
+                "confirmed_at": datetime.utcnow().isoformat(),
+            }, timeout=10)
+        except Exception as e:
+            print(f"[KORAPAY WEBHOOK] DB update failed: {e}")
+
+    return web.Response(status=200, text="ok")
+
+
+def run_korapay_webhook_server():
+    """
+    Runs a small, INDEPENDENT web server in its own background thread
+    with its OWN event loop - deliberately NOT sharing the bot's main
+    asyncio loop (which app.run_polling() manages internally, and
+    which this whole bot's Telegram handling depends on completely).
+    Keeping these fully decoupled means nothing here can interfere
+    with Telegram polling, and Telegram polling can't block webhook
+    delivery. Requires this Railway service to be exposed publicly
+    (Settings -> Networking -> Generate Domain) - it's never needed
+    an inbound HTTP endpoint before now.
+    """
+    webhook_app = web.Application()
+    webhook_app.router.add_post("/korapay-webhook", korapay_webhook_handler)
+    port = int(os.getenv("PORT", 8080))
+    print(f"[KORAPAY WEBHOOK] Starting webhook server on port {port}...")
+    web.run_app(webhook_app, host="0.0.0.0", port=port, print=None)
+
+
+async def check_mt5_autotrade_expiry(context: ContextTypes.DEFAULT_TYPE):
+    """
+    Runs once daily. Per explicit instruction: clients are
+    automatically removed once their subscription expires - no
+    manual intervention needed. Sets is_active=false (auto-trading
+    stops immediately) and notifies the user, rather than silently
+    letting an expired subscription keep trading.
+    """
+    try:
+        now_iso = datetime.utcnow().isoformat()
+        url = (
+            f"{SUPABASE_URL}/rest/v1/mt5_auto_trade_accounts"
+            f"?is_active=eq.true&subscription_expires_at=lt.{now_iso}&select=user_id"
+        )
+        response = requests.get(url, headers=sb_headers(), timeout=10)
+        expired_accounts = response.json()
+    except Exception as e:
+        print(f"[MT5 AUTOTRADE EXPIRY] Error fetching expired accounts: {e}")
+        return
+
+    if not expired_accounts:
+        return
+
+    bot = context.bot
+    for row in expired_accounts:
+        user_id = row.get("user_id")
+        if not user_id:
+            continue
+        try:
+            upsert_mt5_autotrade_account(user_id, {"is_active": False})
+            print(f"[MT5 AUTOTRADE EXPIRY] ⏸️ Deactivated expired subscription for {user_id}")
+            await bot.send_message(
+                chat_id=int(user_id),
+                text=(
+                    "⏸️ <b>Your Exness Auto-Trade subscription has expired.</b>\n\n"
+                    "Auto-trading has been paused. Tap 🤖 Exness Auto-Trade "
+                    "to renew."
+                ),
+                parse_mode=ParseMode.HTML
+            )
+        except Exception as e:
+            print(f"[MT5 AUTOTRADE EXPIRY] ❌ Failed to deactivate/notify {user_id}: {e}")
+
+
+async def process_confirmed_korapay_payments(context: ContextTypes.DEFAULT_TYPE):
+    """
+    Runs every ~20 seconds on the bot's OWN event loop (unlike the
+    webhook handler above). Picks up payments the webhook already
+    confirmed in the database, activates the subscription, and
+    notifies the user - safe to call bot.send_message here since this
+    runs through job_queue, not the separate webhook thread.
+    """
+    transactions = get_unprocessed_confirmed_transactions()
+    if not transactions:
+        return
+
+    bot = context.bot
+    for txn in transactions:
+        user_id = txn.get("user_id")
+        reference = txn.get("reference")
+        if not user_id or not reference:
+            continue
+        try:
+            expires_at = (datetime.utcnow() + timedelta(days=MT5_SUBSCRIPTION_DAYS)).isoformat()
+            account = get_mt5_autotrade_account(user_id)
+            upsert_mt5_autotrade_account(user_id, {"subscription_expires_at": expires_at})
+            mark_korapay_transaction_processed(reference)
+            print(f"[MT5 AUTOTRADE] ✅ Subscription activated for {user_id} until {expires_at}")
+
+            if account and account.get("metaapi_account_id"):
+                await bot.send_message(
+                    chat_id=int(user_id),
+                    text=(
+                        "✅ <b>Payment confirmed!</b>\n\n"
+                        f"Your MT5 auto-trade subscription is active "
+                        f"for {MT5_SUBSCRIPTION_DAYS} more days."
+                    ),
+                    parse_mode=ParseMode.HTML
+                )
+            else:
+                user_modes[user_id] = "mt5_awaiting_account_number"
+                await bot.send_message(
+                    chat_id=int(user_id),
+                    text=(
+                        "✅ <b>Payment confirmed!</b>\n\n"
+                        "Now let's connect your Exness MT5/MT4 account.\n\n"
+                        "Send your <b>account number</b>:"
+                    ),
+                    parse_mode=ParseMode.HTML
+                )
+        except Exception as e:
+            print(f"[MT5 AUTOTRADE] ❌ Failed to process payment for {user_id}: {e}")
+
+
 
 # ============================================
 # YOUR TWO CHANNEL IDs
@@ -246,7 +646,7 @@ OPENROUTER_URL = "https://openrouter.ai/api/v1/chat/completions"
 # ============================================
 
 main_keyboard = ReplyKeyboardMarkup(
-    [["📊 Signal", "📰 News", "🔗 Connect Deriv"]],
+    [["📊 Signal", "📰 News", "🔗 Connect Deriv"], ["🤖 Exness Auto-Trade"]],
     resize_keyboard=True,
     is_persistent=True,
     one_time_keyboard=False
@@ -279,6 +679,12 @@ def get_channel_button():
 # ============================================
 
 user_modes = {}
+
+# Temporary holding spot for MT5/MT4 credentials WHILE a user is
+# mid-signup (account number -> password -> server -> name), before
+# they're encrypted and written to Supabase. Cleared as soon as
+# signup completes or fails - never persisted here across restarts.
+mt5_signup_state = {}
 
 # user_id (str) -> (chat_id, message_id) of their most recent
 # "Welcome back... what would you like to do today?" message - per
@@ -532,6 +938,20 @@ def is_verified(user_id):
     except Exception as e:
         print(f"[DB] is_verified error: {e}")
         return False
+
+def get_verified_user_email(user_id):
+    """Returns this user's own verified email, or None."""
+    try:
+        url = (
+            f"{SUPABASE_URL}/rest/v1/verified_users"
+            f"?user_id=eq.{user_id}&select=email"
+        )
+        response = requests.get(url, headers=sb_headers(), timeout=10)
+        data = response.json()
+        return data[0]["email"] if data else None
+    except Exception as e:
+        print(f"[DB] get_verified_user_email error: {e}")
+        return None
 
 def get_verified_user_by_email(email):
     """
@@ -8909,6 +9329,86 @@ async def handle_buttons(update: Update, context: ContextTypes.DEFAULT_TYPE):
         schedule_auto_delete(sent_news_menu.chat_id, sent_news_menu.message_id)
         return
 
+    if "exness auto-trade" in text:
+        if not is_verified(user_id):
+            sent_not_verified = await update.message.reply_text(
+                "🔒 <b>Exness Auto-Trade requires a verified Exness account first.</b>\n\n"
+                "Verify your Exness account (see the onboarding steps) "
+                "before subscribing to auto-trading.",
+                parse_mode=ParseMode.HTML,
+                reply_markup=main_keyboard
+            )
+            schedule_auto_delete(sent_not_verified.chat_id, sent_not_verified.message_id)
+            return
+
+        account = get_mt5_autotrade_account(user_id)
+        now = datetime.utcnow()
+        expiry = None
+        if account and account.get("subscription_expires_at"):
+            try:
+                expiry = datetime.fromisoformat(
+                    account["subscription_expires_at"].replace("Z", "+00:00")
+                ).replace(tzinfo=None)
+            except Exception:
+                expiry = None
+
+        subscribed = expiry is not None and now < expiry
+
+        if not subscribed:
+            email = get_verified_user_email(user_id)
+            reference = f"MT5AUTO-{user_id}-{int(time.time())}"
+            checkout_url = await korapay_initialize_charge(user_id, email or f"{user_id}@nexoraai.temp", reference)
+            if not checkout_url:
+                sent_payment_error = await update.message.reply_text(
+                    "⚠️ <b>Couldn't start the payment right now.</b> Please try again shortly.",
+                    parse_mode=ParseMode.HTML
+                )
+                schedule_auto_delete(sent_payment_error.chat_id, sent_payment_error.message_id)
+                return
+            log_korapay_transaction(reference, user_id, MT5_AUTOTRADE_MONTHLY_FEE, MT5_AUTOTRADE_CURRENCY)
+            sent_pay = await update.message.reply_text(
+                f"🤖 <b>Exness Auto-Trade — {MT5_SUBSCRIPTION_DAYS}-day subscription</b>\n\n"
+                f"Tap below to pay. Your MT5 connection and settings "
+                f"will unlock automatically once payment is confirmed.",
+                parse_mode=ParseMode.HTML,
+                reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("💳 Pay Now", url=checkout_url)]])
+            )
+            schedule_auto_delete(sent_pay.chat_id, sent_pay.message_id)
+            return
+
+        if not account.get("metaapi_account_id"):
+            user_modes[user_id] = "mt5_awaiting_account_number"
+            sent_connect = await update.message.reply_text(
+                "✅ <b>Subscription active.</b>\n\n"
+                "Now let's connect your Exness MT5/MT4 account.\n\n"
+                "Send your <b>account number</b>:",
+                parse_mode=ParseMode.HTML
+            )
+            schedule_auto_delete(sent_connect.chat_id, sent_connect.message_id)
+            return
+
+        days_left = (expiry - now).days
+        risk_mode = account.get("risk_mode", "lot")
+        risk_display = (
+            f"{account.get('lot_size', 0.01)} lots"
+            if risk_mode == "lot"
+            else f"{account.get('risk_percent', 1.0)}% risk"
+        )
+        sent_status = await update.message.reply_text(
+            f"🤖 <b>Exness Auto-Trade — Active</b>\n\n"
+            f"Subscription: {days_left} day(s) left\n"
+            f"MT5 account: connected\n"
+            f"Mode: {risk_display}\n\n"
+            f"Waiting on the trading strategy to be wired in before "
+            f"real trades begin - infrastructure is ready.",
+            parse_mode=ParseMode.HTML,
+            reply_markup=InlineKeyboardMarkup([
+                [InlineKeyboardButton("⚙️ Change lot size / risk %", callback_data="mt5settings_change")],
+            ])
+        )
+        schedule_auto_delete(sent_status.chat_id, sent_status.message_id)
+        return
+
 # ============================================
 # CALLBACK HANDLER — APPROVE / REJECT
 # ============================================
@@ -8918,6 +9418,36 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
     data = query.data
+
+    if data == "mt5settings_change":
+        user_id = str(query.from_user.id)
+        await query.message.edit_text(
+            "⚙️ <b>Choose your mode:</b>",
+            parse_mode=ParseMode.HTML,
+            reply_markup=InlineKeyboardMarkup([
+                [InlineKeyboardButton("📏 Fixed lot size", callback_data="mt5settings_lot")],
+                [InlineKeyboardButton("📊 Risk %", callback_data="mt5settings_risk")],
+            ])
+        )
+        return
+
+    if data == "mt5settings_lot":
+        user_id = str(query.from_user.id)
+        user_modes[user_id] = "mt5_awaiting_lot_value"
+        await query.message.edit_text(
+            "📏 Send your desired <b>lot size</b> (e.g. 0.01):",
+            parse_mode=ParseMode.HTML
+        )
+        return
+
+    if data == "mt5settings_risk":
+        user_id = str(query.from_user.id)
+        user_modes[user_id] = "mt5_awaiting_risk_value"
+        await query.message.edit_text(
+            "📊 Send your desired <b>risk %</b> per trade (e.g. 1 for 1%):",
+            parse_mode=ParseMode.HTML
+        )
+        return
 
     if data.startswith("newsmenu_"):
         user_id = str(query.from_user.id)
@@ -10177,6 +10707,129 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
             schedule_auto_delete(sent_fetch_failed.chat_id, sent_fetch_failed.message_id)
         return
 
+    if mode == "mt5_awaiting_account_number":
+        mt5_signup_state[user_id] = {"account_number": message.strip()}
+        user_modes[user_id] = "mt5_awaiting_password"
+        sent_ask_password = await update.message.reply_text(
+            "🔑 Now send your MT5/MT4 <b>password</b>.\n\n"
+            "<i>Your message will be deleted immediately after this "
+            "for your security.</i>",
+            parse_mode=ParseMode.HTML
+        )
+        schedule_auto_delete(sent_ask_password.chat_id, sent_ask_password.message_id)
+        return
+
+    if mode == "mt5_awaiting_password":
+        if user_id not in mt5_signup_state:
+            user_modes[user_id] = None
+            return
+        mt5_signup_state[user_id]["password"] = message.strip()
+        user_modes[user_id] = "mt5_awaiting_server"
+        try:
+            await update.message.delete()
+        except Exception as e:
+            print(f"[MT5 SIGNUP] Couldn't delete password message for {user_id}: {e}")
+        sent_ask_server = await update.message.reply_text(
+            "🌐 Now send your <b>server</b> name (e.g. Exness-Real4):",
+            parse_mode=ParseMode.HTML
+        )
+        schedule_auto_delete(sent_ask_server.chat_id, sent_ask_server.message_id)
+        return
+
+    if mode == "mt5_awaiting_server":
+        if user_id not in mt5_signup_state:
+            user_modes[user_id] = None
+            return
+        mt5_signup_state[user_id]["server"] = message.strip()
+        user_modes[user_id] = "mt5_awaiting_name"
+        sent_ask_name = await update.message.reply_text(
+            "📝 Optional - send an account nickname, or type <b>skip</b>:",
+            parse_mode=ParseMode.HTML
+        )
+        schedule_auto_delete(sent_ask_name.chat_id, sent_ask_name.message_id)
+        return
+
+    if mode == "mt5_awaiting_name":
+        if user_id not in mt5_signup_state:
+            user_modes[user_id] = None
+            return
+        account_name = None if message.strip().lower() == "skip" else message.strip()
+        signup = mt5_signup_state.pop(user_id)
+        user_modes[user_id] = None
+
+        wait_connect = await update.message.reply_text(
+            "🔗 <b>Connecting your MT5/MT4 account...</b> this can take up to a minute.",
+            parse_mode=ParseMode.HTML
+        )
+
+        encrypted_pw = encrypt_credential(signup["password"])
+        account_id, error = await provision_mt5_account(
+            signup["account_number"], signup["password"], signup["server"],
+            account_name=account_name
+        )
+
+        if error:
+            await wait_connect.edit_text(
+                f"⚠️ <b>Couldn't connect that account.</b>\n\n{error}\n\n"
+                f"Double-check your login, password, and server name, "
+                f"then tap 🤖 Exness Auto-Trade to try again.",
+                parse_mode=ParseMode.HTML
+            )
+            return
+
+        upsert_mt5_autotrade_account(user_id, {
+            "account_number": signup["account_number"],
+            "encrypted_password": encrypted_pw,
+            "server": signup["server"],
+            "account_name": account_name,
+            "metaapi_account_id": account_id,
+            "is_active": True,
+        })
+
+        await wait_connect.edit_text(
+            "✅ <b>MT5/MT4 account connected!</b>\n\n"
+            "Default mode: 0.01 lots per trade. Tap 🤖 Exness Auto-Trade "
+            "anytime to change your lot size or switch to risk %.\n\n"
+            "Auto-trading itself is still waiting on the trading "
+            "strategy to be wired in - you'll be notified the moment "
+            "it goes live.",
+            parse_mode=ParseMode.HTML,
+            reply_markup=main_keyboard
+        )
+        return
+
+    if mode == "mt5_awaiting_lot_value":
+        try:
+            lot_size = float(message.strip())
+        except ValueError:
+            sent_bad_lot = await update.message.reply_text("⚠️ Please send a number, e.g. 0.01")
+            schedule_auto_delete(sent_bad_lot.chat_id, sent_bad_lot.message_id)
+            return
+        upsert_mt5_autotrade_account(user_id, {"risk_mode": "lot", "lot_size": lot_size})
+        user_modes[user_id] = None
+        sent_lot_saved = await update.message.reply_text(
+            f"✅ Lot size set to <b>{lot_size}</b> per trade.",
+            parse_mode=ParseMode.HTML, reply_markup=main_keyboard
+        )
+        schedule_auto_delete(sent_lot_saved.chat_id, sent_lot_saved.message_id)
+        return
+
+    if mode == "mt5_awaiting_risk_value":
+        try:
+            risk_percent = float(message.strip())
+        except ValueError:
+            sent_bad_risk = await update.message.reply_text("⚠️ Please send a number, e.g. 1 for 1%")
+            schedule_auto_delete(sent_bad_risk.chat_id, sent_bad_risk.message_id)
+            return
+        upsert_mt5_autotrade_account(user_id, {"risk_mode": "percent", "risk_percent": risk_percent})
+        user_modes[user_id] = None
+        sent_risk_saved = await update.message.reply_text(
+            f"✅ Risk set to <b>{risk_percent}%</b> per trade.",
+            parse_mode=ParseMode.HTML, reply_markup=main_keyboard
+        )
+        schedule_auto_delete(sent_risk_saved.chat_id, sent_risk_saved.message_id)
+        return
+
     if mode == "breakdown":
 
         if not is_verified(user_id):
@@ -11302,7 +11955,7 @@ def main():
     app.add_handler(
         MessageHandler(
             filters.Regex(
-                "^(📊 Signal|📰 News|🔗 Connect Deriv|signal|news|connect deriv)$"
+                "^(📊 Signal|📰 News|🔗 Connect Deriv|🤖 Exness Auto-Trade|signal|news|connect deriv|exness auto-trade)$"
             ),
             handle_buttons
         )
@@ -11461,6 +12114,25 @@ def main():
         name="high_impact_news_alert"
     )
 
+    # MT5 auto-trade: payment processing (picks up what the KoraPay
+    # webhook already confirmed in the database, activates the
+    # subscription, notifies the user - runs on the bot's own event
+    # loop, unlike the webhook handler itself).
+    job_queue.run_repeating(
+        process_confirmed_korapay_payments,
+        interval=20,
+        first=15,
+        name="mt5_autotrade_payment_processing"
+    )
+
+    # MT5 auto-trade: daily expiry check - clients automatically
+    # removed once their subscription expires, per explicit instruction.
+    job_queue.run_daily(
+        check_mt5_autotrade_expiry,
+        time=parse_time("00:05"),
+        name="mt5_autotrade_expiry_check"
+    )
+
     # Tick Burst auto-copy scan - DISABLED per explicit instruction
     # after it caused real account losses across multiple users and
     # was found unreliable. Function code (run_tickburst_auto_copy_
@@ -11540,6 +12212,12 @@ def main():
     print(f"Channel 2 (Inner Circle): {CHANNEL_2_ID}")
     print(f"Verify Group: {VERIFY_GROUP_ID}")
     print(f"Bot: @{BOT_USERNAME}")
+
+    # KoraPay webhook server - own thread, own event loop, deliberately
+    # decoupled from the bot's own polling loop below (see
+    # run_korapay_webhook_server's docstring for why). daemon=True so
+    # it doesn't block the process from exiting on shutdown.
+    threading.Thread(target=run_korapay_webhook_server, daemon=True).start()
 
     app.run_polling(drop_pending_updates=True)
 

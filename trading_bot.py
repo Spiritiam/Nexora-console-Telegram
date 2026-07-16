@@ -1359,6 +1359,14 @@ def get_user_utc_offset_minutes(user_id):
         )
         response = requests.get(url, headers=sb_headers(), timeout=10)
         data = response.json()
+        if not isinstance(data, list):
+            # Supabase returns an error object (not a list) if the table
+            # is missing/misconfigured - logging this explicitly rather
+            # than letting it look identical to "user genuinely has no
+            # saved offset yet", which was silently causing the setup
+            # prompt to repeat forever for every single user.
+            print(f"[TIMEZONE DB] Unexpected response (is user_timezones table set up in Supabase?): {data}")
+            return None
         if data and data[0].get("utc_offset_minutes") is not None:
             return int(data[0]["utc_offset_minutes"])
         return None
@@ -1371,11 +1379,18 @@ def save_user_utc_offset_minutes(user_id, offset_minutes):
     try:
         url = f"{SUPABASE_URL}/rest/v1/user_timezones"
         payload = {"user_id": user_id, "utc_offset_minutes": offset_minutes}
-        requests.post(
+        response = requests.post(
             url,
             headers={**sb_headers(), "Prefer": "resolution=merge-duplicates"},
             json=payload, timeout=10
         )
+        if response.status_code not in (200, 201, 204):
+            # A silent failure here (e.g. the table doesn't exist yet)
+            # previously looked identical to a successful save, which
+            # meant the timezone prompt kept re-appearing every single
+            # time since nothing was ever actually persisted.
+            print(f"[TIMEZONE DB] save failed ({response.status_code}): {response.text}")
+            return False
         return True
     except Exception as e:
         print(f"[TIMEZONE DB] save_user_utc_offset_minutes error: {e}")

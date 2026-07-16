@@ -8541,6 +8541,62 @@ def format_event_status(event, now_utc=None):
     return f"🔜 {countdown}", False
 
 
+def get_next_high_impact_event_date():
+    """
+    Scans forward past today for the next date that has at least one
+    USD/EUR/GBP/JPY high-impact event scheduled - checks the rest of
+    Forex Factory's "this week" feed first, then falls back to their
+    "next week" feed if nothing remains in the current week. Used
+    once today's high-impact calendar is fully done, so a user isn't
+    left guessing when to check back in.
+    """
+    try:
+        today = datetime.utcnow().date()
+        candidate_dates = []
+
+        for url in [
+            "https://nfs.faireconomy.media/ff_calendar_thisweek.json",
+            "https://nfs.faireconomy.media/ff_calendar_nextweek.json",
+        ]:
+            try:
+                response = requests.get(url, timeout=10)
+                data = response.json()
+            except Exception:
+                continue
+            if not data:
+                continue
+
+            for event in data:
+                if event.get("impact", "").lower() != "high":
+                    continue
+                if event.get("country", "") not in CURRENCY_PAIR_MAP:
+                    continue
+                date_field = event.get("date", "")
+                if not date_field:
+                    continue
+                try:
+                    dt_parsed = datetime.fromisoformat(date_field)
+                    if dt_parsed.tzinfo is not None:
+                        dt_utc = dt_parsed.astimezone(timezone.utc).replace(tzinfo=None)
+                    else:
+                        dt_utc = dt_parsed
+                except Exception:
+                    continue
+                if dt_utc.date() > today:
+                    candidate_dates.append(dt_utc.date())
+
+            if candidate_dates:
+                break  # found something in thisweek - no need to also hit nextweek
+
+        if not candidate_dates:
+            return None
+        return min(candidate_dates).strftime("%A, %d %B %Y")
+
+    except Exception as e:
+        print(f"[NEWS CALL] get_next_high_impact_event_date error: {e}")
+        return None
+
+
 # Keyed store of news-event batches, NOT a single shared global -
 # each batch (whether from a manual "News" tap or the proactive
 # 30-minutes-before job) gets its own list_id, so one batch being
@@ -8629,6 +8685,104 @@ REASON: [one sentence, max 20 words, plain and beginner-friendly]
         return None, None
 
 
+async def send_news_direction_analysis(bot, chat_id, event, batch_events=None):
+    """
+    Shared by both entry points into this feature: the private-DM
+    callback button (already in a 1:1 chat, so callback_data works
+    fine) AND the channel deep-link button (see start()'s newsevent_
+    branch below) - same fundamentals-first BUY/SELL call either way,
+    just two different doors into it.
+
+    By design, this bot only calls a direction BEFORE a news event
+    releases - once it's out, the trade window it's meant for is
+    already gone, so an already-released event gets no AI call at
+    all, just a plain notice. batch_events (the full list this event
+    came from, if available) lets that notice also say whether
+    anything else in the same list is still upcoming, or otherwise
+    surface the next known high-impact date so the user isn't left
+    guessing when to check back.
+    """
+    now_utc = datetime.utcnow()
+    _, is_released = format_event_status(event, now_utc)
+
+    if is_released:
+        text = (
+            f"📰 <b>{event['title']}</b> ({event['currency']})\n\n"
+            f"✅ This news has already been released — we only call "
+            f"direction <b>before</b> a high-impact event drops, not "
+            f"after it's out.\n\n"
+        )
+        has_other_upcoming = False
+        if batch_events:
+            has_other_upcoming = any(
+                not format_event_status(e, now_utc)[1] for e in batch_events
+            )
+        if has_other_upcoming:
+            text += "Tap another event above that's still upcoming."
+        else:
+            next_date = get_next_high_impact_event_date()
+            if next_date:
+                text += f"No more high-impact events left today. Next one: <b>{next_date}</b>."
+            else:
+                text += "No more high-impact events currently scheduled — check back soon."
+        await bot.send_message(chat_id=chat_id, text=text, parse_mode=ParseMode.HTML)
+        return
+
+    wait_message = await bot.send_message(
+        chat_id=chat_id,
+        text="🧠 <b>Nexora AI reading the news...</b>",
+        parse_mode=ParseMode.HTML
+    )
+
+    ai_direction, ai_reason = await generate_currency_direction(event)
+    if not ai_direction:
+        await wait_message.edit_text(
+            "⚠️ Couldn't get a clear read on this event right now - try again shortly.",
+            parse_mode=ParseMode.HTML
+        )
+        return
+
+    mapping = CURRENCY_PAIR_MAP[event["currency"]]
+    pair_key = mapping["pair_key"]
+    inverted = mapping["inverted"]
+    final_direction = "BUY" if (ai_direction == "BULLISH") != inverted else "SELL"
+    pair_config = PAIR_CONFIG[pair_key]
+    pair_display = pair_config["display"]
+
+    confidence = 65
+    technical_note = "ℹ️ No clear technical read right now — this is a fundamentals-only call."
+    try:
+        _, technical_direction, _, technical_signal_data = await build_signal_response(pair_key, user_id=None)
+        if technical_direction == final_direction and technical_signal_data:
+            confidence = 80
+            technical_note = (
+                f"✅ Technicals agree — Entry: {technical_signal_data.get('entry_price')} | "
+                f"SL: {technical_signal_data.get('stop_loss')} | "
+                f"TP: {technical_signal_data.get('take_profit')}"
+            )
+        elif technical_direction and technical_direction != final_direction:
+            confidence = 50
+            technical_note = (
+                f"⚠️ Technicals currently read {technical_direction} — "
+                f"this is a fundamentals-only call, trade with extra caution."
+            )
+    except Exception as e:
+        print(f"[NEWS CALL] Technical cross-check failed: {e}")
+
+    emoji = "🟢" if final_direction == "BUY" else "🔴"
+    response = (
+        f"📰 <b>{event['title']}</b> ({event['currency']})\n\n"
+        f"<b>Fundamental read:</b> {ai_reason}\n\n"
+        f"{emoji} <b>DIRECT CALL: {final_direction} {pair_display}</b>\n"
+        f"<b>Confidence:</b> {confidence}%\n\n"
+        f"{technical_note}\n\n"
+        f"<i>Trade safe 💼🔥</i>"
+    )
+
+    await wait_message.edit_text(response, parse_mode=ParseMode.HTML)
+    schedule_auto_delete(wait_message.chat_id, wait_message.message_id)
+
+
 async def check_upcoming_high_impact_news(context: ContextTypes.DEFAULT_TYPE):
     """
     Runs every 5 minutes. Notifies every known user AND all 3
@@ -8680,7 +8834,23 @@ async def check_upcoming_high_impact_news(context: ContextTypes.DEFAULT_TYPE):
             f"Time: {event['time_str']} GMT+1\n\n"
             f"Tap below to see the likely direction before it drops:"
         )
-        alert_markup = InlineKeyboardMarkup([[
+        # Channel copy uses a url= deep link, NOT callback_data - a
+        # callback button on a channel post either fails silently for
+        # anyone who hasn't DM'd the bot yet, or replies publicly into
+        # the channel itself for whoever taps it, neither of which is
+        # "take them privately into the bot to see their own call".
+        # Opening the deep link IS the user starting/continuing their
+        # own private DM, handled in start()'s newsevent_ branch.
+        channel_markup = InlineKeyboardMarkup([[
+            InlineKeyboardButton(
+                "🔍 Know the Direction",
+                url=f"https://t.me/{BOT_USERNAME}?start=newsevent_{list_id}_{idx}"
+            )
+        ]])
+        # Per-user DM copy stays on callback_data - it's already inside
+        # a private 1:1 chat, so there's no "channel spam" or "blocked
+        # DM" risk to route around here.
+        dm_markup = InlineKeyboardMarkup([[
             InlineKeyboardButton("🔍 Know the Direction", callback_data=f"newsevent_{list_id}_{idx}")
         ]])
 
@@ -8703,7 +8873,7 @@ async def check_upcoming_high_impact_news(context: ContextTypes.DEFAULT_TYPE):
             try:
                 await bot.send_photo(
                     chat_id=channel_id, photo=image_url, caption=alert_text,
-                    parse_mode=ParseMode.HTML, reply_markup=alert_markup
+                    parse_mode=ParseMode.HTML, reply_markup=channel_markup
                 )
             except Exception as e:
                 print(f"[NEWS ALERT] Channel post failed for {channel_id}: {e}")
@@ -8714,7 +8884,7 @@ async def check_upcoming_high_impact_news(context: ContextTypes.DEFAULT_TYPE):
             try:
                 await bot.send_photo(
                     chat_id=int(uid), photo=image_url, caption=alert_text,
-                    parse_mode=ParseMode.HTML, reply_markup=alert_markup
+                    parse_mode=ParseMode.HTML, reply_markup=dm_markup
                 )
                 sent += 1
             except Exception:
@@ -9583,6 +9753,51 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await send_tier_selection(context.bot, user_id, pending_trades[user_id])
         return
 
+    # Arrived here via the channel's "Know the Direction" news-alert
+    # deep-link button (?start=newsevent_<list_id>_<idx>). Same fix as
+    # chantrade_ above and for the same reason: a callback_data button
+    # on a CHANNEL post either fails silently for anyone who hasn't
+    # DM'd the bot yet, or (worse) replies publicly into the channel
+    # itself instead of privately to the tapper - a url= deep link
+    # opens a private DM instead, which is what "tap to see the
+    # direction" is actually supposed to do. The private per-user copy
+    # of this same alert still uses callback_data, since that copy is
+    # already inside a private chat.
+    if context.args and context.args[0].startswith("newsevent_"):
+        remainder = context.args[0].replace("newsevent_", "")
+        try:
+            list_id, idx_str = remainder.rsplit("_", 1)
+            idx = int(idx_str)
+            event = NEWS_EVENTS_STORE[list_id][idx]
+        except (ValueError, IndexError, KeyError):
+            sent_expired_news = await update.message.reply_text(
+                "⚠️ <b>This news list has expired.</b>\n\n"
+                "Tap 📰 News below for a fresh list.",
+                parse_mode=ParseMode.HTML,
+                reply_markup=main_keyboard
+            )
+            schedule_auto_delete(sent_expired_news.chat_id, sent_expired_news.message_id)
+            return
+
+        if not is_verified(user_id):
+            count = increment_trial(user_id)
+            if count > FREE_TRIAL_LIMIT:
+                user_modes[user_id] = "awaiting_email"
+                await send_verification_gate(update)
+                return
+
+        await send_news_direction_analysis(
+            context.bot, update.effective_chat.id, event,
+            batch_events=NEWS_EVENTS_STORE.get(list_id)
+        )
+
+        if not is_verified(user_id):
+            remaining = trial_remaining(user_id)
+            if remaining <= 0:
+                user_modes[user_id] = "awaiting_email"
+                await send_verification_gate(update)
+        return
+
     # Channel-follow gate - genuine first-time users ONLY, per explicit
     # instruction that returning users should never see this. Sits
     # here, after the chantrade_ branch above (so someone already
@@ -10206,68 +10421,10 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             )
             return
 
-        wait_message = await query.message.reply_text(
-            "🧠 <b>Nexora AI reading the news...</b>",
-            parse_mode=ParseMode.HTML
+        await send_news_direction_analysis(
+            context.bot, query.message.chat_id, event,
+            batch_events=NEWS_EVENTS_STORE.get(list_id)
         )
-
-        ai_direction, ai_reason = await generate_currency_direction(event)
-        if not ai_direction:
-            await wait_message.edit_text(
-                "⚠️ Couldn't get a clear read on this event right now - try again shortly.",
-                parse_mode=ParseMode.HTML
-            )
-            return
-
-        mapping = CURRENCY_PAIR_MAP[event["currency"]]
-        pair_key = mapping["pair_key"]
-        inverted = mapping["inverted"]
-        final_direction = "BUY" if (ai_direction == "BULLISH") != inverted else "SELL"
-        pair_config = PAIR_CONFIG[pair_key]
-        pair_display = pair_config["display"]
-
-        # Cross-check against the pair's REAL existing technical
-        # strategy vote - fundamentals still drive the call either
-        # way (per explicit instruction), but this is surfaced
-        # transparently rather than silently blended in.
-        # Confidence % tied to real technical agreement - not an AI-
-        # invented number, per explicit instruction, matching how
-        # every other confidence figure in this bot is grounded in
-        # something concrete (agreeing strategy votes) rather than an
-        # unverifiable guess. 65% fundamentals-only (no technical read
-        # available), 80% if technicals agree, 50% if they disagree.
-        confidence = 65
-        technical_note = "ℹ️ No clear technical read right now — this is a fundamentals-only call."
-        try:
-            _, technical_direction, _, technical_signal_data = await build_signal_response(pair_key, user_id=None)
-            if technical_direction == final_direction and technical_signal_data:
-                confidence = 80
-                technical_note = (
-                    f"✅ Technicals agree — Entry: {technical_signal_data.get('entry_price')} | "
-                    f"SL: {technical_signal_data.get('stop_loss')} | "
-                    f"TP: {technical_signal_data.get('take_profit')}"
-                )
-            elif technical_direction and technical_direction != final_direction:
-                confidence = 50
-                technical_note = (
-                    f"⚠️ Technicals currently read {technical_direction} — "
-                    f"this is a fundamentals-only call, trade with extra caution."
-                )
-        except Exception as e:
-            print(f"[NEWS CALL] Technical cross-check failed: {e}")
-
-        emoji = "🟢" if final_direction == "BUY" else "🔴"
-        response = (
-            f"📰 <b>{event['title']}</b> ({event['currency']})\n\n"
-            f"<b>Fundamental read:</b> {ai_reason}\n\n"
-            f"{emoji} <b>DIRECT CALL: {final_direction} {pair_display}</b>\n"
-            f"<b>Confidence:</b> {confidence}%\n\n"
-            f"{technical_note}\n\n"
-            f"<i>Trade safe 💼🔥</i>"
-        )
-
-        await wait_message.edit_text(response, parse_mode=ParseMode.HTML)
-        schedule_auto_delete(wait_message.chat_id, wait_message.message_id)
 
         if not is_verified(user_id):
             remaining = trial_remaining(user_id)

@@ -1429,12 +1429,18 @@ def format_local_time(event_dt_utc_str, offset_minutes):
     """
     event_dt_utc_str is the "%Y-%m-%dT%H:%M" TRUE UTC string already
     produced by get_todays_high_impact_events - converts it to this
-    specific viewer's local HH:MM using their own saved offset.
+    specific viewer's local time using their own saved offset,
+    formatted 12-hour with AM/PM (e.g. "7:00 AM") rather than 24-hour,
+    since this is shown to individual traders as their own clock time.
     """
     try:
         dt_utc = datetime.strptime(event_dt_utc_str, "%Y-%m-%dT%H:%M")
         local_dt = dt_utc + timedelta(minutes=offset_minutes)
-        return f"{local_dt.hour:02d}:{local_dt.minute:02d}"
+        hour_12 = local_dt.hour % 12
+        if hour_12 == 0:
+            hour_12 = 12
+        am_pm = "AM" if local_dt.hour < 12 else "PM"
+        return f"{hour_12}:{local_dt.minute:02d} {am_pm}"
     except Exception:
         return ""
 
@@ -8560,9 +8566,16 @@ def get_todays_high_impact_events():
         today = datetime.utcnow()
         today_str = today.strftime("%Y-%m-%d")
 
-        url = "https://nfs.faireconomy.media/ff_calendar_thisweek.json"
-        response = requests.get(url, timeout=10)
-        data = response.json()
+        # Uses the SAME shared 1-hour cache as get_cached_calendar_data
+        # (originally built for get_relevant_calendar_events) rather
+        # than a fresh raw request every call - Forex Factory hard
+        # rate-limits this feed to just 2 requests per 5 minutes
+        # across ALL formats combined. This function used to hit the
+        # feed directly on every single call (background job every 5
+        # min + every manual News tap + get_next_high_impact_event_date
+        # below), which blew through that cap easily and caused silent
+        # empty-result failures - confirmed real, not hypothetical.
+        data = get_cached_calendar_data()
         if not data:
             return []
 
@@ -8658,19 +8671,11 @@ def get_next_high_impact_event_date():
         today = datetime.utcnow().date()
         candidate_dates = []
 
-        for url in [
-            "https://nfs.faireconomy.media/ff_calendar_thisweek.json",
-            "https://nfs.faireconomy.media/ff_calendar_nextweek.json",
-        ]:
-            try:
-                response = requests.get(url, timeout=10)
-                data = response.json()
-            except Exception:
-                continue
-            if not data:
+        for feed_data in [get_cached_calendar_data(), get_cached_nextweek_calendar_data()]:
+            if not feed_data:
                 continue
 
-            for event in data:
+            for event in feed_data:
                 if event.get("impact", "").lower() != "high":
                     continue
                 if event.get("country", "") not in CURRENCY_PAIR_MAP:
@@ -9061,6 +9066,30 @@ def get_cached_calendar_data():
     except Exception as e:
         print(f"[FUNDAMENTAL] Calendar fetch error: {e}")
         return calendar_data_cache["data"] or []
+
+# Sibling cache for the "next week" feed - same rate-limit reasoning
+# as above, but a much longer TTL since next week's calendar barely
+# changes intraday, unlike "actual" values on today's events.
+NEXTWEEK_CALENDAR_CACHE_SECONDS = 21600  # 6 hours
+nextweek_calendar_data_cache = {"data": None, "timestamp": 0}
+
+def get_cached_nextweek_calendar_data():
+    now = time.time()
+    if (
+        nextweek_calendar_data_cache["data"] is not None
+        and now - nextweek_calendar_data_cache["timestamp"] < NEXTWEEK_CALENDAR_CACHE_SECONDS
+    ):
+        return nextweek_calendar_data_cache["data"]
+    try:
+        url = "https://nfs.faireconomy.media/ff_calendar_nextweek.json"
+        response = requests.get(url, timeout=10)
+        data = response.json()
+        nextweek_calendar_data_cache["data"] = data
+        nextweek_calendar_data_cache["timestamp"] = now
+        return data
+    except Exception as e:
+        print(f"[FUNDAMENTAL] Next-week calendar fetch error: {e}")
+        return nextweek_calendar_data_cache["data"] or []
 
 def get_relevant_calendar_events(pair_name, limit=2):
     """

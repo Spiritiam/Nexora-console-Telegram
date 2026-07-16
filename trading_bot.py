@@ -8361,7 +8361,7 @@ def fetch_economic_calendar():
             impact = event.get("impact", "").lower()
             if impact != "high":
                 continue
-            currency = event.get("currency", "")
+            currency = event.get("country", "")
             if currency not in ["USD", "EUR", "GBP", "JPY"]:
                 continue
             title = event.get("title", "")
@@ -8465,7 +8465,7 @@ def get_todays_high_impact_events():
                 continue
             if event.get("impact", "").lower() != "high":
                 continue
-            currency = event.get("currency", "")
+            currency = event.get("country", "")
             if currency not in CURRENCY_PAIR_MAP:
                 continue
 
@@ -8735,7 +8735,7 @@ def get_relevant_calendar_events(pair_name, limit=2):
                 continue
             if event.get("impact", "").lower() != "high":
                 continue
-            currency = event.get("currency", "")
+            currency = event.get("country", "")
             if currency not in relevant_currencies:
                 continue
             title = event.get("title", "")

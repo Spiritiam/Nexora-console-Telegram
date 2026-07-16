@@ -8675,21 +8675,23 @@ def format_event_status(event, now_utc=None):
 
 def get_next_high_impact_event_date():
     """
-    Scans forward past today for the next date that has at least one
-    USD/EUR/GBP/JPY high-impact event scheduled - checks the rest of
-    Forex Factory's "this week" feed first, then falls back to their
-    "next week" feed if nothing remains in the current week. Used
-    once today's high-impact calendar is fully done, so a user isn't
-    left guessing when to check back in.
+    Scans forward past today, within Forex Factory's "this week" feed
+    (the only endpoint of theirs confirmed to actually exist and work -
+    there is no working "next week" JSON feed, despite an earlier
+    attempt to use one), for the next date with at least one
+    USD/EUR/GBP/JPY high-impact event. Used once today's high-impact
+    calendar is fully done, so a user isn't left guessing when to
+    check back in. Returns None if nothing remains in the current
+    week - the caller is expected to phrase that honestly (e.g. "check
+    back next week") rather than implying a specific date was checked
+    and confirmed empty beyond what this can actually see.
     """
     try:
         today = datetime.utcnow().date()
         candidate_dates = []
 
-        for feed_data in [get_cached_calendar_data(), get_cached_nextweek_calendar_data()]:
-            if not feed_data:
-                continue
-
+        feed_data = get_cached_calendar_data()
+        if feed_data:
             for event in feed_data:
                 if event.get("impact", "").lower() != "high":
                     continue
@@ -8708,9 +8710,6 @@ def get_next_high_impact_event_date():
                     continue
                 if dt_utc.date() > today:
                     candidate_dates.append(dt_utc.date())
-
-            if candidate_dates:
-                break  # found something in thisweek - no need to also hit nextweek
 
         if not candidate_dates:
             return None
@@ -8848,7 +8847,7 @@ async def send_news_direction_analysis(bot, chat_id, event, batch_events=None):
             if next_date:
                 text += f"No more high-impact events left today. Next one: <b>{next_date}</b>."
             else:
-                text += "No more high-impact events currently scheduled — check back soon."
+                text += "No more high-impact events left in this week's calendar — check back next week."
         await bot.send_message(chat_id=chat_id, text=text, parse_mode=ParseMode.HTML)
         return
 
@@ -9081,30 +9080,6 @@ def get_cached_calendar_data():
     except Exception as e:
         print(f"[FUNDAMENTAL] Calendar fetch error: {e}")
         return calendar_data_cache["data"] or []
-
-# Sibling cache for the "next week" feed - same rate-limit reasoning
-# as above, but a much longer TTL since next week's calendar barely
-# changes intraday, unlike "actual" values on today's events.
-NEXTWEEK_CALENDAR_CACHE_SECONDS = 21600  # 6 hours
-nextweek_calendar_data_cache = {"data": None, "timestamp": 0}
-
-def get_cached_nextweek_calendar_data():
-    now = time.time()
-    if (
-        nextweek_calendar_data_cache["data"] is not None
-        and now - nextweek_calendar_data_cache["timestamp"] < NEXTWEEK_CALENDAR_CACHE_SECONDS
-    ):
-        return nextweek_calendar_data_cache["data"]
-    try:
-        url = "https://nfs.faireconomy.media/ff_calendar_nextweek.json"
-        response = requests.get(url, timeout=10)
-        data = response.json()
-        nextweek_calendar_data_cache["data"] = data
-        nextweek_calendar_data_cache["timestamp"] = now
-        return data
-    except Exception as e:
-        print(f"[FUNDAMENTAL] Next-week calendar fetch error: {e}")
-        return nextweek_calendar_data_cache["data"] or []
 
 def get_relevant_calendar_events(pair_name, limit=2):
     """

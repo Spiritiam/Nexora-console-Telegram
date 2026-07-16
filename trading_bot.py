@@ -27,6 +27,7 @@ from pathlib import Path
 from telegram import (
     Update,
     ReplyKeyboardMarkup,
+    KeyboardButton,
     InlineKeyboardButton,
     InlineKeyboardMarkup,
     MenuButtonCommands,
@@ -1333,6 +1334,109 @@ def is_verified(user_id):
     except Exception as e:
         print(f"[DB] is_verified error: {e}")
         return False
+
+# ============================================
+# PER-USER TIMEZONE (for auto-localized news/event times)
+# Telegram's Bot API has no way to read a user's device timezone
+# directly, so this is captured once via an optional location share
+# (see trigger_timezone_setup / the awaiting_timezone_location mode)
+# and stored as a UTC offset in minutes - covers half-hour zones like
+# India (+5:30) too, which a plain integer-hours field wouldn't.
+# Users who skip or never set one fall back to WAT (UTC+1), which was
+# this bot's original fixed assumption everywhere - so nothing breaks
+# for anyone who never sets a timezone at all.
+# ============================================
+
+DEFAULT_UTC_OFFSET_MINUTES = 60  # WAT - the bot's original fixed assumption
+
+
+def get_user_utc_offset_minutes(user_id):
+    """Returns this user's saved UTC offset in minutes, or None if never set."""
+    try:
+        url = (
+            f"{SUPABASE_URL}/rest/v1/user_timezones"
+            f"?user_id=eq.{user_id}&select=utc_offset_minutes"
+        )
+        response = requests.get(url, headers=sb_headers(), timeout=10)
+        data = response.json()
+        if data and data[0].get("utc_offset_minutes") is not None:
+            return int(data[0]["utc_offset_minutes"])
+        return None
+    except Exception as e:
+        print(f"[TIMEZONE DB] get_user_utc_offset_minutes error: {e}")
+        return None
+
+
+def save_user_utc_offset_minutes(user_id, offset_minutes):
+    try:
+        url = f"{SUPABASE_URL}/rest/v1/user_timezones"
+        payload = {"user_id": user_id, "utc_offset_minutes": offset_minutes}
+        requests.post(
+            url,
+            headers={**sb_headers(), "Prefer": "resolution=merge-duplicates"},
+            json=payload, timeout=10
+        )
+        return True
+    except Exception as e:
+        print(f"[TIMEZONE DB] save_user_utc_offset_minutes error: {e}")
+        return False
+
+
+def get_all_user_utc_offsets():
+    """
+    Batch fetch of every saved user_id -> utc_offset_minutes, for the
+    news-alert broadcast loop - avoids one DB round-trip per recipient
+    when notifying potentially many users at once.
+    """
+    try:
+        url = f"{SUPABASE_URL}/rest/v1/user_timezones?select=user_id,utc_offset_minutes"
+        response = requests.get(url, headers=sb_headers(), timeout=10)
+        data = response.json()
+        return {row["user_id"]: int(row["utc_offset_minutes"]) for row in data if row.get("utc_offset_minutes") is not None}
+    except Exception as e:
+        print(f"[TIMEZONE DB] get_all_user_utc_offsets error: {e}")
+        return {}
+
+
+def lookup_utc_offset_from_coordinates(latitude, longitude):
+    """
+    Converts a shared location into a UTC offset in minutes, via a
+    free no-key coordinate-to-timezone lookup. Returns None on any
+    failure so the caller can fall back to the default gracefully.
+    """
+    try:
+        url = f"https://timeapi.io/api/TimeZone/coordinate?latitude={latitude}&longitude={longitude}"
+        response = requests.get(url, timeout=10)
+        data = response.json()
+        utc_offset_seconds = data.get("currentUtcOffset", {}).get("seconds")
+        if utc_offset_seconds is None:
+            return None
+        return int(utc_offset_seconds // 60)
+    except Exception as e:
+        print(f"[TIMEZONE LOOKUP] lookup_utc_offset_from_coordinates error: {e}")
+        return None
+
+
+def format_gmt_label(offset_minutes):
+    """e.g. 60 -> 'GMT+1', -240 -> 'GMT-4', 330 -> 'GMT+5:30'"""
+    sign = "+" if offset_minutes >= 0 else "-"
+    abs_minutes = abs(offset_minutes)
+    hours, minutes = divmod(abs_minutes, 60)
+    return f"GMT{sign}{hours}:{minutes:02d}" if minutes else f"GMT{sign}{hours}"
+
+
+def format_local_time(event_dt_utc_str, offset_minutes):
+    """
+    event_dt_utc_str is the "%Y-%m-%dT%H:%M" TRUE UTC string already
+    produced by get_todays_high_impact_events - converts it to this
+    specific viewer's local HH:MM using their own saved offset.
+    """
+    try:
+        dt_utc = datetime.strptime(event_dt_utc_str, "%Y-%m-%dT%H:%M")
+        local_dt = dt_utc + timedelta(minutes=offset_minutes)
+        return f"{local_dt.hour:02d}:{local_dt.minute:02d}"
+    except Exception:
+        return ""
 
 def get_verified_user_email(user_id):
     """Returns this user's own verified email, or None."""
@@ -8756,9 +8860,9 @@ async def send_news_direction_analysis(bot, chat_id, event, batch_events=None):
         if technical_direction == final_direction and technical_signal_data:
             confidence = 80
             technical_note = (
-                f"✅ Technicals agree — Entry: {technical_signal_data.get('entry_price')} | "
-                f"SL: {technical_signal_data.get('stop_loss')} | "
-                f"TP: {technical_signal_data.get('take_profit')}"
+                "✅ Technicals agree with this direction too. "
+                "News moves are sharp and fast — trade safe, use proper "
+                "risk management, and expect a spike."
             )
         elif technical_direction and technical_direction != final_direction:
             confidence = 50
@@ -8828,10 +8932,16 @@ async def check_upcoming_high_impact_news(context: ContextTypes.DEFAULT_TYPE):
         NOTIFIED_EVENTS_TODAY.add(event_key)
         flag = {"USD": "🇺🇸", "EUR": "🇪🇺", "GBP": "🇬🇧", "JPY": "🇯🇵"}.get(event["currency"], "🌍")
 
-        alert_text = (
+        # A channel post is one single message seen by everyone, so it
+        # genuinely can't show each viewer's own local time - showing
+        # WAT (this bot's home base) plus UTC gives every reader a
+        # fixed, unambiguous anchor to convert from either way.
+        wat_time = format_local_time(event.get("event_dt_utc", ""), DEFAULT_UTC_OFFSET_MINUTES)
+        utc_time = format_local_time(event.get("event_dt_utc", ""), 0)
+        channel_alert_text = (
             f"⏰ <b>High-impact news in ~30 minutes</b>\n\n"
             f"{flag} <b>{event['title']}</b> ({event['currency']})\n"
-            f"Time: {event['time_str']} GMT+1\n\n"
+            f"Time: {wat_time} GMT+1 ({utc_time} UTC)\n\n"
             f"Tap below to see the likely direction before it drops:"
         )
         # Channel copy uses a url= deep link, NOT callback_data - a
@@ -8872,18 +8982,32 @@ async def check_upcoming_high_impact_news(context: ContextTypes.DEFAULT_TYPE):
         for channel_id in [CHANNEL_1_ID, CHANNEL_2_ID, CHANNEL_3_ID]:
             try:
                 await bot.send_photo(
-                    chat_id=channel_id, photo=image_url, caption=alert_text,
+                    chat_id=channel_id, photo=image_url, caption=channel_alert_text,
                     parse_mode=ParseMode.HTML, reply_markup=channel_markup
                 )
             except Exception as e:
                 print(f"[NEWS ALERT] Channel post failed for {channel_id}: {e}")
 
+        # Private DMs DO get personalized per-recipient - each user's
+        # own saved offset (falling back to WAT for anyone who never
+        # set one) is looked up once here in bulk, rather than one DB
+        # round-trip per recipient inside the send loop below.
+        user_offsets = get_all_user_utc_offsets()
         user_ids = await get_all_known_user_ids()
         sent = failed = 0
         for uid in user_ids:
             try:
+                offset_minutes = user_offsets.get(uid, DEFAULT_UTC_OFFSET_MINUTES)
+                local_time = format_local_time(event.get("event_dt_utc", ""), offset_minutes)
+                tz_label = format_gmt_label(offset_minutes)
+                personal_alert_text = (
+                    f"⏰ <b>High-impact news in ~30 minutes</b>\n\n"
+                    f"{flag} <b>{event['title']}</b> ({event['currency']})\n"
+                    f"Time: {local_time} {tz_label}\n\n"
+                    f"Tap below to see the likely direction before it drops:"
+                )
                 await bot.send_photo(
-                    chat_id=int(uid), photo=image_url, caption=alert_text,
+                    chat_id=int(uid), photo=image_url, caption=personal_alert_text,
                     parse_mode=ParseMode.HTML, reply_markup=dm_markup
                 )
                 sent += 1
@@ -9986,6 +10110,23 @@ async def handle_buttons(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     if "news" in text:
+        if get_user_utc_offset_minutes(user_id) is None:
+            user_modes[user_id] = "awaiting_timezone_location"
+            sent_tz_prompt = await update.message.reply_text(
+                "🌍 <b>Quick one-time setup:</b> share your location so news "
+                "and event times always show in <b>your own local time</b>, "
+                "wherever you are.\n\n"
+                "Or tap <b>Skip</b> to use West Africa Time (GMT+1) instead.",
+                parse_mode=ParseMode.HTML,
+                reply_markup=ReplyKeyboardMarkup(
+                    [[KeyboardButton("📍 Share My Location", request_location=True)], ["Skip"]],
+                    resize_keyboard=True,
+                    one_time_keyboard=True
+                )
+            )
+            schedule_auto_delete(sent_tz_prompt.chat_id, sent_tz_prompt.message_id)
+            return
+
         sent_news_menu = await update.message.reply_text(
             "📰 <b>News</b>\n\n"
             "What would you like?",
@@ -10354,6 +10495,10 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             list_id = store_news_events_batch(events)
             today_display = datetime.utcnow().strftime("%A, %d %B %Y")
             now_utc = datetime.utcnow()
+            user_offset = get_user_utc_offset_minutes(user_id)
+            if user_offset is None:
+                user_offset = DEFAULT_UTC_OFFSET_MINUTES
+            tz_label = format_gmt_label(user_offset)
 
             released_count = 0
             buttons = []
@@ -10362,9 +10507,10 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 status_label, is_released = format_event_status(event, now_utc)
                 if is_released:
                     released_count += 1
+                local_time = format_local_time(event.get("event_dt_utc", ""), user_offset)
                 label = f"{flag} {event['title'][:32]}"
-                if event["time_str"]:
-                    label += f" ({event['time_str']})"
+                if local_time:
+                    label += f" ({local_time})"
                 if status_label:
                     label += f" — {status_label}"
                 buttons.append([InlineKeyboardButton(label, callback_data=f"newsevent_{list_id}_{i}")])
@@ -10377,7 +10523,8 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
             await query.message.edit_text(
                 f"📅 <b>High-Impact News — {today_display}</b>\n"
-                f"{summary_line}\n\n"
+                f"{summary_line}\n"
+                f"<i>Times shown in your local time ({tz_label})</i>\n\n"
                 f"Tap any event below for a direct BUY/SELL call, "
                 f"fundamentals-first:",
                 parse_mode=ParseMode.HTML,
@@ -11118,6 +11265,54 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
 # HANDLE TEXT
 # ============================================
 
+async def handle_location(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """
+    Only acts when a location arrives WHILE a user is in the
+    awaiting_timezone_location mode (triggered by their first "News"
+    tap) - an unsolicited location share otherwise (e.g. someone just
+    fooling around with the attachment menu) is ignored entirely, per
+    explicit instruction that this is a one-time optional setup step,
+    not a general location-tracking feature.
+    """
+    if update.message is None or update.message.from_user is None or update.message.location is None:
+        return
+
+    user_id = str(update.message.from_user.id)
+    if user_modes.get(user_id) != "awaiting_timezone_location":
+        return
+
+    loc = update.message.location
+    offset_minutes = lookup_utc_offset_from_coordinates(loc.latitude, loc.longitude)
+
+    if offset_minutes is None:
+        offset_minutes = DEFAULT_UTC_OFFSET_MINUTES
+        note = (
+            "⚠️ Couldn't detect your timezone automatically - defaulting "
+            "to West Africa Time (GMT+1). You can retry anytime by "
+            "tapping 📰 News again."
+        )
+    else:
+        note = f"✅ Got it — your news times will now show in <b>{format_gmt_label(offset_minutes)}</b>."
+
+    save_user_utc_offset_minutes(user_id, offset_minutes)
+    user_modes[user_id] = None
+
+    sent_confirm = await update.message.reply_text(
+        note, parse_mode=ParseMode.HTML, reply_markup=main_keyboard
+    )
+    schedule_auto_delete(sent_confirm.chat_id, sent_confirm.message_id)
+
+    sent_news_menu = await update.message.reply_text(
+        "📰 <b>News</b>\n\nWhat would you like?",
+        parse_mode=ParseMode.HTML,
+        reply_markup=InlineKeyboardMarkup([
+            [InlineKeyboardButton("📅 News Calendar", callback_data="newsmenu_calendar")],
+            [InlineKeyboardButton("📚 News Breakdown", callback_data="newsmenu_breakdown")],
+        ])
+    )
+    schedule_auto_delete(sent_news_menu.chat_id, sent_news_menu.message_id)
+
+
 async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     if update.message is None or update.message.from_user is None or update.message.text is None:
@@ -11132,6 +11327,30 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = str(update.message.from_user.id)
     username = update.message.from_user.username or "Trader"
     message = update.message.text.strip()
+
+    if user_modes.get(user_id) == "awaiting_timezone_location":
+        # Any text here (in practice, the "Skip" button) means: use
+        # the default WAT offset and stop asking - saved explicitly so
+        # this prompt never repeats for this user again.
+        save_user_utc_offset_minutes(user_id, DEFAULT_UTC_OFFSET_MINUTES)
+        user_modes[user_id] = None
+        sent_skip = await update.message.reply_text(
+            "✅ Using West Africa Time (GMT+1) for your news times.",
+            parse_mode=ParseMode.HTML,
+            reply_markup=main_keyboard
+        )
+        schedule_auto_delete(sent_skip.chat_id, sent_skip.message_id)
+
+        sent_news_menu = await update.message.reply_text(
+            "📰 <b>News</b>\n\nWhat would you like?",
+            parse_mode=ParseMode.HTML,
+            reply_markup=InlineKeyboardMarkup([
+                [InlineKeyboardButton("📅 News Calendar", callback_data="newsmenu_calendar")],
+                [InlineKeyboardButton("📚 News Breakdown", callback_data="newsmenu_breakdown")],
+            ])
+        )
+        schedule_auto_delete(sent_news_menu.chat_id, sent_news_menu.message_id)
+        return
 
     if user_modes.get(user_id) == "awaiting_email":
 
@@ -12924,6 +13143,13 @@ def main():
                 "^(📊 Signal|📰 News|🔗 Connect Deriv|🤖 Exness Auto-Trade|signal|news|connect deriv|exness auto-trade)$"
             ),
             handle_buttons
+        )
+    )
+
+    app.add_handler(
+        MessageHandler(
+            filters.LOCATION,
+            handle_location
         )
     )
 

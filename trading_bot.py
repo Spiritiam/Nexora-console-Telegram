@@ -21,7 +21,7 @@ from metaapi_cloud_sdk import MetaApi
 from cryptography.fernet import Fernet
 from aiohttp import web
 
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 from telegram import (
@@ -8370,12 +8370,16 @@ def fetch_economic_calendar():
 
             if time_utc and "T" in time_utc:
                 try:
-                    dt = datetime.strptime(
-                        time_utc[:16], "%Y-%m-%dT%H:%M"
-                    )
-                    lagos_hour = (dt.hour + 1) % 24
-                    time_str = f"{lagos_hour:02d}:{dt.minute:02d} GMT+1"
-                except:
+                    # Same fix as get_todays_high_impact_events: the feed's
+                    # date field embeds a US-Eastern offset, not UTC.
+                    dt_parsed = datetime.fromisoformat(time_utc)
+                    if dt_parsed.tzinfo is not None:
+                        dt_utc = dt_parsed.astimezone(timezone.utc).replace(tzinfo=None)
+                    else:
+                        dt_utc = dt_parsed
+                    lagos_dt = dt_utc + timedelta(hours=1)  # WAT = UTC+1 year-round, no DST
+                    time_str = f"{lagos_dt.hour:02d}:{lagos_dt.minute:02d} GMT+1"
+                except Exception:
                     time_str = ""
             else:
                 time_str = ""
@@ -8471,11 +8475,22 @@ def get_todays_high_impact_events():
 
             time_utc = event.get("date", "")
             time_str = ""
+            event_dt_utc = ""
             if time_utc and "T" in time_utc:
                 try:
-                    dt = datetime.strptime(time_utc[:16], "%Y-%m-%dT%H:%M")
-                    lagos_hour = (dt.hour + 1) % 24
-                    time_str = f"{lagos_hour:02d}:{dt.minute:02d}"
+                    # The feed's date field embeds its own offset (e.g.
+                    # "...-04:00" for US Eastern) - it is NOT already UTC.
+                    # fromisoformat respects that embedded offset, unlike
+                    # the previous strptime-on-truncated-string approach
+                    # which silently treated the raw Eastern hour as UTC.
+                    dt_parsed = datetime.fromisoformat(time_utc)
+                    if dt_parsed.tzinfo is not None:
+                        dt_utc = dt_parsed.astimezone(timezone.utc).replace(tzinfo=None)
+                    else:
+                        dt_utc = dt_parsed  # no offset present - assume already UTC
+                    event_dt_utc = dt_utc.strftime("%Y-%m-%dT%H:%M")
+                    lagos_dt = dt_utc + timedelta(hours=1)  # WAT = UTC+1 year-round, no DST
+                    time_str = f"{lagos_dt.hour:02d}:{lagos_dt.minute:02d}"
                 except Exception:
                     time_str = ""
 
@@ -8486,7 +8501,7 @@ def get_todays_high_impact_events():
                 "forecast": event.get("forecast", ""),
                 "previous": event.get("previous", ""),
                 "actual": event.get("actual", ""),
-                "event_dt_utc": time_utc,  # raw ISO string, kept for the 30-min-before notification check
+                "event_dt_utc": event_dt_utc,  # TRUE UTC timestamp now, for the 30-min-before notification check
                 "event_key": f"{today_str}_{currency}_{event.get('title', '')}",
             })
 
@@ -8497,16 +8512,59 @@ def get_todays_high_impact_events():
         return []
 
 
-# Single SHARED list of today's high-impact events, not per-user -
-# per explicit instruction, since the events themselves are the same
-# for everyone (today's real calendar, not personalized). Used both
-# by the manual "News Calendar" tap AND the proactive 30-minutes-
-# before notification (see check_upcoming_high_impact_news below), so
-# a "Know the Direction" button works correctly no matter who taps it
-# - a per-user cache wouldn't work for a broadcast recipient who never
-# tapped anything themselves. Rebuilt fresh each time either path
-# runs - not meant to persist across restarts.
-GLOBAL_NEWS_EVENTS = []
+def format_event_status(event, now_utc=None):
+    """
+    Returns (status_label, is_released) for a single event - "✅
+    Released — Act: X" if its time has already passed (showing the
+    real actual figure if the feed has posted one yet), or "🔜 in Xh
+    Ym" / "🔜 in Ym" counting down to release if it's still ahead.
+    Used by the News Calendar list so closed and still-open events
+    are visually distinct.
+    """
+    now_utc = now_utc or datetime.utcnow()
+    event_dt_str = event.get("event_dt_utc", "")
+    if not event_dt_str:
+        return "", False
+    try:
+        event_dt = datetime.strptime(event_dt_str, "%Y-%m-%dT%H:%M")
+    except Exception:
+        return "", False
+
+    if event_dt <= now_utc:
+        actual = event.get("actual", "")
+        label = f"✅ Released — Act: {actual}" if actual else "✅ Released"
+        return label, True
+
+    total_minutes = int((event_dt - now_utc).total_seconds() // 60)
+    hours, minutes = divmod(max(total_minutes, 0), 60)
+    countdown = f"in {hours}h {minutes}m" if hours > 0 else f"in {minutes}m"
+    return f"🔜 {countdown}", False
+
+
+# Keyed store of news-event batches, NOT a single shared global -
+# each batch (whether from a manual "News" tap or the proactive
+# 30-minutes-before job) gets its own list_id, so one batch being
+# refreshed can never invalidate the button indices of a DIFFERENT
+# batch a user is still looking at. The old approach used one single
+# GLOBAL_NEWS_EVENTS list for everything - since check_upcoming_
+# high_impact_news silently overwrites it every 5 minutes regardless
+# of whether anyone's mid-tap on an older batch, that produced a real
+# bug: a user's own "News" button could go stale seconds after being
+# shown, well before the event itself was actually gone. Not meant to
+# persist across restarts - old batches are trimmed as new ones come in.
+NEWS_EVENTS_STORE = {}
+NEWS_EVENTS_STORE_MAX_BATCHES = 50
+
+
+def store_news_events_batch(events):
+    """Stores a batch of events under a fresh list_id and returns that id."""
+    list_id = str(int(time.time() * 1000))
+    NEWS_EVENTS_STORE[list_id] = events
+    while len(NEWS_EVENTS_STORE) > NEWS_EVENTS_STORE_MAX_BATCHES:
+        oldest_key = next(iter(NEWS_EVENTS_STORE))
+        NEWS_EVENTS_STORE.pop(oldest_key, None)
+    return list_id
+
 
 # Tracks which events have already triggered their 30-minutes-before
 # notification today, so the every-5-minutes check job doesn't send
@@ -8588,11 +8646,10 @@ async def check_upcoming_high_impact_news(context: ContextTypes.DEFAULT_TYPE):
     new one - sending to potentially many users needs that same
     ~20/sec pacing to stay safely under Telegram's rate limits.
     """
-    global GLOBAL_NEWS_EVENTS
     events = get_todays_high_impact_events()
-    GLOBAL_NEWS_EVENTS = events
     if not events:
         return
+    list_id = store_news_events_batch(events)
 
     now = datetime.utcnow()
     bot = context.bot
@@ -8624,7 +8681,7 @@ async def check_upcoming_high_impact_news(context: ContextTypes.DEFAULT_TYPE):
             f"Tap below to see the likely direction before it drops:"
         )
         alert_markup = InlineKeyboardMarkup([[
-            InlineKeyboardButton("🔍 Know the Direction", callback_data=f"newsevent_{idx}")
+            InlineKeyboardButton("🔍 Know the Direction", callback_data=f"newsevent_{list_id}_{idx}")
         ]])
 
         # AI-generated illustration, per explicit instruction - same
@@ -10063,30 +10120,49 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         choice = data.replace("newsmenu_", "")
 
         if choice == "calendar":
+            await query.message.edit_text(
+                "⏳ <b>Fetching today's economic calendar...</b>",
+                parse_mode=ParseMode.HTML
+            )
+
             events = get_todays_high_impact_events()
             if not events:
                 await query.message.edit_text(
                     "📅 <b>No high-impact USD, EUR, GBP, or JPY news "
-                    "scheduled for the rest of today.</b>\n\n"
+                    "scheduled for today.</b>\n\n"
                     "Try <b>News Breakdown</b> instead for a live read "
                     "on any specific pair or currency you're curious about.",
                     parse_mode=ParseMode.HTML
                 )
                 return
 
-            global GLOBAL_NEWS_EVENTS
-            GLOBAL_NEWS_EVENTS = events
+            list_id = store_news_events_batch(events)
             today_display = datetime.utcnow().strftime("%A, %d %B %Y")
+            now_utc = datetime.utcnow()
+
+            released_count = 0
             buttons = []
             for i, event in enumerate(events):
                 flag = {"USD": "🇺🇸", "EUR": "🇪🇺", "GBP": "🇬🇧", "JPY": "🇯🇵"}.get(event["currency"], "🌍")
-                label = f"{flag} {event['title'][:40]}"
+                status_label, is_released = format_event_status(event, now_utc)
+                if is_released:
+                    released_count += 1
+                label = f"{flag} {event['title'][:32]}"
                 if event["time_str"]:
-                    label += f" ({event['time_str']} GMT+1)"
-                buttons.append([InlineKeyboardButton(label, callback_data=f"newsevent_{i}")])
+                    label += f" ({event['time_str']})"
+                if status_label:
+                    label += f" — {status_label}"
+                buttons.append([InlineKeyboardButton(label, callback_data=f"newsevent_{list_id}_{i}")])
+
+            upcoming_count = len(events) - released_count
+            if upcoming_count > 0:
+                summary_line = f"✅ {released_count} released • 🔜 {upcoming_count} upcoming"
+            else:
+                summary_line = f"✅ All {released_count} released — nothing left scheduled today"
 
             await query.message.edit_text(
-                f"📅 <b>High-Impact News — {today_display}</b>\n\n"
+                f"📅 <b>High-Impact News — {today_display}</b>\n"
+                f"{summary_line}\n\n"
                 f"Tap any event below for a direct BUY/SELL call, "
                 f"fundamentals-first:",
                 parse_mode=ParseMode.HTML,
@@ -10119,9 +10195,11 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 return
 
         try:
-            idx = int(data.replace("newsevent_", ""))
-            event = GLOBAL_NEWS_EVENTS[idx]
-        except (ValueError, IndexError):
+            remainder = data.replace("newsevent_", "")
+            list_id, idx_str = remainder.rsplit("_", 1)
+            idx = int(idx_str)
+            event = NEWS_EVENTS_STORE[list_id][idx]
+        except (ValueError, IndexError, KeyError):
             await query.message.reply_text(
                 "⚠️ This news list has expired - tap 📰 News again for a fresh list.",
                 parse_mode=ParseMode.HTML

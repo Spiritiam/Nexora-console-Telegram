@@ -9,6 +9,7 @@ import requests
 import re
 import json
 import time
+import secrets
 import inspect
 import websockets
 import matplotlib
@@ -64,6 +65,11 @@ METALS_API_KEY = os.getenv("METALS_API_KEY")
 API_NINJAS_KEY = os.getenv("API_NINJAS_KEY")
 DERIV_APP_ID = os.getenv("DERIV_APP_ID")
 DERIV_SERVICE_TOKEN = os.getenv("DERIV_SERVICE_TOKEN")
+# The public https URL registered as this app's OAuth "Redirect URL"
+# in Deriv's Developer Portal (app registration page) - must exactly
+# match, protocol and path included, or Deriv will refuse the
+# redirect. e.g. https://your-app.up.railway.app/deriv-oauth-callback
+DERIV_OAUTH_REDIRECT_URL = os.getenv("DERIV_OAUTH_REDIRECT_URL")
 ADMIN_USER_ID = os.getenv("ADMIN_USER_ID")  # restricts /broadcast to this Telegram user ID only
 
 # ============================================
@@ -644,6 +650,7 @@ async def run_mt5_autotrade_bot_scan(context: ContextTypes.DEFAULT_TYPE):
                 )
                 MT5_AUTOTRADE_COPIED_SIGNALS.add(copy_key)
                 if order_id:
+                    log_mt5_autotrade_order(user_id, metaapi_account_id, order_id, pair_config["display"], direction)
                     try:
                         await context.bot.send_message(
                             chat_id=int(user_id),
@@ -724,6 +731,7 @@ async def run_mt5_autotrade_follow_channel_scan(context: ContextTypes.DEFAULT_TY
             )
             MT5_AUTOTRADE_COPIED_SIGNALS.add(copy_key)
             if order_id:
+                log_mt5_autotrade_order(user_id, metaapi_account_id, order_id, pair_config["display"], direction)
                 try:
                     await context.bot.send_message(
                         chat_id=int(user_id),
@@ -775,6 +783,64 @@ async def korapay_webhook_handler(request):
     return web.Response(status=200, text="ok")
 
 
+async def deriv_oauth_callback_handler(request):
+    """
+    Deriv redirects here after a user logs in via oauth.deriv.com.
+    Same rule as korapay_webhook_handler above: does the MINIMUM
+    (resolve which Telegram user this is, pick the real account,
+    write it to the pending-connections table) and returns a plain
+    HTML page - the actual save_deriv_account() call and Telegram
+    confirmation happen separately in
+    process_pending_deriv_oauth_connections, on the bot's own event
+    loop, never from here.
+
+    Deriv's redirect looks like:
+      ?acct1=CR123&token1=xxx&cur1=usd&acct2=VRTC456&token2=yyy&cur2=usd&state=...
+    - one acct/token/cur triplet per account the user has (real AND
+    demo). Real accounts start with CR, demo/virtual start with VRTC
+    or VRW - picks the first CR account found; ignores demo ones.
+    """
+    params = request.query
+    state = params.get("state", "")
+
+    user_id = resolve_deriv_oauth_state(state) if state else None
+    if not user_id:
+        return web.Response(
+            status=400, content_type="text/html",
+            text="<h2>This login link has expired or was already used.</h2>"
+                 "<p>Go back to Telegram and tap Connect Deriv again.</p>"
+        )
+
+    real_loginid, real_token, real_currency = None, None, None
+    i = 1
+    while f"acct{i}" in params:
+        acct = params.get(f"acct{i}", "")
+        if acct.upper().startswith("CR"):
+            real_loginid = acct
+            real_token = params.get(f"token{i}")
+            real_currency = params.get(f"cur{i}", "").upper()
+            break
+        i += 1
+
+    if not real_loginid or not real_token:
+        return web.Response(
+            status=200, content_type="text/html",
+            text="<h2>No real Deriv account found.</h2>"
+                 "<p>Only demo accounts were found on this login. "
+                 "Go back to Telegram, and either paste a real-account "
+                 "API token manually, or log in with an account that "
+                 "has a real Deriv account too.</p>"
+        )
+
+    save_pending_deriv_oauth_connection(user_id, real_loginid, real_token, real_currency)
+
+    return web.Response(
+        status=200, content_type="text/html",
+        text="<h2>✅ Deriv account connected!</h2>"
+             "<p>Go back to Telegram - you'll get a confirmation message there in a few seconds.</p>"
+    )
+
+
 def run_korapay_webhook_server():
     """
     Runs a small, INDEPENDENT web server in its own background thread
@@ -789,6 +855,7 @@ def run_korapay_webhook_server():
     """
     webhook_app = web.Application()
     webhook_app.router.add_post("/korapay-webhook", korapay_webhook_handler)
+    webhook_app.router.add_get("/deriv-oauth-callback", deriv_oauth_callback_handler)
     port = int(os.getenv("PORT", 8080))
     print(f"[KORAPAY WEBHOOK] Starting webhook server on port {port}...")
     # handle_signals=False - CONFIRMED REAL CRASH via live logs:
@@ -893,6 +960,55 @@ async def process_confirmed_korapay_payments(context: ContextTypes.DEFAULT_TYPE)
                 )
         except Exception as e:
             print(f"[MT5 AUTOTRADE] ❌ Failed to process payment for {user_id}: {e}")
+
+
+async def process_pending_deriv_oauth_connections(context: ContextTypes.DEFAULT_TYPE):
+    """
+    Runs every ~20 seconds on the bot's OWN event loop, mirroring
+    process_confirmed_korapay_payments above - picks up whatever
+    deriv_oauth_callback_handler already wrote to the pending table,
+    saves it exactly the same way the manual-token flow does
+    (save_deriv_account - same function either path uses), and
+    confirms to the user. Safe to call bot.send_message here since
+    this runs through job_queue, not the separate webhook thread.
+    """
+    pending = get_unprocessed_deriv_oauth_connections()
+    if not pending:
+        return
+
+    bot = context.bot
+    for row in pending:
+        row_id = row.get("id")
+        user_id = row.get("user_id")
+        loginid = row.get("loginid")
+        token = row.get("token")
+        currency = row.get("currency")
+        if not all([row_id, user_id, loginid, token]):
+            continue
+
+        try:
+            saved = save_deriv_account(user_id, loginid, token, currency)
+            mark_deriv_oauth_connection_processed(row_id)
+            if saved:
+                await bot.send_message(
+                    chat_id=int(user_id),
+                    text=(
+                        f"✅ <b>Deriv account connected!</b>\n\n"
+                        f"Account: {loginid}\n\n"
+                        f"You're all set - use 🔗 Connect Deriv anytime to check your "
+                        f"balance or manage Auto-Copy."
+                    ),
+                    parse_mode=ParseMode.HTML,
+                    reply_markup=main_keyboard
+                )
+            else:
+                await bot.send_message(
+                    chat_id=int(user_id),
+                    text="⚠️ Couldn't save your Deriv connection - please try again from 🔗 Connect Deriv.",
+                    reply_markup=main_keyboard
+                )
+        except Exception as e:
+            print(f"[DERIV OAUTH] Failed to process pending connection for {user_id}: {e}")
 
 
 
@@ -2187,6 +2303,80 @@ async def deriv_fetch_account_snapshot(token):
 # closed_at (timestamptz, nullable)
 # ============================================
 
+# ============================================
+# MT5 AUTO-TRADE ORDER LOG (NEW)
+# Mirrors auto_copy_trades below, but for MT5 auto-trade
+# (mt5_auto_trade_accounts subscribers) - this never existed before:
+# trades were placed and ONE confirmation sent, then nothing ever
+# tracked whether they later hit TP or SL. Per explicit instruction,
+# clients were finding out their account had gone to zero too late -
+# this table + check_mt5_autotrade_closed_orders below is what lets
+# an immediate close notification actually fire.
+#
+# REQUIRED: create this table in Supabase before deploying -
+#   create table mt5_autotrade_orders (
+#     id uuid primary key default gen_random_uuid(),
+#     user_id text not null,
+#     metaapi_account_id text not null,
+#     order_id text not null,
+#     pair_display text,
+#     direction text,
+#     status text default 'OPEN',
+#     profit numeric,
+#     opened_at timestamptz default now()
+#   );
+# ============================================
+
+def log_mt5_autotrade_order(user_id, metaapi_account_id, order_id, pair_display, direction):
+    try:
+        url = f"{SUPABASE_URL}/rest/v1/mt5_autotrade_orders"
+        payload = {
+            "user_id": str(user_id),
+            "metaapi_account_id": metaapi_account_id,
+            "order_id": str(order_id),
+            "pair_display": pair_display,
+            "direction": direction,
+            "status": "OPEN",
+            "opened_at": datetime.utcnow().isoformat(),
+        }
+        response = requests.post(url, headers=sb_headers(), json=payload, timeout=10)
+        if response.status_code not in (200, 201):
+            print(f"[MT5 AUTOTRADE LOG] Failed to log order for {user_id}/{order_id}: {response.status_code} {response.text}")
+    except Exception as e:
+        print(f"[MT5 AUTOTRADE LOG] error: {e}")
+
+def get_open_mt5_autotrade_orders():
+    try:
+        url = f"{SUPABASE_URL}/rest/v1/mt5_autotrade_orders?status=eq.OPEN&select=*"
+        response = requests.get(url, headers=sb_headers(), timeout=15)
+        data = response.json()
+        return data if isinstance(data, list) else []
+    except Exception as e:
+        print(f"[MT5 AUTOTRADE LOG] get_open_mt5_autotrade_orders error: {e}")
+        return []
+
+def mark_mt5_autotrade_order_closed(order_id, profit):
+    try:
+        url = f"{SUPABASE_URL}/rest/v1/mt5_autotrade_orders?order_id=eq.{order_id}"
+        payload = {"status": "CLOSED", "profit": profit}
+        requests.patch(url, headers=sb_headers(), json=payload, timeout=10)
+    except Exception as e:
+        print(f"[MT5 AUTOTRADE LOG] mark_mt5_autotrade_order_closed error: {e}")
+
+def get_todays_mt5_autotrade_orders(user_id):
+    try:
+        today_start = datetime.utcnow().strftime("%Y-%m-%dT00:00:00")
+        url = (
+            f"{SUPABASE_URL}/rest/v1/mt5_autotrade_orders"
+            f"?user_id=eq.{user_id}&opened_at=gte.{today_start}&select=*"
+        )
+        response = requests.get(url, headers=sb_headers(), timeout=10)
+        data = response.json()
+        return data if isinstance(data, list) else []
+    except Exception as e:
+        print(f"[MT5 AUTOTRADE DIGEST] get_todays_mt5_autotrade_orders error: {e}")
+        return []
+
 def log_auto_copy_trade(user_id, symbol, contract_id, direction, stake, risk, win):
     try:
         url = f"{SUPABASE_URL}/rest/v1/auto_copy_trades"
@@ -2359,6 +2549,107 @@ def save_deriv_account(user_id, loginid, token, currency):
     except Exception as e:
         print(f"[DERIV] save_deriv_account error: {e}")
         return False
+
+# ============================================
+# DERIV OAUTH LOGIN (NEW)
+# Alternative to manually pasting an API token, per explicit
+# instruction - manually-copied tokens are the actual source of the
+# "expired/broken on Railway" problem (wrong scope picked, partial
+# copy, accidentally pasting a short-lived session code instead of a
+# real token - all real, already-seen support issues). OAuth issues
+# the SAME kind of legacy per-account token this bot already uses
+# everywhere (deriv_api_headers, save_deriv_account, etc.) - just
+# obtained via Deriv's own official login page instead of manual
+# copy-paste, so nothing else in the bot needs to change to use it.
+#
+# Two tables, matching the exact same "webhook thread never talks to
+# Telegram directly" pattern already proven by the KoraPay flow above:
+#   1. deriv_oauth_states - correlates the redirect callback (which
+#      has no built-in identity) back to the Telegram user who
+#      started it. One-time use, consumed on lookup.
+#   2. pending_deriv_oauth_connections - the callback (running in the
+#      separate webhook thread) writes here and stops; a job on the
+#      BOT'S OWN event loop (process_pending_deriv_oauth_connections)
+#      picks it up and does the actual save_deriv_account() call +
+#      Telegram DM.
+#
+# REQUIRED: create these tables in Supabase before deploying -
+#   create table deriv_oauth_states (
+#     state text primary key,
+#     user_id text not null,
+#     created_at timestamptz default now()
+#   );
+#   create table pending_deriv_oauth_connections (
+#     id uuid primary key default gen_random_uuid(),
+#     user_id text not null,
+#     loginid text not null,
+#     token text not null,
+#     currency text,
+#     processed boolean default false,
+#     created_at timestamptz default now()
+#   );
+# ============================================
+
+def create_deriv_oauth_state(user_id):
+    """Generates a fresh one-time state token and stores who it belongs to."""
+    state = secrets.token_urlsafe(24)
+    try:
+        url = f"{SUPABASE_URL}/rest/v1/deriv_oauth_states"
+        payload = {"state": state, "user_id": str(user_id)}
+        requests.post(url, headers=sb_headers(), json=payload, timeout=10)
+        return state
+    except Exception as e:
+        print(f"[DERIV OAUTH] create_deriv_oauth_state error: {e}")
+        return None
+
+def resolve_deriv_oauth_state(state):
+    """Looks up which user a state belongs to, then deletes it (one-time use)."""
+    try:
+        url = f"{SUPABASE_URL}/rest/v1/deriv_oauth_states?state=eq.{state}&select=user_id"
+        response = requests.get(url, headers=sb_headers(), timeout=10)
+        data = response.json()
+        if not data:
+            return None
+        user_id = data[0]["user_id"]
+        requests.delete(
+            f"{SUPABASE_URL}/rest/v1/deriv_oauth_states?state=eq.{state}",
+            headers=sb_headers(), timeout=10
+        )
+        return user_id
+    except Exception as e:
+        print(f"[DERIV OAUTH] resolve_deriv_oauth_state error: {e}")
+        return None
+
+def save_pending_deriv_oauth_connection(user_id, loginid, token, currency):
+    try:
+        url = f"{SUPABASE_URL}/rest/v1/pending_deriv_oauth_connections"
+        payload = {
+            "user_id": str(user_id),
+            "loginid": loginid,
+            "token": token,
+            "currency": currency,
+            "processed": False,
+        }
+        requests.post(url, headers=sb_headers(), json=payload, timeout=10)
+    except Exception as e:
+        print(f"[DERIV OAUTH] save_pending_deriv_oauth_connection error: {e}")
+
+def get_unprocessed_deriv_oauth_connections():
+    try:
+        url = f"{SUPABASE_URL}/rest/v1/pending_deriv_oauth_connections?processed=eq.false&select=*"
+        response = requests.get(url, headers=sb_headers(), timeout=10)
+        data = response.json()
+        return data if isinstance(data, list) else []
+    except Exception as e:
+        print(f"[DERIV OAUTH] get_unprocessed_deriv_oauth_connections error: {e}")
+        return []
+
+def mark_deriv_oauth_connection_processed(row_id):
+    try:
+        url = f"{SUPABASE_URL}/rest/v1/pending_deriv_oauth_connections?id=eq.{row_id}"
+        requests.patch(url, headers=sb_headers(), json={"processed": True}, timeout=10)
+    except Exception as e:
+        print(f"[DERIV OAUTH] mark_deriv_oauth_connection_processed error: {e}")
 
 def get_deriv_account(user_id):
     try:
@@ -3440,8 +3731,29 @@ async def send_connect_instructions(bot, user_id):
     Trade This Signal flow (send_tier_selection) when no account is
     linked yet, so a brand-new user goes straight from intent to
     sign-up to linking without needing to find a separate button.
+
+    Leads with "Login with Deriv" (OAuth) as the recommended option,
+    per explicit instruction - manually-copied API tokens are the
+    actual source of most "expired/broken" support issues (wrong
+    scope, partial copy, pasting a short-lived session code by
+    mistake). OAuth sidesteps all of that since Deriv issues the
+    token directly. Manual token paste stays available as a fallback
+    for anyone who prefers it or hits an OAuth issue.
     """
     user_modes[user_id] = "awaiting_deriv_token"
+
+    login_markup = None
+    if DERIV_APP_ID and DERIV_OAUTH_REDIRECT_URL:
+        state = create_deriv_oauth_state(user_id)
+        if state:
+            oauth_url = (
+                f"https://oauth.deriv.com/oauth2/authorize"
+                f"?app_id={DERIV_APP_ID}&state={state}"
+            )
+            login_markup = InlineKeyboardMarkup([[
+                InlineKeyboardButton("🔑 Login with Deriv (recommended)", url=oauth_url)
+            ]])
+
     await bot.send_message(
         chat_id=int(user_id),
         text=(
@@ -3452,7 +3764,12 @@ async def send_connect_instructions(bot, user_id):
             "Don't have a Deriv account yet? "
             "<a href=\"https://track.deriv.com/_eBizfEiAKzC6tyDIijdDK2Nd7ZgqdRLk/1/\">"
             "Sign up here first</a>, then come back to this step.\n\n"
-            "<b>How to connect:</b>\n"
+            + (
+                "👇 Tap below to log in directly with Deriv - fastest, "
+                "and avoids the token issues below entirely.\n\n"
+                if login_markup else ""
+            ) +
+            "<b>Or connect with an API token instead:</b>\n"
             "1️⃣ Go to <b>developers.deriv.com</b> and log in\n"
             "2️⃣ Tap the menu (☰) in the top right, then tap "
             "<b>API tokens</b>\n"
@@ -3468,8 +3785,14 @@ async def send_connect_instructions(bot, user_id):
             "correct token."
         ),
         parse_mode=ParseMode.HTML,
-        reply_markup=main_keyboard
+        reply_markup=login_markup or main_keyboard
     )
+    if login_markup:
+        await bot.send_message(
+            chat_id=int(user_id),
+            text="Or paste your API token here if you'd rather do that instead:",
+            reply_markup=main_keyboard
+        )
 
 async def send_tier_selection(bot, user_id, trade_context):
     """
@@ -10147,12 +10470,32 @@ async def handle_buttons(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     reply_markup=InlineKeyboardMarkup([[toggle_button]])
                 )
             else:
-                sent_unreachable = await update.message.reply_text(
+                reconnect_markup = main_keyboard
+                reconnect_text = (
                     "⚠️ <b>Couldn't reach your linked Deriv account.</b>\n\n"
                     "Your saved token may have expired or been revoked. "
-                    "Paste a new real-account API token below to relink.",
+                    "Paste a new real-account API token below to relink."
+                )
+                if DERIV_APP_ID and DERIV_OAUTH_REDIRECT_URL:
+                    state = create_deriv_oauth_state(user_id)
+                    if state:
+                        oauth_url = (
+                            f"https://oauth.deriv.com/oauth2/authorize"
+                            f"?app_id={DERIV_APP_ID}&state={state}"
+                        )
+                        reconnect_markup = InlineKeyboardMarkup([[
+                            InlineKeyboardButton("🔑 Login with Deriv (recommended)", url=oauth_url)
+                        ]])
+                        reconnect_text = (
+                            "⚠️ <b>Couldn't reach your linked Deriv account.</b>\n\n"
+                            "Your saved token may have expired or been revoked. "
+                            "Tap below to log in directly with Deriv and relink "
+                            "instantly, or paste a new API token here instead."
+                        )
+                sent_unreachable = await update.message.reply_text(
+                    reconnect_text,
                     parse_mode=ParseMode.HTML,
-                    reply_markup=main_keyboard
+                    reply_markup=reconnect_markup
                 )
                 schedule_auto_delete(sent_unreachable.chat_id, sent_unreachable.message_id)
             user_modes[user_id] = "awaiting_deriv_token"
@@ -12865,6 +13208,35 @@ async def check_open_signals(context: ContextTypes.DEFAULT_TYPE):
                 update_signal_status(sig["id"], "SL_HIT")
 
 # ============================================
+# MT5 AUTO-TRADE CLOSE MONITOR (NEW)
+# Deriv equivalent is check_open_auto_copy_trades below - this is the
+# MT5 side, which never existed before (see log_mt5_autotrade_order
+# above). Runs every 15 minutes: for each order still marked OPEN,
+# asks MetaAPI directly whether it has actually closed yet (real
+# profit/loss via get_mt5_trade_outcome, ground truth from the real
+# trade), and DMs the client immediately once it has - per explicit
+# instruction, so a bad run is visible in real time instead of
+# discovered too late.
+# ============================================
+
+async def check_mt5_autotrade_closed_orders(context: ContextTypes.DEFAULT_TYPE):
+    open_orders = get_open_mt5_autotrade_orders()
+    if not open_orders:
+        return
+
+    for order in open_orders:
+        order_id = order.get("order_id")
+        user_id = order.get("user_id")
+        if not order_id or not user_id:
+            continue
+
+        outcome, profit = await get_mt5_trade_outcome(order_id)
+        if outcome != "CLOSED" or profit is None:
+            continue  # still open, or lookup failed - retry next sweep
+
+        mark_mt5_autotrade_order_closed(order_id, profit)
+
+# ============================================
 # AUTO-COPY TRADE MONITOR (NEW)
 # Deriv equivalent of check_open_signals/
 # get_mt5_trade_outcome above, but for
@@ -12965,6 +13337,91 @@ def save_last_digest_message_id(user_id, message_id):
     except Exception as e:
         print(f"[AUTO-COPY DIGEST] save_last_digest_message_id error: {e}")
 
+def save_mt5_digest_message_id(user_id, message_id):
+    try:
+        url = f"{SUPABASE_URL}/rest/v1/mt5_auto_trade_accounts?user_id=eq.{user_id}"
+        requests.patch(
+            url, headers=sb_headers(),
+            json={"last_digest_message_id": message_id}, timeout=10
+        )
+    except Exception as e:
+        print(f"[MT5 AUTOTRADE DIGEST] save_mt5_digest_message_id error: {e}")
+
+# ============================================
+# MT5 AUTO-TRADE DAILY DIGEST (NEW)
+# Exness/MT5 equivalent of send_auto_copy_daily_digest above - same
+# once-a-day, no-real-time-pings approach, per explicit instruction.
+# Summarizes today's trades, real $ P&L (from mt5_autotrade_orders,
+# via check_mt5_autotrade_closed_orders' silent close-detection), and
+# current balance.
+#
+# REQUIRED: add this column in Supabase before deploying -
+#   alter table mt5_auto_trade_accounts add column last_digest_message_id text;
+# ============================================
+
+async def send_mt5_autotrade_daily_digest(context: ContextTypes.DEFAULT_TYPE):
+    accounts = get_all_active_mt5_autotrade_accounts()
+    if not accounts:
+        return
+
+    bot = context.bot
+
+    for account in accounts:
+        user_id = account.get("user_id")
+        metaapi_account_id = account.get("metaapi_account_id")
+        if not user_id:
+            continue
+
+        orders_today = get_todays_mt5_autotrade_orders(user_id)
+        if not orders_today:
+            continue  # nothing happened for this user today - no digest at all
+
+        lines = [
+            f"✅ <b>{o.get('direction', '')} {o.get('pair_display', '')}</b> — order #{o.get('order_id', '')}"
+            for o in orders_today
+        ]
+
+        closed_today = [o for o in orders_today if o.get("status") == "CLOSED" and o.get("profit") is not None]
+        total_profit = sum(o["profit"] for o in closed_today)
+        still_open = len(orders_today) - len(closed_today)
+
+        digest = "🤖 <b>Exness Auto-Trade — today's summary</b>\n\n"
+        digest += "\n".join(lines)
+
+        if closed_today:
+            sign = "+" if total_profit >= 0 else "-"
+            emoji = "📈" if total_profit >= 0 else "📉"
+            digest += (
+                f"\n\n{emoji} <b>Today's P&L: {sign}${abs(total_profit):.2f}</b> "
+                f"({len(closed_today)} closed"
+                + (f", {still_open} still open" if still_open else "")
+                + ")"
+            )
+        else:
+            digest += f"\n\n<i>All {len(orders_today)} of today's trades are still open.</i>"
+
+        if metaapi_account_id:
+            balance = await get_client_mt5_balance(metaapi_account_id)
+            if balance is not None:
+                digest += f"\n💰 <b>Current balance:</b> ${balance:.2f}"
+
+        try:
+            old_message_id = account.get("last_digest_message_id")
+            if old_message_id:
+                try:
+                    await bot.delete_message(chat_id=int(user_id), message_id=int(old_message_id))
+                except Exception as e:
+                    print(f"[MT5 AUTOTRADE DIGEST] Couldn't delete yesterday's digest for {user_id}: {e}")
+
+            sent = await bot.send_message(
+                chat_id=int(user_id),
+                text=digest,
+                parse_mode=ParseMode.HTML
+            )
+            save_mt5_digest_message_id(user_id, sent.message_id)
+        except Exception as e:
+            print(f"[MT5 AUTOTRADE DIGEST] ❌ Couldn't send digest to {user_id}: {e}")
+
 async def send_auto_copy_daily_digest(context: ContextTypes.DEFAULT_TYPE):
     accounts = get_all_auto_copy_accounts()
     if not accounts:
@@ -12974,6 +13431,7 @@ async def send_auto_copy_daily_digest(context: ContextTypes.DEFAULT_TYPE):
 
     for account in accounts:
         user_id = account.get("user_id")
+        token = account.get("api_token")
         if not user_id:
             continue
 
@@ -12989,8 +13447,35 @@ async def send_auto_copy_daily_digest(context: ContextTypes.DEFAULT_TYPE):
             for t in trades_today
         ]
 
+        # Real $ P&L, per explicit instruction - summed from whatever
+        # check_open_auto_copy_trades has already confirmed CLOSED
+        # today (real profit/loss, not the fixed risk/win figures
+        # above, which are just what was PROPOSED per trade).
+        closed_today = [t for t in trades_today if t.get("status") == "CLOSED" and t.get("profit") is not None]
+        total_profit = sum(t["profit"] for t in closed_today)
+        still_open = len(trades_today) - len(closed_today)
+
         digest = "🤖 <b>Auto-Copy — today's summary</b>\n\n"
         digest += "\n\n".join(lines) if lines else "<i>No trades placed today.</i>"
+
+        if closed_today:
+            sign = "+" if total_profit >= 0 else "-"
+            emoji = "📈" if total_profit >= 0 else "📉"
+            digest += (
+                f"\n\n{emoji} <b>Today's P&L: {sign}${abs(total_profit):.2f}</b> "
+                f"({len(closed_today)} closed"
+                + (f", {still_open} still open" if still_open else "")
+                + ")"
+            )
+        elif trades_today:
+            digest += f"\n\n<i>All {len(trades_today)} of today's trades are still open.</i>"
+
+        if token:
+            snapshot = await deriv_fetch_account_snapshot(token)
+            balance = snapshot.get("balance") if snapshot else None
+            if balance is not None:
+                digest += f"\n💰 <b>Current balance:</b> ${balance:.2f}"
+
         if failure_count:
             digest += (
                 f"\n\n<i>{failure_count} other signal"
@@ -13344,6 +13829,17 @@ def main():
         name="tp_sl_monitor"
     )
 
+    # MT5 auto-trade close monitor - detects closed orders every 15
+    # minutes and logs the real profit/loss silently, feeding the
+    # daily digest below. No per-trade DM, per explicit instruction -
+    # consolidated into one daily summary instead of real-time pings.
+    job_queue.run_repeating(
+        check_mt5_autotrade_closed_orders,
+        interval=900,
+        first=90,
+        name="mt5_autotrade_close_monitor"
+    )
+
     # Auto-delete sweep - performs the actual deletion for anything
     # in auto_delete_queue_db whose time has come. Every 10 minutes
     # is frequent enough that a message disappears close to its real
@@ -13400,6 +13896,16 @@ def main():
         interval=20,
         first=15,
         name="mt5_autotrade_payment_processing"
+    )
+
+    # Deriv OAuth: picks up what deriv_oauth_callback_handler already
+    # wrote to the database, saves the account, notifies the user -
+    # same pattern as the KoraPay job above.
+    job_queue.run_repeating(
+        process_pending_deriv_oauth_connections,
+        interval=20,
+        first=15,
+        name="deriv_oauth_connection_processing"
     )
 
     # MT5 auto-trade: daily expiry check - clients automatically
@@ -13463,18 +13969,28 @@ def main():
     #     name="accumulation_zone_auto_trade"
     # )
 
-    # Auto-copy daily digest - PERMANENTLY DISABLED per explicit
-    # instruction. Function code (send_auto_copy_daily_digest) is
-    # left intact below in case this is revisited later, but this
-    # job registration is commented out - it will NOT run at all.
-    #
-    # job_queue.run_daily(
-    #     send_auto_copy_daily_digest,
-    #     time=parse_time("23:59"),
-    #     name="auto_copy_daily_digest",
-    #     days=EVERY_DAY,
-    #     job_kwargs={"misfire_grace_time": 300}
-    # )
+    # Auto-copy daily digest - RE-ENABLED, now with real $ P&L and
+    # current balance included (previously just listed trades placed).
+    # Per explicit instruction: real-time per-trade/low-balance pings
+    # were too noisy - this one daily summary per platform is the
+    # agreed replacement, not an addition on top of them.
+    job_queue.run_daily(
+        send_auto_copy_daily_digest,
+        time=parse_time("23:59"),
+        name="auto_copy_daily_digest",
+        days=EVERY_DAY,
+        job_kwargs={"misfire_grace_time": 300}
+    )
+
+    # MT5/Exness auto-trade daily digest - same schedule and same
+    # once-a-day approach as the Deriv digest above.
+    job_queue.run_daily(
+        send_mt5_autotrade_daily_digest,
+        time=parse_time("23:59"),
+        name="mt5_autotrade_daily_digest",
+        days=EVERY_DAY,
+        job_kwargs={"misfire_grace_time": 300}
+    )
 
     # Weekly performance report - every Sunday at 23:00 UTC
     # NOTE: PTB v20+ uses cron-style day indexing for run_daily's

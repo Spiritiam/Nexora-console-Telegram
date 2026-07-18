@@ -122,29 +122,44 @@ MT5_AUTOTRADE_CURRENCY = "NGN"
 MT5_SUBSCRIPTION_DAYS = 30
 
 # 4 bot presets for Exness Auto-Trade, per explicit instruction -
-# built from REAL, already-proven strategies live in this bot (not
-# invented), split 2 aggressive / 2 conservative. Used only for
-# clients who choose "Pick a Bot" instead of following the channel's
-# own signals as-is.
+# SAME 4 bots as before - not adding or renaming any. Each bot keeps
+# its own original base strategy and gets ONE paired strategy added
+# alongside it (OR-vote: fires on whichever of the two confirms
+# first), per explicit instruction. Mapped from your reference list
+# by matching each bot's EXISTING base strategy to the pair that
+# reference used for that same base strategy:
+#   aggressive_scalper   already ran ema_pullback_scalper  -> paired with macd_momentum          (matches "Gold Scalper")
+#   aggressive_breakout  already ran volatility_breakout_scalper -> paired with rsi_extreme_reversal (matches "Quantum AI")
+#   conservative_trend   already ran trend_following        -> paired with macd_momentum          (matches "Trend Engine")
+#   conservative_structure already ran support_resistance_bounce -> paired with ict_smc (strategy_unicorn_model - the
+#       real ICT/Smart-Money-Concepts strategy already in this bank)  (matches "SMC Pro")
+#
+# "strategy_functions" (plural) replaces the old single
+# "strategy_function". "timeframe": "1min" for Aggressive, "5min" for
+# Conservative (down from the old 1h/4h) - per explicit instruction.
 MT5_AUTOTRADE_BOTS = {
     "aggressive_scalper": {
         "label": "🐆 Aggressive Scalper",
-        "strategy_function": "strategy_ema_pullback_scalper",
+        "strategy_functions": ["strategy_ema_pullback_scalper", "strategy_momentum_macd"],
+        "timeframe": "1min",
         "description": "Fast, frequent entries on short-term pullbacks.",
     },
     "aggressive_breakout": {
         "label": "⚡ Aggressive Breakout",
-        "strategy_function": "strategy_volatility_breakout_scalper",
+        "strategy_functions": ["strategy_volatility_breakout_scalper", "strategy_rsi_extreme_reversal"],
+        "timeframe": "1min",
         "description": "Fires on sharp volatility expansions.",
     },
     "conservative_trend": {
         "label": "🛡️ Conservative Trend",
-        "strategy_function": "strategy_trend_following",
+        "strategy_functions": ["strategy_trend_following", "strategy_momentum_macd"],
+        "timeframe": "5min",
         "description": "Slower, higher-conviction trend-following entries.",
     },
     "conservative_structure": {
         "label": "🏛️ Conservative Structure",
-        "strategy_function": "strategy_support_resistance_bounce",
+        "strategy_functions": ["strategy_support_resistance_bounce", "strategy_unicorn_model"],
+        "timeframe": "5min",
         "description": "Patient, level-based support/resistance entries.",
     },
 }
@@ -556,25 +571,46 @@ async def run_mt5_autotrade_bot_scan(context: ContextTypes.DEFAULT_TYPE):
         if not bot_info or not pair_config:
             continue
 
-        strategy_fn = globals().get(bot_info["strategy_function"])
-        if not strategy_fn:
-            print(f"[MT5 AUTOTRADE] ⚠️ Strategy function {bot_info['strategy_function']} not found.")
+        strategy_fns = []
+        for fn_name in bot_info["strategy_functions"]:
+            fn = globals().get(fn_name)
+            if not fn:
+                print(f"[MT5 AUTOTRADE] ⚠️ Strategy function {fn_name} not found.")
+                continue
+            strategy_fns.append(fn)
+        if not strategy_fns:
             continue
 
         try:
-            h1_candles = get_cached_candles(pair_key, pair_config, "1h", outputsize=210)
+            # Primary analysis timeframe is now the bot's own setting
+            # (1m for Aggressive, 5m for Conservative), per explicit
+            # instruction - fed into the same h1_candles slot every
+            # strategy function already reads from, so no strategy
+            # needed rewriting to support this. h4/daily are still
+            # fetched normally in case a strategy also leans on the
+            # genuinely-higher-timeframe context for trend alignment.
+            primary_candles = get_cached_candles(pair_key, pair_config, bot_info["timeframe"], outputsize=210)
             h4_candles = get_cached_candles(pair_key, pair_config, "4h", outputsize=60)
             daily_candles = get_cached_candles(pair_key, pair_config, "1day", outputsize=10)
-            if not h1_candles:
+            if not primary_candles:
                 continue
 
-            vote = strategy_fn(pair_key, pair_config, h1_candles, h4_candles, daily_candles)
+            # OR-vote across this bot's paired strategies - try each in
+            # order, fire on whichever one confirms FIRST. A single
+            # confirmed setup on either strategy is enough, per
+            # explicit instruction - they don't need to agree with
+            # each other.
+            vote = None
+            for strategy_fn in strategy_fns:
+                vote = strategy_fn(pair_key, pair_config, primary_candles, h4_candles, daily_candles)
+                if vote:
+                    break
             if not vote:
                 continue
 
             direction = vote.get("direction")
-            entry_price = h1_candles[-1]["close"]
-            atr = _accum_zone_atr(h1_candles, 14) if len(h1_candles) > 15 else None
+            entry_price = primary_candles[-1]["close"]
+            atr = _accum_zone_atr(primary_candles, 14) if len(primary_candles) > 15 else None
             if not atr:
                 continue
             if direction == "BUY":
@@ -5484,6 +5520,8 @@ def get_cached_price_data(pair_key, symbol, config):
 # ============================================
 
 CANDLE_CACHE_SECONDS = {
+    "1min": 60,     # matches the actual candle length - no point caching longer than one candle's real duration
+    "5min": 300,
     "1h": 3600,
     "4h": 14400,
     "1day": 21600,  # 6h - previous day's high/low doesn't change intraday, no need to refetch often
@@ -6846,6 +6884,34 @@ SYNTHETIC_STRATEGY_BANK = [
     strategy_volatility_breakout_scalper,
 ]
 
+# Per-index strategy groups, mirroring the Nexora AI Trading App's
+# index-specific bots - per explicit instruction, restructured away
+# from one uniform 9-strategy bank applied identically to every
+# index, since the Trading App's better win rate comes from matching
+# specific strategies to each index's own character, not a generic
+# blanket vote.
+#
+# Only r75/r100 ("Volatility Pro") and r10/r25/r50 ("Synthetic DCA")
+# are mapped - those are the only indices this bot actually trades
+# (see SYNTHETIC_CONFIG above). The Trading App's "Boom & Crash" and
+# "Step Scalper" bots trade BOOM1000/CRASH1000/stpRNG, which aren't
+# in SYNTHETIC_CONFIG at all right now - there's nothing here for
+# those strategy assignments to apply TO yet. Adding those symbols is
+# a separate, bigger job (new index config + Deriv multiplier-floor
+# discovery testing, the same careful live-tested process every
+# existing index went through above), not a strategy swap.
+# SYNTHETIC_STRATEGY_BANK itself is left in place, still used as the
+# fallback for any index that isn't in this dict (none currently, but
+# safer than crashing if a new index is added to SYNTHETIC_CONFIG
+# later without also being added here).
+SYNTHETIC_INDEX_STRATEGY_GROUPS = {
+    "r75": [strategy_trend_following, strategy_momentum_macd],
+    "r100": [strategy_trend_following, strategy_momentum_macd],
+    "r10": [strategy_bollinger_rsi_mean_reversion],
+    "r25": [strategy_bollinger_rsi_mean_reversion],
+    "r50": [strategy_bollinger_rsi_mean_reversion],
+}
+
 def run_strategy_bank(pair_key, config, h1_candles, h4_candles, daily_candles, min_agree=2):
     """
     Runs every strategy in STRATEGY_BANK plus the existing ICT/SMC
@@ -7015,7 +7081,7 @@ async def run_strategy_bank_synthetic(index_key, config, h1_candles, h4_candles,
             f"{h1_closes} | times: {h1_times}"
         )
 
-    for strategy_fn in SYNTHETIC_STRATEGY_BANK:
+    for strategy_fn in SYNTHETIC_INDEX_STRATEGY_GROUPS.get(index_key, SYNTHETIC_STRATEGY_BANK):
         try:
             sig = inspect.signature(strategy_fn)
             if "m1_candles" in sig.parameters:

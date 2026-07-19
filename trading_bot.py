@@ -811,7 +811,16 @@ async def deriv_oauth_callback_handler(request):
     params = request.query
     state = params.get("state", "")
 
+    # TEMPORARY DIAGNOSTIC LOGGING - remove once the redirect issue is
+    # confirmed fixed. This is the single most useful piece of
+    # information right now: whether Deriv is reaching this endpoint
+    # AT ALL, and if so, exactly what it sent. Check Railway's deploy
+    # logs immediately after testing the login button.
+    print(f"[DERIV OAUTH] 🔔 Callback hit! Full query params: {dict(params)}")
+    print(f"[DERIV OAUTH] state param received: {state!r}")
+
     user_id = resolve_deriv_oauth_state(state) if state else None
+    print(f"[DERIV OAUTH] resolve_deriv_oauth_state({state!r}) -> user_id={user_id!r}")
     if not user_id:
         return web.Response(
             status=400, content_type="text/html",
@@ -830,6 +839,8 @@ async def deriv_oauth_callback_handler(request):
             break
         i += 1
 
+    print(f"[DERIV OAUTH] Found real account: loginid={real_loginid!r}, currency={real_currency!r}, token_present={bool(real_token)}")
+
     if not real_loginid or not real_token:
         return web.Response(
             status=200, content_type="text/html",
@@ -841,6 +852,7 @@ async def deriv_oauth_callback_handler(request):
         )
 
     save_pending_deriv_oauth_connection(user_id, real_loginid, real_token, real_currency)
+    print(f"[DERIV OAUTH] ✅ Saved pending connection for user_id={user_id}")
 
     return web.Response(
         status=200, content_type="text/html",

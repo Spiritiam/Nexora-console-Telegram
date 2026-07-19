@@ -70,6 +70,14 @@ DERIV_SERVICE_TOKEN = os.getenv("DERIV_SERVICE_TOKEN")
 # match, protocol and path included, or Deriv will refuse the
 # redirect. e.g. https://your-app.up.railway.app/deriv-oauth-callback
 DERIV_OAUTH_REDIRECT_URL = os.getenv("DERIV_OAUTH_REDIRECT_URL")
+# Deliberately SEPARATE from DERIV_APP_ID above, per explicit
+# instruction - the existing app is a different registration "type"
+# than what OAuth login needs, and swapping DERIV_APP_ID itself would
+# risk affecting the already-working manual-token connect flow (which
+# uses DERIV_APP_ID for every Deriv API call, not just OAuth). This
+# app_id is used ONLY for building the "Login with Deriv" URL below -
+# nowhere else in the bot.
+DERIV_OAUTH_APP_ID = os.getenv("DERIV_OAUTH_APP_ID")
 ADMIN_USER_ID = os.getenv("ADMIN_USER_ID")  # restricts /broadcast to this Telegram user ID only
 
 # ============================================
@@ -3743,12 +3751,12 @@ async def send_connect_instructions(bot, user_id):
     user_modes[user_id] = "awaiting_deriv_token"
 
     login_markup = None
-    if DERIV_APP_ID and DERIV_OAUTH_REDIRECT_URL:
+    if DERIV_OAUTH_APP_ID and DERIV_OAUTH_REDIRECT_URL:
         state = create_deriv_oauth_state(user_id)
         if state:
             oauth_url = (
                 f"https://oauth.deriv.com/oauth2/authorize"
-                f"?app_id={DERIV_APP_ID}&state={state}"
+                f"?app_id={DERIV_OAUTH_APP_ID}&state={state}"
             )
             login_markup = InlineKeyboardMarkup([[
                 InlineKeyboardButton("🔑 Login with Deriv (recommended)", url=oauth_url)
@@ -10476,12 +10484,12 @@ async def handle_buttons(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     "Your saved token may have expired or been revoked. "
                     "Paste a new real-account API token below to relink."
                 )
-                if DERIV_APP_ID and DERIV_OAUTH_REDIRECT_URL:
+                if DERIV_OAUTH_APP_ID and DERIV_OAUTH_REDIRECT_URL:
                     state = create_deriv_oauth_state(user_id)
                     if state:
                         oauth_url = (
                             f"https://oauth.deriv.com/oauth2/authorize"
-                            f"?app_id={DERIV_APP_ID}&state={state}"
+                            f"?app_id={DERIV_OAUTH_APP_ID}&state={state}"
                         )
                         reconnect_markup = InlineKeyboardMarkup([[
                             InlineKeyboardButton("🔑 Login with Deriv (recommended)", url=oauth_url)

@@ -10,6 +10,7 @@ import re
 import json
 import time
 import secrets
+import base64
 import inspect
 import websockets
 import matplotlib
@@ -65,19 +66,12 @@ METALS_API_KEY = os.getenv("METALS_API_KEY")
 API_NINJAS_KEY = os.getenv("API_NINJAS_KEY")
 DERIV_APP_ID = os.getenv("DERIV_APP_ID")
 DERIV_SERVICE_TOKEN = os.getenv("DERIV_SERVICE_TOKEN")
-# The public https URL registered as this app's OAuth "Redirect URL"
-# in Deriv's Developer Portal (app registration page) - must exactly
-# match, protocol and path included, or Deriv will refuse the
-# redirect. e.g. https://your-app.up.railway.app/deriv-oauth-callback
-DERIV_OAUTH_REDIRECT_URL = os.getenv("DERIV_OAUTH_REDIRECT_URL")
-# Deliberately SEPARATE from DERIV_APP_ID above, per explicit
-# instruction - the existing app is a different registration "type"
-# than what OAuth login needs, and swapping DERIV_APP_ID itself would
-# risk affecting the already-working manual-token connect flow (which
-# uses DERIV_APP_ID for every Deriv API call, not just OAuth). This
-# app_id is used ONLY for building the "Login with Deriv" URL below -
-# nowhere else in the bot.
+# Separate app_id + redirect used ONLY for "Login with Deriv" - kept
+# apart from DERIV_APP_ID (used for every other Deriv API call) so
+# nothing about the existing manual-token flow is ever at risk from
+# this. See the PKCE OAuth block further down for how these are used.
 DERIV_OAUTH_APP_ID = os.getenv("DERIV_OAUTH_APP_ID")
+DERIV_OAUTH_REDIRECT_URL = os.getenv("DERIV_OAUTH_REDIRECT_URL")
 ADMIN_USER_ID = os.getenv("ADMIN_USER_ID")  # restricts /broadcast to this Telegram user ID only
 
 # ============================================
@@ -793,55 +787,66 @@ async def korapay_webhook_handler(request):
 
 async def deriv_oauth_callback_handler(request):
     """
-    Deriv redirects here after a user logs in via oauth.deriv.com.
-    Same rule as korapay_webhook_handler above: does the MINIMUM
-    (resolve which Telegram user this is, pick the real account,
-    write it to the pending-connections table) and returns a plain
-    HTML page - the actual save_deriv_account() call and Telegram
-    confirmation happen separately in
+    Deriv redirects here after a user logs in via the modern PKCE flow
+    (auth.deriv.com). Unlike the old legacy-flow attempt, Deriv sends
+    back a temporary ?code=...&state=... - not a token directly - so
+    this handler does the full exchange itself (resolve state -> user
+    + code_verifier, trade the code for a real access_token, look up
+    the real account's loginid) before handing off to the pending
+    table. Still follows the same rule as korapay_webhook_handler:
+    never talks to Telegram directly from here - that happens in
     process_pending_deriv_oauth_connections, on the bot's own event
-    loop, never from here.
-
-    Deriv's redirect looks like:
-      ?acct1=CR123&token1=xxx&cur1=usd&acct2=VRTC456&token2=yyy&cur2=usd&state=...
-    - one acct/token/cur triplet per account the user has (real AND
-    demo). Real accounts start with CR, demo/virtual start with VRTC
-    or VRW - picks the first CR account found; ignores demo ones.
+    loop.
     """
     params = request.query
     state = params.get("state", "")
+    code = params.get("code", "")
 
-    # TEMPORARY DIAGNOSTIC LOGGING - remove once the redirect issue is
-    # confirmed fixed. This is the single most useful piece of
-    # information right now: whether Deriv is reaching this endpoint
-    # AT ALL, and if so, exactly what it sent. Check Railway's deploy
-    # logs immediately after testing the login button.
-    print(f"[DERIV OAUTH] 🔔 Callback hit! Full query params: {dict(params)}")
-    print(f"[DERIV OAUTH] state param received: {state!r}")
-
-    user_id = resolve_deriv_oauth_state(state) if state else None
-    print(f"[DERIV OAUTH] resolve_deriv_oauth_state({state!r}) -> user_id={user_id!r}")
-    if not user_id:
+    user_id, code_verifier = resolve_deriv_oauth_state(state) if state else (None, None)
+    if not user_id or not code_verifier:
         return web.Response(
             status=400, content_type="text/html",
             text="<h2>This login link has expired or was already used.</h2>"
                  "<p>Go back to Telegram and tap Connect Deriv again.</p>"
         )
 
-    real_loginid, real_token, real_currency = None, None, None
-    i = 1
-    while f"acct{i}" in params:
-        acct = params.get(f"acct{i}", "")
-        if acct.upper().startswith("CR"):
-            real_loginid = acct
-            real_token = params.get(f"token{i}")
-            real_currency = params.get(f"cur{i}", "").upper()
-            break
-        i += 1
+    if not code:
+        error = params.get("error_description") or params.get("error") or "unknown error"
+        print(f"[DERIV OAUTH] No code in callback for user {user_id}: {error}")
+        return web.Response(
+            status=200, content_type="text/html",
+            text=f"<h2>Login didn't complete.</h2><p>{error}</p>"
+                 "<p>Go back to Telegram and try again.</p>"
+        )
 
-    print(f"[DERIV OAUTH] Found real account: loginid={real_loginid!r}, currency={real_currency!r}, token_present={bool(real_token)}")
+    access_token = exchange_deriv_oauth_code(code, code_verifier)
+    if not access_token:
+        return web.Response(
+            status=200, content_type="text/html",
+            text="<h2>Something went wrong finishing the login.</h2>"
+                 "<p>Go back to Telegram and try again, or paste an API token instead.</p>"
+        )
 
-    if not real_loginid or not real_token:
+    accounts_data = await deriv_get_options_accounts(access_token)
+    accounts_list = None
+    if accounts_data:
+        accounts_list = accounts_data.get("data")
+        if not isinstance(accounts_list, list):
+            accounts_list = accounts_data.get("accounts")
+
+    real_loginid, real_currency = None, None
+    if accounts_list:
+        for acct in accounts_list:
+            is_virtual = bool(
+                acct.get("is_virtual")
+                or str(acct.get("account_type", "")).lower() in ("demo", "virtual")
+            )
+            if not is_virtual:
+                real_loginid = acct.get("loginid") or acct.get("account_id") or acct.get("id")
+                real_currency = str(acct.get("currency", "")).upper()
+                break
+
+    if not real_loginid:
         return web.Response(
             status=200, content_type="text/html",
             text="<h2>No real Deriv account found.</h2>"
@@ -851,8 +856,7 @@ async def deriv_oauth_callback_handler(request):
                  "has a real Deriv account too.</p>"
         )
 
-    save_pending_deriv_oauth_connection(user_id, real_loginid, real_token, real_currency)
-    print(f"[DERIV OAUTH] ✅ Saved pending connection for user_id={user_id}")
+    save_pending_deriv_oauth_connection(user_id, real_loginid, access_token, real_currency)
 
     return web.Response(
         status=200, content_type="text/html",
@@ -986,11 +990,14 @@ async def process_pending_deriv_oauth_connections(context: ContextTypes.DEFAULT_
     """
     Runs every ~20 seconds on the bot's OWN event loop, mirroring
     process_confirmed_korapay_payments above - picks up whatever
-    deriv_oauth_callback_handler already wrote to the pending table,
-    saves it exactly the same way the manual-token flow does
-    (save_deriv_account - same function either path uses), and
-    confirms to the user. Safe to call bot.send_message here since
-    this runs through job_queue, not the separate webhook thread.
+    deriv_oauth_callback_handler already resolved and wrote to the
+    pending table, saves it through save_deriv_account (the EXACT
+    same function the manual-token flow uses - an OAuth-issued
+    access_token is stored and used identically to a manually-pasted
+    one, confirmed via this bot's own existing Deriv integration
+    already being Bearer-token-based end to end), and confirms to the
+    user. Safe to call bot.send_message here since this runs through
+    job_queue, not the separate webhook thread.
     """
     pending = get_unprocessed_deriv_oauth_connections()
     if not pending:
@@ -1029,6 +1036,7 @@ async def process_pending_deriv_oauth_connections(context: ContextTypes.DEFAULT_
                 )
         except Exception as e:
             print(f"[DERIV OAUTH] Failed to process pending connection for {user_id}: {e}")
+
 
 
 
@@ -2571,32 +2579,35 @@ def save_deriv_account(user_id, loginid, token, currency):
         return False
 
 # ============================================
-# DERIV OAUTH LOGIN (NEW)
-# Alternative to manually pasting an API token, per explicit
-# instruction - manually-copied tokens are the actual source of the
-# "expired/broken on Railway" problem (wrong scope picked, partial
-# copy, accidentally pasting a short-lived session code instead of a
-# real token - all real, already-seen support issues). OAuth issues
-# the SAME kind of legacy per-account token this bot already uses
-# everywhere (deriv_api_headers, save_deriv_account, etc.) - just
-# obtained via Deriv's own official login page instead of manual
-# copy-paste, so nothing else in the bot needs to change to use it.
+# DERIV OAUTH LOGIN (PKCE) - CORRECTED VERSION
+# Uses Deriv's modern Authorization Code + PKCE flow (auth.deriv.com,
+# not the old oauth.deriv.com endpoint - that one no longer works for
+# newly-registered "OAuth"-type apps, confirmed by testing). The
+# resulting access_token is a genuine drop-in for save_deriv_account -
+# this bot's ENTIRE Deriv integration already runs on Bearer tokens
+# against the same REST API (see deriv_api_headers/
+# deriv_get_options_accounts above), so nothing downstream needs to
+# change to use an OAuth-issued token instead of a manually-pasted one.
+# Confirmed with real (not documented-example) tokens: no refresh
+# token exists or is needed - Deriv issues access_token with a ~30-day
+# expiry_in, so this is "re-auth once a month", not "expires hourly".
 #
-# Two tables, matching the exact same "webhook thread never talks to
+# Two tables, matching the same "webhook thread never talks to
 # Telegram directly" pattern already proven by the KoraPay flow above:
-#   1. deriv_oauth_states - correlates the redirect callback (which
-#      has no built-in identity) back to the Telegram user who
-#      started it. One-time use, consumed on lookup.
+#   1. deriv_oauth_states - correlates the redirect callback back to
+#      the Telegram user who started it, AND holds the PKCE
+#      code_verifier needed for the token exchange. One-time use.
 #   2. pending_deriv_oauth_connections - the callback (running in the
-#      separate webhook thread) writes here and stops; a job on the
-#      BOT'S OWN event loop (process_pending_deriv_oauth_connections)
-#      picks it up and does the actual save_deriv_account() call +
-#      Telegram DM.
+#      separate webhook thread) resolves everything (including the
+#      real account's loginid) and writes here; a job on the BOT'S
+#      OWN event loop (process_pending_deriv_oauth_connections) picks
+#      it up and does the actual save_deriv_account() call + Telegram DM.
 #
 # REQUIRED: create these tables in Supabase before deploying -
 #   create table deriv_oauth_states (
 #     state text primary key,
 #     user_id text not null,
+#     code_verifier text not null,
 #     created_at timestamptz default now()
 #   );
 #   create table pending_deriv_oauth_connections (
@@ -2610,12 +2621,19 @@ def save_deriv_account(user_id, loginid, token, currency):
 #   );
 # ============================================
 
-def create_deriv_oauth_state(user_id):
-    """Generates a fresh one-time state token and stores who it belongs to."""
+def generate_pkce_pair():
+    """Returns (code_verifier, code_challenge) per RFC 7636 - S256 method."""
+    code_verifier = secrets.token_urlsafe(64)[:128]
+    digest = hashlib.sha256(code_verifier.encode("ascii")).digest()
+    code_challenge = base64.urlsafe_b64encode(digest).decode("ascii").rstrip("=")
+    return code_verifier, code_challenge
+
+def create_deriv_oauth_state(user_id, code_verifier):
+    """Generates a fresh one-time state token, storing who it belongs to and its PKCE verifier."""
     state = secrets.token_urlsafe(24)
     try:
         url = f"{SUPABASE_URL}/rest/v1/deriv_oauth_states"
-        payload = {"state": state, "user_id": str(user_id)}
+        payload = {"state": state, "user_id": str(user_id), "code_verifier": code_verifier}
         requests.post(url, headers=sb_headers(), json=payload, timeout=10)
         return state
     except Exception as e:
@@ -2623,21 +2641,51 @@ def create_deriv_oauth_state(user_id):
         return None
 
 def resolve_deriv_oauth_state(state):
-    """Looks up which user a state belongs to, then deletes it (one-time use)."""
+    """Looks up (user_id, code_verifier) for a state, then deletes it (one-time use)."""
     try:
-        url = f"{SUPABASE_URL}/rest/v1/deriv_oauth_states?state=eq.{state}&select=user_id"
+        url = f"{SUPABASE_URL}/rest/v1/deriv_oauth_states?state=eq.{state}&select=user_id,code_verifier"
         response = requests.get(url, headers=sb_headers(), timeout=10)
         data = response.json()
         if not data:
-            return None
+            return None, None
         user_id = data[0]["user_id"]
+        code_verifier = data[0]["code_verifier"]
         requests.delete(
             f"{SUPABASE_URL}/rest/v1/deriv_oauth_states?state=eq.{state}",
             headers=sb_headers(), timeout=10
         )
-        return user_id
+        return user_id, code_verifier
     except Exception as e:
         print(f"[DERIV OAUTH] resolve_deriv_oauth_state error: {e}")
+        return None, None
+
+def exchange_deriv_oauth_code(code, code_verifier):
+    """
+    POSTs to Deriv's token endpoint to exchange the authorization code
+    for a real access_token. Returns the access_token string, or None
+    on any failure. Synchronous (requests, not httpx) - fine to call
+    from the aiohttp callback handler as a quick blocking call, same
+    pattern already used by deriv_get_options_accounts elsewhere.
+    """
+    try:
+        response = requests.post(
+            "https://auth.deriv.com/oauth2/token",
+            headers={"Content-Type": "application/x-www-form-urlencoded"},
+            data={
+                "grant_type": "authorization_code",
+                "client_id": DERIV_OAUTH_APP_ID,
+                "code": code,
+                "code_verifier": code_verifier,
+                "redirect_uri": DERIV_OAUTH_REDIRECT_URL,
+            },
+            timeout=15,
+        )
+        if response.status_code != 200:
+            print(f"[DERIV OAUTH] Token exchange failed {response.status_code}: {response.text}")
+            return None
+        return response.json().get("access_token")
+    except Exception as e:
+        print(f"[DERIV OAUTH] exchange_deriv_oauth_code error: {e}")
         return None
 
 def save_pending_deriv_oauth_connection(user_id, loginid, token, currency):
@@ -2670,6 +2718,33 @@ def mark_deriv_oauth_connection_processed(row_id):
         requests.patch(url, headers=sb_headers(), json={"processed": True}, timeout=10)
     except Exception as e:
         print(f"[DERIV OAUTH] mark_deriv_oauth_connection_processed error: {e}")
+
+async def build_deriv_login_button(user_id):
+    """
+    Shared by both send_connect_instructions and the "token expired"
+    reconnect message - generates a fresh PKCE pair + one-time state,
+    stores them, and returns a ready InlineKeyboardMarkup with the
+    "Login with Deriv" button, or None if the OAuth env vars aren't
+    configured (callers fall back to manual-token-only in that case).
+    """
+    if not (DERIV_OAUTH_APP_ID and DERIV_OAUTH_REDIRECT_URL):
+        return None
+    code_verifier, code_challenge = generate_pkce_pair()
+    state = create_deriv_oauth_state(user_id, code_verifier)
+    if not state:
+        return None
+    oauth_url = (
+        "https://auth.deriv.com/oauth2/auth"
+        f"?response_type=code&client_id={DERIV_OAUTH_APP_ID}"
+        f"&redirect_uri={requests.utils.quote(DERIV_OAUTH_REDIRECT_URL, safe='')}"
+        "&scope=trade+account_manage"
+        f"&state={state}"
+        f"&code_challenge={code_challenge}&code_challenge_method=S256"
+    )
+    return InlineKeyboardMarkup([[
+        InlineKeyboardButton("🔑 Login with Deriv (recommended)", url=oauth_url)
+    ]])
+
 
 def get_deriv_account(user_id):
     try:
@@ -3752,27 +3827,17 @@ async def send_connect_instructions(bot, user_id):
     linked yet, so a brand-new user goes straight from intent to
     sign-up to linking without needing to find a separate button.
 
-    Leads with "Login with Deriv" (OAuth) as the recommended option,
-    per explicit instruction - manually-copied API tokens are the
-    actual source of most "expired/broken" support issues (wrong
-    scope, partial copy, pasting a short-lived session code by
-    mistake). OAuth sidesteps all of that since Deriv issues the
-    token directly. Manual token paste stays available as a fallback
-    for anyone who prefers it or hits an OAuth issue.
+    Leads with "Login with Deriv" (PKCE OAuth) as the recommended
+    option, per explicit instruction - manually-copied API tokens are
+    the actual source of most "expired/broken" support issues. The
+    resulting access_token is a genuine drop-in for save_deriv_account
+    (this bot's whole Deriv integration is already Bearer-token-based),
+    and Deriv's real tokens last ~30 days, not the 1-hour figure their
+    generic docs example shows - confirmed against a real live token.
+    Manual token paste stays available as a fallback either way.
     """
     user_modes[user_id] = "awaiting_deriv_token"
-
-    login_markup = None
-    if DERIV_OAUTH_APP_ID and DERIV_OAUTH_REDIRECT_URL:
-        state = create_deriv_oauth_state(user_id)
-        if state:
-            oauth_url = (
-                f"https://oauth.deriv.com/oauth2/authorize"
-                f"?app_id={DERIV_OAUTH_APP_ID}&state={state}"
-            )
-            login_markup = InlineKeyboardMarkup([[
-                InlineKeyboardButton("🔑 Login with Deriv (recommended)", url=oauth_url)
-            ]])
+    login_markup = await build_deriv_login_button(user_id)
 
     await bot.send_message(
         chat_id=int(user_id),
@@ -10490,32 +10555,23 @@ async def handle_buttons(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     reply_markup=InlineKeyboardMarkup([[toggle_button]])
                 )
             else:
-                reconnect_markup = main_keyboard
+                reconnect_markup = await build_deriv_login_button(user_id)
                 reconnect_text = (
                     "⚠️ <b>Couldn't reach your linked Deriv account.</b>\n\n"
                     "Your saved token may have expired or been revoked. "
                     "Paste a new real-account API token below to relink."
                 )
-                if DERIV_OAUTH_APP_ID and DERIV_OAUTH_REDIRECT_URL:
-                    state = create_deriv_oauth_state(user_id)
-                    if state:
-                        oauth_url = (
-                            f"https://oauth.deriv.com/oauth2/authorize"
-                            f"?app_id={DERIV_OAUTH_APP_ID}&state={state}"
-                        )
-                        reconnect_markup = InlineKeyboardMarkup([[
-                            InlineKeyboardButton("🔑 Login with Deriv (recommended)", url=oauth_url)
-                        ]])
-                        reconnect_text = (
-                            "⚠️ <b>Couldn't reach your linked Deriv account.</b>\n\n"
-                            "Your saved token may have expired or been revoked. "
-                            "Tap below to log in directly with Deriv and relink "
-                            "instantly, or paste a new API token here instead."
-                        )
+                if reconnect_markup:
+                    reconnect_text = (
+                        "⚠️ <b>Couldn't reach your linked Deriv account.</b>\n\n"
+                        "Your saved token may have expired or been revoked. "
+                        "Tap below to log in directly with Deriv and relink "
+                        "instantly, or paste a new API token here instead."
+                    )
                 sent_unreachable = await update.message.reply_text(
                     reconnect_text,
                     parse_mode=ParseMode.HTML,
-                    reply_markup=reconnect_markup
+                    reply_markup=reconnect_markup or main_keyboard
                 )
                 schedule_auto_delete(sent_unreachable.chat_id, sent_unreachable.message_id)
             user_modes[user_id] = "awaiting_deriv_token"
@@ -10931,11 +10987,19 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
             events = get_todays_high_impact_events()
             if not events:
-                await query.message.edit_text(
+                next_date = get_next_high_impact_event_date()
+                no_news_text = (
                     "📅 <b>No high-impact USD, EUR, GBP, or JPY news "
                     "scheduled for today.</b>\n\n"
+                )
+                if next_date:
+                    no_news_text += f"Next one: <b>{next_date}</b>.\n\n"
+                no_news_text += (
                     "Try <b>News Breakdown</b> instead for a live read "
-                    "on any specific pair or currency you're curious about.",
+                    "on any specific pair or currency you're curious about."
+                )
+                await query.message.edit_text(
+                    no_news_text,
                     parse_mode=ParseMode.HTML
                 )
                 return
@@ -13569,7 +13633,7 @@ async def send_auto_copy_daily_digest(context: ContextTypes.DEFAULT_TYPE):
 # silently treated as $0.
 # ============================================
 
-SCHEDULED_DAILY_PAIRS = ("XAUUSD", "EURUSD", "GBPUSD", "GBPJPY", "BTCUSD")
+SCHEDULED_DAILY_PAIRS = ("XAUUSD", "GBPJPY", "BTCUSD")
 
 # Fixed SL/TP pip distances per pair, per explicit instruction (added
 # alongside the dollar P&L above so pip-focused traders can see both).
@@ -13919,8 +13983,8 @@ def main():
     )
 
     # Deriv OAuth: picks up what deriv_oauth_callback_handler already
-    # wrote to the database, saves the account, notifies the user -
-    # same pattern as the KoraPay job above.
+    # resolved and wrote to the database, saves the account, notifies
+    # the user - same pattern as the KoraPay job above.
     job_queue.run_repeating(
         process_pending_deriv_oauth_connections,
         interval=20,

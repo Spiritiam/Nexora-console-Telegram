@@ -802,7 +802,10 @@ async def deriv_oauth_callback_handler(request):
     state = params.get("state", "")
     code = params.get("code", "")
 
-    user_id, code_verifier = resolve_deriv_oauth_state(state) if state else (None, None)
+    if state:
+        user_id, code_verifier, prompt_chat_id, prompt_message_id = resolve_deriv_oauth_state(state)
+    else:
+        user_id, code_verifier, prompt_chat_id, prompt_message_id = None, None, None, None
     if not user_id or not code_verifier:
         return web.Response(
             status=400, content_type="text/html",
@@ -856,7 +859,10 @@ async def deriv_oauth_callback_handler(request):
                  "has a real Deriv account too.</p>"
         )
 
-    save_pending_deriv_oauth_connection(user_id, real_loginid, access_token, real_currency)
+    save_pending_deriv_oauth_connection(
+        user_id, real_loginid, access_token, real_currency,
+        prompt_chat_id, prompt_message_id
+    )
 
     return web.Response(
         status=200, content_type="text/html",
@@ -1010,19 +1016,31 @@ async def process_pending_deriv_oauth_connections(context: ContextTypes.DEFAULT_
         loginid = row.get("loginid")
         token = row.get("token")
         currency = row.get("currency")
+        prompt_chat_id = row.get("prompt_chat_id")
+        prompt_message_id = row.get("prompt_message_id")
         if not all([row_id, user_id, loginid, token]):
             continue
 
         try:
-            saved = save_deriv_account(user_id, loginid, token, currency)
+            saved = save_deriv_account(user_id, loginid, token, currency, auth_method="oauth")
             mark_deriv_oauth_connection_processed(row_id)
             if saved:
+                # Clean up the "Login with Deriv" prompt now that it's
+                # done its job - per explicit instruction, leaving a
+                # still-tappable login button visible after a
+                # successful connection risks a newbie tapping it
+                # again out of confusion.
+                if prompt_chat_id and prompt_message_id:
+                    try:
+                        await bot.delete_message(chat_id=int(prompt_chat_id), message_id=int(prompt_message_id))
+                    except Exception as e:
+                        print(f"[DERIV OAUTH] Couldn't delete prompt message for {user_id}: {e}")
                 await bot.send_message(
                     chat_id=int(user_id),
                     text=(
                         f"✅ <b>Deriv account connected!</b>\n\n"
                         f"Account: {loginid}\n\n"
-                        f"You're all set - use 🔗 Connect Deriv anytime to check your "
+                        f"Tap 🔗 Connect Deriv below anytime to check your "
                         f"balance or manage Auto-Copy."
                     ),
                     parse_mode=ParseMode.HTML,
@@ -2552,7 +2570,7 @@ def log_auto_copy_failure(user_id, symbol, reason):
     except Exception as e:
         print(f"[AUTO-COPY LOG] log_auto_copy_failure error: {e}")
 
-def save_deriv_account(user_id, loginid, token, currency):
+def save_deriv_account(user_id, loginid, token, currency, auth_method="manual"):
     try:
         url = (
             f"{SUPABASE_URL}/rest/v1/deriv_accounts"
@@ -2564,6 +2582,14 @@ def save_deriv_account(user_id, loginid, token, currency):
             "api_token": token,
             "currency": currency,
             "linked_at": datetime.utcnow().isoformat(),
+            # "oauth" vs "manual" - kept as informational metadata
+            # (e.g. useful for support/debugging) even though no
+            # feature currently acts on it - per explicit instruction,
+            # the proactive expiry-warning feature that used to read
+            # this was removed; the existing reactive "couldn't reach
+            # your account" fallback (which already has the login
+            # button) is the agreed approach instead.
+            "auth_method": auth_method,
         }
         headers = {**sb_headers(), "Prefer": "resolution=merge-duplicates"}
         response = requests.post(
@@ -2572,7 +2598,7 @@ def save_deriv_account(user_id, loginid, token, currency):
         if response.status_code not in (200, 201):
             print(f"[DERIV] save_deriv_account unexpected status {response.status_code}: {response.text}")
             return False
-        print(f"[DERIV] ✅ Linked account for user {user_id}: {loginid}")
+        print(f"[DERIV] ✅ Linked account for user {user_id}: {loginid} (via {auth_method})")
         return True
     except Exception as e:
         print(f"[DERIV] save_deriv_account error: {e}")
@@ -2641,23 +2667,25 @@ def create_deriv_oauth_state(user_id, code_verifier):
         return None
 
 def resolve_deriv_oauth_state(state):
-    """Looks up (user_id, code_verifier) for a state, then deletes it (one-time use)."""
+    """Looks up (user_id, code_verifier, prompt_chat_id, prompt_message_id) for a state, then deletes it (one-time use)."""
     try:
-        url = f"{SUPABASE_URL}/rest/v1/deriv_oauth_states?state=eq.{state}&select=user_id,code_verifier"
+        url = (
+            f"{SUPABASE_URL}/rest/v1/deriv_oauth_states?state=eq.{state}"
+            f"&select=user_id,code_verifier,prompt_chat_id,prompt_message_id"
+        )
         response = requests.get(url, headers=sb_headers(), timeout=10)
         data = response.json()
         if not data:
-            return None, None
-        user_id = data[0]["user_id"]
-        code_verifier = data[0]["code_verifier"]
+            return None, None, None, None
+        row = data[0]
         requests.delete(
             f"{SUPABASE_URL}/rest/v1/deriv_oauth_states?state=eq.{state}",
             headers=sb_headers(), timeout=10
         )
-        return user_id, code_verifier
+        return row["user_id"], row["code_verifier"], row.get("prompt_chat_id"), row.get("prompt_message_id")
     except Exception as e:
         print(f"[DERIV OAUTH] resolve_deriv_oauth_state error: {e}")
-        return None, None
+        return None, None, None, None
 
 def exchange_deriv_oauth_code(code, code_verifier):
     """
@@ -2688,7 +2716,7 @@ def exchange_deriv_oauth_code(code, code_verifier):
         print(f"[DERIV OAUTH] exchange_deriv_oauth_code error: {e}")
         return None
 
-def save_pending_deriv_oauth_connection(user_id, loginid, token, currency):
+def save_pending_deriv_oauth_connection(user_id, loginid, token, currency, prompt_chat_id=None, prompt_message_id=None):
     try:
         url = f"{SUPABASE_URL}/rest/v1/pending_deriv_oauth_connections"
         payload = {
@@ -2697,6 +2725,8 @@ def save_pending_deriv_oauth_connection(user_id, loginid, token, currency):
             "token": token,
             "currency": currency,
             "processed": False,
+            "prompt_chat_id": prompt_chat_id,
+            "prompt_message_id": prompt_message_id,
         }
         requests.post(url, headers=sb_headers(), json=payload, timeout=10)
     except Exception as e:
@@ -2723,16 +2753,21 @@ async def build_deriv_login_button(user_id):
     """
     Shared by both send_connect_instructions and the "token expired"
     reconnect message - generates a fresh PKCE pair + one-time state,
-    stores them, and returns a ready InlineKeyboardMarkup with the
-    "Login with Deriv" button, or None if the OAuth env vars aren't
-    configured (callers fall back to manual-token-only in that case).
+    stores them, and returns (markup, state) - markup is a ready
+    InlineKeyboardMarkup with the "Login with Deriv" button, or None
+    if the OAuth env vars aren't configured (callers fall back to
+    manual-token-only in that case). state is returned too so the
+    caller can attach the sent message's ID to it afterward (see
+    update_deriv_oauth_state_message_id) - lets the prompt message get
+    cleaned up automatically once the connection actually succeeds,
+    instead of sitting there looking tappable forever.
     """
     if not (DERIV_OAUTH_APP_ID and DERIV_OAUTH_REDIRECT_URL):
-        return None
+        return None, None
     code_verifier, code_challenge = generate_pkce_pair()
     state = create_deriv_oauth_state(user_id, code_verifier)
     if not state:
-        return None
+        return None, None
     oauth_url = (
         "https://auth.deriv.com/oauth2/auth"
         f"?response_type=code&client_id={DERIV_OAUTH_APP_ID}"
@@ -2741,9 +2776,23 @@ async def build_deriv_login_button(user_id):
         f"&state={state}"
         f"&code_challenge={code_challenge}&code_challenge_method=S256"
     )
-    return InlineKeyboardMarkup([[
+    markup = InlineKeyboardMarkup([[
         InlineKeyboardButton("🔑 Login with Deriv (recommended)", url=oauth_url)
     ]])
+    return markup, state
+
+
+def update_deriv_oauth_state_message_id(state, chat_id, message_id):
+    """Attaches the sent prompt message's location to its state row, for later cleanup on success."""
+    try:
+        url = f"{SUPABASE_URL}/rest/v1/deriv_oauth_states?state=eq.{state}"
+        requests.patch(
+            url, headers=sb_headers(),
+            json={"prompt_chat_id": str(chat_id), "prompt_message_id": message_id},
+            timeout=10
+        )
+    except Exception as e:
+        print(f"[DERIV OAUTH] update_deriv_oauth_state_message_id error: {e}")
 
 
 def get_deriv_account(user_id):
@@ -3835,47 +3884,64 @@ async def send_connect_instructions(bot, user_id):
     and Deriv's real tokens last ~30 days, not the 1-hour figure their
     generic docs example shows - confirmed against a real live token.
     Manual token paste stays available as a fallback either way.
+
+    Wording kept deliberately simple throughout, per explicit
+    instruction - written for someone who's never done this before,
+    not for a developer. The old "not a login/session code" nuance
+    line was dropped entirely (not shortened) - it was explaining a
+    distinction only relevant to the manual-token path, which most
+    people won't even need now that login is front and center.
     """
     user_modes[user_id] = "awaiting_deriv_token"
-    login_markup = await build_deriv_login_button(user_id)
+    login_markup, oauth_state = await build_deriv_login_button(user_id)
 
-    await bot.send_message(
+    sent = await bot.send_message(
         chat_id=int(user_id),
         text=(
             "🔗 <b>Connect Your Deriv Account</b>\n\n"
-            "Nexora can show your real Deriv <b>Options account</b> "
-            "balance and open positions right here in Telegram. "
-            "(MT5 and cTrader accounts aren't supported yet.)\n\n"
+            "This lets Nexora show your real Deriv balance and "
+            "positions right here in Telegram. (MT5 and cTrader "
+            "accounts aren't supported yet - Options accounts only.)\n\n"
             "Don't have a Deriv account yet? "
             "<a href=\"https://track.deriv.com/_eBizfEiAKzC6tyDIijdDK2Nd7ZgqdRLk/1/\">"
             "Sign up here first</a>, then come back to this step.\n\n"
             + (
-                "👇 Tap below to log in directly with Deriv - fastest, "
-                "and avoids the token issues below entirely.\n\n"
-                if login_markup else ""
-            ) +
-            "<b>Or connect with an API token instead:</b>\n"
-            "1️⃣ Go to <b>developers.deriv.com</b> and log in\n"
-            "2️⃣ Tap the menu (☰) in the top right, then tap "
-            "<b>API tokens</b>\n"
-            "3️⃣ Tap <b>Create new token</b>, and check <b>Trade</b> and "
-            "<b>Account management</b>\n"
-            "4️⃣ Copy the token and paste it here\n\n"
-            "⚠️ <b>Real accounts only</b> — demo/virtual tokens will be "
-            "rejected.\n\n"
-            "⚠️ <b>Use the API token from step 3, not a login/session "
-            "code.</b> Some users accidentally paste a short-lived "
-            "code instead — that type expires within hours and will "
-            "make trading stop working until you reconnect with the "
-            "correct token."
+                "👇 Tap the button below to log in with Deriv. That's it "
+                "- one tap and you're connected.\n\n"
+                "Prefer to connect a different way? Scroll down for "
+                "another option."
+                if login_markup else
+                "<b>How to connect:</b>\n"
+                "1️⃣ Go to <b>developers.deriv.com</b> and log in\n"
+                "2️⃣ Tap the menu (☰) in the top right, then tap "
+                "<b>API tokens</b>\n"
+                "3️⃣ Tap <b>Create new token</b>, and check <b>Trade</b> "
+                "and <b>Account management</b>\n"
+                "4️⃣ Copy the token and paste it here\n\n"
+                "⚠️ <b>Real accounts only</b> — demo/virtual tokens "
+                "will be rejected."
+            )
         ),
         parse_mode=ParseMode.HTML,
         reply_markup=login_markup or main_keyboard
     )
+    if login_markup and oauth_state:
+        update_deriv_oauth_state_message_id(oauth_state, sent.chat_id, sent.message_id)
     if login_markup:
         await bot.send_message(
             chat_id=int(user_id),
-            text="Or paste your API token here if you'd rather do that instead:",
+            text=(
+                "<b>Or connect with an API token instead:</b>\n"
+                "1️⃣ Go to <b>developers.deriv.com</b> and log in\n"
+                "2️⃣ Tap the menu (☰) in the top right, then tap "
+                "<b>API tokens</b>\n"
+                "3️⃣ Tap <b>Create new token</b>, and check <b>Trade</b> "
+                "and <b>Account management</b>\n"
+                "4️⃣ Copy the token and paste it here\n\n"
+                "⚠️ <b>Real accounts only</b> — demo/virtual tokens "
+                "will be rejected."
+            ),
+            parse_mode=ParseMode.HTML,
             reply_markup=main_keyboard
         )
 
@@ -9256,19 +9322,24 @@ DIRECTION: BULLISH or BEARISH
 REASON: [one sentence, max 20 words, plain and beginner-friendly]
 """
     try:
+        # NO outer retry loop here (there used to be one, 15s + 30s
+        # waits on top of ask_gemini's own retry) - removed per
+        # explicit instruction after it turned out to be the actual
+        # cause of "takes forever, then still fails". ask_gemini
+        # ALREADY retries Gemini once internally AND falls back to a
+        # completely different provider (OpenRouter) on failure - that
+        # was already real resilience against a one-off blip. Stacking
+        # a third retry layer on top of that doesn't add meaningful
+        # protection against a PERSISTENT problem (wrong API key,
+        # exhausted quota, real outage) - it just makes the user wait
+        # up to ~6 minutes worst-case for the exact same eventual
+        # failure. This is a foreground call someone is actively
+        # waiting on, not a background job - fail fast here matters
+        # more than squeezing out one more retry.
         result = await ask_gemini(prompt)
-
-        # Same retry-with-backoff resilience as the daily news post
-        # and News Breakdown - per explicit instruction, so a single
-        # unlucky moment where both Gemini and OpenRouter are briefly
-        # busy doesn't just fail this call outright.
-        retry_waits = [15, 30]
-        for attempt_number, wait_seconds in enumerate(retry_waits, start=2):
-            if result.strip() not in KNOWN_AI_FAILURE_STRINGS:
-                break
-            print(f"[NEWS CALL] AI direction judgment failed ('{result.strip()}') - waiting {wait_seconds}s then retrying (attempt {attempt_number}/3)...")
-            await asyncio.sleep(wait_seconds)
-            result = await ask_gemini(prompt)
+        if result.strip() in KNOWN_AI_FAILURE_STRINGS:
+            print(f"[NEWS CALL] AI direction judgment failed ('{result.strip()}')")
+            return None, None
 
         direction_match = re.search(r"DIRECTION:\s*(BULLISH|BEARISH)", result, re.IGNORECASE)
         reason_match = re.search(r"REASON:\s*(.+)", result)
@@ -10555,7 +10626,7 @@ async def handle_buttons(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     reply_markup=InlineKeyboardMarkup([[toggle_button]])
                 )
             else:
-                reconnect_markup = await build_deriv_login_button(user_id)
+                reconnect_markup, oauth_state = await build_deriv_login_button(user_id)
                 reconnect_text = (
                     "⚠️ <b>Couldn't reach your linked Deriv account.</b>\n\n"
                     "Your saved token may have expired or been revoked. "
@@ -10573,6 +10644,8 @@ async def handle_buttons(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     parse_mode=ParseMode.HTML,
                     reply_markup=reconnect_markup or main_keyboard
                 )
+                if reconnect_markup and oauth_state:
+                    update_deriv_oauth_state_message_id(oauth_state, sent_unreachable.chat_id, sent_unreachable.message_id)
                 schedule_auto_delete(sent_unreachable.chat_id, sent_unreachable.message_id)
             user_modes[user_id] = "awaiting_deriv_token"
             return
@@ -12477,18 +12550,16 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
         response = await generate_breakdown(message)
 
-        # Same retry-with-backoff resilience already used for the
-        # daily news post - per explicit instruction, after finding
-        # this call previously had ZERO retry, showing the raw
-        # "AI server busy" failure directly on the first unlucky
-        # moment both Gemini and OpenRouter were briefly busy.
-        breakdown_retry_waits = [15, 30]
-        for attempt_number, wait_seconds in enumerate(breakdown_retry_waits, start=2):
-            if response.strip() not in KNOWN_AI_FAILURE_STRINGS:
-                break
-            print(f"[BREAKDOWN] AI generation failed ('{response.strip()}') - waiting {wait_seconds}s then retrying (attempt {attempt_number}/3)...")
-            await asyncio.sleep(wait_seconds)
-            response = await generate_breakdown(message)
+        # NO outer retry loop here (there used to be one, 15s + 30s
+        # waits on top of ask_gemini's own retry) - removed per
+        # explicit instruction, same fix as generate_currency_direction
+        # above: ask_gemini already retries Gemini internally AND
+        # falls back to a different provider (OpenRouter). Stacking a
+        # third retry layer on top just made a real, waiting user sit
+        # through up to ~6 minutes for the same eventual failure
+        # instead of finding out quickly.
+        if response.strip() in KNOWN_AI_FAILURE_STRINGS:
+            print(f"[BREAKDOWN] AI generation failed ('{response.strip()}')")
 
         response = clean_text(response)
         response = format_breakdown(response)
@@ -13460,34 +13531,31 @@ async def send_mt5_autotrade_daily_digest(context: ContextTypes.DEFAULT_TYPE):
         if not orders_today:
             continue  # nothing happened for this user today - no digest at all
 
-        lines = [
-            f"✅ <b>{o.get('direction', '')} {o.get('pair_display', '')}</b> — order #{o.get('order_id', '')}"
-            for o in orders_today
-        ]
-
+        # Compact summary ONLY, per explicit instruction - matches the
+        # same fix applied to the Deriv Auto-Copy digest above.
         closed_today = [o for o in orders_today if o.get("status") == "CLOSED" and o.get("profit") is not None]
+        wins = [o for o in closed_today if o["profit"] >= 0]
+        losses = [o for o in closed_today if o["profit"] < 0]
         total_profit = sum(o["profit"] for o in closed_today)
         still_open = len(orders_today) - len(closed_today)
 
         digest = "🤖 <b>Exness Auto-Trade — today's summary</b>\n\n"
-        digest += "\n".join(lines)
-
+        digest += f"Trades placed: {len(orders_today)}\n"
         if closed_today:
+            digest += f"✅ {len(wins)} win{'s' if len(wins) != 1 else ''} • ❌ {len(losses)} loss{'es' if len(losses) != 1 else ''}"
+            if still_open:
+                digest += f" • ⏳ {still_open} still open"
+            digest += "\n"
             sign = "+" if total_profit >= 0 else "-"
             emoji = "📈" if total_profit >= 0 else "📉"
-            digest += (
-                f"\n\n{emoji} <b>Today's P&L: {sign}${abs(total_profit):.2f}</b> "
-                f"({len(closed_today)} closed"
-                + (f", {still_open} still open" if still_open else "")
-                + ")"
-            )
+            digest += f"{emoji} <b>Today's P&L: {sign}${abs(total_profit):.2f}</b>\n"
         else:
-            digest += f"\n\n<i>All {len(orders_today)} of today's trades are still open.</i>"
+            digest += f"⏳ All still open - nothing closed yet today.\n"
 
         if metaapi_account_id:
             balance = await get_client_mt5_balance(metaapi_account_id)
             if balance is not None:
-                digest += f"\n💰 <b>Current balance:</b> ${balance:.2f}"
+                digest += f"💰 <b>Current balance:</b> ${balance:.2f}\n"
 
         try:
             old_message_id = account.get("last_digest_message_id")
@@ -13525,44 +13593,39 @@ async def send_auto_copy_daily_digest(context: ContextTypes.DEFAULT_TYPE):
         if not trades_today and not failure_count:
             continue  # nothing happened for this user today - no digest at all
 
-        lines = [
-            f"✅ <b>{t['direction']} {SYNTHETIC_CONFIG.get(t['symbol'], {}).get('display', t['symbol'])}</b>\n"
-            f"Stake: ${t['stake']} | Risk ${t['risk']} → Win ${t['win']} | ID: {t['contract_id']}"
-            for t in trades_today
-        ]
-
-        # Real $ P&L, per explicit instruction - summed from whatever
-        # check_open_auto_copy_trades has already confirmed CLOSED
-        # today (real profit/loss, not the fixed risk/win figures
-        # above, which are just what was PROPOSED per trade).
+        # Compact summary ONLY, per explicit instruction - a wall of
+        # one line per individual trade (the previous version) is
+        # exactly the kind of message flooding this bot has been
+        # steered away from throughout. One digest, one screenful,
+        # every trade folded into counts instead of listed out.
         closed_today = [t for t in trades_today if t.get("status") == "CLOSED" and t.get("profit") is not None]
+        wins = [t for t in closed_today if t["profit"] >= 0]
+        losses = [t for t in closed_today if t["profit"] < 0]
         total_profit = sum(t["profit"] for t in closed_today)
         still_open = len(trades_today) - len(closed_today)
 
         digest = "🤖 <b>Auto-Copy — today's summary</b>\n\n"
-        digest += "\n\n".join(lines) if lines else "<i>No trades placed today.</i>"
-
+        digest += f"Trades placed: {len(trades_today)}\n"
         if closed_today:
+            digest += f"✅ {len(wins)} win{'s' if len(wins) != 1 else ''} • ❌ {len(losses)} loss{'es' if len(losses) != 1 else ''}"
+            if still_open:
+                digest += f" • ⏳ {still_open} still open"
+            digest += "\n"
             sign = "+" if total_profit >= 0 else "-"
             emoji = "📈" if total_profit >= 0 else "📉"
-            digest += (
-                f"\n\n{emoji} <b>Today's P&L: {sign}${abs(total_profit):.2f}</b> "
-                f"({len(closed_today)} closed"
-                + (f", {still_open} still open" if still_open else "")
-                + ")"
-            )
+            digest += f"{emoji} <b>Today's P&L: {sign}${abs(total_profit):.2f}</b>\n"
         elif trades_today:
-            digest += f"\n\n<i>All {len(trades_today)} of today's trades are still open.</i>"
+            digest += f"⏳ All still open - nothing closed yet today.\n"
 
         if token:
             snapshot = await deriv_fetch_account_snapshot(token)
             balance = snapshot.get("balance") if snapshot else None
             if balance is not None:
-                digest += f"\n💰 <b>Current balance:</b> ${balance:.2f}"
+                digest += f"💰 <b>Current balance:</b> ${balance:.2f}\n"
 
         if failure_count:
             digest += (
-                f"\n\n<i>{failure_count} other signal"
+                f"\n<i>{failure_count} other signal"
                 f"{'s' if failure_count != 1 else ''} couldn't be "
                 f"placed today — no action needed, they retry "
                 f"automatically.</i>"

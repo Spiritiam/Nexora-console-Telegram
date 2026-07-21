@@ -9344,6 +9344,14 @@ REASON: [one sentence, max 20 words, plain and beginner-friendly]
         direction_match = re.search(r"DIRECTION:\s*(BULLISH|BEARISH)", result, re.IGNORECASE)
         reason_match = re.search(r"REASON:\s*(.+)", result)
         if not direction_match:
+            # This was silently returning None before, with NO log
+            # line at all - meaning a real, distinct failure mode
+            # (the AI answered, just not in the exact expected format)
+            # left zero trace to diagnose from. Logging the raw
+            # response now so the next occurrence is actually visible
+            # in Railway's logs instead of indistinguishable from a
+            # hard API failure.
+            print(f"[NEWS CALL] AI responded but format didn't match - raw response: {result!r}")
             return None, None
         direction = direction_match.group(1).upper()
         reason = reason_match.group(1).strip() if reason_match else ""

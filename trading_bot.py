@@ -3038,16 +3038,17 @@ SYNTHETIC_CONFIG = {
     "r100": {"symbol": "R_100", "display": "Volatility 100 Index", "default_multiplier": 20},
 }
 
-# Indices excluded from auto-copy specifically - per explicit
-# instruction, R_75's Deriv-enforced multiplier floor (400) caps the
-# widest possible stop distance at 0.25% of price, mathematically,
-# regardless of stake or dollar risk chosen. That's too tight to
-# survive Volatility 75's normal noise, which real trade history
-# confirmed as the actual driver of auto-copy's poor win rate. The
-# channel signal and manual "Trade This Signal" flow are UNCHANGED -
-# this only stops it from being silently auto-traded for every
-# opted-in user.
-AUTO_COPY_EXCLUDED_INDICES = {"r75"}
+# R_75 was excluded from auto-copy for a real, data-backed reason:
+# Deriv's enforced 400x multiplier floor caps the widest possible
+# stop distance at 0.25% of price, mathematically, regardless of
+# stake or risk chosen - too tight to survive Volatility 75's normal
+# noise, which real trade history confirmed drove a ~17% win rate
+# against a required ~33% breakeven. RE-ENABLED per explicit
+# instruction - that underlying risk hasn't changed, this is a
+# deliberate choice to accept it, not a fix to it. Kept as an empty
+# set (not deleted entirely) so this history stays documented and any
+# future index can still be excluded the same way if needed.
+AUTO_COPY_EXCLUDED_INDICES = set()
 
 SYNTHETIC_ALIASES = {
     "r10": ["r10", "r_10", "r 10", "volatility 10", "volatility10", "vol 10", "vol10", "v10"],
@@ -13030,6 +13031,78 @@ async def _run_broadcast(bot, message_text, admin_chat_id):
 # Remove once confirmed working.
 # ============================================
 
+async def discoversymbols_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """
+    One-time diagnostic, per explicit instruction - before adding the
+    1-second Volatility indices or Step Index to SYNTHETIC_CONFIG
+    (which controls REAL auto-trading), get their ACTUAL symbol codes
+    directly from Deriv's own active_symbols API instead of guessing.
+    This is a read-only call - zero trading risk, just a lookup.
+    Reuses the exact same DERIV_SERVICE_TOKEN connection pattern
+    already proven for candle fetching (get_synthetic_candles, etc.).
+    Admin-only, remove once the real codes are confirmed and added.
+    """
+    user_id = str(update.message.from_user.id)
+    if not ADMIN_USER_ID or user_id != str(ADMIN_USER_ID):
+        return
+
+    if not DERIV_SERVICE_TOKEN:
+        await update.message.reply_text("No DERIV_SERVICE_TOKEN set - can't run this.")
+        return
+
+    await update.message.reply_text("Looking up real symbol codes from Deriv...")
+
+    try:
+        accounts_data = await deriv_get_options_accounts(DERIV_SERVICE_TOKEN)
+        if not accounts_data:
+            await update.message.reply_text("Couldn't reach Deriv accounts.")
+            return
+        accounts_list = accounts_data.get("data")
+        if not isinstance(accounts_list, list):
+            accounts_list = accounts_data.get("accounts")
+        if not accounts_list:
+            await update.message.reply_text("Couldn't read the accounts list.")
+            return
+
+        account_id = (
+            accounts_list[0].get("account_id")
+            or accounts_list[0].get("loginid")
+            or accounts_list[0].get("id")
+        )
+        ws_url = await deriv_get_otp_url(DERIV_SERVICE_TOKEN, account_id)
+        if not ws_url:
+            await update.message.reply_text("Couldn't establish a connection to Deriv.")
+            return
+
+        async with websockets.connect(ws_url, open_timeout=10, close_timeout=5) as ws:
+            await ws.send(json.dumps({"active_symbols": "brief", "product_type": "basic"}))
+            response = json.loads(await ws.recv())
+
+        symbols = response.get("active_symbols", [])
+        if not symbols:
+            await update.message.reply_text(f"Unexpected response: {response}")
+            return
+
+        matches = [
+            s for s in symbols
+            if "1s" in s.get("display_name", "").lower().replace(" ", "")
+            or "step" in s.get("display_name", "").lower()
+        ]
+
+        if not matches:
+            await update.message.reply_text("No matching symbols found - check the raw log output.")
+            print(f"[DISCOVER SYMBOLS] Full active_symbols response: {symbols}")
+            return
+
+        lines = [f"{m['display_name']}: {m['symbol']}" for m in matches]
+        await update.message.reply_text(
+            "✅ Confirmed real symbol codes:\n\n" + "\n".join(lines)
+        )
+    except Exception as e:
+        await update.message.reply_text(f"Failed: {e}")
+        print(f"[DISCOVER SYMBOLS] error: {e}")
+
+
 async def testsynth_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = str(update.message.from_user.id)
 
@@ -13962,6 +14035,7 @@ def main():
     app.add_handler(CommandHandler("broadcast", broadcast_command))
     app.add_handler(CommandHandler("mt5revenue", mt5revenue_command))
     app.add_handler(CommandHandler("testsynth", testsynth_command))
+    app.add_handler(CommandHandler("discoversymbols", discoversymbols_command))
     app.add_handler(CommandHandler("testsignal", testsignal_command))
     app.add_handler(CommandHandler("welcome", welcome_command))
     app.add_handler(CommandHandler("purgedigests", purgedigests_command))

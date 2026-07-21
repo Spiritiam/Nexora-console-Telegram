@@ -617,6 +617,10 @@ async def run_mt5_autotrade_bot_scan(context: ContextTypes.DEFAULT_TYPE):
                 continue
 
             direction = vote.get("direction")
+
+            if check_fresh_momentum_veto(pair_key, pair_config, primary_candles, direction):
+                continue
+
             entry_price = primary_candles[-1]["close"]
             atr = _accum_zone_atr(primary_candles, 14) if len(primary_candles) > 15 else None
             if not atr:
@@ -7386,6 +7390,60 @@ SYNTHETIC_INDEX_STRATEGY_GROUPS = {
     "r50": [strategy_bollinger_rsi_mean_reversion],
 }
 
+def check_fresh_momentum_veto(pair_key, config, h1_candles, direction):
+    """
+    Safety check: does the CURRENT live price show strong, immediate
+    momentum AGAINST the direction a strategy just voted for? Uses
+    ONLY data already being fetched anyway - the raw h1_candles
+    already passed into every strategy, and get_cached_price_data's
+    existing 60-second price cache - so this adds ZERO new API calls.
+
+    Why this exists: swing-confirmed structure (BOS/CHoCH, Unicorn
+    Model, Fibonacci retracement, S/R bounce - anything built on
+    find_swing_points) has an inherent blind spot. A swing point can
+    only be confirmed once there are 2+ candles of follow-through
+    AFTER it, so this kind of analysis structurally cannot "see" a
+    sharp move still unfolding in just the last couple of candles.
+    Confirmed live: a real SELL fired on XAUUSD with "bearish break of
+    structure" as the stated reason, while the freshest candles were
+    in the middle of a strong, fast rally straight into the entry
+    zone - the swing data was real, just already out of date relative
+    to what was actually happening.
+
+    Returns True if the signal should be SUPPRESSED this round (fresh
+    momentum contradicts it), False if it's safe to proceed.
+    """
+    if not h1_candles or len(h1_candles) < 3:
+        return False  # not enough data to check - don't block on missing data
+
+    try:
+        symbol = config["symbol"]
+        current_price, _ = get_cached_price_data(pair_key, symbol, config)
+        if current_price is None:
+            return False  # couldn't get a live price - don't block a signal on a fetch failure
+
+        reference_close = h1_candles[-3]["close"]
+        if not reference_close:
+            return False
+
+        pct_move = (current_price - reference_close) / reference_close * 100
+        # 0.3% within the last 2 H1 candles is a genuinely fast, sharp
+        # move for most pairs this bot trades - tuned to catch exactly
+        # the kind of situation that prompted this, not everyday noise.
+        THRESHOLD_PCT = 0.3
+
+        if direction == "SELL" and pct_move > THRESHOLD_PCT:
+            print(f"[MOMENTUM VETO] {pair_key} SELL suppressed - price up {pct_move:.2f}% in the last 2 candles, against the call")
+            return True
+        if direction == "BUY" and pct_move < -THRESHOLD_PCT:
+            print(f"[MOMENTUM VETO] {pair_key} BUY suppressed - price down {pct_move:.2f}% in the last 2 candles, against the call")
+            return True
+        return False
+    except Exception as e:
+        print(f"[MOMENTUM VETO] check failed for {pair_key}: {e}")
+        return False  # never let the veto itself become a new point of failure
+
+
 def run_strategy_bank(pair_key, config, h1_candles, h4_candles, daily_candles, min_agree=2):
     """
     Runs every strategy in STRATEGY_BANK plus the existing ICT/SMC
@@ -7475,6 +7533,9 @@ def run_strategy_bank(pair_key, config, h1_candles, h4_candles, daily_candles, m
 
     agreeing_names = [v["strategy_name"] for v in winning_votes]
     confidence = min(95, 70 + len(winning_votes) * 6)
+
+    if check_fresh_momentum_veto(pair_key, config, h1_candles, direction):
+        return None
 
     # Short bullet points, one per agreeing strategy, instead of one
     # long run-on sentence - reads cleanly even with 2-3 strategies
@@ -9297,11 +9358,16 @@ async def generate_currency_direction(event):
     """
     Constrained AI call: judges ONLY whether this specific event's
     likely result is bullish or bearish for the event's OWN currency,
-    with one sentence of reasoning. Does NOT pick a pair or a BUY/SELL
-    call itself - see the module docstring above for why that
-    mechanical step is deliberately kept in code, not left to the AI.
-    Returns (direction, reasoning) where direction is "BULLISH" or
-    "BEARISH", or (None, None) on failure.
+    with a strength percentage and one sentence of reasoning. Does NOT
+    pick a pair or a BUY/SELL call itself - see the module docstring
+    above for why that mechanical step is deliberately kept in code,
+    not left to the AI.
+    Returns (direction, strength_pct, reasoning) where direction is
+    "BULLISH" or "BEARISH" and strength_pct is an int 51-95 (how
+    strongly the data favors that direction - capped below 100 since
+    fundamentals are never a certainty, and above 50 since anything
+    weaker wouldn't be worth calling a direction at all), or
+    (None, None, None) on failure.
     """
     forecast_line = f"Forecast: {event['forecast']}" if event.get("forecast") else ""
     previous_line = f"Previous: {event['previous']}" if event.get("previous") else ""
@@ -9313,13 +9379,22 @@ You are a forex fundamental analyst. Judge ONLY whether this news
 event is likely BULLISH or BEARISH for its own currency - nothing
 else, no pair, no trade call.
 
+Also judge HOW STRONGLY the data favors that direction, as a
+percentage between 51 and 95 - use a number close to 51 when the data
+is only mildly one-sided (e.g. actual barely beat forecast), and
+closer to 95 only when the data is a large, unambiguous surprise
+versus forecast/previous. Never output 50 or below (that wouldn't be
+a direction at all) and never output 100 (fundamentals are never a
+certainty).
+
 EVENT: {event['title']}
 CURRENCY: {event['currency']}
 {data_lines}
 
 Respond in EXACTLY this format, nothing else, no markdown:
 DIRECTION: BULLISH or BEARISH
-REASON: [one sentence, max 20 words, plain and beginner-friendly]
+STRENGTH: [a number 51-95]
+REASON: [one sentence, max 25 words - explicitly reference the actual Forecast/Previous/Actual numbers above, not just a general statement. Plain and beginner-friendly.]
 """
     try:
         # NO outer retry loop here (there used to be one, 15s + 30s
@@ -9339,9 +9414,10 @@ REASON: [one sentence, max 20 words, plain and beginner-friendly]
         result = await ask_gemini(prompt)
         if result.strip() in KNOWN_AI_FAILURE_STRINGS:
             print(f"[NEWS CALL] AI direction judgment failed ('{result.strip()}')")
-            return None, None
+            return None, None, None
 
         direction_match = re.search(r"DIRECTION:\s*(BULLISH|BEARISH)", result, re.IGNORECASE)
+        strength_match = re.search(r"STRENGTH:\s*(\d+)", result)
         reason_match = re.search(r"REASON:\s*(.+)", result)
         if not direction_match:
             # This was silently returning None before, with NO log
@@ -9352,13 +9428,31 @@ REASON: [one sentence, max 20 words, plain and beginner-friendly]
             # in Railway's logs instead of indistinguishable from a
             # hard API failure.
             print(f"[NEWS CALL] AI responded but format didn't match - raw response: {result!r}")
-            return None, None
+            return None, None, None
         direction = direction_match.group(1).upper()
+        # Clamp defensively even though the prompt constrains the
+        # range - never trust a model to perfectly honor a numeric
+        # bound, clamp rather than reject so a slightly-out-of-range
+        # answer still displays sensibly instead of failing outright.
+        strength_pct = min(95, max(51, int(strength_match.group(1)))) if strength_match else 65
         reason = reason_match.group(1).strip() if reason_match else ""
-        return direction, reason
+        return direction, strength_pct, reason
     except Exception as e:
         print(f"[NEWS CALL] AI direction judgment failed: {e}")
-        return None, None
+        return None, None, None
+
+
+# Caches a successful analysis per event_key, so re-tapping "Know the
+# Direction" on the SAME event re-displays the same result instantly
+# instead of re-running the AI call. Per explicit instruction: a
+# repeat tap was re-running the whole analysis every time, which not
+# only wasted a call re-deriving an answer that can't have changed for
+# the same event, but meant a second tap could fail even after the
+# FIRST one already succeeded (e.g. hitting a rate limit the second
+# time around, as seen live). Not persisted across restarts, and
+# naturally bounded - only ever holds today's events, and there are
+# never more than a handful of high-impact events on any given day.
+NEWS_DIRECTION_CACHE = {}
 
 
 async def send_news_direction_analysis(bot, chat_id, event, batch_events=None):
@@ -9404,13 +9498,18 @@ async def send_news_direction_analysis(bot, chat_id, event, batch_events=None):
         await bot.send_message(chat_id=chat_id, text=text, parse_mode=ParseMode.HTML)
         return
 
+    event_key = event.get("event_key")
+    if event_key and event_key in NEWS_DIRECTION_CACHE:
+        await bot.send_message(chat_id=chat_id, text=NEWS_DIRECTION_CACHE[event_key], parse_mode=ParseMode.HTML)
+        return
+
     wait_message = await bot.send_message(
         chat_id=chat_id,
         text="🧠 <b>Nexora AI reading the news...</b>",
         parse_mode=ParseMode.HTML
     )
 
-    ai_direction, ai_reason = await generate_currency_direction(event)
+    ai_direction, ai_strength, ai_reason = await generate_currency_direction(event)
     if not ai_direction:
         await wait_message.edit_text(
             "⚠️ Couldn't get a clear read on this event right now - try again shortly.",
@@ -9425,35 +9524,37 @@ async def send_news_direction_analysis(bot, chat_id, event, batch_events=None):
     pair_config = PAIR_CONFIG[pair_key]
     pair_display = pair_config["display"]
 
-    confidence = 65
-    technical_note = "ℹ️ No clear technical read right now — this is a fundamentals-only call."
-    try:
-        _, technical_direction, _, technical_signal_data = await build_signal_response(pair_key, user_id=None)
-        if technical_direction == final_direction and technical_signal_data:
-            confidence = 80
-            technical_note = (
-                "✅ Technicals agree with this direction too. "
-                "News moves are sharp and fast — trade safe, use proper "
-                "risk management, and expect a spike."
-            )
-        elif technical_direction and technical_direction != final_direction:
-            confidence = 50
-            technical_note = (
-                f"⚠️ Technicals currently read {technical_direction} — "
-                f"this is a fundamentals-only call, trade with extra caution."
-            )
-    except Exception as e:
-        print(f"[NEWS CALL] Technical cross-check failed: {e}")
+    # Real Forecast/Previous/Actual figures, per explicit instruction -
+    # shows the actual data behind the call instead of just a
+    # qualitative statement.
+    data_parts = []
+    if event.get("forecast"):
+        data_parts.append(f"Forecast: {event['forecast']}")
+    if event.get("previous"):
+        data_parts.append(f"Previous: {event['previous']}")
+    if event.get("actual"):
+        data_parts.append(f"Actual: {event['actual']}")
+    data_line = " | ".join(data_parts)
 
+    # Technical cross-check REMOVED entirely, per explicit instruction -
+    # it could (and did) contradict the fundamental call outright
+    # ("Technicals read SELL" right under "DIRECT CALL: BUY"), which
+    # read as confusing and undermined the whole point of a direct
+    # call. Confidence is now the AI's own fundamental strength
+    # percentage (see generate_currency_direction) - one clear number,
+    # not two that can disagree with each other.
     emoji = "🟢" if final_direction == "BUY" else "🔴"
     response = (
         f"📰 <b>{event['title']}</b> ({event['currency']})\n\n"
-        f"<b>Fundamental read:</b> {ai_reason}\n\n"
+        + (f"📊 {data_line}\n\n" if data_line else "")
+        + f"<b>Fundamental read:</b> {ai_reason}\n\n"
         f"{emoji} <b>DIRECT CALL: {final_direction} {pair_display}</b>\n"
-        f"<b>Confidence:</b> {confidence}%\n\n"
-        f"{technical_note}\n\n"
+        f"<b>Confidence:</b> {ai_strength}%\n\n"
         f"<i>Trade safe 💼🔥</i>"
     )
+
+    if event_key:
+        NEWS_DIRECTION_CACHE[event_key] = response
 
     await wait_message.edit_text(response, parse_mode=ParseMode.HTML)
     schedule_auto_delete(wait_message.chat_id, wait_message.message_id)
@@ -9765,7 +9866,11 @@ async def post_news(context: ContextTypes.DEFAULT_TYPE):
         if not calendar:
             print(f"[NEWS] {reason} - no calendar events either, skipping this post entirely.")
             return
-        text = f"📆 <b>MARKET CALENDAR — {session_type.upper()}</b>{calendar}"
+        # calendar already carries its own "CALENDAR TODAY" header (see
+        # fetch_economic_calendar) - it was a genuine bug to also prepend
+        # "MARKET CALENDAR — MORNING" here, stacking two headers that
+        # said the same thing in different words back to back.
+        text = calendar.strip()
         for channel_id in [CHANNEL_1_ID, CHANNEL_2_ID, CHANNEL_3_ID]:
             try:
                 await context.bot.send_message(

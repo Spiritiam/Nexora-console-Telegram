@@ -10595,6 +10595,14 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 await send_verification_gate(update)
         return
 
+    # Arrived here via a "Try it now" deep-link button in a broadcast
+    # (?start=exnessautotrade) - works identically whether the tap
+    # came from a channel post or a DM, since a url= deep link always
+    # opens a private chat regardless of where it was tapped.
+    if context.args and context.args[0] == "exnessautotrade":
+        await send_exness_autotrade_intro(context.bot, update.effective_chat.id)
+        return
+
     # Channel-follow gate - genuine first-time users ONLY, per explicit
     # instruction that returning users should never see this. Sits
     # here, after the chantrade_ branch above (so someone already
@@ -10688,6 +10696,46 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
 # ============================================
 # HANDLE BUTTONS
 # ============================================
+
+async def send_exness_autotrade_intro(bot, chat_id):
+    """
+    Shared by the normal "🤖 Exness Auto-Trade" button tap (handle_buttons
+    below) AND the "Try it now" deep-link button used in broadcasts
+    (start()'s exnessautotrade branch) - same intro either way, just
+    two different doors into it, mirroring the same pattern already
+    used for send_connect_instructions/send_tier_selection.
+    """
+    sent_info = await bot.send_message(
+        chat_id=chat_id,
+        text=(
+            "🤖 <b>Exness Auto-Trade</b>\n\n"
+            "Let Nexora AI trade directly on your own Exness MT5/MT4 "
+            "account, automatically, using the same technical strategy "
+            "already powering your signals — no need to manually "
+            "watch charts or place trades yourself.\n\n"
+            f"💵 <b>Price:</b> {MT5_AUTOTRADE_DISPLAY_PRICE}\n"
+            f"<i>Covers your dedicated MT5 connection, server uptime, "
+            f"and continuous strategy execution — running for you "
+            f"around the clock, not just a one-time signal.</i>\n\n"
+            "📈 <b>Why auto-trade?</b> Markets move fast, and the best "
+            "setups don't always happen when you're free to act on "
+            "them. Auto-trading lets you stay in the market on your "
+            "own terms — your own lot size, your own risk %, executed "
+            "the moment a real setup appears.\n\n"
+            "⚠️ <b>Disclaimer:</b> Trading involves real risk. Past "
+            "performance is not a guarantee of future results, and "
+            "you can lose money. Only subscribe with funds you can "
+            "afford to risk, and never with borrowed money.\n\n"
+            "━━━━━━━━━━━━━━━━━━━━━\n"
+            "Ready to continue?"
+        ),
+        parse_mode=ParseMode.HTML,
+        reply_markup=InlineKeyboardMarkup([
+            [InlineKeyboardButton("➡️ Continue", callback_data="mt5auto_start")]
+        ])
+    )
+    schedule_auto_delete(sent_info.chat_id, sent_info.message_id)
+
 
 async def handle_buttons(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
@@ -10826,33 +10874,7 @@ async def handle_buttons(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     if "exness auto-trade" in text:
-        sent_info = await update.message.reply_text(
-            "🤖 <b>Exness Auto-Trade</b>\n\n"
-            "Let Nexora AI trade directly on your own Exness MT5/MT4 "
-            "account, automatically, using the same technical strategy "
-            "already powering your signals — no need to manually "
-            "watch charts or place trades yourself.\n\n"
-            f"💵 <b>Price:</b> {MT5_AUTOTRADE_DISPLAY_PRICE}\n"
-            f"<i>Covers your dedicated MT5 connection, server uptime, "
-            f"and continuous strategy execution — running for you "
-            f"around the clock, not just a one-time signal.</i>\n\n"
-            "📈 <b>Why auto-trade?</b> Markets move fast, and the best "
-            "setups don't always happen when you're free to act on "
-            "them. Auto-trading lets you stay in the market on your "
-            "own terms — your own lot size, your own risk %, executed "
-            "the moment a real setup appears.\n\n"
-            "⚠️ <b>Disclaimer:</b> Trading involves real risk. Past "
-            "performance is not a guarantee of future results, and "
-            "you can lose money. Only subscribe with funds you can "
-            "afford to risk, and never with borrowed money.\n\n"
-            "━━━━━━━━━━━━━━━━━━━━━\n"
-            "Ready to continue?",
-            parse_mode=ParseMode.HTML,
-            reply_markup=InlineKeyboardMarkup([
-                [InlineKeyboardButton("➡️ Continue", callback_data="mt5auto_start")]
-            ])
-        )
-        schedule_auto_delete(sent_info.chat_id, sent_info.message_id)
+        await send_exness_autotrade_intro(context.bot, update.message.chat_id)
         return
 
 # ============================================
@@ -12978,7 +13000,7 @@ async def get_all_known_user_ids():
 
     return user_ids
 
-async def _run_broadcast(bot, message_text, admin_chat_id):
+async def _run_broadcast(bot, message_text, admin_chat_id, button_label=None):
     user_ids = await get_all_known_user_ids()
     total = len(user_ids)
     print(f"[BROADCAST] Starting send to {total} users")
@@ -12986,13 +13008,24 @@ async def _run_broadcast(bot, message_text, admin_chat_id):
     sent = 0
     failed = 0
 
+    # A button and the persistent reply keyboard can't both attach to
+    # the same message (Telegram only allows one reply_markup type) -
+    # when a button's requested, this message uses that instead of
+    # refreshing the keyboard, per explicit instruction to support a
+    # "Try it now"-style CTA on broadcasts.
+    markup = main_keyboard
+    if button_label:
+        markup = InlineKeyboardMarkup([[
+            InlineKeyboardButton(button_label, url=f"https://t.me/{BOT_USERNAME}?start=exnessautotrade")
+        ]])
+
     for uid in user_ids:
         try:
             await bot.send_message(
                 chat_id=int(uid),
                 text=message_text,
                 parse_mode=ParseMode.HTML,
-                reply_markup=main_keyboard
+                reply_markup=markup
             )
             sent += 1
         except Exception as e:
@@ -13339,12 +13372,20 @@ async def broadcast_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     message_text = update.message.text.replace("/broadcast", "", 1).strip()
     if not message_text:
         await update.message.reply_text(
-            "Usage: /broadcast <message>\n\n"
+            "Usage: /broadcast <message>\n"
+            "Usage with a button: /broadcast <message> || <button label>\n\n"
             "Sends to every known user, with the current keyboard "
-            "attached so everyone's buttons refresh too. HTML "
-            "formatting tags (<b>, <i>, etc.) are supported."
+            "attached so everyone's buttons refresh too (unless a "
+            "button is included, which takes its place on that "
+            "message only). The button links straight to Exness "
+            "Auto-Trade. HTML formatting tags (<b>, <i>, etc.) are "
+            "supported."
         )
         return
+
+    button_label = None
+    if "||" in message_text:
+        message_text, button_label = (p.strip() for p in message_text.split("||", 1))
 
     user_count = len(await get_all_known_user_ids())
     await update.message.reply_text(
@@ -13354,8 +13395,63 @@ async def broadcast_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
 
     asyncio.create_task(
-        _run_broadcast(context.bot, message_text, update.message.chat_id)
+        _run_broadcast(context.bot, message_text, update.message.chat_id, button_label)
     )
+
+
+async def broadcastchannels_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """
+    Same idea as /broadcast above, but posts to the 3 channels instead
+    of individual DM users - added per explicit instruction so a
+    feature announcement is one command instead of manually pasting
+    into each channel. Only 3 channels, so this runs inline rather
+    than as a background task like _run_broadcast does for the
+    (much larger, slower) user list.
+    """
+    user_id = str(update.message.from_user.id)
+
+    if not ADMIN_USER_ID or user_id != str(ADMIN_USER_ID):
+        return  # silently ignore - don't reveal this command to anyone else
+
+    message_text = update.message.text.replace("/broadcastchannels", "", 1).strip()
+    if not message_text:
+        await update.message.reply_text(
+            "Usage: /broadcastchannels <message>\n"
+            "Usage with a button: /broadcastchannels <message> || <button label>\n\n"
+            "Posts to all 3 channels at once. Channels have no "
+            "persistent keyboard, so a button is the only way to make "
+            "the post tappable - it links straight to Exness "
+            "Auto-Trade. HTML formatting tags (<b>, <i>, etc.) are "
+            "supported."
+        )
+        return
+
+    button_label = None
+    if "||" in message_text:
+        message_text, button_label = (p.strip() for p in message_text.split("||", 1))
+
+    markup = None
+    if button_label:
+        markup = InlineKeyboardMarkup([[
+            InlineKeyboardButton(button_label, url=f"https://t.me/{BOT_USERNAME}?start=exnessautotrade")
+        ]])
+
+    sent, failed = [], []
+    for channel_id in [CHANNEL_1_ID, CHANNEL_2_ID, CHANNEL_3_ID]:
+        try:
+            await context.bot.send_message(
+                chat_id=channel_id, text=message_text, parse_mode=ParseMode.HTML,
+                reply_markup=markup
+            )
+            sent.append(channel_id)
+        except Exception as e:
+            failed.append(channel_id)
+            print(f"[BROADCAST CHANNELS] Failed for {channel_id}: {e}")
+
+    result_text = f"✅ Posted to {len(sent)}/3 channels."
+    if failed:
+        result_text += f"\n⚠️ Failed: {', '.join(failed)} - check Railway logs for why."
+    await update.message.reply_text(result_text)
 
 # ============================================
 # STARTUP CATCH-UP (NEW)
@@ -14028,6 +14124,7 @@ def main():
 
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("broadcast", broadcast_command))
+    app.add_handler(CommandHandler("broadcastchannels", broadcastchannels_command))
     app.add_handler(CommandHandler("mt5revenue", mt5revenue_command))
     app.add_handler(CommandHandler("testsynth", testsynth_command))
     app.add_handler(CommandHandler("discoversymbols", discoversymbols_command))

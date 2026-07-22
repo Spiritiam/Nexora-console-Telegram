@@ -7347,7 +7347,11 @@ def strategy_fibonacci_retracement(pair_key, config, h1_candles, h4_candles, dai
 
 STRATEGY_BANK = [
     strategy_rsi_extreme_reversal,
-    strategy_unicorn_model,
+    # strategy_unicorn_model REMOVED per explicit instruction - all
+    # ICT/SMC influence taken out of channel and manual signals. The
+    # function itself is untouched and still used by MT5 auto-trade's
+    # Conservative Structure bot (a separate, explicitly out-of-scope
+    # system) - only removed from THIS list.
     strategy_previous_day_high_low_manipulation,
     strategy_london_session_orb,
     strategy_trend_following,
@@ -7465,51 +7469,32 @@ def check_fresh_momentum_veto(pair_key, config, h1_candles, direction):
 
 def run_strategy_bank(pair_key, config, h1_candles, h4_candles, daily_candles, min_agree=2):
     """
-    Runs every strategy in STRATEGY_BANK plus the existing ICT/SMC
-    structure analysis (analyze_smc_structure), and prefers at least
+    Runs every strategy in STRATEGY_BANK and prefers at least
     `min_agree` of them to independently agree on the SAME direction.
 
-    min_agree=2 is the PREFERRED bar, not a hard gate - per explicit
-    instruction, every strategy in this bank (including ICT/SMC) is
-    individually pre-verified/trusted, so even 1 agreeing strategy is
-    an acceptable signal to send, just at a lower, honestly-scaled
-    confidence (1 agreeing -> 76%, 2 -> 82%, 3 -> 88%, etc.) rather
-    than falling back to the much weaker rule-based bias. The bank
-    only returns None when literally NO strategy cast any vote at
-    all (votes is empty) - a real "couldn't analyze this pair right
-    now" case, not a disagreement, since there's nothing to fall
-    back to.
+    ICT/SMC REMOVED ENTIRELY per explicit instruction - this used to
+    also run a separate analyze_smc_structure call (XAUUSD-only) plus
+    a special-case rule demoting it whenever it was the sole winning
+    vote. Both are gone now: strategy_unicorn_model was already taken
+    out of STRATEGY_BANK itself, and analyze_smc_structure is no
+    longer called from here at all. No ICT/SMC-influenced vote can
+    reach a channel or manual signal through this function anymore.
 
-    SPECIAL CASE - exactly 1 winning vote: if that lone vote is
-    ICT/SMC, per explicit instruction prefer pairing it down to any
-    OTHER single strategy instead, if one fired at all (regardless of
-    its direction) - ICT/SMC is the most subjective/discretionary
-    strategy in the bank, so when only one vote exists at all, a
-    more mechanical rule-based strategy (RSI, MACD, MA, breakout,
-    etc.) is the safer single signal to send. ICT/SMC only sends
-    alone if it's truly the ONLY strategy that produced any result
-    whatsoever this round.
+    min_agree=2 is the PREFERRED bar, not a hard gate - per explicit
+    instruction, every strategy in this bank is individually
+    pre-verified/trusted, so even 1 agreeing strategy is an acceptable
+    signal to send, just at a lower, honestly-scaled confidence
+    (1 agreeing -> 76%, 2 -> 82%, 3 -> 88%, etc.) rather than falling
+    back to the much weaker rule-based bias. The bank only returns
+    None when literally NO strategy cast any vote at all (votes is
+    empty) - a real "couldn't analyze this pair right now" case, not
+    a disagreement, since there's nothing to fall back to.
 
     Returns (direction, confidence, reason, agreeing_strategies) or
     None if no strategy produced any result at all. confidence scales
-    with how many strategies agreed, same spirit as
-    analyze_smc_structure's confluence-based confidence.
+    with how many strategies agreed.
     """
     votes = []
-
-    # ICT/SMC restricted to XAUUSD only, per explicit instruction -
-    # confirmed reliable specifically on gold, but not on other
-    # pairs. Every other strategy below still runs for every pair
-    # unchanged; this only gates the one call to analyze_smc_structure.
-    if pair_key == "xauusd":
-        smc_result = analyze_smc_structure(pair_key, config)
-        if smc_result:
-            smc_direction, smc_confidence, smc_reason, _ = smc_result
-            votes.append({
-                "strategy_name": "ICT/SMC",
-                "direction": smc_direction,
-                "detail": _shorten_for_bullet(smc_reason),
-            })
 
     for strategy_fn in STRATEGY_BANK:
         try:
@@ -7529,19 +7514,6 @@ def run_strategy_bank(pair_key, config, h1_candles, h4_candles, daily_candles, m
 
     winning_votes = buy_votes if len(buy_votes) >= len(sell_votes) else sell_votes
     direction = "BUY" if winning_votes is buy_votes else "SELL"
-
-    # Exactly 1 winning vote AND it's ICT/SMC -> swap to any other
-    # single strategy that fired this round, if one exists at all.
-    if len(winning_votes) == 1 and winning_votes[0]["strategy_name"] == "ICT/SMC":
-        non_smc_votes = [v for v in votes if v["strategy_name"] != "ICT/SMC"]
-        if non_smc_votes:
-            replacement = non_smc_votes[0]
-            print(
-                f"[STRATEGY BANK] {pair_key} - sole vote was ICT/SMC, "
-                f"swapping to {replacement['strategy_name']} per explicit instruction"
-            )
-            winning_votes = [replacement]
-            direction = replacement["direction"]
 
     if len(winning_votes) < min_agree:
         print(

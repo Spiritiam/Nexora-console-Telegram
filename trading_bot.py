@@ -7822,20 +7822,6 @@ def run_strategy_bank(pair_key, config, h1_candles, h4_candles, daily_candles, m
     None if no strategy produced any result at all. confidence scales
     with how many strategies agreed.
     """
-    # ADX FILTER, per explicit instruction - not a voting strategy,
-    # a gate on the whole round. Below 20 is a genuinely choppy/
-    # non-trending market; every strategy in this bank is at least
-    # partly directional, so a confirmed choppy reading skips the
-    # round entirely rather than trust any of their calls right now.
-    # Falls through to the exact same "no votes this round" path
-    # below, which already sends signals the old way when that
-    # happens - no separate handling needed for this case.
-    if h1_candles and len(h1_candles) >= 28:
-        adx = calculate_adx(h1_candles, period=14)
-        if adx is not None and adx < 20:
-            print(f"[STRATEGY BANK] {pair_key} - ADX {adx:.1f} (< 20, choppy) - skipping this round")
-            return None
-
     votes = []
 
     for strategy_fn in STRATEGY_BANK:

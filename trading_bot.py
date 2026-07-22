@@ -13708,6 +13708,42 @@ async def mt5revenue_command(update: Update, context: ContextTypes.DEFAULT_TYPE)
     )
 
 
+def parse_broadcast_button_syntax(message_text):
+    """
+    Parses the (message, button_label, destination) out of a broadcast
+    command's raw text. Uses plain keyword LINES ("BUTTON:" / "LINK:")
+    rather than special characters like the old || delimiter - a
+    real broadcast came through with the button missing because a
+    phone's keyboard autocorrect silently mangled the || sequence
+    before the message was even sent (confirmed by the visible
+    capitalization change alongside it). Plain English words on their
+    own line are not something autocorrect meaningfully alters, so
+    this is the actual fix, not just a workaround.
+
+    Returns (message_text, button_label_or_None, destination_string).
+    destination defaults to "exness" when a button is present but no
+    LINK: line was given.
+    """
+    lines = message_text.split("\n")
+    button_label = None
+    destination = "exness"
+    message_lines = []
+    skip_next_link_check = False
+
+    for line in lines:
+        stripped = line.strip()
+        if stripped.lower().startswith("button:"):
+            button_label = stripped[len("button:"):].strip()
+            skip_next_link_check = True
+            continue
+        if skip_next_link_check and stripped.lower().startswith("link:"):
+            destination = stripped[len("link:"):].strip().lower()
+            continue
+        message_lines.append(line)
+
+    return "\n".join(message_lines).strip(), button_label, destination
+
+
 async def broadcast_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = str(update.message.from_user.id)
 
@@ -13717,9 +13753,10 @@ async def broadcast_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     message_text = update.message.text.replace("/broadcast", "", 1).strip()
     if not message_text:
         await update.message.reply_text(
-            "Usage: /broadcast <message>\n"
-            "With a button: /broadcast <message> || <button label>\n"
-            "Choosing where it goes: /broadcast <message> || <button label> || <destination>\n\n"
+            "Usage: /broadcast <message>\n\n"
+            "With a button, add these on their own lines at the end:\n"
+            "BUTTON: <button label>\n"
+            "LINK: <destination>\n\n"
             "Destinations: exness (default), deriv, signal.\n\n"
             "Sends to every known user, with the current keyboard "
             "attached so everyone's buttons refresh too (unless a "
@@ -13729,15 +13766,7 @@ async def broadcast_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         return
 
-    button_label = None
-    destination = "exness"
-    if "||" in message_text:
-        parts = [p.strip() for p in message_text.split("||")]
-        message_text = parts[0]
-        if len(parts) > 1:
-            button_label = parts[1]
-        if len(parts) > 2:
-            destination = parts[2].lower()
+    message_text, button_label, destination = parse_broadcast_button_syntax(message_text)
 
     user_count = len(await get_all_known_user_ids())
     await update.message.reply_text(
@@ -13768,9 +13797,10 @@ async def broadcastchannels_command(update: Update, context: ContextTypes.DEFAUL
     message_text = update.message.text.replace("/broadcastchannels", "", 1).strip()
     if not message_text:
         await update.message.reply_text(
-            "Usage: /broadcastchannels <message>\n"
-            "With a button: /broadcastchannels <message> || <button label>\n"
-            "Choosing where it goes: /broadcastchannels <message> || <button label> || <destination>\n\n"
+            "Usage: /broadcastchannels <message>\n\n"
+            "With a button, add these on their own lines at the end:\n"
+            "BUTTON: <button label>\n"
+            "LINK: <destination>\n\n"
             "Destinations: exness (default), deriv, signal.\n\n"
             "Posts to all 3 channels at once. Channels have no "
             "persistent keyboard, so a button is the only way to make "
@@ -13779,15 +13809,7 @@ async def broadcastchannels_command(update: Update, context: ContextTypes.DEFAUL
         )
         return
 
-    button_label = None
-    destination = "exness"
-    if "||" in message_text:
-        parts = [p.strip() for p in message_text.split("||")]
-        message_text = parts[0]
-        if len(parts) > 1:
-            button_label = parts[1]
-        if len(parts) > 2:
-            destination = parts[2].lower()
+    message_text, button_label, destination = parse_broadcast_button_syntax(message_text)
 
     markup = None
     if button_label:

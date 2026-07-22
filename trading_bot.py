@@ -129,18 +129,14 @@ MT5_AUTOTRADE_CURRENCY = "NGN"
 
 MT5_SUBSCRIPTION_DAYS = 30
 
-# 4 bot presets for Exness Auto-Trade, per explicit instruction -
-# SAME 4 bots as before - not adding or renaming any. Each bot keeps
-# its own original base strategy and gets ONE paired strategy added
-# alongside it (OR-vote: fires on whichever of the two confirms
-# first), per explicit instruction. Mapped from your reference list
-# by matching each bot's EXISTING base strategy to the pair that
-# reference used for that same base strategy:
-#   aggressive_scalper   already ran ema_pullback_scalper  -> paired with macd_momentum          (matches "Gold Scalper")
-#   aggressive_breakout  already ran volatility_breakout_scalper -> paired with rsi_extreme_reversal (matches "Quantum AI")
-#   conservative_trend   already ran trend_following        -> paired with macd_momentum          (matches "Trend Engine")
-#   conservative_structure already ran support_resistance_bounce -> paired with ict_smc (strategy_unicorn_model - the
-#       real ICT/Smart-Money-Concepts strategy already in this bank)  (matches "SMC Pro")
+# 4 bot presets for Exness Auto-Trade - SAME 4 bots as always, never
+# renamed. Each pairs its own original base strategy with a second
+# one (OR-vote: fires on whichever of the two confirms first).
+# Current pairings, after two rounds of explicit-instruction changes:
+#   aggressive_scalper      ema_pullback_scalper       + macd_momentum
+#   aggressive_breakout     volatility_breakout_scalper + atr_volatility_breakout (was rsi_extreme_reversal - removed per explicit instruction, too subjective a concept)
+#   conservative_trend      trend_following             + macd_momentum
+#   conservative_structure  support_resistance_bounce   + supertrend (was ict_smc/strategy_unicorn_model - removed per explicit instruction, the most subjective/discretionary strategy in the whole bank)
 #
 # "strategy_functions" (plural) replaces the old single
 # "strategy_function". "timeframe": "1min" for Aggressive, "5min" for
@@ -154,7 +150,12 @@ MT5_AUTOTRADE_BOTS = {
     },
     "aggressive_breakout": {
         "label": "⚡ Aggressive Breakout",
-        "strategy_functions": ["strategy_volatility_breakout_scalper", "strategy_rsi_extreme_reversal"],
+        # strategy_rsi_extreme_reversal REMOVED and REPLACED per
+        # explicit instruction - ATR Volatility Breakout fits this
+        # bot's own character (breakout + volatility) at least as
+        # well, and is a simple, mechanical concept rather than a
+        # subjective reversal call.
+        "strategy_functions": ["strategy_volatility_breakout_scalper", "strategy_atr_volatility_breakout"],
         "timeframe": "1min",
         "description": "Fires on sharp volatility expansions.",
     },
@@ -166,7 +167,12 @@ MT5_AUTOTRADE_BOTS = {
     },
     "conservative_structure": {
         "label": "🏛️ Conservative Structure",
-        "strategy_functions": ["strategy_support_resistance_bounce", "strategy_unicorn_model"],
+        # strategy_unicorn_model REMOVED and REPLACED per explicit
+        # instruction - Supertrend is a genuinely simple, mechanical
+        # structure/trend indicator (ATR-based bands, flips on a
+        # clean cross), replacing the most subjective, discretionary
+        # strategy in the whole bank with one of the least.
+        "strategy_functions": ["strategy_support_resistance_bounce", "strategy_supertrend"],
         "timeframe": "5min",
         "description": "Patient, level-based support/resistance entries.",
     },
@@ -7153,6 +7159,127 @@ def calculate_ema_series(candles, period):
         ema_values.append(price * k + ema_values[-1] * (1 - k))
     return ema_values
 
+def calculate_atr_series(candles, period=14):
+    """
+    Standard ATR (Average True Range) via Wilder's smoothing. Returns
+    the full series aligned to candles[period:], or [] if there isn't
+    enough data - needed as a series (not just the latest value) so
+    callers can compare current ATR against ATR several candles ago
+    to detect genuine expansion, not just read one static number.
+    """
+    if len(candles) < period + 1:
+        return []
+
+    true_ranges = []
+    for i in range(1, len(candles)):
+        high, low, prev_close = candles[i]["high"], candles[i]["low"], candles[i - 1]["close"]
+        tr = max(high - low, abs(high - prev_close), abs(low - prev_close))
+        true_ranges.append(tr)
+
+    atr_values = [sum(true_ranges[:period]) / period]
+    for tr in true_ranges[period:]:
+        atr_values.append((atr_values[-1] * (period - 1) + tr) / period)
+
+    return atr_values
+
+
+def calculate_supertrend(candles, period=10, multiplier=3):
+    """
+    Standard Supertrend indicator. Returns a list of (is_uptrend,
+    supertrend_value) tuples aligned to candles[period:], or [] if
+    there isn't enough data. is_uptrend flips exactly when price
+    crosses the final band - that flip IS the buy/sell signal,
+    checked by the strategy function below.
+    """
+    atr_values = calculate_atr_series(candles, period)
+    if not atr_values:
+        return []
+
+    aligned_candles = candles[-len(atr_values):]
+    final_upper, final_lower = None, None
+    is_uptrend = True
+    results = []
+
+    for i, candle in enumerate(aligned_candles):
+        atr = atr_values[i]
+        hl2 = (candle["high"] + candle["low"]) / 2
+        basic_upper = hl2 + multiplier * atr
+        basic_lower = hl2 - multiplier * atr
+        close = candle["close"]
+
+        if i == 0:
+            final_upper, final_lower = basic_upper, basic_lower
+        else:
+            prev_close = aligned_candles[i - 1]["close"]
+            final_upper = basic_upper if (basic_upper < final_upper or prev_close > final_upper) else final_upper
+            final_lower = basic_lower if (basic_lower > final_lower or prev_close < final_lower) else final_lower
+
+        if close > final_upper:
+            is_uptrend = True
+        elif close < final_lower:
+            is_uptrend = False
+        # else: no cross this candle, is_uptrend carries over unchanged
+
+        results.append((is_uptrend, final_lower if is_uptrend else final_upper))
+
+    return results
+
+
+def calculate_adx(candles, period=14):
+    """
+    Standard ADX (Average Directional Index) via Wilder's smoothing.
+    Returns the latest ADX value only (a single float, 0-100), or
+    None if there isn't enough data. Used as a FILTER on the whole
+    strategy bank, per explicit instruction - not a voting strategy
+    of its own. ADX > 25 = strong trend, ADX < 20 = choppy/no clear
+    trend, and everything in between is a grey zone this filter
+    deliberately doesn't touch.
+    """
+    if len(candles) < period * 2:
+        return None
+
+    plus_dm, minus_dm, true_ranges = [], [], []
+    for i in range(1, len(candles)):
+        high, low = candles[i]["high"], candles[i]["low"]
+        prev_high, prev_low, prev_close = candles[i - 1]["high"], candles[i - 1]["low"], candles[i - 1]["close"]
+
+        up_move = high - prev_high
+        down_move = prev_low - low
+        plus_dm.append(up_move if (up_move > down_move and up_move > 0) else 0)
+        minus_dm.append(down_move if (down_move > up_move and down_move > 0) else 0)
+        true_ranges.append(max(high - low, abs(high - prev_close), abs(low - prev_close)))
+
+    def wilder_smooth(values, period):
+        smoothed = [sum(values[:period])]
+        for v in values[period:]:
+            smoothed.append(smoothed[-1] - (smoothed[-1] / period) + v)
+        return smoothed
+
+    smoothed_tr = wilder_smooth(true_ranges, period)
+    smoothed_plus_dm = wilder_smooth(plus_dm, period)
+    smoothed_minus_dm = wilder_smooth(minus_dm, period)
+
+    dx_values = []
+    for tr, pdm, mdm in zip(smoothed_tr, smoothed_plus_dm, smoothed_minus_dm):
+        if tr == 0:
+            continue
+        plus_di = 100 * pdm / tr
+        minus_di = 100 * mdm / tr
+        di_sum = plus_di + minus_di
+        if di_sum == 0:
+            continue
+        dx_values.append(100 * abs(plus_di - minus_di) / di_sum)
+
+    if len(dx_values) < period:
+        return None
+
+    adx = sum(dx_values[:period]) / period
+    for dx in dx_values[period:]:
+        adx = (adx * (period - 1) + dx) / period
+
+    return adx
+
+
 def strategy_bollinger_rsi_mean_reversion(pair_key, config, h1_candles, h4_candles, daily_candles, m1_candles=None):
     """
     Synthetics-specific (per explicit instruction: best for V75,
@@ -7345,15 +7472,208 @@ def strategy_fibonacci_retracement(pair_key, config, h1_candles, h4_candles, dai
 
     return None
 
+
+def strategy_rsi_trend_continuation(pair_key, config, h1_candles, h4_candles, daily_candles):
+    """
+    NEW per explicit instruction - genuinely different from the
+    removed RSI Extreme Reversal (that traded RSI extremes as
+    reversal points; this trades RSI as a CONTINUATION signal within
+    an existing trend, which is a real, distinct concept, not a
+    duplicate). Trend direction uses the same simple MA20/50
+    alignment already established elsewhere in this bank.
+
+    Uptrend (MA20 > MA50): RSI dipped into 40-50 on either of the
+    last 2 candles, then turned up (current RSI > previous) -> BUY.
+    Downtrend (MA20 < MA50): RSI rose into 50-60, then turned down
+    -> SELL.
+    """
+    if not h1_candles or len(h1_candles) < 55:
+        return None
+
+    closes = [c["close"] for c in h1_candles]
+    ma20 = sum(closes[-20:]) / 20
+    ma50 = sum(closes[-50:]) / 50
+
+    rsi_series = calculate_rsi(h1_candles, period=14)
+    if len(rsi_series) < 3:
+        return None
+
+    prev_rsi, curr_rsi = rsi_series[-2], rsi_series[-1]
+    recent_dip = rsi_series[-3] if len(rsi_series) >= 3 else prev_rsi
+
+    if ma20 > ma50:
+        dipped_to_zone = 40 <= prev_rsi <= 50 or 40 <= recent_dip <= 50
+        turned_up = curr_rsi > prev_rsi
+        if dipped_to_zone and turned_up:
+            return {
+                "strategy_name": "RSI Trend Continuation",
+                "direction": "BUY",
+                "detail": f"uptrend intact (20MA above 50MA), RSI dipped to {prev_rsi:.1f} and turned back up to {curr_rsi:.1f}",
+            }
+    elif ma20 < ma50:
+        rose_to_zone = 50 <= prev_rsi <= 60 or 50 <= recent_dip <= 60
+        turned_down = curr_rsi < prev_rsi
+        if rose_to_zone and turned_down:
+            return {
+                "strategy_name": "RSI Trend Continuation",
+                "direction": "SELL",
+                "detail": f"downtrend intact (20MA below 50MA), RSI rose to {prev_rsi:.1f} and turned back down to {curr_rsi:.1f}",
+            }
+
+    return None
+
+
+def strategy_bollinger_squeeze_breakout(pair_key, config, h1_candles, h4_candles, daily_candles):
+    """
+    NEW per explicit instruction - genuinely different from the
+    existing Breakout strategy (which measures raw high-low range
+    compression, not actual Bollinger Band width). Squeeze = current
+    band width sits in the tightest 25% of the last 20 candles' width
+    history. Breakout = the latest candle both closes outside the
+    (pre-breakout) band AND has a real body - at least 60% of its own
+    range - not just a thin wick poking through.
+    """
+    if not h1_candles or len(h1_candles) < 40:
+        return None
+
+    widths = []
+    for i in range(20, 0, -1):
+        window = h1_candles[:len(h1_candles) - i + 1] if i > 1 else h1_candles
+        upper, middle, lower = calculate_bollinger_bands(window, period=20)
+        if upper is None:
+            return None
+        widths.append(upper - lower)
+
+    current_width = widths[-1]
+    prior_widths = sorted(widths[:-1])
+    squeeze_threshold = prior_widths[len(prior_widths) // 4] if prior_widths else None
+    if squeeze_threshold is None or current_width > squeeze_threshold:
+        return None  # bands aren't actually tight right now - no squeeze to break out of
+
+    upper, middle, lower = calculate_bollinger_bands(h1_candles[:-1], period=20)
+    if upper is None:
+        return None
+
+    last = h1_candles[-1]
+    candle_range = last["high"] - last["low"]
+    if candle_range == 0:
+        return None
+    body_ratio = abs(last["close"] - last["open"]) / candle_range
+    is_strong_candle = body_ratio >= 0.6
+
+    if last["close"] > upper and is_strong_candle:
+        return {
+            "strategy_name": "Bollinger Squeeze Breakout",
+            "direction": "BUY",
+            "detail": f"bands squeezed tight then a strong candle closed above the upper band ({upper:.2f})",
+        }
+    if last["close"] < lower and is_strong_candle:
+        return {
+            "strategy_name": "Bollinger Squeeze Breakout",
+            "direction": "SELL",
+            "detail": f"bands squeezed tight then a strong candle closed below the lower band ({lower:.2f})",
+        }
+
+    return None
+
+
+def strategy_atr_volatility_breakout(pair_key, config, h1_candles, h4_candles, daily_candles):
+    """
+    NEW per explicit instruction - genuinely different from the
+    existing Breakout/Volatility Breakout Scalper strategies (both
+    measure a PRICE LEVEL breaking out of a range; this measures
+    VOLATILITY ITSELF expanding, a different signal entirely).
+    Requires current ATR meaningfully above its own recent average
+    (genuine expansion, not just noise) AND the latest candle's range
+    being unusually large relative to that same average - "large
+    breakout candle" from the spec, not just any directional move.
+    """
+    if not h1_candles or len(h1_candles) < 30:
+        return None
+
+    atr_series = calculate_atr_series(h1_candles, period=14)
+    if len(atr_series) < 10:
+        return None
+
+    current_atr = atr_series[-1]
+    avg_atr = sum(atr_series[-10:-1]) / 9
+    if avg_atr == 0 or current_atr < avg_atr * 1.3:
+        return None  # ATR isn't genuinely expanding right now
+
+    last = h1_candles[-1]
+    prior_20 = h1_candles[-21:-1]
+    candle_range = last["high"] - last["low"]
+    if candle_range < avg_atr * 1.5:
+        return None  # not actually a large breakout candle, just a wider-than-usual one
+
+    recent_high = max(c["high"] for c in prior_20)
+    recent_low = min(c["low"] for c in prior_20)
+
+    if last["close"] > recent_high:
+        return {
+            "strategy_name": "ATR Volatility Breakout",
+            "direction": "BUY",
+            "detail": f"ATR expanding ({current_atr:.2f} vs avg {avg_atr:.2f}) with a large candle breaking above {recent_high:.2f}",
+        }
+    if last["close"] < recent_low:
+        return {
+            "strategy_name": "ATR Volatility Breakout",
+            "direction": "SELL",
+            "detail": f"ATR expanding ({current_atr:.2f} vs avg {avg_atr:.2f}) with a large candle breaking below {recent_low:.2f}",
+        }
+
+    return None
+
+
+def strategy_supertrend(pair_key, config, h1_candles, h4_candles, daily_candles):
+    """
+    NEW per explicit instruction - standard Supertrend (period=10,
+    multiplier=3), firing only on the exact candle the trend flips,
+    not on every candle while already in an established trend
+    (otherwise this would fire constantly rather than at genuine
+    turning points).
+    """
+    if not h1_candles or len(h1_candles) < 25:
+        return None
+
+    st = calculate_supertrend(h1_candles, period=10, multiplier=3)
+    if len(st) < 2:
+        return None
+
+    prev_uptrend, _ = st[-2]
+    curr_uptrend, curr_value = st[-1]
+
+    if not prev_uptrend and curr_uptrend:
+        return {
+            "strategy_name": "Supertrend",
+            "direction": "BUY",
+            "detail": f"Supertrend flipped bullish at {curr_value:.2f}",
+        }
+    if prev_uptrend and not curr_uptrend:
+        return {
+            "strategy_name": "Supertrend",
+            "direction": "SELL",
+            "detail": f"Supertrend flipped bearish at {curr_value:.2f}",
+        }
+
+    return None
+
+
 STRATEGY_BANK = [
-    strategy_rsi_extreme_reversal,
+    # strategy_rsi_extreme_reversal REMOVED per explicit instruction -
+    # too subjective/complex a concept for a simple candle feed. Still
+    # used elsewhere (Exness Auto-Trade's Aggressive Breakout bot,
+    # SYNTHETIC_STRATEGY_BANK) - only removed from THIS list.
     # strategy_unicorn_model REMOVED per explicit instruction - all
     # ICT/SMC influence taken out of channel and manual signals. The
     # function itself is untouched and still used by MT5 auto-trade's
     # Conservative Structure bot (a separate, explicitly out-of-scope
     # system) - only removed from THIS list.
     strategy_previous_day_high_low_manipulation,
-    strategy_london_session_orb,
+    # strategy_london_session_orb REMOVED per explicit instruction -
+    # same reason (too subjective/complex). Nothing else uses this
+    # function, so it's now fully unused - left in place rather than
+    # deleted in case it's wanted again later.
     strategy_trend_following,
     strategy_breakout,
     strategy_support_resistance_bounce,
@@ -7361,6 +7681,10 @@ STRATEGY_BANK = [
     strategy_fibonacci_retracement,
     strategy_ema_pullback_scalper,  # per explicit instruction - already existed for synthetics only, now also runs on forex/crypto (falls back to h1_candles since m1_candles is never passed here)
     strategy_volume_profile_poc,  # diagnostic only right now, always returns None - see docstring
+    strategy_rsi_trend_continuation,  # NEW - genuinely different concept from the removed RSI Extreme Reversal (continuation, not reversal)
+    strategy_bollinger_squeeze_breakout,  # NEW
+    strategy_atr_volatility_breakout,  # NEW
+    strategy_supertrend,  # NEW
 ]
 
 # Distinct roster for synthetic (Deriv) indices - per explicit
@@ -7374,7 +7698,11 @@ STRATEGY_BANK = [
 # behave (mean reversion off Bollinger extremes, EMA pullback
 # continuation, and raw volatility breakout).
 SYNTHETIC_STRATEGY_BANK = [
-    strategy_rsi_extreme_reversal,
+    # strategy_rsi_extreme_reversal REMOVED and REPLACED per explicit
+    # instruction - strategy_rsi_trend_continuation keeps an
+    # RSI-based vote in this bank, just using the newer continuation
+    # logic instead of the removed reversal-at-extremes approach.
+    strategy_rsi_trend_continuation,
     strategy_trend_following,
     strategy_breakout,
     strategy_support_resistance_bounce,
@@ -7494,6 +7822,20 @@ def run_strategy_bank(pair_key, config, h1_candles, h4_candles, daily_candles, m
     None if no strategy produced any result at all. confidence scales
     with how many strategies agreed.
     """
+    # ADX FILTER, per explicit instruction - not a voting strategy,
+    # a gate on the whole round. Below 20 is a genuinely choppy/
+    # non-trending market; every strategy in this bank is at least
+    # partly directional, so a confirmed choppy reading skips the
+    # round entirely rather than trust any of their calls right now.
+    # Falls through to the exact same "no votes this round" path
+    # below, which already sends signals the old way when that
+    # happens - no separate handling needed for this case.
+    if h1_candles and len(h1_candles) >= 28:
+        adx = calculate_adx(h1_candles, period=14)
+        if adx is not None and adx < 20:
+            print(f"[STRATEGY BANK] {pair_key} - ADX {adx:.1f} (< 20, choppy) - skipping this round")
+            return None
+
     votes = []
 
     for strategy_fn in STRATEGY_BANK:

@@ -9857,29 +9857,18 @@ async def post_news(context: ContextTypes.DEFAULT_TYPE):
 
     async def post_calendar_only(reason: str):
         """
-        Fallback path - posts high-impact calendar events (if any) on
-        their own, with no article/image, whenever the article
-        pipeline below can't produce a real post. Skips silently (like
-        before) only if there's ALSO no calendar content, so a day
-        with neither a usable article nor any high-impact calendar
-        event still posts nothing - never inventing filler content.
+        Per explicit instruction: this used to post a standalone
+        calendar recap to the channels whenever the article pipeline
+        below couldn't produce a real post. Removed - it was landing
+        as a separate message right around/after the same events
+        subscribers already got a dedicated 30-minutes-before alert
+        for (check_upcoming_high_impact_news), making it pure
+        duplication with no real use of its own. Now just logs why
+        the main post didn't go out, so that's still visible in
+        Railway's logs, without posting anything to the channels.
         """
-        if not calendar:
-            print(f"[NEWS] {reason} - no calendar events either, skipping this post entirely.")
-            return
-        # calendar already carries its own "CALENDAR TODAY" header (see
-        # fetch_economic_calendar) - it was a genuine bug to also prepend
-        # "MARKET CALENDAR — MORNING" here, stacking two headers that
-        # said the same thing in different words back to back.
-        text = calendar.strip()
-        for channel_id in [CHANNEL_1_ID, CHANNEL_2_ID, CHANNEL_3_ID]:
-            try:
-                await context.bot.send_message(
-                    chat_id=channel_id, text=text, parse_mode=ParseMode.HTML,
-                )
-                print(f"[NEWS] ✅ calendar-only post sent to {channel_id} ({reason})")
-            except Exception as e:
-                print(f"[NEWS] ⚠️ calendar-only post failed for {channel_id}: {e}")
+        print(f"[NEWS] {reason} - skipping today's post (calendar-only fallback disabled per explicit instruction).")
+        return
 
     article = fetch_market_news()
 
@@ -9973,8 +9962,14 @@ async def post_news(context: ContextTypes.DEFAULT_TYPE):
         await post_calendar_only("article judged not relevant")
         return
 
-    if calendar:
-        summary += calendar
+    # Calendar text NO LONGER appended here, per explicit instruction -
+    # "it shouldn't post at all, whether successful or not." The
+    # standalone fallback post (post_calendar_only above) was already
+    # disabled; this was the one remaining path where "CALENDAR TODAY"
+    # content could still appear, tacked onto a real article's caption.
+    # fetch_economic_calendar() itself is untouched (still computed
+    # above, still available if needed elsewhere) - just no longer
+    # used for any channel-facing content.
 
     for channel_id in [CHANNEL_1_ID, CHANNEL_2_ID, CHANNEL_3_ID]:
         try:

@@ -1250,6 +1250,24 @@ main_keyboard = ReplyKeyboardMarkup(
     one_time_keyboard=False
 )
 
+def styled_button(text, style="primary", **kwargs):
+    """
+    Wraps InlineKeyboardButton, applying Telegram's Bot API 9.4 button
+    color (added Feb 2026 - 'primary'=blue, 'success'=green,
+    'danger'=red) when the installed python-telegram-bot version
+    supports it, per explicit instruction to make CTA buttons stand
+    out in the same blue as the pinned-message UI element. Falls back
+    to a plain, unstyled button automatically if the installed library
+    is too old to recognize the parameter (raises TypeError) - so this
+    can never crash the bot regardless of what's actually deployed on
+    Railway, and there's nothing to check or upgrade first.
+    """
+    try:
+        return InlineKeyboardButton(text, style=style, **kwargs)
+    except TypeError:
+        return InlineKeyboardButton(text, **kwargs)
+
+
 def get_channel_button():
     # CONFIRMED REAL BUG, same class already fixed once before for
     # the "Trade This Signal" button (see start()'s chantrade_
@@ -1266,7 +1284,7 @@ def get_channel_button():
     # plain /start already runs the exact same follow-gate/welcome
     # logic the old callback handler was duplicating by hand.
     return InlineKeyboardMarkup([
-        [InlineKeyboardButton(
+        [styled_button(
             "🤖 Get Your Own Signal",
             url=f"https://t.me/{BOT_USERNAME}?start=channelcta"
         )]
@@ -10595,12 +10613,38 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 await send_verification_gate(update)
         return
 
-    # Arrived here via a "Try it now" deep-link button in a broadcast
-    # (?start=exnessautotrade) - works identically whether the tap
+    # Arrived here via a broadcast's optional button
+    # (?start=goto_<destination>) - works identically whether the tap
     # came from a channel post or a DM, since a url= deep link always
-    # opens a private chat regardless of where it was tapped.
-    if context.args and context.args[0] == "exnessautotrade":
-        await send_exness_autotrade_intro(context.bot, update.effective_chat.id)
+    # opens a private chat regardless of where it was tapped. Add a
+    # new keyword here any time a new destination is needed (see
+    # broadcast_command's || syntax) - this is the one place that
+    # ever needs to know about it.
+    if context.args and context.args[0].startswith("goto_"):
+        destination = context.args[0].replace("goto_", "")
+        if destination == "exness":
+            await send_exness_autotrade_intro(context.bot, update.effective_chat.id)
+        elif destination == "deriv":
+            await send_connect_instructions(context.bot, user_id)
+        elif destination == "signal":
+            user_modes[user_id] = "signal"
+            await context.bot.send_message(
+                chat_id=update.effective_chat.id,
+                text=(
+                    "📊 <b>Signal Mode Activated</b>\n\n"
+                    "Now type the pair you want a signal for.\n\n"
+                    "<b>Available pairs:</b>\n"
+                    "• XAUUSD — Gold\n"
+                    "• BTCUSD — Bitcoin\n"
+                    "• XAGUSD — Silver\n"
+                    "• USOIL — US Oil\n"
+                    "• GBPUSD\n"
+                    "• GBPJPY\n"
+                    "• EURUSD\n"
+                    "• USDJPY"
+                ),
+                parse_mode=ParseMode.HTML
+            )
         return
 
     # Channel-follow gate - genuine first-time users ONLY, per explicit
@@ -13000,7 +13044,7 @@ async def get_all_known_user_ids():
 
     return user_ids
 
-async def _run_broadcast(bot, message_text, admin_chat_id, button_label=None):
+async def _run_broadcast(bot, message_text, admin_chat_id, button_label=None, destination="exness"):
     user_ids = await get_all_known_user_ids()
     total = len(user_ids)
     print(f"[BROADCAST] Starting send to {total} users")
@@ -13012,11 +13056,12 @@ async def _run_broadcast(bot, message_text, admin_chat_id, button_label=None):
     # the same message (Telegram only allows one reply_markup type) -
     # when a button's requested, this message uses that instead of
     # refreshing the keyboard, per explicit instruction to support a
-    # "Try it now"-style CTA on broadcasts.
+    # "Try it now"-style CTA on broadcasts, for whichever destination
+    # the admin picked (see start()'s goto_ branch for the full list).
     markup = main_keyboard
     if button_label:
         markup = InlineKeyboardMarkup([[
-            InlineKeyboardButton(button_label, url=f"https://t.me/{BOT_USERNAME}?start=exnessautotrade")
+            styled_button(button_label, url=f"https://t.me/{BOT_USERNAME}?start=goto_{destination}")
         ]])
 
     for uid in user_ids:
@@ -13373,19 +13418,26 @@ async def broadcast_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not message_text:
         await update.message.reply_text(
             "Usage: /broadcast <message>\n"
-            "Usage with a button: /broadcast <message> || <button label>\n\n"
+            "With a button: /broadcast <message> || <button label>\n"
+            "Choosing where it goes: /broadcast <message> || <button label> || <destination>\n\n"
+            "Destinations: exness (default), deriv, signal.\n\n"
             "Sends to every known user, with the current keyboard "
             "attached so everyone's buttons refresh too (unless a "
             "button is included, which takes its place on that "
-            "message only). The button links straight to Exness "
-            "Auto-Trade. HTML formatting tags (<b>, <i>, etc.) are "
-            "supported."
+            "message only). HTML formatting tags (<b>, <i>, etc.) "
+            "are supported."
         )
         return
 
     button_label = None
+    destination = "exness"
     if "||" in message_text:
-        message_text, button_label = (p.strip() for p in message_text.split("||", 1))
+        parts = [p.strip() for p in message_text.split("||")]
+        message_text = parts[0]
+        if len(parts) > 1:
+            button_label = parts[1]
+        if len(parts) > 2:
+            destination = parts[2].lower()
 
     user_count = len(await get_all_known_user_ids())
     await update.message.reply_text(
@@ -13395,7 +13447,7 @@ async def broadcast_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
 
     asyncio.create_task(
-        _run_broadcast(context.bot, message_text, update.message.chat_id, button_label)
+        _run_broadcast(context.bot, message_text, update.message.chat_id, button_label, destination)
     )
 
 
@@ -13417,23 +13469,30 @@ async def broadcastchannels_command(update: Update, context: ContextTypes.DEFAUL
     if not message_text:
         await update.message.reply_text(
             "Usage: /broadcastchannels <message>\n"
-            "Usage with a button: /broadcastchannels <message> || <button label>\n\n"
+            "With a button: /broadcastchannels <message> || <button label>\n"
+            "Choosing where it goes: /broadcastchannels <message> || <button label> || <destination>\n\n"
+            "Destinations: exness (default), deriv, signal.\n\n"
             "Posts to all 3 channels at once. Channels have no "
             "persistent keyboard, so a button is the only way to make "
-            "the post tappable - it links straight to Exness "
-            "Auto-Trade. HTML formatting tags (<b>, <i>, etc.) are "
-            "supported."
+            "the post tappable. HTML formatting tags (<b>, <i>, etc.) "
+            "are supported."
         )
         return
 
     button_label = None
+    destination = "exness"
     if "||" in message_text:
-        message_text, button_label = (p.strip() for p in message_text.split("||", 1))
+        parts = [p.strip() for p in message_text.split("||")]
+        message_text = parts[0]
+        if len(parts) > 1:
+            button_label = parts[1]
+        if len(parts) > 2:
+            destination = parts[2].lower()
 
     markup = None
     if button_label:
         markup = InlineKeyboardMarkup([[
-            InlineKeyboardButton(button_label, url=f"https://t.me/{BOT_USERNAME}?start=exnessautotrade")
+            styled_button(button_label, url=f"https://t.me/{BOT_USERNAME}?start=goto_{destination}")
         ]])
 
     sent, failed = [], []

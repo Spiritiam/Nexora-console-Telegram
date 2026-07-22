@@ -1290,7 +1290,7 @@ def get_channel_button():
     # plain /start already runs the exact same follow-gate/welcome
     # logic the old callback handler was duplicating by hand.
     return InlineKeyboardMarkup([
-        [styled_button(
+        [InlineKeyboardButton(
             "🤖 Get Your Own Signal",
             url=f"https://t.me/{BOT_USERNAME}?start=channelcta"
         )]
@@ -13361,7 +13361,7 @@ async def _run_broadcast(bot, message_text, admin_chat_id, button_label=None, de
     markup = main_keyboard
     if button_label:
         markup = InlineKeyboardMarkup([[
-            styled_button(button_label, url=f"https://t.me/{BOT_USERNAME}?start=goto_{destination}")
+            InlineKeyboardButton(button_label, url=f"https://t.me/{BOT_USERNAME}?start=goto_{destination}")
         ]])
 
     for uid in user_ids:
@@ -13814,7 +13814,7 @@ async def broadcastchannels_command(update: Update, context: ContextTypes.DEFAUL
     markup = None
     if button_label:
         markup = InlineKeyboardMarkup([[
-            styled_button(button_label, url=f"https://t.me/{BOT_USERNAME}?start=goto_{destination}")
+            InlineKeyboardButton(button_label, url=f"https://t.me/{BOT_USERNAME}?start=goto_{destination}")
         ]])
 
     sent, failed = [], []

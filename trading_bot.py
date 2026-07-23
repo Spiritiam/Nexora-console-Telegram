@@ -7666,6 +7666,395 @@ def strategy_supertrend(pair_key, config, h1_candles, h4_candles, daily_candles)
     return None
 
 
+def calculate_parabolic_sar(candles, af_start=0.02, af_step=0.02, af_max=0.2):
+    """
+    Standard Parabolic SAR. Returns a list of (is_uptrend, sar_value)
+    tuples aligned to the full candles list, or [] if there isn't
+    enough data. Mirrors calculate_supertrend's return shape - a
+    trend flip (is_uptrend changing between consecutive candles) IS
+    the buy/sell signal, checked by the strategy function below.
+    """
+    if len(candles) < 5:
+        return []
+
+    is_uptrend = candles[1]["close"] >= candles[0]["close"]
+    sar = candles[0]["low"] if is_uptrend else candles[0]["high"]
+    ep = candles[0]["high"] if is_uptrend else candles[0]["low"]
+    af = af_start
+    results = [(is_uptrend, sar)]
+
+    for i in range(1, len(candles)):
+        prev_sar = sar
+        sar = prev_sar + af * (ep - prev_sar)
+        high, low = candles[i]["high"], candles[i]["low"]
+
+        if is_uptrend:
+            sar = min(sar, candles[i - 1]["low"], candles[i - 2]["low"] if i >= 2 else candles[i - 1]["low"])
+            if low < sar:
+                is_uptrend = False
+                sar = ep
+                ep = low
+                af = af_start
+            else:
+                if high > ep:
+                    ep = high
+                    af = min(af + af_step, af_max)
+        else:
+            sar = max(sar, candles[i - 1]["high"], candles[i - 2]["high"] if i >= 2 else candles[i - 1]["high"])
+            if high > sar:
+                is_uptrend = True
+                sar = ep
+                ep = high
+                af = af_start
+            else:
+                if low < ep:
+                    ep = low
+                    af = min(af + af_step, af_max)
+
+        results.append((is_uptrend, sar))
+
+    return results
+
+
+def strategy_parabolic_sar(pair_key, config, h1_candles, h4_candles, daily_candles):
+    """
+    NEW per explicit instruction - same "fires only on the exact flip"
+    principle as Supertrend, but a genuinely different calculation
+    (a trailing dot that accelerates as the trend extends, rather than
+    an ATR-band cross) - not a duplicate vote of Supertrend.
+    """
+    if not h1_candles or len(h1_candles) < 20:
+        return None
+
+    sar = calculate_parabolic_sar(h1_candles)
+    if len(sar) < 2:
+        return None
+
+    prev_uptrend, _ = sar[-2]
+    curr_uptrend, curr_value = sar[-1]
+
+    if not prev_uptrend and curr_uptrend:
+        return {
+            "strategy_name": "Parabolic SAR",
+            "direction": "BUY",
+            "detail": f"SAR flipped below price at {curr_value:.2f}, signaling a new uptrend",
+        }
+    if prev_uptrend and not curr_uptrend:
+        return {
+            "strategy_name": "Parabolic SAR",
+            "direction": "SELL",
+            "detail": f"SAR flipped above price at {curr_value:.2f}, signaling a new downtrend",
+        }
+
+    return None
+
+
+def strategy_ichimoku_breakout(pair_key, config, h1_candles, h4_candles, daily_candles):
+    """
+    NEW per explicit instruction - Ichimoku Cloud breakout. Cloud =
+    the area between Senkou Span A and B, projected forward 26
+    periods when drawn on a chart - but since this only needs
+    "is CURRENT price above/below the cloud that applies to THIS
+    candle", it uses the span values computed 26 periods ago
+    directly, with no need to actually shift/plot anything.
+    """
+    if not h1_candles or len(h1_candles) < 78:
+        return None
+
+    def donchian_mid(candles, period):
+        highs = [c["high"] for c in candles[-period:]]
+        lows = [c["low"] for c in candles[-period:]]
+        return (max(highs) + min(lows)) / 2
+
+    # Cloud values as they were computed 26 candles ago - that's the
+    # cloud that actually applies to today's candle when charted.
+    candles_26_ago = h1_candles[:-26]
+    if len(candles_26_ago) < 52:
+        return None
+
+    tenkan_then = donchian_mid(candles_26_ago, 9)
+    kijun_then = donchian_mid(candles_26_ago, 26)
+    span_a = (tenkan_then + kijun_then) / 2
+    span_b = donchian_mid(candles_26_ago, 52)
+
+    cloud_top = max(span_a, span_b)
+    cloud_bottom = min(span_a, span_b)
+
+    prev_close = h1_candles[-2]["close"]
+    curr_close = h1_candles[-1]["close"]
+
+    if prev_close <= cloud_top and curr_close > cloud_top:
+        return {
+            "strategy_name": "Ichimoku Breakout",
+            "direction": "BUY",
+            "detail": f"price broke above the cloud (top at {cloud_top:.2f})",
+        }
+    if prev_close >= cloud_bottom and curr_close < cloud_bottom:
+        return {
+            "strategy_name": "Ichimoku Breakout",
+            "direction": "SELL",
+            "detail": f"price broke below the cloud (bottom at {cloud_bottom:.2f})",
+        }
+
+    return None
+
+
+def strategy_keltner_breakout(pair_key, config, h1_candles, h4_candles, daily_candles):
+    """
+    NEW per explicit instruction - genuinely different band calculation
+    from the existing Bollinger Squeeze Breakout: Keltner bands are
+    ATR-based around an EMA, not standard-deviation-based around an
+    SMA, so this reacts differently to the same price action and
+    isn't a duplicate vote.
+    """
+    if not h1_candles or len(h1_candles) < 25:
+        return None
+
+    ema20_series = calculate_ema_series(h1_candles, 20)
+    atr_series = calculate_atr_series(h1_candles, 10)
+    if not ema20_series or not atr_series:
+        return None
+
+    ema_now = ema20_series[-1]
+    atr_now = atr_series[-1]
+    upper = ema_now + 2 * atr_now
+    lower = ema_now - 2 * atr_now
+
+    last = h1_candles[-1]
+    if last["close"] > upper:
+        return {
+            "strategy_name": "Keltner Breakout",
+            "direction": "BUY",
+            "detail": f"price closed above the upper Keltner band ({upper:.2f})",
+        }
+    if last["close"] < lower:
+        return {
+            "strategy_name": "Keltner Breakout",
+            "direction": "SELL",
+            "detail": f"price closed below the lower Keltner band ({lower:.2f})",
+        }
+
+    return None
+
+
+def strategy_ema_ribbon(pair_key, config, h1_candles, h4_candles, daily_candles):
+    """
+    NEW per explicit instruction - a stricter, higher-conviction
+    cousin of the existing Trend Following (which only checks 20 vs
+    50) - requires 5 EMAs (5/10/20/50/100) to ALL stack in order,
+    genuinely different confluence than a simple 2-average check.
+    """
+    if not h1_candles or len(h1_candles) < 105:
+        return None
+
+    periods = [5, 10, 20, 50, 100]
+    emas = {}
+    for p in periods:
+        series = calculate_ema_series(h1_candles, p)
+        if not series:
+            return None
+        emas[p] = series[-1]
+
+    values = [emas[p] for p in periods]
+    if all(values[i] > values[i + 1] for i in range(len(values) - 1)):
+        return {
+            "strategy_name": "EMA Ribbon",
+            "direction": "BUY",
+            "detail": "all 5 EMAs (5/10/20/50/100) stacked in bullish order",
+        }
+    if all(values[i] < values[i + 1] for i in range(len(values) - 1)):
+        return {
+            "strategy_name": "EMA Ribbon",
+            "direction": "SELL",
+            "detail": "all 5 EMAs (5/10/20/50/100) stacked in bearish order",
+        }
+
+    return None
+
+
+def strategy_rate_of_change(pair_key, config, h1_candles, h4_candles, daily_candles):
+    """
+    NEW per explicit instruction - Rate of Change: simply today's
+    close vs the close N periods ago, as a %. A much simpler
+    momentum measure than MACD - genuinely different math, not a
+    duplicate vote.
+    """
+    if not h1_candles or len(h1_candles) < 13:
+        return None
+
+    period = 12
+    curr_close = h1_candles[-1]["close"]
+    past_close = h1_candles[-1 - period]["close"]
+    if not past_close:
+        return None
+
+    roc = (curr_close - past_close) / past_close * 100
+    THRESHOLD_PCT = 1.0
+
+    if roc > THRESHOLD_PCT:
+        return {
+            "strategy_name": "Rate of Change",
+            "direction": "BUY",
+            "detail": f"price up {roc:.2f}% over the last {period} candles - strong upside momentum",
+        }
+    if roc < -THRESHOLD_PCT:
+        return {
+            "strategy_name": "Rate of Change",
+            "direction": "SELL",
+            "detail": f"price down {abs(roc):.2f}% over the last {period} candles - strong downside momentum",
+        }
+
+    return None
+
+
+def calculate_cci(candles, period=20):
+    """Standard CCI (Commodity Channel Index). Returns the latest value, or None if there isn't enough data."""
+    if len(candles) < period:
+        return None
+
+    typical_prices = [(c["high"] + c["low"] + c["close"]) / 3 for c in candles[-period:]]
+    sma_tp = sum(typical_prices) / period
+    mean_deviation = sum(abs(tp - sma_tp) for tp in typical_prices) / period
+    if mean_deviation == 0:
+        return None
+
+    current_tp = typical_prices[-1]
+    return (current_tp - sma_tp) / (0.015 * mean_deviation)
+
+
+def strategy_cci_breakout(pair_key, config, h1_candles, h4_candles, daily_candles):
+    """
+    NEW per explicit instruction - CCI crossing beyond +/-100, the
+    classic "strong momentum" reading. Same family as RSI but a
+    genuinely different formula (based on typical price deviation
+    from its own moving average, not up/down close comparisons).
+    """
+    if not h1_candles or len(h1_candles) < 21:
+        return None
+
+    cci = calculate_cci(h1_candles, period=20)
+    if cci is None:
+        return None
+
+    if cci > 100:
+        return {
+            "strategy_name": "CCI Breakout",
+            "direction": "BUY",
+            "detail": f"CCI at {cci:.1f}, above +100 - strong bullish momentum",
+        }
+    if cci < -100:
+        return {
+            "strategy_name": "CCI Breakout",
+            "direction": "SELL",
+            "detail": f"CCI at {cci:.1f}, below -100 - strong bearish momentum",
+        }
+
+    return None
+
+
+def calculate_williams_r(candles, period=14):
+    """Standard Williams %R. Returns the latest value (-100 to 0), or None if there isn't enough data."""
+    if len(candles) < period:
+        return None
+    window = candles[-period:]
+    highest_high = max(c["high"] for c in window)
+    lowest_low = min(c["low"] for c in window)
+    if highest_high == lowest_low:
+        return None
+    return (highest_high - candles[-1]["close"]) / (highest_high - lowest_low) * -100
+
+
+def strategy_williams_r(pair_key, config, h1_candles, h4_candles, daily_candles):
+    """
+    NEW per explicit instruction - Williams %R turning back from an
+    extreme (below -80, then rising = BUY; above -20, then falling =
+    SELL) - same "continuation from extreme" spirit as RSI Trend
+    Continuation, but a genuinely different formula (based on the
+    high-low range position, not average gains/losses).
+    """
+    if not h1_candles or len(h1_candles) < 16:
+        return None
+
+    prev_wr = calculate_williams_r(h1_candles[:-1], period=14)
+    curr_wr = calculate_williams_r(h1_candles, period=14)
+    if prev_wr is None or curr_wr is None:
+        return None
+
+    if prev_wr <= -80 and curr_wr > prev_wr:
+        return {
+            "strategy_name": "Williams %R",
+            "direction": "BUY",
+            "detail": f"Williams %R turned up from {prev_wr:.1f} (oversold) to {curr_wr:.1f}",
+        }
+    if prev_wr >= -20 and curr_wr < prev_wr:
+        return {
+            "strategy_name": "Williams %R",
+            "direction": "SELL",
+            "detail": f"Williams %R turned down from {prev_wr:.1f} (overbought) to {curr_wr:.1f}",
+        }
+
+    return None
+
+
+def calculate_heikin_ashi(candles):
+    """
+    Converts raw OHLC candles into Heikin-Ashi (smoothed) candles.
+    Returns a list of {open, high, low, close} dicts, same length as
+    input.
+    """
+    ha_candles = []
+    for i, c in enumerate(candles):
+        ha_close = (c["open"] + c["high"] + c["low"] + c["close"]) / 4
+        if i == 0:
+            ha_open = (c["open"] + c["close"]) / 2
+        else:
+            ha_open = (ha_candles[-1]["open"] + ha_candles[-1]["close"]) / 2
+        ha_high = max(c["high"], ha_open, ha_close)
+        ha_low = min(c["low"], ha_open, ha_close)
+        ha_candles.append({"open": ha_open, "high": ha_high, "low": ha_low, "close": ha_close})
+    return ha_candles
+
+
+def strategy_heikin_ashi_trend(pair_key, config, h1_candles, h4_candles, daily_candles):
+    """
+    NEW per explicit instruction - requires 3 consecutive Heikin-Ashi
+    candles in the same direction, each with little to no opposing
+    wick (a clean, strong trend candle, not just barely-green/red) -
+    a different way of reading trend strength than moving averages,
+    using smoothed candles instead of raw price.
+    """
+    if not h1_candles or len(h1_candles) < 15:
+        return None
+
+    ha = calculate_heikin_ashi(h1_candles[-10:])
+    last_three = ha[-3:]
+
+    def is_clean_bullish(c):
+        body = c["close"] - c["open"]
+        lower_wick = c["open"] - c["low"]
+        return body > 0 and lower_wick < body * 0.15
+
+    def is_clean_bearish(c):
+        body = c["open"] - c["close"]
+        upper_wick = c["high"] - c["open"]
+        return body > 0 and upper_wick < body * 0.15
+
+    if all(is_clean_bullish(c) for c in last_three):
+        return {
+            "strategy_name": "Heikin-Ashi Trend",
+            "direction": "BUY",
+            "detail": "3 consecutive clean bullish Heikin-Ashi candles - strong uptrend",
+        }
+    if all(is_clean_bearish(c) for c in last_three):
+        return {
+            "strategy_name": "Heikin-Ashi Trend",
+            "direction": "SELL",
+            "detail": "3 consecutive clean bearish Heikin-Ashi candles - strong downtrend",
+        }
+
+    return None
+
+
 STRATEGY_BANK = [
     # strategy_rsi_extreme_reversal REMOVED per explicit instruction -
     # too subjective/complex a concept for a simple candle feed. Still
@@ -7698,6 +8087,14 @@ STRATEGY_BANK = [
     strategy_bollinger_squeeze_breakout,  # NEW
     strategy_atr_volatility_breakout,  # NEW
     strategy_supertrend,  # NEW
+    strategy_parabolic_sar,  # NEW
+    strategy_ichimoku_breakout,  # NEW
+    strategy_keltner_breakout,  # NEW
+    strategy_ema_ribbon,  # NEW
+    strategy_rate_of_change,  # NEW
+    strategy_cci_breakout,  # NEW
+    strategy_williams_r,  # NEW
+    strategy_heikin_ashi_trend,  # NEW
 ]
 
 # Distinct roster for synthetic (Deriv) indices - per explicit

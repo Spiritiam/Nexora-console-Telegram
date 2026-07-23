@@ -144,45 +144,57 @@ MT5_SUBSCRIPTION_DAYS = 30
 MT5_AUTOTRADE_BOTS = {
     "aggressive_scalper": {
         "label": "🐆 Aggressive Scalper",
-        # SWAPPED per explicit instruction, from ema_pullback_scalper +
-        # momentum_macd - Parabolic SAR (fast-flipping trend signal)
-        # and Rate of Change (simple, immediate momentum measure) both
-        # fit this bot's fast/frequent character.
-        "strategy_functions": ["strategy_parabolic_sar", "strategy_rate_of_change"],
+        # EXPANDED per explicit instruction, mirroring the exact
+        # synthetics pattern - kept the bot's original pair (EMA
+        # Pullback Scalper + Momentum MACD) as the "core", added all 8
+        # new strategies on top (10 total). A bigger, genuinely
+        # independent pool means the real 2-vote gate below has room
+        # to find agreement often, not just occasionally.
+        "strategy_functions": [
+            "strategy_ema_pullback_scalper", "strategy_momentum_macd",
+            "strategy_parabolic_sar", "strategy_ichimoku_breakout", "strategy_keltner_breakout",
+            "strategy_ema_ribbon", "strategy_rate_of_change", "strategy_cci_breakout",
+            "strategy_williams_r", "strategy_heikin_ashi_trend",
+        ],
         "timeframe": "1min",
         "description": "Fast, frequent entries on short-term pullbacks.",
     },
     "aggressive_breakout": {
         "label": "⚡ Aggressive Breakout",
-        # SWAPPED per explicit instruction, from
-        # volatility_breakout_scalper + atr_volatility_breakout -
-        # Keltner Breakout (ATR-band breakout) and CCI Breakout
-        # (extreme-momentum reading) both keep the breakout/volatility
-        # character this bot is named for.
-        "strategy_functions": ["strategy_keltner_breakout", "strategy_cci_breakout"],
+        # EXPANDED per explicit instruction - core: Volatility
+        # Breakout Scalper + ATR Volatility Breakout, plus all 8 new.
+        "strategy_functions": [
+            "strategy_volatility_breakout_scalper", "strategy_atr_volatility_breakout",
+            "strategy_parabolic_sar", "strategy_ichimoku_breakout", "strategy_keltner_breakout",
+            "strategy_ema_ribbon", "strategy_rate_of_change", "strategy_cci_breakout",
+            "strategy_williams_r", "strategy_heikin_ashi_trend",
+        ],
         "timeframe": "1min",
         "description": "Fires on sharp volatility expansions.",
     },
     "conservative_trend": {
         "label": "🛡️ Conservative Trend",
-        # SWAPPED per explicit instruction, from trend_following +
-        # momentum_macd - EMA Ribbon (5 EMAs all stacked in order - a
-        # stricter trend confirmation) and Ichimoku Breakout (cloud
-        # cross) both fit this bot's patient, higher-conviction
-        # trend-following character.
-        "strategy_functions": ["strategy_ema_ribbon", "strategy_ichimoku_breakout"],
+        # EXPANDED per explicit instruction - core: Trend Following +
+        # Momentum MACD, plus all 8 new.
+        "strategy_functions": [
+            "strategy_trend_following", "strategy_momentum_macd",
+            "strategy_parabolic_sar", "strategy_ichimoku_breakout", "strategy_keltner_breakout",
+            "strategy_ema_ribbon", "strategy_rate_of_change", "strategy_cci_breakout",
+            "strategy_williams_r", "strategy_heikin_ashi_trend",
+        ],
         "timeframe": "5min",
         "description": "Slower, higher-conviction trend-following entries.",
     },
     "conservative_structure": {
         "label": "🏛️ Conservative Structure",
-        # SWAPPED per explicit instruction, from
-        # bollinger_squeeze_breakout + supertrend - Heikin-Ashi Trend
-        # (smoothed-candle confirmation, a different lens on
-        # "structure" than raw price) and Williams %R (patient,
-        # extreme-reading oscillator) both fit this bot's patient
-        # character.
-        "strategy_functions": ["strategy_heikin_ashi_trend", "strategy_williams_r"],
+        # EXPANDED per explicit instruction - core: Bollinger Squeeze
+        # Breakout + Supertrend, plus all 8 new.
+        "strategy_functions": [
+            "strategy_bollinger_squeeze_breakout", "strategy_supertrend",
+            "strategy_parabolic_sar", "strategy_ichimoku_breakout", "strategy_keltner_breakout",
+            "strategy_ema_ribbon", "strategy_rate_of_change", "strategy_cci_breakout",
+            "strategy_williams_r", "strategy_heikin_ashi_trend",
+        ],
         "timeframe": "5min",
         "description": "Patient, level-based support/resistance entries.",
     },
@@ -619,20 +631,44 @@ async def run_mt5_autotrade_bot_scan(context: ContextTypes.DEFAULT_TYPE):
             if not primary_candles:
                 continue
 
-            # OR-vote across this bot's paired strategies - try each in
-            # order, fire on whichever one confirms FIRST. A single
-            # confirmed setup on either strategy is enough, per
-            # explicit instruction - they don't need to agree with
-            # each other.
-            vote = None
+            # Collect votes from EVERY strategy in this bot's list,
+            # per explicit instruction - previously this was
+            # first-match-wins (fire on whichever strategy confirmed
+            # FIRST, ignoring the rest). Now that every bot has 10
+            # strategies instead of 2, first-match-wins would mean
+            # far more trades firing on just 1 confirmation out of a
+            # much bigger pool - the same overtrading risk already
+            # fixed for synthetics, applied here for the same reason.
+            votes = []
             for strategy_fn in strategy_fns:
-                vote = strategy_fn(pair_key, pair_config, primary_candles, h4_candles, daily_candles)
-                if vote:
-                    break
-            if not vote:
+                try:
+                    result = strategy_fn(pair_key, pair_config, primary_candles, h4_candles, daily_candles)
+                    if result:
+                        votes.append(result)
+                except Exception as e:
+                    print(f"[MT5 AUTOTRADE] {strategy_fn.__name__} failed for {pair_key}: {e}")
+                    continue
+
+            if not votes:
                 continue
 
-            direction = vote.get("direction")
+            buy_votes = [v for v in votes if v["direction"] == "BUY"]
+            sell_votes = [v for v in votes if v["direction"] == "SELL"]
+            winning_votes = buy_votes if len(buy_votes) >= len(sell_votes) else sell_votes
+            direction = "BUY" if winning_votes is buy_votes else "SELL"
+
+            # REAL hard-gate, per explicit instruction - genuinely
+            # require 2+ agreement now that there's a real pool to
+            # draw from, mirroring the exact fix already applied to
+            # synthetics for the same reason.
+            if len(winning_votes) < 2:
+                print(
+                    f"[MT5 AUTOTRADE] {bot_key}/{pair_key} - only {len(winning_votes)} of "
+                    f"{len(strategy_fns)} strategies agreed on {direction} - needs 2+, skipping this round"
+                )
+                continue
+
+            vote = winning_votes[0]
 
             entry_price = primary_candles[-1]["close"]
             atr = _accum_zone_atr(primary_candles, 14) if len(primary_candles) > 15 else None
@@ -9376,6 +9412,30 @@ def _narrative_strategy_sentence(vote):
         return f"Price stretched too far, and is snapping back: {detail}."
     if name == "ICT/SMC":
         return f"Structure confirms it: {detail}."
+    if name == "RSI Trend Continuation":
+        return f"Trend holds - {detail}."
+    if name == "Bollinger Squeeze Breakout":
+        return f"Volatility just broke loose: {detail}."
+    if name == "ATR Volatility Breakout":
+        return f"A genuine volatility surge: {detail}."
+    if name == "Supertrend":
+        return f"Trend flip confirmed - {detail}."
+    if name == "Parabolic SAR":
+        return f"Trailing stop flipped sides: {detail}."
+    if name == "Ichimoku Breakout":
+        return f"Cloud broken - {detail}."
+    if name == "Keltner Breakout":
+        return f"Band broken - {detail}."
+    if name == "EMA Ribbon":
+        return f"Every average agrees: {detail}."
+    if name == "Rate of Change":
+        return f"Momentum is accelerating - {detail}."
+    if name == "CCI Breakout":
+        return f"Momentum reading extreme: {detail}."
+    if name == "Williams %R":
+        return f"Oscillator turning - {detail}."
+    if name == "Heikin-Ashi Trend":
+        return f"Smoothed candles agree: {detail}."
     return detail[0].upper() + detail[1:] + "."
 
 

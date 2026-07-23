@@ -13408,8 +13408,15 @@ async def _run_broadcast(bot, message_text, admin_chat_id, button_label=None, de
     # the admin picked (see start()'s goto_ branch for the full list).
     markup = main_keyboard
     if button_label:
+        # "nexora" is a plain link straight into the bot - no deep-link
+        # payload, no specific feature - just "go to Nexora AI" itself.
+        button_url = (
+            f"https://t.me/{BOT_USERNAME}"
+            if destination == "nexora"
+            else f"https://t.me/{BOT_USERNAME}?start=goto_{destination}"
+        )
         markup = InlineKeyboardMarkup([[
-            InlineKeyboardButton(button_label, url=f"https://t.me/{BOT_USERNAME}?start=goto_{destination}")
+            InlineKeyboardButton(button_label, url=button_url)
         ]])
 
     for uid in user_ids:
@@ -13805,7 +13812,7 @@ async def broadcast_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
             "With a button, add these on their own lines at the end:\n"
             "BUTTON: <button label>\n"
             "LINK: <destination>\n\n"
-            "Destinations: exness (default), deriv, signal.\n\n"
+            "Destinations: exness (default), deriv, signal, nexora (just opens the bot directly).\n\n"
             "Sends to every known user, with the current keyboard "
             "attached so everyone's buttons refresh too (unless a "
             "button is included, which takes its place on that "
@@ -13849,7 +13856,7 @@ async def broadcastchannels_command(update: Update, context: ContextTypes.DEFAUL
             "With a button, add these on their own lines at the end:\n"
             "BUTTON: <button label>\n"
             "LINK: <destination>\n\n"
-            "Destinations: exness (default), deriv, signal.\n\n"
+            "Destinations: exness (default), deriv, signal, nexora (just opens the bot directly).\n\n"
             "Posts to all 3 channels at once. Channels have no "
             "persistent keyboard, so a button is the only way to make "
             "the post tappable. HTML formatting tags (<b>, <i>, etc.) "
@@ -13861,8 +13868,13 @@ async def broadcastchannels_command(update: Update, context: ContextTypes.DEFAUL
 
     markup = None
     if button_label:
+        button_url = (
+            f"https://t.me/{BOT_USERNAME}"
+            if destination == "nexora"
+            else f"https://t.me/{BOT_USERNAME}?start=goto_{destination}"
+        )
         markup = InlineKeyboardMarkup([[
-            InlineKeyboardButton(button_label, url=f"https://t.me/{BOT_USERNAME}?start=goto_{destination}")
+            InlineKeyboardButton(button_label, url=button_url)
         ]])
 
     sent, failed = [], []

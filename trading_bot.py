@@ -3357,7 +3357,7 @@ def match_synthetic_key(question):
                 return key
     return None
 
-SYNTHETIC_CANDLE_CACHE_SECONDS = {"1m": 30, "5m": 120, "1h": 3600, "4h": 14400}
+SYNTHETIC_CANDLE_CACHE_SECONDS = {"1m": 30, "5m": 120, "1h": 300, "4h": 14400}
 synthetic_candle_cache = {}
 
 async def deriv_get_candles(symbol, granularity, count=60):
@@ -7870,6 +7870,51 @@ def run_strategy_bank(pair_key, config, h1_candles, h4_candles, daily_candles, m
 
     return direction, confidence, reason, agreeing_names, winning_votes
 
+async def check_fresh_momentum_veto_synthetic(index_key, config, h1_candles, direction):
+    """
+    Synthetic-index sibling of check_fresh_momentum_veto (used for
+    forex/crypto) - same blind spot (swing-confirmed structure can't
+    see a sharp move still unfolding in the last couple of candles),
+    same fix, but sourcing the "live price" from Deriv's own candle
+    feed instead of TwelveData, since synthetic indices aren't on
+    TwelveData at all. Uses the already-short-cached (30s) 1-minute
+    granularity as the freshness source - cheap, already proven safe,
+    no new API load.
+
+    Returns True if the signal should be SUPPRESSED this round (fresh
+    momentum contradicts it), False if it's safe to proceed.
+    """
+    if not h1_candles or len(h1_candles) < 3:
+        return False
+
+    try:
+        symbol = config["symbol"]
+        fresh_m1 = await get_cached_synthetic_candles(index_key, symbol, "1m", 60, count=2)
+        if not fresh_m1:
+            return False
+        current_price = fresh_m1[-1]["close"]
+
+        reference_close = h1_candles[-3]["close"]
+        if not reference_close:
+            return False
+
+        pct_move = (current_price - reference_close) / reference_close * 100
+        # Same 0.3% threshold as the forex/crypto version - tuned to
+        # catch a genuinely fast, sharp move, not everyday noise.
+        THRESHOLD_PCT = 0.3
+
+        if direction == "SELL" and pct_move > THRESHOLD_PCT:
+            print(f"[MOMENTUM VETO SYNTH] {index_key} SELL suppressed - price up {pct_move:.2f}% in the last 2 H1 candles, against the call")
+            return True
+        if direction == "BUY" and pct_move < -THRESHOLD_PCT:
+            print(f"[MOMENTUM VETO SYNTH] {index_key} BUY suppressed - price down {pct_move:.2f}% in the last 2 H1 candles, against the call")
+            return True
+        return False
+    except Exception as e:
+        print(f"[MOMENTUM VETO SYNTH] check failed for {index_key}: {e}")
+        return False
+
+
 async def run_strategy_bank_synthetic(index_key, config, h1_candles, h4_candles, daily_candles, m1_candles=None, min_agree=2):
     """
     Async sibling of run_strategy_bank, for synthetic (Deriv)
@@ -7967,6 +8012,9 @@ async def run_strategy_bank_synthetic(index_key, config, h1_candles, h4_candles,
 
     agreeing_names = [v["strategy_name"] for v in winning_votes]
     confidence = min(95, 70 + len(winning_votes) * 6)
+
+    if await check_fresh_momentum_veto_synthetic(index_key, config, h1_candles, direction):
+        return None
 
     detail_strings = [v["detail"] for v in winning_votes[:3]]
     reason = (

@@ -144,45 +144,45 @@ MT5_SUBSCRIPTION_DAYS = 30
 MT5_AUTOTRADE_BOTS = {
     "aggressive_scalper": {
         "label": "🐆 Aggressive Scalper",
-        "strategy_functions": ["strategy_ema_pullback_scalper", "strategy_momentum_macd"],
+        # SWAPPED per explicit instruction, from ema_pullback_scalper +
+        # momentum_macd - Parabolic SAR (fast-flipping trend signal)
+        # and Rate of Change (simple, immediate momentum measure) both
+        # fit this bot's fast/frequent character.
+        "strategy_functions": ["strategy_parabolic_sar", "strategy_rate_of_change"],
         "timeframe": "1min",
         "description": "Fast, frequent entries on short-term pullbacks.",
     },
     "aggressive_breakout": {
         "label": "⚡ Aggressive Breakout",
-        # strategy_rsi_extreme_reversal REMOVED and REPLACED per
-        # explicit instruction - ATR Volatility Breakout fits this
-        # bot's own character (breakout + volatility) at least as
-        # well, and is a simple, mechanical concept rather than a
-        # subjective reversal call.
-        "strategy_functions": ["strategy_volatility_breakout_scalper", "strategy_atr_volatility_breakout"],
+        # SWAPPED per explicit instruction, from
+        # volatility_breakout_scalper + atr_volatility_breakout -
+        # Keltner Breakout (ATR-band breakout) and CCI Breakout
+        # (extreme-momentum reading) both keep the breakout/volatility
+        # character this bot is named for.
+        "strategy_functions": ["strategy_keltner_breakout", "strategy_cci_breakout"],
         "timeframe": "1min",
         "description": "Fires on sharp volatility expansions.",
     },
     "conservative_trend": {
         "label": "🛡️ Conservative Trend",
-        "strategy_functions": ["strategy_trend_following", "strategy_momentum_macd"],
+        # SWAPPED per explicit instruction, from trend_following +
+        # momentum_macd - EMA Ribbon (5 EMAs all stacked in order - a
+        # stricter trend confirmation) and Ichimoku Breakout (cloud
+        # cross) both fit this bot's patient, higher-conviction
+        # trend-following character.
+        "strategy_functions": ["strategy_ema_ribbon", "strategy_ichimoku_breakout"],
         "timeframe": "5min",
         "description": "Slower, higher-conviction trend-following entries.",
     },
     "conservative_structure": {
         "label": "🏛️ Conservative Structure",
-        # strategy_unicorn_model REMOVED and REPLACED per explicit
-        # instruction - Supertrend is a genuinely simple, mechanical
-        # structure/trend indicator (ATR-based bands, flips on a
-        # clean cross), replacing the most subjective, discretionary
-        # strategy in the whole bank with one of the least.
-        # strategy_support_resistance_bounce REMOVED and REPLACED per
-        # explicit instruction - it (like Fibonacci Retracement) still
-        # relied on find_swing_points, the same swing-confirmation
-        # blind spot the momentum veto existed to catch. Since the
-        # veto itself is also being removed (per explicit instruction -
-        # votes alone should decide, nothing should override them
-        # after the fact), removing the strategies that most needed
-        # that veto is the more consistent fix, not just a substitute.
-        # Bollinger Squeeze Breakout keeps a level/band-based
-        # "structure" character without that blind spot.
-        "strategy_functions": ["strategy_bollinger_squeeze_breakout", "strategy_supertrend"],
+        # SWAPPED per explicit instruction, from
+        # bollinger_squeeze_breakout + supertrend - Heikin-Ashi Trend
+        # (smoothed-candle confirmation, a different lens on
+        # "structure" than raw price) and Williams %R (patient,
+        # extreme-reading oscillator) both fit this bot's patient
+        # character.
+        "strategy_functions": ["strategy_heikin_ashi_trend", "strategy_williams_r"],
         "timeframe": "5min",
         "description": "Patient, level-based support/resistance entries.",
     },
@@ -8119,6 +8119,18 @@ SYNTHETIC_STRATEGY_BANK = [
     strategy_bollinger_rsi_mean_reversion,
     strategy_ema_pullback_scalper,
     strategy_volatility_breakout_scalper,
+    # 8 NEW per explicit instruction - none of these rely on
+    # ICT/FVG-style institutional-order-flow concepts (same reason
+    # ICT/SMC and London Session ORB were excluded from synthetics
+    # in the first place), so they're a genuine fit here.
+    strategy_parabolic_sar,
+    strategy_ichimoku_breakout,
+    strategy_keltner_breakout,
+    strategy_ema_ribbon,
+    strategy_rate_of_change,
+    strategy_cci_breakout,
+    strategy_williams_r,
+    strategy_heikin_ashi_trend,
 ]
 
 # Per-index strategy groups, mirroring the Nexora AI Trading App's
@@ -8141,12 +8153,21 @@ SYNTHETIC_STRATEGY_BANK = [
 # fallback for any index that isn't in this dict (none currently, but
 # safer than crashing if a new index is added to SYNTHETIC_CONFIG
 # later without also being added here).
+#
+# Both groups below EXPANDED with 2 new strategies each, per explicit
+# instruction, following real live data showing both original
+# pairings losing money (documented ~confirmed via real Deriv trade
+# history). r75/r100 gets Supertrend + Ichimoku Breakout (same
+# trend-confirmation character as the existing pair, genuinely
+# different math). r10/r25/r50 gets CCI Breakout + Williams %R (same
+# mean-reversion/extreme-reading character as the existing Bollinger+
+# RSI strategy, genuinely different formulas).
 SYNTHETIC_INDEX_STRATEGY_GROUPS = {
-    "r75": [strategy_trend_following, strategy_momentum_macd],
-    "r100": [strategy_trend_following, strategy_momentum_macd],
-    "r10": [strategy_bollinger_rsi_mean_reversion],
-    "r25": [strategy_bollinger_rsi_mean_reversion],
-    "r50": [strategy_bollinger_rsi_mean_reversion],
+    "r75": [strategy_trend_following, strategy_momentum_macd, strategy_supertrend, strategy_ichimoku_breakout],
+    "r100": [strategy_trend_following, strategy_momentum_macd, strategy_supertrend, strategy_ichimoku_breakout],
+    "r10": [strategy_bollinger_rsi_mean_reversion, strategy_cci_breakout, strategy_williams_r],
+    "r25": [strategy_bollinger_rsi_mean_reversion, strategy_cci_breakout, strategy_williams_r],
+    "r50": [strategy_bollinger_rsi_mean_reversion, strategy_cci_breakout, strategy_williams_r],
 }
 
 def check_fresh_momentum_veto(pair_key, config, h1_candles, direction):

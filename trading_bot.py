@@ -8154,20 +8154,47 @@ SYNTHETIC_STRATEGY_BANK = [
 # safer than crashing if a new index is added to SYNTHETIC_CONFIG
 # later without also being added here).
 #
-# Both groups below EXPANDED with 2 new strategies each, per explicit
-# instruction, following real live data showing both original
-# pairings losing money (documented ~confirmed via real Deriv trade
-# history). r75/r100 gets Supertrend + Ichimoku Breakout (same
-# trend-confirmation character as the existing pair, genuinely
-# different math). r10/r25/r50 gets CCI Breakout + Williams %R (same
-# mean-reversion/extreme-reading character as the existing Bollinger+
-# RSI strategy, genuinely different formulas).
+# Both groups below EXPANDED to include the FULL set of 8 new
+# strategies each, per explicit instruction - with the real 2+
+# agreement gate now in place (see run_strategy_bank_synthetic), a
+# small candidate pool risks long stretches with no trades at all.
+# A bigger, genuinely independent pool means reaching 2 agreement is
+# realistic far more often, without loosening the gate itself.
+# r75/r100 keep their original Trend Following + MACD (matches the
+# reference app's "Volatility Pro" bot) plus all 8 new strategies.
+# r10/r25/r50 keep their original Bollinger+RSI Mean Reversion
+# (matches "Synthetic DCA") plus all 8 new strategies.
 SYNTHETIC_INDEX_STRATEGY_GROUPS = {
-    "r75": [strategy_trend_following, strategy_momentum_macd, strategy_supertrend, strategy_ichimoku_breakout],
-    "r100": [strategy_trend_following, strategy_momentum_macd, strategy_supertrend, strategy_ichimoku_breakout],
-    "r10": [strategy_bollinger_rsi_mean_reversion, strategy_cci_breakout, strategy_williams_r],
-    "r25": [strategy_bollinger_rsi_mean_reversion, strategy_cci_breakout, strategy_williams_r],
-    "r50": [strategy_bollinger_rsi_mean_reversion, strategy_cci_breakout, strategy_williams_r],
+    "r75": [
+        strategy_trend_following, strategy_momentum_macd, strategy_supertrend,
+        strategy_parabolic_sar, strategy_ichimoku_breakout, strategy_keltner_breakout,
+        strategy_ema_ribbon, strategy_rate_of_change, strategy_cci_breakout,
+        strategy_williams_r, strategy_heikin_ashi_trend,
+    ],
+    "r100": [
+        strategy_trend_following, strategy_momentum_macd, strategy_supertrend,
+        strategy_parabolic_sar, strategy_ichimoku_breakout, strategy_keltner_breakout,
+        strategy_ema_ribbon, strategy_rate_of_change, strategy_cci_breakout,
+        strategy_williams_r, strategy_heikin_ashi_trend,
+    ],
+    "r10": [
+        strategy_bollinger_rsi_mean_reversion,
+        strategy_parabolic_sar, strategy_ichimoku_breakout, strategy_keltner_breakout,
+        strategy_ema_ribbon, strategy_rate_of_change, strategy_cci_breakout,
+        strategy_williams_r, strategy_heikin_ashi_trend,
+    ],
+    "r25": [
+        strategy_bollinger_rsi_mean_reversion,
+        strategy_parabolic_sar, strategy_ichimoku_breakout, strategy_keltner_breakout,
+        strategy_ema_ribbon, strategy_rate_of_change, strategy_cci_breakout,
+        strategy_williams_r, strategy_heikin_ashi_trend,
+    ],
+    "r50": [
+        strategy_bollinger_rsi_mean_reversion,
+        strategy_parabolic_sar, strategy_ichimoku_breakout, strategy_keltner_breakout,
+        strategy_ema_ribbon, strategy_rate_of_change, strategy_cci_breakout,
+        strategy_williams_r, strategy_heikin_ashi_trend,
+    ],
 }
 
 def check_fresh_momentum_veto(pair_key, config, h1_candles, direction):
@@ -8428,6 +8455,25 @@ async def run_strategy_bank_synthetic(index_key, config, h1_candles, h4_candles,
 
     winning_votes = buy_votes if len(buy_votes) >= len(sell_votes) else sell_votes
     direction = "BUY" if winning_votes is buy_votes else "SELL"
+
+    # REAL hard-gate, per explicit instruction - the check below this
+    # comment used to only print a log line, never actually stopping
+    # anything from sending even on just 1 vote. That was fine when
+    # every group had only 1-2 strategies (1 vote WAS the realistic
+    # ceiling), but r75/r100 and r10/r25/r50 were just expanded to 4
+    # and 3 strategies respectively - without a real floor, a bigger
+    # candidate pool directly means more chances for a single stray
+    # vote to fire a trade, i.e. higher raw trade frequency, not just
+    # better odds on a fixed number of attempts. Groups with only 1-2
+    # strategies are UNCHANGED - this only tightens the ones that grew.
+    group_size = len(SYNTHETIC_INDEX_STRATEGY_GROUPS.get(index_key, SYNTHETIC_STRATEGY_BANK))
+    if group_size > 2 and len(winning_votes) < 2:
+        print(
+            f"[STRATEGY BANK SYNTH] {index_key} - only {len(winning_votes)} of {group_size} "
+            f"strategies agreed on {direction} - needs 2+ agreement now that this group has "
+            f"more than 2 strategies, skipping this round"
+        )
+        return None
 
     if len(winning_votes) < min_agree:
         print(

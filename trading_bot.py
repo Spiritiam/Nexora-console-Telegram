@@ -9929,15 +9929,22 @@ async def send_news_direction_analysis(bot, chat_id, event, batch_events=None):
 
 async def check_upcoming_high_impact_news(context: ContextTypes.DEFAULT_TYPE):
     """
-    Runs every 5 minutes. Notifies every known user AND all 3
-    channels roughly 30 minutes before a high-impact USD/EUR/GBP/JPY
-    event, with a "Know the Direction" button that triggers the same
-    fundamentals-first call as tapping News Calendar manually. Per
-    explicit instruction. Uses a 25-30 minute WINDOW rather than an
-    exact 30 (since this job only checks every 5 minutes, an exact
-    match would miss most events entirely), and NOTIFIED_EVENTS_TODAY
-    guards against sending the same alert twice as the job keeps
-    re-scanning through that window.
+    Runs every 5 minutes. Fires ONE notification per day, ~30 minutes
+    before the FIRST high-impact USD/EUR/GBP/JPY event, bundling
+    EVERY remaining event for today into that single message - per
+    explicit instruction, to cut this down to one notification a day
+    instead of one per event (or one per group of same-time events,
+    which is what this used to do). Each event still gets its own
+    "Know the Direction" button, since each needs its own fundamental
+    read - only the surrounding alert message and image are shared.
+    Once this fires, every event it listed is marked notified, so none
+    of them trigger anything again later that day, however far apart
+    their actual times are.
+
+    Uses a 25-30 minute WINDOW on the EARLIEST unnotified event only
+    (since this job checks every 5 minutes, an exact 30 would miss
+    most days entirely), and NOTIFIED_EVENTS_TODAY guards against
+    re-firing as the job keeps re-scanning through that window.
 
     Reuses get_all_known_user_ids() + the same rate-limited send loop
     already proven safe in _run_broadcast, rather than inventing a
@@ -9951,12 +9958,13 @@ async def check_upcoming_high_impact_news(context: ContextTypes.DEFAULT_TYPE):
 
     now = datetime.utcnow()
     bot = context.bot
+    flag_by_currency = {"USD": "🇺🇸", "EUR": "🇪🇺", "GBP": "🇬🇧", "JPY": "🇯🇵"}
 
+    # Every event not yet notified today, with a valid parseable time.
+    pending = []
     for idx, event in enumerate(events):
-        event_key = event["event_key"]
-        if event_key in NOTIFIED_EVENTS_TODAY:
+        if event["event_key"] in NOTIFIED_EVENTS_TODAY:
             continue
-
         raw_dt = event.get("event_dt_utc", "")
         if not raw_dt or "T" not in raw_dt:
             continue
@@ -9964,98 +9972,121 @@ async def check_upcoming_high_impact_news(context: ContextTypes.DEFAULT_TYPE):
             event_time = datetime.strptime(raw_dt[:16], "%Y-%m-%dT%H:%M")
         except Exception:
             continue
+        pending.append((idx, event, event_time))
 
-        minutes_until = (event_time - now).total_seconds() / 60
-        if not (25 <= minutes_until <= 30):
-            continue
+    if not pending:
+        return
 
-        NOTIFIED_EVENTS_TODAY.add(event_key)
-        flag = {"USD": "🇺🇸", "EUR": "🇪🇺", "GBP": "🇬🇧", "JPY": "🇯🇵"}.get(event["currency"], "🌍")
+    # Only fire once the EARLIEST of these is 25-30 minutes out - at
+    # that point, bundle ALL of them into one message, not just the
+    # earliest one.
+    pending.sort(key=lambda p: p[2])
+    _, _, earliest_time = pending[0]
+    minutes_until_earliest = (earliest_time - now).total_seconds() / 60
+    if not (25 <= minutes_until_earliest <= 30):
+        return
 
-        # A channel post is one single message seen by everyone, so it
-        # genuinely can't show each viewer's own local time - showing
-        # WAT (this bot's home base) plus UTC gives every reader a
-        # fixed, unambiguous anchor to convert from either way.
-        wat_time = format_local_time(event.get("event_dt_utc", ""), DEFAULT_UTC_OFFSET_MINUTES)
-        utc_time = format_local_time(event.get("event_dt_utc", ""), 0)
-        channel_alert_text = (
-            f"⏰ <b>High-impact news in ~30 minutes</b>\n\n"
-            f"{flag} <b>{event['title']}</b> ({event['currency']})\n"
-            f"Time: {wat_time} GMT+1 ({utc_time} UTC)\n\n"
-            f"Tap below to see the likely direction before it drops:"
-        )
-        # Channel copy uses a url= deep link, NOT callback_data - a
-        # callback button on a channel post either fails silently for
-        # anyone who hasn't DM'd the bot yet, or replies publicly into
-        # the channel itself for whoever taps it, neither of which is
-        # "take them privately into the bot to see their own call".
-        # Opening the deep link IS the user starting/continuing their
-        # own private DM, handled in start()'s newsevent_ branch.
-        channel_markup = InlineKeyboardMarkup([[
-            InlineKeyboardButton(
-                "🔍 Know the Direction",
-                url=f"https://t.me/{BOT_USERNAME}?start=newsevent_{list_id}_{idx}"
+    group = [(idx, event) for idx, event, _ in pending]
+    for _, event in group:
+        NOTIFIED_EVENTS_TODAY.add(event["event_key"])
+
+    header = "First high-impact event in ~30 minutes" if len(group) == 1 else f"First high-impact event in ~30 minutes — {len(group)} today"
+
+    first_event = group[0][1]
+    image_prompt = (
+        f"professional financial news illustration: {first_event['currency']} "
+        f"{first_event['title']}, cinematic digital art, dramatic lighting, high quality"
+    )
+    image_url = (
+        f"https://image.pollinations.ai/prompt/"
+        f"{requests.utils.quote(image_prompt)}"
+        f"?width=800&height=450&nologo=true"
+    )
+
+    # Channel copy uses url= deep links, NOT callback_data - a
+    # callback button on a channel post either fails silently for
+    # anyone who hasn't DM'd the bot yet, or replies publicly into
+    # the channel itself for whoever taps it, neither of which is
+    # "take them privately into the bot to see their own call".
+    # Opening the deep link IS the user starting/continuing their
+    # own private DM, handled in start()'s newsevent_ branch.
+    channel_markup = InlineKeyboardMarkup([
+        [InlineKeyboardButton(
+            f"🔍 {event['title']} ({event['currency']})",
+            url=f"https://t.me/{BOT_USERNAME}?start=newsevent_{list_id}_{idx}"
+        )]
+        for idx, event in group
+    ])
+    # Per-user DM copy stays on callback_data - it's already inside
+    # a private 1:1 chat, so there's no "channel spam" or "blocked
+    # DM" risk to route around here.
+    dm_markup = InlineKeyboardMarkup([
+        [InlineKeyboardButton(
+            f"🔍 {event['title']} ({event['currency']})",
+            callback_data=f"newsevent_{list_id}_{idx}"
+        )]
+        for idx, event in group
+    ])
+
+    # A channel post is one single message seen by everyone, so it
+    # genuinely can't show each viewer's own local time - showing WAT
+    # (this bot's home base) for every event's own time gives every
+    # reader a fixed, unambiguous anchor to convert from.
+    channel_event_lines = "\n".join(
+        f"{flag_by_currency.get(event['currency'], '🌍')} <b>{event['title']}</b> ({event['currency']}) — "
+        f"{format_local_time(event.get('event_dt_utc', ''), DEFAULT_UTC_OFFSET_MINUTES)} GMT+1"
+        for _, event in group
+    )
+    channel_alert_text = (
+        f"⏰ <b>{header}</b>\n\n"
+        f"{channel_event_lines}\n\n"
+        f"Tap any event below to see the likely direction before it drops:"
+    )
+
+    print(f"[NEWS ALERT] Notifying for {len(group)} event(s) today, first at {earliest_time}: {[e['title'] for _, e in group]}")
+
+    for channel_id in [CHANNEL_1_ID, CHANNEL_2_ID, CHANNEL_3_ID]:
+        try:
+            await bot.send_photo(
+                chat_id=channel_id, photo=image_url, caption=channel_alert_text,
+                parse_mode=ParseMode.HTML, reply_markup=channel_markup
             )
-        ]])
-        # Per-user DM copy stays on callback_data - it's already inside
-        # a private 1:1 chat, so there's no "channel spam" or "blocked
-        # DM" risk to route around here.
-        dm_markup = InlineKeyboardMarkup([[
-            InlineKeyboardButton("🔍 Know the Direction", callback_data=f"newsevent_{list_id}_{idx}")
-        ]])
+        except Exception as e:
+            print(f"[NEWS ALERT] Channel post failed for {channel_id}: {e}")
 
-        # AI-generated illustration, per explicit instruction - same
-        # pollinations.ai pattern already used for the daily news
-        # post, so this alert doesn't land as plain text alone.
-        image_prompt = (
-            f"professional financial news illustration: {event['currency']} "
-            f"{event['title']}, cinematic digital art, dramatic lighting, high quality"
-        )
-        image_url = (
-            f"https://image.pollinations.ai/prompt/"
-            f"{requests.utils.quote(image_prompt)}"
-            f"?width=800&height=450&nologo=true"
-        )
+    # Private DMs DO get personalized per-recipient - each user's own
+    # saved offset (falling back to WAT for anyone who never set one)
+    # is looked up once here in bulk, rather than one DB round-trip
+    # per recipient inside the send loop below. Each event's own line
+    # is reformatted per-user too, since they're spread across the
+    # day at different times, not all sharing one moment anymore.
+    user_offsets = get_all_user_utc_offsets()
+    user_ids = await get_all_known_user_ids()
+    sent = failed = 0
+    for uid in user_ids:
+        try:
+            offset_minutes = user_offsets.get(uid, DEFAULT_UTC_OFFSET_MINUTES)
+            tz_label = format_gmt_label(offset_minutes)
+            personal_event_lines = "\n".join(
+                f"{flag_by_currency.get(event['currency'], '🌍')} <b>{event['title']}</b> ({event['currency']}) — "
+                f"{format_local_time(event.get('event_dt_utc', ''), offset_minutes)} {tz_label}"
+                for _, event in group
+            )
+            personal_alert_text = (
+                f"⏰ <b>{header}</b>\n\n"
+                f"{personal_event_lines}\n\n"
+                f"Tap any event below to see the likely direction before it drops:"
+            )
+            await bot.send_photo(
+                chat_id=int(uid), photo=image_url, caption=personal_alert_text,
+                parse_mode=ParseMode.HTML, reply_markup=dm_markup
+            )
+            sent += 1
+        except Exception:
+            failed += 1
+        await asyncio.sleep(0.05)  # ~20/sec, same safe pacing as _run_broadcast
 
-        print(f"[NEWS ALERT] Notifying for upcoming event: {event['title']} ({event['currency']})")
-
-        for channel_id in [CHANNEL_1_ID, CHANNEL_2_ID, CHANNEL_3_ID]:
-            try:
-                await bot.send_photo(
-                    chat_id=channel_id, photo=image_url, caption=channel_alert_text,
-                    parse_mode=ParseMode.HTML, reply_markup=channel_markup
-                )
-            except Exception as e:
-                print(f"[NEWS ALERT] Channel post failed for {channel_id}: {e}")
-
-        # Private DMs DO get personalized per-recipient - each user's
-        # own saved offset (falling back to WAT for anyone who never
-        # set one) is looked up once here in bulk, rather than one DB
-        # round-trip per recipient inside the send loop below.
-        user_offsets = get_all_user_utc_offsets()
-        user_ids = await get_all_known_user_ids()
-        sent = failed = 0
-        for uid in user_ids:
-            try:
-                offset_minutes = user_offsets.get(uid, DEFAULT_UTC_OFFSET_MINUTES)
-                local_time = format_local_time(event.get("event_dt_utc", ""), offset_minutes)
-                tz_label = format_gmt_label(offset_minutes)
-                personal_alert_text = (
-                    f"⏰ <b>High-impact news in ~30 minutes</b>\n\n"
-                    f"{flag} <b>{event['title']}</b> ({event['currency']})\n"
-                    f"Time: {local_time} {tz_label}\n\n"
-                    f"Tap below to see the likely direction before it drops:"
-                )
-                await bot.send_photo(
-                    chat_id=int(uid), photo=image_url, caption=personal_alert_text,
-                    parse_mode=ParseMode.HTML, reply_markup=dm_markup
-                )
-                sent += 1
-            except Exception:
-                failed += 1
-            await asyncio.sleep(0.05)  # ~20/sec, same safe pacing as _run_broadcast
-
-        print(f"[NEWS ALERT] Done — sent {sent}, failed {failed}")
+    print(f"[NEWS ALERT] Done — sent {sent}, failed {failed}")
 
 # ============================================
 # FUNDAMENTAL GROUNDING DATA (NEW)
@@ -10704,9 +10735,9 @@ async def ask_gemini(prompt):
                 GEMINI_URL, headers=headers, json=data, timeout=30
             )
             if response.status_code == 429:
-                raise Exception("RATE_LIMIT")
+                raise Exception(f"RATE_LIMIT | body: {response.text[:300]}")
         if response.status_code != 200:
-            raise Exception("GEMINI_ERROR")
+            raise Exception(f"GEMINI_ERROR_{response.status_code} | body: {response.text[:300]}")
         result = response.json()
         return result["candidates"][0]["content"]["parts"][0]["text"]
     except Exception as e:
@@ -10758,6 +10789,7 @@ async def ask_openrouter(prompt):
             OPENROUTER_URL, headers=headers, json=data, timeout=30
         )
         if response.status_code != 200:
+            print(f"[OPENROUTER] Failed with status {response.status_code} | body: {response.text[:300]}")
             return "⚠️ AI server busy."
         result = response.json()
         return result["choices"][0]["message"]["content"]

@@ -8013,9 +8013,6 @@ async def run_strategy_bank_synthetic(index_key, config, h1_candles, h4_candles,
     agreeing_names = [v["strategy_name"] for v in winning_votes]
     confidence = min(95, 70 + len(winning_votes) * 6)
 
-    if await check_fresh_momentum_veto_synthetic(index_key, config, h1_candles, direction):
-        return None
-
     detail_strings = [v["detail"] for v in winning_votes[:3]]
     reason = (
         f"{len(winning_votes)} independent strategy(ies) agree on {direction}: "

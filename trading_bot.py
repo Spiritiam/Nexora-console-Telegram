@@ -172,7 +172,17 @@ MT5_AUTOTRADE_BOTS = {
         # structure/trend indicator (ATR-based bands, flips on a
         # clean cross), replacing the most subjective, discretionary
         # strategy in the whole bank with one of the least.
-        "strategy_functions": ["strategy_support_resistance_bounce", "strategy_supertrend"],
+        # strategy_support_resistance_bounce REMOVED and REPLACED per
+        # explicit instruction - it (like Fibonacci Retracement) still
+        # relied on find_swing_points, the same swing-confirmation
+        # blind spot the momentum veto existed to catch. Since the
+        # veto itself is also being removed (per explicit instruction -
+        # votes alone should decide, nothing should override them
+        # after the fact), removing the strategies that most needed
+        # that veto is the more consistent fix, not just a substitute.
+        # Bollinger Squeeze Breakout keeps a level/band-based
+        # "structure" character without that blind spot.
+        "strategy_functions": ["strategy_bollinger_squeeze_breakout", "strategy_supertrend"],
         "timeframe": "5min",
         "description": "Patient, level-based support/resistance entries.",
     },
@@ -623,9 +633,6 @@ async def run_mt5_autotrade_bot_scan(context: ContextTypes.DEFAULT_TYPE):
                 continue
 
             direction = vote.get("direction")
-
-            if check_fresh_momentum_veto(pair_key, pair_config, primary_candles, direction):
-                continue
 
             entry_price = primary_candles[-1]["close"]
             atr = _accum_zone_atr(primary_candles, 14) if len(primary_candles) > 15 else None
@@ -7676,9 +7683,15 @@ STRATEGY_BANK = [
     # deleted in case it's wanted again later.
     strategy_trend_following,
     strategy_breakout,
-    strategy_support_resistance_bounce,
+    # strategy_support_resistance_bounce REMOVED per explicit
+    # instruction - relied on find_swing_points, the same
+    # swing-confirmation blind spot the momentum veto existed to
+    # catch. Removed alongside the veto itself for consistency,
+    # rather than leaving the exact risk the veto was protecting
+    # against in place with no protection at all.
     strategy_momentum_macd,
-    strategy_fibonacci_retracement,
+    # strategy_fibonacci_retracement REMOVED per explicit instruction -
+    # same reason as Support/Resistance Bounce above.
     strategy_ema_pullback_scalper,  # per explicit instruction - already existed for synthetics only, now also runs on forex/crypto (falls back to h1_candles since m1_candles is never passed here)
     strategy_volume_profile_poc,  # diagnostic only right now, always returns None - see docstring
     strategy_rsi_trend_continuation,  # NEW - genuinely different concept from the removed RSI Extreme Reversal (continuation, not reversal)
@@ -7705,9 +7718,7 @@ SYNTHETIC_STRATEGY_BANK = [
     strategy_rsi_trend_continuation,
     strategy_trend_following,
     strategy_breakout,
-    strategy_support_resistance_bounce,
     strategy_momentum_macd,
-    strategy_fibonacci_retracement,
     strategy_bollinger_rsi_mean_reversion,
     strategy_ema_pullback_scalper,
     strategy_volatility_breakout_scalper,
@@ -7852,9 +7863,6 @@ def run_strategy_bank(pair_key, config, h1_candles, h4_candles, daily_candles, m
 
     agreeing_names = [v["strategy_name"] for v in winning_votes]
     confidence = min(95, 70 + len(winning_votes) * 6)
-
-    if check_fresh_momentum_veto(pair_key, config, h1_candles, direction):
-        return None
 
     # Short bullet points, one per agreeing strategy, instead of one
     # long run-on sentence - reads cleanly even with 2-3 strategies

@@ -13953,7 +13953,7 @@ async def get_all_known_user_ids():
 
     return user_ids
 
-async def _run_broadcast(bot, message_text, admin_chat_id, button_label=None, destination="exness"):
+async def _run_broadcast(bot, message_text, admin_chat_id, button_label=None, destination="exness", photo_file_id=None):
     user_ids = await get_all_known_user_ids()
     total = len(user_ids)
     print(f"[BROADCAST] Starting send to {total} users")
@@ -13982,12 +13982,21 @@ async def _run_broadcast(bot, message_text, admin_chat_id, button_label=None, de
 
     for uid in user_ids:
         try:
-            await bot.send_message(
-                chat_id=int(uid),
-                text=message_text,
-                parse_mode=ParseMode.HTML,
-                reply_markup=markup
-            )
+            if photo_file_id:
+                await bot.send_photo(
+                    chat_id=int(uid),
+                    photo=photo_file_id,
+                    caption=message_text,
+                    parse_mode=ParseMode.HTML,
+                    reply_markup=markup
+                )
+            else:
+                await bot.send_message(
+                    chat_id=int(uid),
+                    text=message_text,
+                    parse_mode=ParseMode.HTML,
+                    reply_markup=markup
+                )
             sent += 1
         except Exception as e:
             failed += 1
@@ -14360,20 +14369,31 @@ def parse_broadcast_button_syntax(message_text):
     return "\n".join(message_lines).strip(), button_label, destination
 
 
-async def broadcast_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user_id = str(update.message.from_user.id)
-
+async def _handle_broadcast_request(update: Update, context: ContextTypes.DEFAULT_TYPE, raw_text: str, photo_file_id=None):
+    """
+    Shared core for /broadcast - used by BOTH the plain-text
+    CommandHandler below AND the new photo-caption handler
+    (broadcast_photo_handler). Confirmed directly from Telegram's own
+    docs: CommandHandler can NEVER see a command typed as a photo's
+    caption, in any version of the library - that's why a broadcast
+    sent as "photo + /broadcast... caption" silently did nothing
+    before. This shared core is what makes both paths actually work
+    the same way, rather than duplicating the parsing/sending logic.
+    """
+    user_id = str(update.effective_user.id)
     if not ADMIN_USER_ID or user_id != str(ADMIN_USER_ID):
         return  # silently ignore - don't reveal this command to anyone else
 
-    message_text = update.message.text.replace("/broadcast", "", 1).strip()
+    message_text = raw_text.replace("/broadcast", "", 1).strip()
     if not message_text:
-        await update.message.reply_text(
+        await update.effective_message.reply_text(
             "Usage: /broadcast <message>\n\n"
             "With a button, add these on their own lines at the end:\n"
             "BUTTON: <button label>\n"
             "LINK: <destination>\n\n"
             "Destinations: exness (default), deriv, signal, nexora (just opens the bot directly).\n\n"
+            "Attach a photo (with this as its caption) to send it as "
+            "an image with caption instead of plain text.\n\n"
             "Sends to every known user, with the current keyboard "
             "attached so everyone's buttons refresh too (unless a "
             "button is included, which takes its place on that "
@@ -14385,39 +14405,41 @@ async def broadcast_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     message_text, button_label, destination = parse_broadcast_button_syntax(message_text)
 
     user_count = len(await get_all_known_user_ids())
-    await update.message.reply_text(
+    await update.effective_message.reply_text(
         f"📡 <b>Broadcasting to {user_count} users in the background...</b>\n"
         f"I'll message you here when it's done.",
         parse_mode=ParseMode.HTML
     )
 
     asyncio.create_task(
-        _run_broadcast(context.bot, message_text, update.message.chat_id, button_label, destination)
+        _run_broadcast(context.bot, message_text, update.effective_chat.id, button_label, destination, photo_file_id)
     )
 
 
-async def broadcastchannels_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """
-    Same idea as /broadcast above, but posts to the 3 channels instead
-    of individual DM users - added per explicit instruction so a
-    feature announcement is one command instead of manually pasting
-    into each channel. Only 3 channels, so this runs inline rather
-    than as a background task like _run_broadcast does for the
-    (much larger, slower) user list.
-    """
-    user_id = str(update.message.from_user.id)
+async def broadcast_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await _handle_broadcast_request(update, context, update.message.text)
 
+
+async def _handle_broadcastchannels_request(update: Update, context: ContextTypes.DEFAULT_TYPE, raw_text: str, photo_file_id=None):
+    """
+    Shared core for /broadcastchannels - same reasoning as
+    _handle_broadcast_request above. Only 3 channels, so this still
+    runs inline rather than as a background task.
+    """
+    user_id = str(update.effective_user.id)
     if not ADMIN_USER_ID or user_id != str(ADMIN_USER_ID):
         return  # silently ignore - don't reveal this command to anyone else
 
-    message_text = update.message.text.replace("/broadcastchannels", "", 1).strip()
+    message_text = raw_text.replace("/broadcastchannels", "", 1).strip()
     if not message_text:
-        await update.message.reply_text(
+        await update.effective_message.reply_text(
             "Usage: /broadcastchannels <message>\n\n"
             "With a button, add these on their own lines at the end:\n"
             "BUTTON: <button label>\n"
             "LINK: <destination>\n\n"
             "Destinations: exness (default), deriv, signal, nexora (just opens the bot directly).\n\n"
+            "Attach a photo (with this as its caption) to post it as "
+            "an image with caption instead of plain text.\n\n"
             "Posts to all 3 channels at once. Channels have no "
             "persistent keyboard, so a button is the only way to make "
             "the post tappable. HTML formatting tags (<b>, <i>, etc.) "
@@ -14441,10 +14463,16 @@ async def broadcastchannels_command(update: Update, context: ContextTypes.DEFAUL
     sent, failed = [], []
     for channel_id in [CHANNEL_1_ID, CHANNEL_2_ID, CHANNEL_3_ID]:
         try:
-            await context.bot.send_message(
-                chat_id=channel_id, text=message_text, parse_mode=ParseMode.HTML,
-                reply_markup=markup
-            )
+            if photo_file_id:
+                await context.bot.send_photo(
+                    chat_id=channel_id, photo=photo_file_id, caption=message_text,
+                    parse_mode=ParseMode.HTML, reply_markup=markup
+                )
+            else:
+                await context.bot.send_message(
+                    chat_id=channel_id, text=message_text, parse_mode=ParseMode.HTML,
+                    reply_markup=markup
+                )
             sent.append(channel_id)
         except Exception as e:
             failed.append(channel_id)
@@ -14453,7 +14481,34 @@ async def broadcastchannels_command(update: Update, context: ContextTypes.DEFAUL
     result_text = f"✅ Posted to {len(sent)}/3 channels."
     if failed:
         result_text += f"\n⚠️ Failed: {', '.join(failed)} - check Railway logs for why."
-    await update.message.reply_text(result_text)
+    await update.effective_message.reply_text(result_text)
+
+
+async def broadcastchannels_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await _handle_broadcastchannels_request(update, context, update.message.text)
+
+
+async def broadcast_photo_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """
+    Catches /broadcast or /broadcastchannels sent as a PHOTO's
+    caption - the exact scenario that silently failed before.
+    CommandHandler can never see these (confirmed directly from
+    Telegram's own docs, true in every library version), so this is
+    a separate MessageHandler specifically watching for a photo whose
+    caption starts with one of these commands. Checks
+    "/broadcastchannels" before the bare "/broadcast" prefix, since
+    the latter is a prefix of the former and would otherwise catch
+    it by mistake.
+    """
+    caption = update.message.caption or ""
+    if not update.message.photo:
+        return
+    photo_file_id = update.message.photo[-1].file_id  # highest resolution Telegram sent
+
+    if caption.startswith("/broadcastchannels"):
+        await _handle_broadcastchannels_request(update, context, caption, photo_file_id)
+    elif caption.startswith("/broadcast"):
+        await _handle_broadcast_request(update, context, caption, photo_file_id)
 
 # ============================================
 # STARTUP CATCH-UP (NEW)
@@ -15127,6 +15182,7 @@ def main():
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("broadcast", broadcast_command))
     app.add_handler(CommandHandler("broadcastchannels", broadcastchannels_command))
+    app.add_handler(MessageHandler(filters.PHOTO, broadcast_photo_handler))
     app.add_handler(CommandHandler("mt5revenue", mt5revenue_command))
     app.add_handler(CommandHandler("testsynth", testsynth_command))
     app.add_handler(CommandHandler("discoversymbols", discoversymbols_command))

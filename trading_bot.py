@@ -9441,17 +9441,21 @@ def _narrative_strategy_sentence(vote):
 
 def generate_signal_narrative(display_name, direction, winning_votes):
     """
-    Returns ONE short, explanatory sentence stating the real technical
-    reason for the trade - per explicit instruction. Uses the short
-    per-strategy lead-in phrase (_narrative_strategy_sentence, e.g.
-    "The moving averages confirm it: ...") so the raw numbers still
-    read naturally instead of starting cold with data, but drops the
-    randomized opener/closer flavor text that used to surround it -
-    that was too much information on the signal itself.
+    Returns up to 3 short lines, one per agreeing strategy, per
+    explicit instruction - names every agreeing strategy rather than
+    just the first, while staying short and direct. Capped at 3 lines
+    even if more than 3 agreed (adds a brief "+N more" line instead
+    of listing every single one), since some banks now have 10+
+    strategies and listing all of them would be far too much text on
+    a single signal.
     """
     if not winning_votes:
         return f"{display_name} {direction.lower()} signal."
-    return _narrative_strategy_sentence(winning_votes[0])
+
+    lines = [_narrative_strategy_sentence(v) for v in winning_votes[:3]]
+    if len(winning_votes) > 3:
+        lines.append(f"+ {len(winning_votes) - 3} more strategy(ies) agree.")
+    return "\n".join(lines)
 
 
 # ============================================

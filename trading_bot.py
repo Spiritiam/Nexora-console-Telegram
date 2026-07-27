@@ -15120,19 +15120,33 @@ async def post_weekly_report(context: ContextTypes.DEFAULT_TYPE):
     profit_emoji = "📈" if total_profit_usd >= 0 else "📉"
     net_pips_sign = "+" if net_pips >= 0 else ""
 
+    # Was a hardcoded, disconnected string ("XAUUSD, EURUSD, GBPUSD,
+    # GBPJPY, BTCUSD") left over from before SCHEDULED_DAILY_PAIRS was
+    # narrowed to just the 3 actually-traded pairs - the underlying
+    # numbers were already correctly filtered, but this label never
+    # got updated to match, so it kept showing 2 pairs that aren't
+    # actually traded. Now built directly from the same constant the
+    # filtering itself uses, so the two can never diverge again.
+    traded_pairs_label = ", ".join(SCHEDULED_DAILY_PAIRS)
+
     report = (
         f"📊 <b>WEEKLY PERFORMANCE REPORT</b>\n"
         f"<i>#NexoraAI — {date_range}</i>\n\n"
         f"━━━━━━━━━━━━━━━━━━━━━\n\n"
         f"<b>Total Signals Issued:</b> {total} "
-        f"<i>(XAUUSD, EURUSD, GBPUSD, GBPJPY, BTCUSD)</i>\n\n"
+        f"<i>({traded_pairs_label})</i>\n\n"
         f"✅ <b>Take Profit Hit:</b> {tp_hit}\n"
         f"❌ <b>Stop Loss Hit:</b> {sl_hit}\n"
         f"⏳ <b>Still Running:</b> {still_open}\n\n"
         f"🎯 <b>Win Rate:</b> {win_rate}% ({tp_hit}/{closed} closed signals)\n\n"
         f"📐 <b>Pips Won:</b> +{total_pips_won:.1f}\n"
-        f"📐 <b>Pips Lost:</b> -{total_pips_lost:.1f}\n"
-        f"📐 <b>Net Pips:</b> {net_pips_sign}{net_pips:.1f}\n\n"
+        f"📐 <b>Pips Lost:</b> -{total_pips_lost:.1f}\n\n"
+        # Net Pips REMOVED per explicit instruction - it could show a
+        # negative figure in the same report as a positive dollar P&L
+        # (different pairs carry very different $-per-pip values, so
+        # the two totals don't move together), which read as
+        # confusing/contradictory to beginners. Pips Won/Lost above
+        # are kept as-is; only the combined net figure is gone.
         f"{profit_emoji} <b>Real Net P&L (0.1 lot):</b> {profit_sign}${profit_abs:.2f}\n\n"
     )
     # NOTE: the missing_pnl_count warning ("N closed signal(s) couldn't

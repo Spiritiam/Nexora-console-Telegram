@@ -7551,7 +7551,7 @@ def strategy_rsi_trend_continuation(pair_key, config, h1_candles, h4_candles, da
             return {
                 "strategy_name": "RSI Trend Continuation",
                 "direction": "BUY",
-                "detail": f"uptrend intact (20MA above 50MA), RSI dipped to {prev_rsi:.1f} and turned back up to {curr_rsi:.1f}",
+                "detail": f"RSI {prev_rsi:.1f} to {curr_rsi:.1f}, uptrend intact",
             }
     elif ma20 < ma50:
         rose_to_zone = 50 <= prev_rsi <= 60 or 50 <= recent_dip <= 60
@@ -7560,7 +7560,7 @@ def strategy_rsi_trend_continuation(pair_key, config, h1_candles, h4_candles, da
             return {
                 "strategy_name": "RSI Trend Continuation",
                 "direction": "SELL",
-                "detail": f"downtrend intact (20MA below 50MA), RSI rose to {prev_rsi:.1f} and turned back down to {curr_rsi:.1f}",
+                "detail": f"RSI {prev_rsi:.1f} to {curr_rsi:.1f}, downtrend intact",
             }
 
     return None
@@ -7608,13 +7608,13 @@ def strategy_bollinger_squeeze_breakout(pair_key, config, h1_candles, h4_candles
         return {
             "strategy_name": "Bollinger Squeeze Breakout",
             "direction": "BUY",
-            "detail": f"bands squeezed tight then a strong candle closed above the upper band ({upper:.2f})",
+            "detail": f"closed above the upper band at {upper:.2f}",
         }
     if last["close"] < lower and is_strong_candle:
         return {
             "strategy_name": "Bollinger Squeeze Breakout",
             "direction": "SELL",
-            "detail": f"bands squeezed tight then a strong candle closed below the lower band ({lower:.2f})",
+            "detail": f"closed below the lower band at {lower:.2f}",
         }
 
     return None
@@ -7656,13 +7656,13 @@ def strategy_atr_volatility_breakout(pair_key, config, h1_candles, h4_candles, d
         return {
             "strategy_name": "ATR Volatility Breakout",
             "direction": "BUY",
-            "detail": f"ATR expanding ({current_atr:.2f} vs avg {avg_atr:.2f}) with a large candle breaking above {recent_high:.2f}",
+            "detail": f"broke above {recent_high:.2f} on expanding volatility",
         }
     if last["close"] < recent_low:
         return {
             "strategy_name": "ATR Volatility Breakout",
             "direction": "SELL",
-            "detail": f"ATR expanding ({current_atr:.2f} vs avg {avg_atr:.2f}) with a large candle breaking below {recent_low:.2f}",
+            "detail": f"broke below {recent_low:.2f} on expanding volatility",
         }
 
     return None
@@ -7976,13 +7976,13 @@ def strategy_cci_breakout(pair_key, config, h1_candles, h4_candles, daily_candle
         return {
             "strategy_name": "CCI Breakout",
             "direction": "BUY",
-            "detail": f"CCI at {cci:.1f}, above +100 - strong bullish momentum",
+            "detail": f"CCI at {cci:.1f}, above +100",
         }
     if cci < -100:
         return {
             "strategy_name": "CCI Breakout",
             "direction": "SELL",
-            "detail": f"CCI at {cci:.1f}, below -100 - strong bearish momentum",
+            "detail": f"CCI at {cci:.1f}, below -100",
         }
 
     return None
@@ -8020,13 +8020,13 @@ def strategy_williams_r(pair_key, config, h1_candles, h4_candles, daily_candles)
         return {
             "strategy_name": "Williams %R",
             "direction": "BUY",
-            "detail": f"Williams %R turned up from {prev_wr:.1f} (oversold) to {curr_wr:.1f}",
+            "detail": f"{prev_wr:.1f} to {curr_wr:.1f} from oversold",
         }
     if prev_wr >= -20 and curr_wr < prev_wr:
         return {
             "strategy_name": "Williams %R",
             "direction": "SELL",
-            "detail": f"Williams %R turned down from {prev_wr:.1f} (overbought) to {curr_wr:.1f}",
+            "detail": f"{prev_wr:.1f} to {curr_wr:.1f} from overbought",
         }
 
     return None
@@ -9390,71 +9390,74 @@ def _narrative_strategy_sentence(vote):
     detail = vote["detail"]
     if name == "Trend Following (MA)":
         if vote["direction"] == "BUY":
-            return "Price is trading above both the 20MA and 50MA — a bullish setup."
+            return "Price is above both the 20MA and 50MA — bullish."
         else:
-            return "Price is trading below both the 20MA and 50MA — a bearish setup."
+            return "Price is below both the 20MA and 50MA — bearish."
     if name == "Breakout":
-        return f"Price just {detail}, clearing a multi-candle range."
+        return f"Broke out of its recent range: {detail}."
     if name == "Support/Resistance Bounce":
-        return f"Price action shows it - {detail}."
+        return f"Price rejected a key level: {detail}."
     if name == "Volatility Breakout Scalper":
-        return f"A clean breakout move: {detail}."
+        return f"Clean breakout: {detail}."
     if name == "EMA Pullback Scalper":
         if vote["direction"] == "BUY":
-            return "Price pulled back and bounced off the short-term average — a bullish continuation setup."
+            return "Bullish pullback bounce off the short-term average."
         else:
-            return "Price pulled back and rejected the short-term average — a bearish continuation setup."
+            return "Bearish pullback rejection off the short-term average."
     if name == "Momentum (MACD)":
-        return f"Momentum agrees - {detail}."
+        return f"MACD confirms momentum: {detail}."
     if name == "RSI Extreme Reversal":
-        return f"RSI is flashing an extreme reading: {detail}."
+        return f"RSI at an extreme: {detail}."
     if name == "Bollinger+RSI Mean Reversion":
-        return f"Price stretched too far, and is snapping back: {detail}."
+        return f"Price snapping back: {detail}."
     if name == "ICT/SMC":
         return f"Structure confirms it: {detail}."
     if name == "RSI Trend Continuation":
-        return f"Trend holds - {detail}."
+        return f"RSI trend continuation: {detail}."
     if name == "Bollinger Squeeze Breakout":
-        return f"Volatility just broke loose: {detail}."
+        return f"Bollinger squeeze fired: {detail}."
     if name == "ATR Volatility Breakout":
-        return f"A genuine volatility surge: {detail}."
+        return f"Volatility surge: {detail}."
     if name == "Supertrend":
-        return f"Trend flip confirmed - {detail}."
+        return f"Supertrend flip: {detail}."
     if name == "Parabolic SAR":
-        return f"Trailing stop flipped sides: {detail}."
+        return f"SAR flip: {detail}."
     if name == "Ichimoku Breakout":
-        return f"Cloud broken - {detail}."
+        return f"Cloud break: {detail}."
     if name == "Keltner Breakout":
-        return f"Band broken - {detail}."
+        return f"Keltner break: {detail}."
     if name == "EMA Ribbon":
-        return f"Every average agrees: {detail}."
+        return f"EMA ribbon aligned: {detail}."
     if name == "Rate of Change":
-        return f"Momentum is accelerating - {detail}."
+        return f"Momentum accelerating: {detail}."
     if name == "CCI Breakout":
-        return f"Momentum reading extreme: {detail}."
+        return f"CCI extreme: {detail}."
     if name == "Williams %R":
-        return f"Oscillator turning - {detail}."
+        return f"Williams %R turning: {detail}."
     if name == "Heikin-Ashi Trend":
-        return f"Smoothed candles agree: {detail}."
+        return f"Heikin-Ashi confirms trend: {detail}."
     return detail[0].upper() + detail[1:] + "."
 
 
 def generate_signal_narrative(display_name, direction, winning_votes):
     """
-    Returns up to 3 short lines, one per agreeing strategy, per
+    Returns up to 3 short bullet lines, one per agreeing strategy, per
     explicit instruction - names every agreeing strategy rather than
-    just the first, while staying short and direct. Capped at 3 lines
-    even if more than 3 agreed (adds a brief "+N more" line instead
-    of listing every single one), since some banks now have 10+
-    strategies and listing all of them would be far too much text on
-    a single signal.
+    just the first, each prefixed with "• " so multiple strategies
+    read as a clean, scannable list instead of a run-on paragraph.
+    Capped at 3 lines even if more agreed (adds a brief "+N more"
+    line instead of listing every single one), since some banks now
+    have 10+ strategies and listing all of them would be far too much
+    text on a single signal. Confidence % always reflects the TRUE
+    total agreement count regardless of this cap - only the printed
+    reasons are capped, never the confidence math.
     """
     if not winning_votes:
         return f"{display_name} {direction.lower()} signal."
 
-    lines = [_narrative_strategy_sentence(v) for v in winning_votes[:3]]
+    lines = [f"• {_narrative_strategy_sentence(v)}" for v in winning_votes[:3]]
     if len(winning_votes) > 3:
-        lines.append(f"+ {len(winning_votes) - 3} more strategy(ies) agree.")
+        lines.append(f"• + {len(winning_votes) - 3} more strategy(ies) agree.")
     return "\n".join(lines)
 
 

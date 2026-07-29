@@ -409,6 +409,18 @@ async def provision_mt5_account(login, password, server, platform="mt5", account
             "server": server,
             "platform": platform,
             "keywords": ["Exness"],
+            # REAL FIX, per explicit instruction - MetaApi's own
+            # validation error (surfaced only after fixing the error
+            # logging above) confirmed this exact field was missing:
+            # {'parameter': 'magic', 'message': 'Required value.'}.
+            # This wasn't specific to any one customer's login/
+            # password/server - EVERY account creation attempt was
+            # hitting this exact wall, regardless of what credentials
+            # were entered. 'magic' is a standard MT4/MT5 concept (a
+            # numeric tag identifying which system placed a trade) -
+            # any consistent value works here since MetaApi just
+            # requires the field to be present.
+            "magic": 123456,
         }
         for attempt in range(3):
             try:

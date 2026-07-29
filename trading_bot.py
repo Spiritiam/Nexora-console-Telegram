@@ -416,10 +416,24 @@ async def provision_mt5_account(login, password, server, platform="mt5", account
                 return account.id, None
             except Exception as e:
                 msg = str(e)
+                # REAL FIX, per explicit instruction - MetaApi's own SDK
+                # source confirms its ValidationException carries a
+                # separate .details field (a specific error code like
+                # E_SERVER_TIMEZONE, E_BROKEN_FILE, E_RESOURCE_SLOTS) -
+                # str(e) alone only returns the generic message, which
+                # literally says "check error.details for more
+                # information" without ever actually surfacing it. This
+                # was a real, confirmed case: a customer got that exact
+                # unhelpful generic message with no way to know what
+                # was actually wrong.
+                details = getattr(e, "details", None)
+                if details:
+                    msg = f"{msg} | details: {details}"
                 if "retry" in msg.lower() and attempt < 2:
                     print(f"[MT5 PROVISION] Broker detection in progress, waiting 60s (attempt {attempt + 1}/3)...")
                     await asyncio.sleep(60)
                     continue
+                print(f"[MT5 PROVISION] Failed for login {login}/{server}: {msg}")
                 return None, msg
         return None, "Broker settings detection timed out after 3 attempts."
     except Exception as e:
@@ -13496,7 +13510,22 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     if mode == "mt5_awaiting_account_number":
+        # REDESIGNED per explicit instruction - saves to Supabase
+        # IMMEDIATELY instead of only holding it in the in-memory
+        # mt5_signup_state dict. A confirmed real case: a bot
+        # redeploy happened while a customer was mid-signup, silently
+        # wiping their in-progress state (user_modes/mt5_signup_state
+        # are plain Python dicts, gone on every restart) - they typed
+        # their server name into what looked like the right place,
+        # but the bot had already forgotten they were mid-signup and
+        # showed a generic "here's what you can do" fallback instead.
+        # Saving each field the moment it's collected means this
+        # survives a restart - see the recovery check further below.
         mt5_signup_state[user_id] = {"account_number": message.strip()}
+        try:
+            upsert_mt5_autotrade_account(user_id, {"account_number": message.strip()})
+        except Exception as e:
+            print(f"[MT5 SIGNUP] Couldn't persist account_number for {user_id}: {e}")
         user_modes[user_id] = "mt5_awaiting_password"
         sent_ask_password = await update.message.reply_text(
             "🔑 Now send your MT5/MT4 <b>password</b>.\n\n"
@@ -13508,10 +13537,12 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     if mode == "mt5_awaiting_password":
-        if user_id not in mt5_signup_state:
-            user_modes[user_id] = None
-            return
-        mt5_signup_state[user_id]["password"] = message.strip()
+        encrypted_pw = encrypt_credential(message.strip())
+        mt5_signup_state.setdefault(user_id, {})["password"] = message.strip()
+        try:
+            upsert_mt5_autotrade_account(user_id, {"encrypted_password": encrypted_pw})
+        except Exception as e:
+            print(f"[MT5 SIGNUP] Couldn't persist password for {user_id}: {e}")
         user_modes[user_id] = "mt5_awaiting_server"
         try:
             await update.message.delete()
@@ -13525,34 +13556,67 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     if mode == "mt5_awaiting_server":
-        if user_id not in mt5_signup_state:
-            user_modes[user_id] = None
-            return
-        mt5_signup_state[user_id]["server"] = message.strip()
+        mt5_signup_state.setdefault(user_id, {})["server"] = message.strip()
+        try:
+            upsert_mt5_autotrade_account(user_id, {"server": message.strip()})
+        except Exception as e:
+            print(f"[MT5 SIGNUP] Couldn't persist server for {user_id}: {e}")
         user_modes[user_id] = "mt5_awaiting_name"
         sent_ask_name = await update.message.reply_text(
-            "📝 Optional - send an account nickname, or type <b>skip</b>:",
+            "📝 Send an account <b>nickname</b> (e.g. \"My Exness\"):",
             parse_mode=ParseMode.HTML
         )
         schedule_auto_delete(sent_ask_name.chat_id, sent_ask_name.message_id)
         return
 
     if mode == "mt5_awaiting_name":
-        if user_id not in mt5_signup_state:
-            user_modes[user_id] = None
+        # Nickname is now COMPULSORY, per explicit instruction - reject
+        # empty input and ask again, rather than silently accepting
+        # blank/skip like before.
+        account_name = message.strip()
+        if not account_name or account_name.lower() == "skip":
+            sent_name_required = await update.message.reply_text(
+                "📝 An account nickname is required now - send one "
+                "(e.g. \"My Exness\"):",
+                parse_mode=ParseMode.HTML
+            )
+            schedule_auto_delete(sent_name_required.chat_id, sent_name_required.message_id)
             return
-        account_name = None if message.strip().lower() == "skip" else message.strip()
-        signup = mt5_signup_state.pop(user_id)
+
+        # Pulls account_number/password/server fresh from Supabase
+        # rather than the in-memory mt5_signup_state dict - per
+        # explicit instruction, since that dict may be empty here if
+        # a restart happened between an earlier step and this one,
+        # even though every field was already safely persisted above.
         user_modes[user_id] = None
+        saved_account = get_mt5_autotrade_account(user_id) or {}
+        account_number = saved_account.get("account_number") or mt5_signup_state.get(user_id, {}).get("account_number")
+        server = saved_account.get("server") or mt5_signup_state.get(user_id, {}).get("server")
+        raw_password = mt5_signup_state.get(user_id, {}).get("password")
+        if not raw_password and saved_account.get("encrypted_password"):
+            try:
+                raw_password = decrypt_credential(saved_account["encrypted_password"])
+            except Exception as e:
+                print(f"[MT5 SIGNUP] Couldn't decrypt saved password for {user_id}: {e}")
+
+        if not account_number or not raw_password or not server:
+            await update.message.reply_text(
+                "⚠️ <b>Something's missing to finish connecting.</b>\n\n"
+                "Tap 🤖 Exness Auto-Trade to pick up right where you left off.",
+                parse_mode=ParseMode.HTML,
+                reply_markup=main_keyboard
+            )
+            return
+
+        mt5_signup_state.pop(user_id, None)
 
         wait_connect = await update.message.reply_text(
             "🔗 <b>Connecting your MT5/MT4 account...</b> this can take up to a minute.",
             parse_mode=ParseMode.HTML
         )
 
-        encrypted_pw = encrypt_credential(signup["password"])
         account_id, error = await provision_mt5_account(
-            signup["account_number"], signup["password"], signup["server"],
+            account_number, raw_password, server,
             account_name=account_name
         )
 
@@ -13566,9 +13630,9 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
             return
 
         upsert_mt5_autotrade_account(user_id, {
-            "account_number": signup["account_number"],
-            "encrypted_password": encrypted_pw,
-            "server": signup["server"],
+            "account_number": account_number,
+            "encrypted_password": encrypt_credential(raw_password),
+            "server": server,
             "account_name": account_name,
             "metaapi_account_id": account_id,
             "is_active": True,
@@ -13722,6 +13786,60 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 user_modes[user_id] = "awaiting_email"
                 await send_verification_gate(update)
         return
+
+    # RECOVERY CHECK, per explicit instruction - catches exactly the
+    # case that just happened for real: a customer's user_modes/
+    # mt5_signup_state got wiped by a bot restart mid-signup (both are
+    # in-memory only), so their next message (meant to answer the
+    # bot's last question) matched no known mode and was about to
+    # silently fall through to the generic "here's what you can do"
+    # message below. If they have an active, unexpired subscription
+    # with an incomplete MT5 connection, resume them at whichever
+    # field is genuinely still missing - checked against Supabase
+    # (persisted, survives restarts), not the volatile in-memory dicts.
+    account = get_mt5_autotrade_account(user_id)
+    if account and not account.get("metaapi_account_id"):
+        expiry = None
+        if account.get("subscription_expires_at"):
+            try:
+                expiry = datetime.fromisoformat(
+                    account["subscription_expires_at"].replace("Z", "+00:00")
+                ).replace(tzinfo=None)
+            except Exception:
+                expiry = None
+        if expiry is not None and datetime.utcnow() < expiry:
+            if not account.get("account_number"):
+                user_modes[user_id] = "mt5_awaiting_account_number"
+                sent_recover = await update.message.reply_text(
+                    "👋 <b>Let's pick up where you left off.</b>\n\n"
+                    "Send your Exness <b>account number</b>:",
+                    parse_mode=ParseMode.HTML
+                )
+            elif not account.get("encrypted_password"):
+                user_modes[user_id] = "mt5_awaiting_password"
+                sent_recover = await update.message.reply_text(
+                    "👋 <b>Let's pick up where you left off.</b>\n\n"
+                    "🔑 Now send your MT5/MT4 <b>password</b>.\n\n"
+                    "<i>Your message will be deleted immediately after "
+                    "this for your security.</i>",
+                    parse_mode=ParseMode.HTML
+                )
+            elif not account.get("server"):
+                user_modes[user_id] = "mt5_awaiting_server"
+                sent_recover = await update.message.reply_text(
+                    "👋 <b>Let's pick up where you left off.</b>\n\n"
+                    "🌐 Now send your <b>server</b> name (e.g. Exness-Real4):",
+                    parse_mode=ParseMode.HTML
+                )
+            else:
+                user_modes[user_id] = "mt5_awaiting_name"
+                sent_recover = await update.message.reply_text(
+                    "👋 <b>Let's pick up where you left off.</b>\n\n"
+                    "📝 Send an account <b>nickname</b> (e.g. \"My Exness\"):",
+                    parse_mode=ParseMode.HTML
+                )
+            schedule_auto_delete(sent_recover.chat_id, sent_recover.message_id)
+            return
 
     sent_fallback = await update.message.reply_text(
         "👇 <b>Here's what you can do:</b>\n\n"

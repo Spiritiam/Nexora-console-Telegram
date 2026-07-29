@@ -11910,6 +11910,34 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             )
             return
 
+        # REAL FIX, per explicit instruction - a confirmed case: a
+        # customer paid successfully (subscription_expires_at was set
+        # the moment payment cleared), but their FIRST attempt to
+        # connect their MT5 account failed (wrong password), leaving
+        # metaapi_account_id empty. Tapping "Exness Auto-Trade" again
+        # used to fall straight through to the full bot-choice ->
+        # payment flow below, as if they'd never paid at all - meaning
+        # a simple retry-after-typo demanded a SECOND payment. This
+        # checks for exactly that in-between state (valid, unexpired
+        # subscription + no connected account yet) and resumes account
+        # setup directly instead, skipping payment and bot-choice
+        # entirely since both are already settled.
+        already_paid_not_connected = (
+            account and expiry is not None and now < expiry
+            and not account.get("metaapi_account_id")
+        )
+        if already_paid_not_connected:
+            days_left = (expiry - now).days
+            user_modes[user_id] = "mt5_awaiting_account_number"
+            await query.message.edit_text(
+                f"✅ <b>You're already subscribed</b> ({days_left} day(s) "
+                f"left) - no need to pay again. Let's just finish "
+                f"connecting your account.\n\n"
+                f"Send your Exness <b>account number</b>:",
+                parse_mode=ParseMode.HTML
+            )
+            return
+
         mt5_signup_state[user_id] = {"flow": "presetup"}
         await query.message.edit_text(
             "🤖 <b>How should Exness Auto-Trade decide your trades?</b>\n\n"

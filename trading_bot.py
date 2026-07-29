@@ -336,16 +336,31 @@ def get_mt5_autotrade_account(user_id):
 
 
 def upsert_mt5_autotrade_account(user_id, fields):
+    """
+    REAL BUG FOUND AND FIXED, per explicit instruction - this used to
+    call requests.post and never check the response at all. If
+    Supabase rejected the write for ANY reason (a confirmed real case:
+    a payment got marked "processed" in korapay_transactions, but the
+    matching subscription row was never created here, with zero error
+    anywhere), this function reported silent success regardless,
+    since requests.post() only raises on network-level failures, not
+    on Supabase/PostgREST rejecting the request itself. Now actually
+    checks the status code and raises with the real response body, so
+    a rejected write is loud and traceable instead of vanishing.
+    """
     try:
         url = f"{SUPABASE_URL}/rest/v1/mt5_auto_trade_accounts"
         payload = {**fields, "user_id": user_id}
-        requests.post(
+        response = requests.post(
             url,
             headers={**sb_headers(), "Prefer": "resolution=merge-duplicates"},
             json=payload, timeout=10
         )
+        if response.status_code not in (200, 201, 204):
+            raise Exception(f"Supabase rejected the write (status {response.status_code}): {response.text[:500]}")
     except Exception as e:
-        print(f"[MT5 AUTOTRADE DB] upsert_mt5_autotrade_account error: {e}")
+        print(f"[MT5 AUTOTRADE DB] upsert_mt5_autotrade_account error for user {user_id}: {e}")
+        raise
 
 
 def is_mt5_autotrade_active(user_id):

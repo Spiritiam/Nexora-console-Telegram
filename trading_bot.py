@@ -7145,6 +7145,30 @@ def detect_inside_bar_breakout(candles):
     return None
 
 
+def get_account_flip_defaults(pair_key, base_lot):
+    """
+    Everything about Account Flip except the starting lot size is a
+    sensible default now, per explicit instruction (the full 6-question
+    setup was too much for a layman) - only the lot size is still a
+    real choice. Layer growth is exactly "one step upward" from the
+    base size (0.01 base -> layers of 0.01, 0.02, 0.03, ...), pip
+    spacing/trailing distance is wider for the two volatile instruments
+    (gold, BTC) and tighter for everything else, and the per-layer cap
+    is set to exactly cover all 10 max layers rather than an arbitrary
+    number - it's a safety ceiling, not meant to bind before then.
+    """
+    volatile_pairs = ("xauusd", "btcusd")
+    pips = 10 if pair_key in volatile_pairs else 3
+    max_layers = 10
+    return {
+        "flip_step": base_lot,
+        "flip_max_layers": max_layers,
+        "flip_max_lot": round(base_lot * max_layers, 2),
+        "flip_trigger_pips": pips,
+        "flip_trail_pips": pips,
+    }
+
+
 def account_flip_signal(pair_key, pair_config, candles):
     """
     Account Flip's own dedicated, standalone entry logic - pure price
@@ -12689,9 +12713,10 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         user_modes[user_id] = "mt5_awaiting_flip_base"
         await query.message.edit_text(
             f"✅ {PAIR_CONFIG[pair_key]['display']} selected.\n\n"
-            f"🚀 <b>Account Flip setup (1/6)</b>\n\n"
-            f"Send your <b>starting lot size</b> for the first layer "
-            f"(e.g. 0.01):",
+            f"🚀 <b>Account Flip — last step</b>\n\n"
+            f"Send your <b>starting lot size</b> (e.g. 0.01) — everything "
+            f"else (layer growth, spacing, trailing stop) is set to a "
+            f"sensible default for this pair automatically:",
             parse_mode=ParseMode.HTML
         )
         return
@@ -13014,9 +13039,10 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         user_modes[user_id] = "mt5_awaiting_flip_base"
         await query.message.edit_text(
             f"✅ {PAIR_CONFIG[pair_key]['display']} selected.\n\n"
-            f"🚀 <b>Account Flip setup (1/6)</b>\n\n"
-            f"Send your <b>starting lot size</b> for the first layer "
-            f"(e.g. 0.01):",
+            f"🚀 <b>Account Flip — last step</b>\n\n"
+            f"Send your <b>starting lot size</b> (e.g. 0.01) — everything "
+            f"else (layer growth, spacing, trailing stop) is set to a "
+            f"sensible default for this pair automatically:",
             parse_mode=ParseMode.HTML
         )
         return
@@ -14598,6 +14624,7 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     if mode == "mt5_awaiting_flip_base":
+        signup = mt5_signup_state.setdefault(user_id, {})
         try:
             flip_base = float(message.strip())
             if flip_base <= 0:
@@ -14606,144 +14633,34 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
             sent_bad = await update.message.reply_text("⚠️ Please send a positive number, e.g. 0.01")
             schedule_auto_delete(sent_bad.chat_id, sent_bad.message_id)
             return
-        mt5_signup_state.setdefault(user_id, {})["flip_base_lot"] = flip_base
-        user_modes[user_id] = "mt5_awaiting_flip_step"
-        sent = await update.message.reply_text(
-            "🚀 <b>Account Flip setup (2/6)</b>\n\n"
-            "Send how much bigger each <b>new layer</b> should be than the "
-            f"last one (e.g. 0.01 means each added layer is 0.01 lots bigger):",
-            parse_mode=ParseMode.HTML
-        )
-        schedule_auto_delete(sent.chat_id, sent.message_id)
-        return
 
-    if mode == "mt5_awaiting_flip_step":
-        try:
-            flip_step = float(message.strip())
-            if flip_step <= 0:
-                raise ValueError
-        except ValueError:
-            sent_bad = await update.message.reply_text("⚠️ Please send a positive number, e.g. 0.01")
-            schedule_auto_delete(sent_bad.chat_id, sent_bad.message_id)
-            return
-        mt5_signup_state.setdefault(user_id, {})["flip_step"] = flip_step
-        user_modes[user_id] = "mt5_awaiting_flip_max"
-        base = mt5_signup_state[user_id].get("flip_base_lot", 0.01)
-        sent = await update.message.reply_text(
-            "🚀 <b>Account Flip setup (3/6)</b>\n\n"
-            "Send a <b>max lot size cap per layer</b> - no single layer "
-            f"will ever be bigger than this, no matter how many stack up "
-            f"(must be at least your starting size of {base}):",
-            parse_mode=ParseMode.HTML
-        )
-        schedule_auto_delete(sent.chat_id, sent.message_id)
-        return
-
-    if mode == "mt5_awaiting_flip_max":
-        signup = mt5_signup_state.setdefault(user_id, {})
-        base = float(signup.get("flip_base_lot", 0.01))
-        try:
-            flip_max = float(message.strip())
-            if flip_max < base:
-                raise ValueError
-        except ValueError:
-            sent_bad = await update.message.reply_text(
-                f"⚠️ Please send a number of at least {base} (your starting size)."
-            )
-            schedule_auto_delete(sent_bad.chat_id, sent_bad.message_id)
-            return
-        signup["flip_max_lot"] = flip_max
-        user_modes[user_id] = "mt5_awaiting_flip_trigger"
-        sent = await update.message.reply_text(
-            "🚀 <b>Account Flip setup (4/6)</b>\n\n"
-            "Send how many <b>pips in profit</b> a trade needs to move "
-            f"before it adds the next layer (tight spacing = more layers, "
-            f"e.g. 10):",
-            parse_mode=ParseMode.HTML
-        )
-        schedule_auto_delete(sent.chat_id, sent.message_id)
-        return
-
-    if mode == "mt5_awaiting_flip_trigger":
-        try:
-            flip_trigger = float(message.strip())
-            if flip_trigger <= 0:
-                raise ValueError
-        except ValueError:
-            sent_bad = await update.message.reply_text("⚠️ Please send a positive number of pips, e.g. 10")
-            schedule_auto_delete(sent_bad.chat_id, sent_bad.message_id)
-            return
-        mt5_signup_state.setdefault(user_id, {})["flip_trigger_pips"] = flip_trigger
-        user_modes[user_id] = "mt5_awaiting_flip_layers"
-        sent = await update.message.reply_text(
-            "🚀 <b>Account Flip setup (5/6)</b>\n\n"
-            "Send the <b>max number of layers</b> it can stack on one "
-            f"trade before it stops adding more (e.g. 3):",
-            parse_mode=ParseMode.HTML
-        )
-        schedule_auto_delete(sent.chat_id, sent.message_id)
-        return
-
-    if mode == "mt5_awaiting_flip_layers":
-        try:
-            flip_layers = int(float(message.strip()))
-            if flip_layers < 1:
-                raise ValueError
-        except ValueError:
-            sent_bad = await update.message.reply_text("⚠️ Please send a whole number of at least 1, e.g. 3")
-            schedule_auto_delete(sent_bad.chat_id, sent_bad.message_id)
-            return
-        mt5_signup_state.setdefault(user_id, {})["flip_max_layers"] = flip_layers
-        user_modes[user_id] = "mt5_awaiting_flip_trail"
-        sent = await update.message.reply_text(
-            "🚀 <b>Account Flip setup (6/6)</b>\n\n"
-            "Send the <b>trailing stop distance in pips</b> - once the "
-            f"stack is in profit, it closes everything together if price "
-            f"pulls back this many pips from its best point (e.g. 10):",
-            parse_mode=ParseMode.HTML
-        )
-        schedule_auto_delete(sent.chat_id, sent.message_id)
-        return
-
-    if mode == "mt5_awaiting_flip_trail":
-        signup = mt5_signup_state.setdefault(user_id, {})
-        try:
-            flip_trail = float(message.strip())
-            if flip_trail <= 0:
-                raise ValueError
-        except ValueError:
-            sent_bad = await update.message.reply_text("⚠️ Please send a positive number of pips, e.g. 10")
-            schedule_auto_delete(sent_bad.chat_id, sent_bad.message_id)
-            return
         user_modes[user_id] = None
-        signup["flip_trail_pips"] = flip_trail
+        pair_key = signup.get("pair_choice")
+        defaults = get_account_flip_defaults(pair_key, flip_base)
+        signup["flip_base_lot"] = flip_base
+        signup.update(defaults)
         signup["risk_mode"] = "account_flip"
         signup["bot_choice"] = "account_flip"
 
-        base = signup.get("flip_base_lot")
-        step = signup.get("flip_step")
-        max_lot = signup.get("flip_max_lot")
-        trigger = signup.get("flip_trigger_pips")
-        layers = signup.get("flip_max_layers")
-
         summary = (
-            f"Pair: {PAIR_CONFIG.get(signup.get('pair_choice'), {}).get('display', '—')}\n"
-            f"Start: {base} lots | +{step}/layer | caps at {max_lot} per layer\n"
-            f"New layer every {trigger} pips in profit | max {layers} layers\n"
-            f"Trailing stop: {flip_trail} pips across the whole stack"
+            f"Pair: {PAIR_CONFIG.get(pair_key, {}).get('display', '—')}\n"
+            f"Start: {flip_base} lots | +{defaults['flip_step']}/layer "
+            f"(caps at {defaults['flip_max_lot']} after {defaults['flip_max_layers']} layers)\n"
+            f"New layer every {defaults['flip_trigger_pips']} pips in profit\n"
+            f"Trailing stop: {defaults['flip_trail_pips']} pips across the whole stack"
         )
 
         if signup.get("flow") == "switch":
             upsert_mt5_autotrade_account(user_id, {
                 "bot_choice": "account_flip",
-                "pair_choice": signup.get("pair_choice"),
+                "pair_choice": pair_key,
                 "risk_mode": "account_flip",
-                "flip_base_lot": base,
-                "flip_step": step,
-                "flip_max_lot": max_lot,
-                "flip_trigger_pips": trigger,
-                "flip_max_layers": layers,
-                "flip_trail_pips": flip_trail,
+                "flip_base_lot": flip_base,
+                "flip_step": defaults["flip_step"],
+                "flip_max_lot": defaults["flip_max_lot"],
+                "flip_trigger_pips": defaults["flip_trigger_pips"],
+                "flip_max_layers": defaults["flip_max_layers"],
+                "flip_trail_pips": defaults["flip_trail_pips"],
                 "flip_disclaimer_accepted": True,
             })
             sent_done = await update.message.reply_text(

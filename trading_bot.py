@@ -12631,8 +12631,7 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             "bots and one specific pair for it to trade.\n\n"
             "🚀 <b>Account Flip</b> — its own standalone price-action "
             "strategy that layers in bigger positions while winning, "
-            "with a trailing stop across the whole stack. Higher risk — "
-            "shows a full warning before you can enable it.",
+            "with a trailing stop across the whole stack. Higher risk.",
             parse_mode=ParseMode.HTML,
             reply_markup=InlineKeyboardMarkup([
                 [InlineKeyboardButton("📡 Follow Channel Signals", callback_data="mt5auto_follow_channel")],
@@ -12714,9 +12713,7 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await query.message.edit_text(
             f"✅ {PAIR_CONFIG[pair_key]['display']} selected.\n\n"
             f"🚀 <b>Account Flip — last step</b>\n\n"
-            f"Send your <b>starting lot size</b> (e.g. 0.01) — everything "
-            f"else (layer growth, spacing, trailing stop) is set to a "
-            f"sensible default for this pair automatically:",
+            f"Send your <b>starting lot size</b> (e.g. 0.01):",
             parse_mode=ParseMode.HTML
         )
         return
@@ -12975,8 +12972,7 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             "bots and one specific pair for it to trade.\n\n"
             "🚀 <b>Account Flip</b> — its own standalone price-action "
             "strategy that layers in bigger positions while winning, "
-            "with a trailing stop across the whole stack. Higher risk — "
-            "shows a full warning before you can enable it.",
+            "with a trailing stop across the whole stack. Higher risk.",
             parse_mode=ParseMode.HTML,
             reply_markup=InlineKeyboardMarkup([
                 [InlineKeyboardButton("📡 Follow Channel Signals", callback_data="mt5switch_follow_channel")],
@@ -13040,9 +13036,7 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await query.message.edit_text(
             f"✅ {PAIR_CONFIG[pair_key]['display']} selected.\n\n"
             f"🚀 <b>Account Flip — last step</b>\n\n"
-            f"Send your <b>starting lot size</b> (e.g. 0.01) — everything "
-            f"else (layer growth, spacing, trailing stop) is set to a "
-            f"sensible default for this pair automatically:",
+            f"Send your <b>starting lot size</b> (e.g. 0.01):",
             parse_mode=ParseMode.HTML
         )
         return

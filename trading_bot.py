@@ -130,6 +130,29 @@ MT5_AUTOTRADE_CURRENCY = "NGN"
 
 MT5_SUBSCRIPTION_DAYS = 30
 
+# EXPERIMENTAL, per explicit instruction - a one-week test flipping
+# every final BUY/SELL call to its opposite, applied EVERYWHERE
+# (channel signals, manual /Signal, Exness Auto-Trade, Deriv
+# Auto-Copy), without touching any strategy logic itself. Deliberately
+# a single flag in one place so this is trivial to revert - set back
+# to False (or delete the flip calls) to return to exactly how things
+# were before. No strategies were removed or added for this test;
+# only the final direction gets flipped, at the last possible moment,
+# right before it's displayed or traded on.
+EXPERIMENTAL_INVERT_SIGNALS = True
+
+
+def maybe_invert_direction(direction):
+    """
+    Applies the EXPERIMENTAL_INVERT_SIGNALS flip, if it's on. Kept as
+    one small, reusable function so every call site (channel signals,
+    manual signals, Exness Auto-Trade, Deriv Auto-Copy) stays in sync
+    automatically - flip the single flag above, not each call site.
+    """
+    if not EXPERIMENTAL_INVERT_SIGNALS:
+        return direction
+    return "SELL" if direction == "BUY" else "BUY"
+
 # 4 bot presets for Exness Auto-Trade - SAME 4 bots as always, never
 # renamed. Each pairs its own original base strategy with a second
 # one (OR-vote: fires on whichever of the two confirms first).
@@ -729,6 +752,13 @@ async def run_mt5_autotrade_bot_scan(context: ContextTypes.DEFAULT_TYPE):
                 continue
 
             vote = winning_votes[0]
+
+            # EXPERIMENTAL flip, per explicit instruction - see
+            # EXPERIMENTAL_INVERT_SIGNALS above. Applied after the
+            # 2-vote gate and its logging above (so that log still
+            # shows the TRUE, un-flipped consensus for later review) -
+            # only the direction actually traded on is inverted.
+            direction = maybe_invert_direction(direction)
 
             entry_price = primary_candles[-1]["close"]
             atr = _accum_zone_atr(primary_candles, 14) if len(primary_candles) > 15 else None
@@ -8424,6 +8454,13 @@ def run_strategy_bank(pair_key, config, h1_candles, h4_candles, daily_candles, m
         f"{len(winning_votes)} agreeing: {', '.join(agreeing_names)}"
     )
 
+    # EXPERIMENTAL flip, per explicit instruction - see
+    # EXPERIMENTAL_INVERT_SIGNALS above. Applied AFTER logging, so
+    # Railway's logs still show the strategies' TRUE, un-flipped
+    # consensus for later review - only what actually gets displayed/
+    # traded on is inverted.
+    direction = maybe_invert_direction(direction)
+
     return direction, confidence, reason, agreeing_names, winning_votes
 
 async def check_fresh_momentum_veto_synthetic(index_key, config, h1_candles, direction):
@@ -8588,16 +8625,26 @@ async def run_strategy_bank_synthetic(index_key, config, h1_candles, h4_candles,
     agreeing_names = [v["strategy_name"] for v in winning_votes]
     confidence = min(95, 70 + len(winning_votes) * 6)
 
+    print(
+        f"[STRATEGY BANK SYNTH] {index_key} -> {direction} (true consensus) | "
+        f"{len(winning_votes)} agreeing: {', '.join(agreeing_names)}"
+    )
+
+    # EXPERIMENTAL flip, per explicit instruction - see
+    # EXPERIMENTAL_INVERT_SIGNALS above. Applied here, BEFORE the
+    # reason text is built below, specifically because that text
+    # names the direction inline ("...agree on {direction}: ...") -
+    # flipping after would leave the reasoning text describing the
+    # opposite of what's actually shown as the headline. The print()
+    # just above already captured the TRUE, un-flipped consensus for
+    # Railway's logs before this runs.
+    direction = maybe_invert_direction(direction)
+
     detail_strings = [v["detail"] for v in winning_votes[:3]]
     reason = (
         f"{len(winning_votes)} independent strategy(ies) agree on {direction}: "
         + "; ".join(detail_strings)
         + ("." if len(detail_strings) == len(winning_votes) else f", and {len(winning_votes) - 3} more.")
-    )
-
-    print(
-        f"[STRATEGY BANK SYNTH] {index_key} -> {direction} | "
-        f"{len(winning_votes)} agreeing: {', '.join(agreeing_names)}"
     )
 
     return direction, confidence, reason, agreeing_names, winning_votes

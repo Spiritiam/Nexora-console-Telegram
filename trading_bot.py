@@ -587,6 +587,13 @@ def compute_lot_size(account, entry_price, stop_loss):
     if risk_mode == "lot":
         return float(account.get("lot_size", 0.01))
 
+    # NOTE: "account_flip" mode does NOT go through this function -
+    # it has its own dedicated entry/layering logic in
+    # run_account_flip_entry_scan / manage_account_flip_stacks,
+    # since layer sizing depends on floating profit within a single
+    # open stack, not a flat per-trade calculation like the modes
+    # below.
+
     risk_percent = float(account.get("risk_percent", 1.0))
     balance = account.get("_live_balance")
     if not balance or not entry_price or not stop_loss:
@@ -642,6 +649,118 @@ async def place_client_mt5_trade(metaapi_account_id, mt5_symbol, direction, volu
         return None
 
 
+async def get_client_mt5_positions_for_symbol(metaapi_account_id, mt5_symbol):
+    """
+    Returns the list of currently open MetaTrader positions for one
+    symbol on a client account (raw position dicts - id, currentPrice,
+    profit, volume, etc. straight from MetaAPI). Used by Account
+    Flip's stack manager to check floating price/profit; deliberately
+    separate from has_client_open_mt5_position (which only returns a
+    bool) since the stack manager needs the actual numbers.
+    """
+    try:
+        connection = await get_client_mt5_connection(metaapi_account_id)
+        if connection is None:
+            return []
+        positions = await asyncio.wait_for(connection.get_positions(), timeout=15)
+        if isinstance(positions, dict):
+            positions = positions.get("positions", [])
+        target = mt5_symbol.upper()
+        return [
+            p for p in positions
+            if isinstance(p, dict) and (
+                p.get("symbol", "").upper().startswith(target)
+                or target.startswith(p.get("symbol", "").upper())
+            )
+        ]
+    except Exception as e:
+        print(f"[ACCOUNT FLIP] Position fetch failed for {metaapi_account_id}: {e}")
+        _reset_client_mt5_connection(metaapi_account_id)
+        return []
+
+
+async def close_all_client_mt5_positions(metaapi_account_id, mt5_symbol):
+    """
+    Closes every open position on one symbol for one client account in
+    a single call (MetaAPI's POSITIONS_CLOSE_SYMBOL action) - this is
+    how Account Flip closes an entire layered stack at once when the
+    trailing stop triggers, rather than closing each layer
+    individually. Confirmed against MetaAPI's live REST trade docs
+    (metaapi.cloud/docs/client/restApi/api/trade) - same endpoint
+    place_client_mt5_trade already uses successfully.
+    """
+    if not METAAPI_TOKEN:
+        return False
+    try:
+        headers = {"auth-token": METAAPI_TOKEN, "Content-Type": "application/json"}
+        payload = {"actionType": "POSITIONS_CLOSE_SYMBOL", "symbol": mt5_symbol}
+        url = (
+            f"https://mt-client-api-v1.london.agiliumtrade.ai"
+            f"/users/current/accounts/{metaapi_account_id}/trade"
+        )
+        response = requests.post(url, headers=headers, json=payload, timeout=30)
+        if response.status_code in (200, 201):
+            print(f"[ACCOUNT FLIP] ✅ Closed full stack for {metaapi_account_id} on {mt5_symbol}")
+            return True
+        print(f"[ACCOUNT FLIP] ❌ Close-stack failed for {metaapi_account_id}: {response.status_code} {response.text}")
+        return False
+    except Exception as e:
+        print(f"[ACCOUNT FLIP] ❌ Exception closing stack for {metaapi_account_id}: {e}")
+        return False
+
+
+def get_open_flip_stack(user_id):
+    try:
+        url = (
+            f"{SUPABASE_URL}/rest/v1/mt5_flip_stacks"
+            f"?user_id=eq.{user_id}&status=eq.OPEN&select=*&limit=1"
+        )
+        response = requests.get(url, headers=sb_headers(), timeout=10)
+        rows = response.json()
+        return rows[0] if rows else None
+    except Exception as e:
+        print(f"[ACCOUNT FLIP] Error fetching open stack for {user_id}: {e}")
+        return None
+
+
+def get_all_open_flip_stacks():
+    try:
+        url = f"{SUPABASE_URL}/rest/v1/mt5_flip_stacks?status=eq.OPEN&select=*"
+        response = requests.get(url, headers=sb_headers(), timeout=10)
+        return response.json()
+    except Exception as e:
+        print(f"[ACCOUNT FLIP] Error fetching open stacks: {e}")
+        return []
+
+
+def create_flip_stack(user_id, metaapi_account_id, pair_key, mt5_symbol, direction, entry_price, stop_loss):
+    try:
+        url = f"{SUPABASE_URL}/rest/v1/mt5_flip_stacks"
+        payload = {
+            "user_id": str(user_id),
+            "metaapi_account_id": metaapi_account_id,
+            "pair_key": pair_key,
+            "mt5_symbol": mt5_symbol,
+            "direction": direction,
+            "layer_count": 1,
+            "last_layer_price": entry_price,
+            "peak_price": entry_price,
+            "initial_stop_loss": stop_loss,
+            "status": "OPEN",
+        }
+        requests.post(url, headers=sb_headers(), json=payload, timeout=10)
+    except Exception as e:
+        print(f"[ACCOUNT FLIP] Error creating stack for {user_id}: {e}")
+
+
+def update_flip_stack(stack_id, fields):
+    try:
+        url = f"{SUPABASE_URL}/rest/v1/mt5_flip_stacks?id=eq.{stack_id}"
+        requests.patch(url, headers=sb_headers(), json=fields, timeout=10)
+    except Exception as e:
+        print(f"[ACCOUNT FLIP] Error updating stack {stack_id}: {e}")
+
+
 def get_all_active_mt5_autotrade_accounts():
     try:
         now_iso = datetime.utcnow().isoformat()
@@ -675,7 +794,10 @@ async def run_mt5_autotrade_bot_scan(context: ContextTypes.DEFAULT_TYPE):
     reasoning as every other scan job in this file.
     """
     accounts = get_all_active_mt5_autotrade_accounts()
-    bot_accounts = [a for a in accounts if a.get("bot_choice") != "follow_channel" and a.get("pair_choice")]
+    bot_accounts = [
+        a for a in accounts
+        if a.get("bot_choice") not in ("follow_channel", "account_flip") and a.get("pair_choice")
+    ]
     if not bot_accounts:
         return
 
@@ -889,6 +1011,253 @@ async def run_mt5_autotrade_follow_channel_scan(context: ContextTypes.DEFAULT_TY
                     )
                 except Exception as e:
                     print(f"[MT5 AUTOTRADE FOLLOW] Couldn't notify {user_id}: {e}")
+
+
+async def run_account_flip_entry_scan(context: ContextTypes.DEFAULT_TYPE):
+    """
+    Runs every 5 minutes on the M15 timeframe. For every Account Flip
+    subscriber with NO currently open stack, checks their one chosen
+    pair for a fresh price-action signal (account_flip_signal - the
+    dedicated Engulfing/Pin Bar/Inside Bar pool, deliberately separate
+    from every other bot's indicator strategies). If one fires, opens
+    the FIRST layer with a real broker-side stop loss and starts a new
+    row in mt5_flip_stacks for manage_account_flip_stacks to take over
+    from there.
+    """
+    accounts = get_all_active_mt5_autotrade_accounts()
+    flip_accounts = [a for a in accounts if a.get("bot_choice") == "account_flip" and a.get("pair_choice")]
+    if not flip_accounts:
+        return
+
+    combos = {}
+    for account in flip_accounts:
+        combos.setdefault(account["pair_choice"], []).append(account)
+
+    for pair_key, subscribers in combos.items():
+        pair_config = PAIR_CONFIG.get(pair_key)
+        if not pair_config:
+            continue
+        try:
+            candles = get_cached_candles(pair_key, pair_config, "15min", outputsize=210)
+            if not candles or len(candles) < 5:
+                continue
+
+            vote = account_flip_signal(pair_key, pair_config, candles)
+            if not vote:
+                continue
+
+            direction = vote["direction"]
+            entry_price = candles[-1]["close"]
+            invalidation = vote["invalidation"]
+            # Small buffer beyond the pattern's own invalidation point,
+            # using the pair's own pip_size so it scales sensibly per
+            # instrument rather than a flat price offset.
+            buffer_dist = pair_config["pip_size"] * 0.2
+            if direction == "BUY":
+                stop_loss = min(invalidation - buffer_dist, entry_price - pair_config["pip_size"] * 0.5)
+            else:
+                stop_loss = max(invalidation + buffer_dist, entry_price + pair_config["pip_size"] * 0.5)
+
+            signal_marker = f"accountflip_{pair_key}_{int(time.time() // 300)}"
+
+            for account in subscribers:
+                user_id = account["user_id"]
+                metaapi_account_id = account["metaapi_account_id"]
+                copy_key = (user_id, signal_marker)
+                if copy_key in MT5_AUTOTRADE_COPIED_SIGNALS:
+                    continue
+
+                if get_open_flip_stack(user_id):
+                    continue  # already riding a stack - entry scan sits out until it closes
+
+                if await has_client_open_mt5_position(metaapi_account_id, pair_config["mt5_symbol"]):
+                    continue
+
+                base_lot = float(account.get("flip_base_lot") or 0.01)
+                order_id = await place_client_mt5_trade(
+                    metaapi_account_id, pair_config["mt5_symbol"], direction,
+                    base_lot, stop_loss, None
+                )
+                MT5_AUTOTRADE_COPIED_SIGNALS.add(copy_key)
+                if order_id:
+                    create_flip_stack(
+                        user_id, metaapi_account_id, pair_key, pair_config["mt5_symbol"],
+                        direction, entry_price, stop_loss
+                    )
+                    try:
+                        await context.bot.send_message(
+                            chat_id=int(user_id),
+                            text=(
+                                f"🚀 <b>Account Flip — {direction} {pair_config['display']}</b>\n\n"
+                                f"Pattern: {vote['strategy']}\n"
+                                f"Entry: {entry_price:.4f} | SL: {stop_loss:.4f}\n"
+                                f"Volume: {base_lot} lots (layer 1)\n\n"
+                                f"No take-profit set - this position rides on a trailing "
+                                f"stop across the whole stack as layers get added."
+                            ),
+                            parse_mode=ParseMode.HTML
+                        )
+                    except Exception as e:
+                        print(f"[ACCOUNT FLIP] Couldn't notify {user_id}: {e}")
+        except Exception as e:
+            print(f"[ACCOUNT FLIP] ❌ Entry scan error for {pair_key}: {e}")
+
+
+async def manage_account_flip_stacks(context: ContextTypes.DEFAULT_TYPE):
+    """
+    Runs every 1 minute. For every OPEN stack: checks live floating
+    price, adds another layer once price has moved flip_trigger_pips
+    further in favor since the last layer (capped at flip_max_layers),
+    tracks the best price seen (peak_price) to run a trailing stop,
+    and closes the ENTIRE stack at once (all layers together) if
+    price pulls back through the trail - but only once the stack has
+    reached the trigger distance at least once (trigger_reached),
+    so a brand-new single-layer position isn't closed by trail logic
+    before it's ever shown real profit; before that point the
+    original broker-side stop loss on layer 1 is its only protection.
+    """
+    stacks = get_all_open_flip_stacks()
+    if not stacks:
+        return
+
+    for stack in stacks:
+        try:
+            stack_id = stack["id"]
+            user_id = stack["user_id"]
+            metaapi_account_id = stack["metaapi_account_id"]
+            pair_key = stack["pair_key"]
+            mt5_symbol = stack["mt5_symbol"]
+            direction = stack["direction"]
+            pair_config = PAIR_CONFIG.get(pair_key)
+            if not pair_config:
+                continue
+
+            account = get_mt5_autotrade_account(user_id)
+            if not account or account.get("bot_choice") != "account_flip":
+                continue  # user switched modes mid-stack - stop managing it further
+
+            positions = await get_client_mt5_positions_for_symbol(metaapi_account_id, mt5_symbol)
+            if not positions:
+                # Closed already (SL hit, or manually closed) - reconcile and stop.
+                update_flip_stack(stack_id, {"status": "CLOSED", "closed_at": datetime.utcnow().isoformat()})
+                try:
+                    await context.bot.send_message(
+                        chat_id=int(user_id),
+                        text=(
+                            f"🚀 <b>Account Flip stack closed</b> — {pair_config['display']}\n\n"
+                            f"Position(s) no longer open on the account (stop loss hit, or closed "
+                            f"manually). A new stack can start on the next fresh signal."
+                        ),
+                        parse_mode=ParseMode.HTML
+                    )
+                except Exception as e:
+                    print(f"[ACCOUNT FLIP] Couldn't notify {user_id} of stack close: {e}")
+                continue
+
+            current_price = positions[0].get("currentPrice")
+            if not current_price:
+                continue
+
+            pip_size = pair_config["pip_size"]
+            trigger_pips = float(account.get("flip_trigger_pips") or 10)
+            trail_pips = float(account.get("flip_trail_pips") or 10)
+            max_layers = int(account.get("flip_max_layers") or 3)
+            step = float(account.get("flip_step") or 0.01)
+            max_lot = float(account.get("flip_max_lot") or account.get("flip_base_lot") or 0.01)
+
+            layer_count = stack["layer_count"]
+            last_layer_price = float(stack["last_layer_price"])
+            peak_price = float(stack["peak_price"])
+            trigger_reached = stack.get("trigger_reached", False)
+
+            favorable_move = (
+                (current_price - last_layer_price) if direction == "BUY"
+                else (last_layer_price - current_price)
+            )
+            favorable_pips = favorable_move / pip_size
+
+            # Update peak (best price seen so far in the favorable direction)
+            if direction == "BUY":
+                peak_price = max(peak_price, current_price)
+            else:
+                peak_price = min(peak_price, current_price)
+
+            peak_favorable_pips = (
+                (peak_price - stack["last_layer_price"]) if direction == "BUY"
+                else (stack["last_layer_price"] - peak_price)
+            ) / pip_size
+
+            updates = {"peak_price": peak_price}
+
+            if peak_favorable_pips >= trigger_pips:
+                trigger_reached = True
+                updates["trigger_reached"] = True
+
+            # Add a new layer once price has moved far enough in favor
+            # since the LAST layer specifically (not just off the peak) -
+            # keeps layer spacing consistent even if price has been
+            # choppy rather than moving in a straight line.
+            if favorable_pips >= trigger_pips and layer_count < max_layers:
+                new_lot = round(min(float(account.get("flip_base_lot") or 0.01) + step * layer_count, max_lot), 2)
+                order_id = await place_client_mt5_trade(
+                    metaapi_account_id, mt5_symbol, direction, new_lot, None, None
+                )
+                if order_id:
+                    layer_count += 1
+                    updates["layer_count"] = layer_count
+                    updates["last_layer_price"] = current_price
+                    try:
+                        await context.bot.send_message(
+                            chat_id=int(user_id),
+                            text=(
+                                f"🚀 <b>Account Flip — layer {layer_count} added</b> "
+                                f"({pair_config['display']})\n\n"
+                                f"Added {new_lot} lots at {current_price:.4f} — "
+                                f"{favorable_pips:.1f} pips in favor since the last layer."
+                            ),
+                            parse_mode=ParseMode.HTML
+                        )
+                    except Exception as e:
+                        print(f"[ACCOUNT FLIP] Couldn't notify {user_id} of new layer: {e}")
+
+            # Trailing-stop close check - only once the stack has shown
+            # real profit at least once (trigger_reached).
+            if trigger_reached:
+                trail_price = (
+                    peak_price - trail_pips * pip_size if direction == "BUY"
+                    else peak_price + trail_pips * pip_size
+                )
+                pulled_back = (
+                    current_price <= trail_price if direction == "BUY"
+                    else current_price >= trail_price
+                )
+                if pulled_back:
+                    total_profit = sum(p.get("profit", 0) or 0 for p in positions)
+                    await close_all_client_mt5_positions(metaapi_account_id, mt5_symbol)
+                    update_flip_stack(stack_id, {
+                        "status": "CLOSED",
+                        "total_profit": total_profit,
+                        "closed_at": datetime.utcnow().isoformat(),
+                    })
+                    try:
+                        await context.bot.send_message(
+                            chat_id=int(user_id),
+                            text=(
+                                f"🚀 <b>Account Flip — trailing stop closed the stack</b> "
+                                f"({pair_config['display']})\n\n"
+                                f"{layer_count} layer(s) closed together at {current_price:.4f}.\n"
+                                f"Total P&L: {total_profit:.2f}\n\n"
+                                f"A new stack can start on the next fresh signal."
+                            ),
+                            parse_mode=ParseMode.HTML
+                        )
+                    except Exception as e:
+                        print(f"[ACCOUNT FLIP] Couldn't notify {user_id} of stack close: {e}")
+                    continue
+
+            update_flip_stack(stack_id, updates)
+        except Exception as e:
+            print(f"[ACCOUNT FLIP] ❌ Stack manager error for stack {stack.get('id')}: {e}")
 
 
 async def korapay_webhook_handler(request):
@@ -6726,6 +7095,106 @@ def detect_bearish_engulfing(candles):
     engulfs = last["open"] >= prev["close"] and last["close"] <= prev["open"]
     return prev_bullish and last_bearish and engulfs
 
+
+def detect_pin_bar(candles):
+    """
+    Classic hammer (bullish) / shooting star (bearish) rejection
+    candle. Returns "BUY", "SELL", or None. Wick must be at least 2x
+    the body, and the body must sit at the opposite end of the
+    candle's range from the long wick - a real rejection, not just a
+    doji with a long wick on both sides.
+    """
+    if len(candles) < 1:
+        return None
+    c = candles[-1]
+    body = abs(c["close"] - c["open"])
+    candle_range = c["high"] - c["low"]
+    if candle_range <= 0 or body <= 0:
+        return None
+
+    upper_wick = c["high"] - max(c["open"], c["close"])
+    lower_wick = min(c["open"], c["close"]) - c["low"]
+
+    # Hammer: long lower wick, small body near the top -> bullish rejection
+    if lower_wick >= body * 2 and upper_wick <= body * 0.5:
+        return "BUY"
+    # Shooting star: long upper wick, small body near the bottom -> bearish rejection
+    if upper_wick >= body * 2 and lower_wick <= body * 0.5:
+        return "SELL"
+    return None
+
+
+def detect_inside_bar_breakout(candles):
+    """
+    Inside bar: a candle fully contained within the prior candle's
+    high/low range (a pause/coil). Signal fires on the candle AFTER
+    the inside bar, once price actually breaks outside the inside
+    bar's own range - momentum/continuation, not reversal. Needs 3
+    candles: the "mother" bar, the inside bar, and the breakout bar.
+    """
+    if len(candles) < 3:
+        return None
+    mother, inside, breakout = candles[-3], candles[-2], candles[-1]
+    is_inside = inside["high"] <= mother["high"] and inside["low"] >= mother["low"]
+    if not is_inside:
+        return None
+    if breakout["close"] > inside["high"]:
+        return "BUY"
+    if breakout["close"] < inside["low"]:
+        return "SELL"
+    return None
+
+
+def account_flip_signal(pair_key, pair_config, candles):
+    """
+    Account Flip's own dedicated, standalone entry logic - pure price
+    action only, deliberately separate from the indicator-based
+    strategy banks every other bot draws from. Checks all 3 patterns
+    on the latest candle(s); whichever fires first wins (checked in
+    this fixed order: Engulfing, Pin Bar, Inside Bar Breakout - not a
+    vote, just "first real signal on this candle").
+
+    Returns a vote dict matching the shape the rest of the codebase
+    already expects ({"direction", "reasoning", "strategy"}), or None.
+    Stop-loss anchor is pattern-specific (the invalidation point of
+    whichever pattern fired), used only for the FIRST layer - later
+    layers ride without their own broker-side stop, per the
+    trailing-stop design that closes the whole stack together.
+    """
+    if len(candles) < 3:
+        return None
+
+    if detect_bullish_engulfing(candles):
+        return {"direction": "BUY", "strategy": "Engulfing Bar Reversal",
+                "reasoning": "Bullish engulfing candle - full reversal of the prior bearish candle.",
+                "invalidation": candles[-1]["low"]}
+    if detect_bearish_engulfing(candles):
+        return {"direction": "SELL", "strategy": "Engulfing Bar Reversal",
+                "reasoning": "Bearish engulfing candle - full reversal of the prior bullish candle.",
+                "invalidation": candles[-1]["high"]}
+
+    pin_bar_direction = detect_pin_bar(candles)
+    if pin_bar_direction == "BUY":
+        return {"direction": "BUY", "strategy": "Pin Bar",
+                "reasoning": "Hammer - long lower wick rejecting lower prices.",
+                "invalidation": candles[-1]["low"]}
+    if pin_bar_direction == "SELL":
+        return {"direction": "SELL", "strategy": "Pin Bar",
+                "reasoning": "Shooting star - long upper wick rejecting higher prices.",
+                "invalidation": candles[-1]["high"]}
+
+    inside_bar_direction = detect_inside_bar_breakout(candles)
+    if inside_bar_direction == "BUY":
+        return {"direction": "BUY", "strategy": "Inside Bar Breakout",
+                "reasoning": "Price broke above an inside bar's coiled range.",
+                "invalidation": candles[-2]["low"]}
+    if inside_bar_direction == "SELL":
+        return {"direction": "SELL", "strategy": "Inside Bar Breakout",
+                "reasoning": "Price broke below an inside bar's coiled range.",
+                "invalidation": candles[-2]["high"]}
+
+    return None
+
 def detect_rsi_divergence(candles, rsi_values, direction, lookback=10):
     """
     Bullish divergence: price makes a lower low while RSI makes a
@@ -12052,14 +12521,29 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             # lot-risk selection again, just show current status.
             days_left = (expiry - now).days
             risk_mode = account.get("risk_mode", "lot")
-            risk_display = (
-                f"{account.get('lot_size', 0.01)} lots"
-                if risk_mode == "lot"
-                else f"{account.get('risk_percent', 1.0)}% risk"
-            )
+            if risk_mode == "lot":
+                risk_display = f"{account.get('lot_size', 0.01)} lots"
+            elif risk_mode == "account_flip":
+                open_stack = get_open_flip_stack(user_id)
+                if open_stack:
+                    risk_display = (
+                        f"🚀 Flip — stack open, {open_stack.get('layer_count', 1)} layer(s) so far "
+                        f"(base {account.get('flip_base_lot', 0.01)}, +{account.get('flip_step', 0.01)}/layer, "
+                        f"cap {account.get('flip_max_lot', 0.01)}, trail {account.get('flip_trail_pips', 10)} pips)"
+                    )
+                else:
+                    risk_display = (
+                        f"🚀 Flip — no open stack right now "
+                        f"(base {account.get('flip_base_lot', 0.01)}, +{account.get('flip_step', 0.01)}/layer, "
+                        f"cap {account.get('flip_max_lot', 0.01)}, every {account.get('flip_trigger_pips', 10)} "
+                        f"pips, max {account.get('flip_max_layers', 3)} layers)"
+                    )
+            else:
+                risk_display = f"{account.get('risk_percent', 1.0)}% risk"
             bot_choice = account.get("bot_choice", "follow_channel")
             bot_label = (
                 "Following channel signals" if bot_choice == "follow_channel"
+                else "🚀 Account Flip (own price-action strategy)" if bot_choice == "account_flip"
                 else MT5_AUTOTRADE_BOTS.get(bot_choice, {}).get("label", bot_choice)
             )
             # Account name/server come straight from the saved row;
@@ -12120,11 +12604,16 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             "📡 <b>Follow Channel Signals</b> — auto-copies whatever "
             "the main channel already posts (XAUUSD, GBPJPY, BTCUSD, etc).\n\n"
             "🎯 <b>Pick a Bot</b> — choose one of 4 dedicated strategy "
-            "bots and one specific pair for it to trade.",
+            "bots and one specific pair for it to trade.\n\n"
+            "🚀 <b>Account Flip</b> — its own standalone price-action "
+            "strategy that layers in bigger positions while winning, "
+            "with a trailing stop across the whole stack. Higher risk — "
+            "shows a full warning before you can enable it.",
             parse_mode=ParseMode.HTML,
             reply_markup=InlineKeyboardMarkup([
                 [InlineKeyboardButton("📡 Follow Channel Signals", callback_data="mt5auto_follow_channel")],
                 [InlineKeyboardButton("🎯 Pick a Bot", callback_data="mt5auto_choose_bot")],
+                [InlineKeyboardButton("🚀 Account Flip", callback_data="mt5auto_account_flip")],
             ])
         )
         return
@@ -12142,6 +12631,68 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 [InlineKeyboardButton("📏 Fixed lot size", callback_data="mt5auto_mode_lot")],
                 [InlineKeyboardButton("📊 Risk %", callback_data="mt5auto_mode_risk")],
             ])
+        )
+        return
+
+    if data == "mt5auto_account_flip":
+        user_id = str(query.from_user.id)
+        await query.message.edit_text(
+            "⚠️ <b>Account Flip — Read Before Enabling</b>\n\n"
+            "This mode compounds lot size while a trade is winning, adding "
+            "bigger positions as price moves further your way. It is built "
+            "to grow fast, not to protect capital the way Follow Channel or "
+            "Choose a Bot do. A sudden reversal after several layers have "
+            "stacked can hand back a large chunk of the run's gains at "
+            "once. Every layer beyond the first only exists because the "
+            "trade is already in profit — nothing is added while losing — "
+            "but this is still meaningfully higher-risk than the other two "
+            "modes and is not suitable for money you aren't prepared to see "
+            "swing hard in both directions.\n\n"
+            "It also runs its own standalone strategy — pure price action "
+            "(Engulfing / Pin Bar / Inside Bar Breakout), separate from "
+            "every other bot's strategy pool.",
+            parse_mode=ParseMode.HTML,
+            reply_markup=InlineKeyboardMarkup([
+                [InlineKeyboardButton("✅ I Understand, Continue", callback_data="mt5auto_flip_accept")],
+                [InlineKeyboardButton("⬅️ Back", callback_data="mt5auto_start")],
+            ])
+        )
+        return
+
+    if data == "mt5auto_flip_accept":
+        user_id = str(query.from_user.id)
+        if user_id not in mt5_signup_state:
+            mt5_signup_state[user_id] = {"flow": "presetup"}
+        mt5_signup_state[user_id]["bot_choice"] = "account_flip"
+        mt5_signup_state[user_id]["risk_mode"] = "account_flip"
+        mt5_signup_state[user_id]["flip_disclaimer_accepted"] = True
+
+        buttons = [
+            [InlineKeyboardButton(PAIR_CONFIG[p]["display"], callback_data=f"mt5auto_flippair_{p}")]
+            for p in MT5_AUTOTRADE_PAIRS
+        ]
+        await query.message.edit_text(
+            "🚀 <b>Account Flip</b> — choose the one pair it should trade:",
+            parse_mode=ParseMode.HTML,
+            reply_markup=InlineKeyboardMarkup(buttons)
+        )
+        return
+
+    if data.startswith("mt5auto_flippair_"):
+        user_id = str(query.from_user.id)
+        pair_key = data.replace("mt5auto_flippair_", "")
+        if pair_key not in MT5_AUTOTRADE_PAIRS:
+            return
+        if user_id not in mt5_signup_state:
+            mt5_signup_state[user_id] = {"flow": "presetup"}
+        mt5_signup_state[user_id]["pair_choice"] = pair_key
+        user_modes[user_id] = "mt5_awaiting_flip_base"
+        await query.message.edit_text(
+            f"✅ {PAIR_CONFIG[pair_key]['display']} selected.\n\n"
+            f"🚀 <b>Account Flip setup (1/6)</b>\n\n"
+            f"Send your <b>starting lot size</b> for the first layer "
+            f"(e.g. 0.01):",
+            parse_mode=ParseMode.HTML
         )
         return
 
@@ -12265,13 +12816,24 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             # activates the subscription (which happens independently,
             # possibly minutes later).
             signup = mt5_signup_state.get(user_id, {})
-            upsert_mt5_autotrade_account(user_id, {
+            account_fields = {
                 "bot_choice": signup.get("bot_choice", "follow_channel"),
                 "pair_choice": signup.get("pair_choice"),
                 "risk_mode": signup.get("risk_mode", "lot"),
                 "lot_size": signup.get("lot_size", 0.01),
                 "risk_percent": signup.get("risk_percent", 1.0),
-            })
+            }
+            if signup.get("risk_mode") == "account_flip":
+                account_fields.update({
+                    "flip_base_lot": signup.get("flip_base_lot", 0.01),
+                    "flip_step": signup.get("flip_step"),
+                    "flip_max_lot": signup.get("flip_max_lot"),
+                    "flip_trigger_pips": signup.get("flip_trigger_pips"),
+                    "flip_max_layers": signup.get("flip_max_layers"),
+                    "flip_trail_pips": signup.get("flip_trail_pips"),
+                    "flip_disclaimer_accepted": True,
+                })
+            upsert_mt5_autotrade_account(user_id, account_fields)
 
             await query.message.edit_text(
                 f"🤖 <b>Exness Auto-Trade — {MT5_SUBSCRIPTION_DAYS}-day subscription</b>\n\n"
@@ -12294,11 +12856,22 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
         days_left = (expiry - now).days
         risk_mode = account.get("risk_mode", "lot")
-        risk_display = (
-            f"{account.get('lot_size', 0.01)} lots"
-            if risk_mode == "lot"
-            else f"{account.get('risk_percent', 1.0)}% risk"
-        )
+        if risk_mode == "lot":
+            risk_display = f"{account.get('lot_size', 0.01)} lots"
+        elif risk_mode == "account_flip":
+            open_stack = get_open_flip_stack(user_id)
+            stack_note = (
+                f"stack open, {open_stack.get('layer_count', 1)} layer(s)" if open_stack
+                else "no open stack right now"
+            )
+            risk_display = (
+                f"🚀 Account Flip — {stack_note} "
+                f"(base {account.get('flip_base_lot', 0.01)}, +{account.get('flip_step', 0.01)}/layer, "
+                f"cap {account.get('flip_max_lot', 0.01)}, every {account.get('flip_trigger_pips', 10)} pips, "
+                f"max {account.get('flip_max_layers', 3)} layers, trail {account.get('flip_trail_pips', 10)} pips)"
+            )
+        else:
+            risk_display = f"{account.get('risk_percent', 1.0)}% risk"
         await query.message.edit_text(
             f"🤖 <b>Exness Auto-Trade — Active</b>\n\n"
             f"Subscription: {days_left} day(s) left\n"
@@ -12374,12 +12947,77 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             "📡 <b>Follow Channel Signals</b> — auto-copies whatever "
             "the main channel already posts (XAUUSD, GBPJPY, BTCUSD, etc).\n\n"
             "🎯 <b>Pick a Bot</b> — choose one of 4 dedicated strategy "
-            "bots and one specific pair for it to trade.",
+            "bots and one specific pair for it to trade.\n\n"
+            "🚀 <b>Account Flip</b> — its own standalone price-action "
+            "strategy that layers in bigger positions while winning, "
+            "with a trailing stop across the whole stack. Higher risk — "
+            "shows a full warning before you can enable it.",
             parse_mode=ParseMode.HTML,
             reply_markup=InlineKeyboardMarkup([
                 [InlineKeyboardButton("📡 Follow Channel Signals", callback_data="mt5switch_follow_channel")],
                 [InlineKeyboardButton("🎯 Pick a Bot", callback_data="mt5switch_choose_bot")],
+                [InlineKeyboardButton("🚀 Account Flip", callback_data="mt5switch_account_flip")],
             ])
+        )
+        return
+
+    if data == "mt5switch_account_flip":
+        user_id = str(query.from_user.id)
+        await query.message.edit_text(
+            "⚠️ <b>Account Flip — Read Before Enabling</b>\n\n"
+            "This mode compounds lot size while a trade is winning, adding "
+            "bigger positions as price moves further your way. It is built "
+            "to grow fast, not to protect capital the way Follow Channel or "
+            "Choose a Bot do. A sudden reversal after several layers have "
+            "stacked can hand back a large chunk of the run's gains at "
+            "once. Every layer beyond the first only exists because the "
+            "trade is already in profit — nothing is added while losing — "
+            "but this is still meaningfully higher-risk than the other two "
+            "modes and is not suitable for money you aren't prepared to see "
+            "swing hard in both directions.\n\n"
+            "It also runs its own standalone strategy — pure price action "
+            "(Engulfing / Pin Bar / Inside Bar Breakout), separate from "
+            "every other bot's strategy pool.",
+            parse_mode=ParseMode.HTML,
+            reply_markup=InlineKeyboardMarkup([
+                [InlineKeyboardButton("✅ I Understand, Continue", callback_data="mt5switch_flip_accept")],
+                [InlineKeyboardButton("⬅️ Back", callback_data="mt5switch_menu")],
+            ])
+        )
+        return
+
+    if data == "mt5switch_flip_accept":
+        user_id = str(query.from_user.id)
+        mt5_signup_state[user_id] = {
+            "flow": "switch",
+            "bot_choice": "account_flip",
+            "risk_mode": "account_flip",
+            "flip_disclaimer_accepted": True,
+        }
+        buttons = [
+            [InlineKeyboardButton(PAIR_CONFIG[p]["display"], callback_data=f"mt5switch_flippair_{p}")]
+            for p in MT5_AUTOTRADE_PAIRS
+        ]
+        await query.message.edit_text(
+            "🚀 <b>Account Flip</b> — choose the one pair it should trade:",
+            parse_mode=ParseMode.HTML,
+            reply_markup=InlineKeyboardMarkup(buttons)
+        )
+        return
+
+    if data.startswith("mt5switch_flippair_"):
+        user_id = str(query.from_user.id)
+        pair_key = data.replace("mt5switch_flippair_", "")
+        if pair_key not in MT5_AUTOTRADE_PAIRS:
+            return
+        mt5_signup_state.setdefault(user_id, {"flow": "switch"})["pair_choice"] = pair_key
+        user_modes[user_id] = "mt5_awaiting_flip_base"
+        await query.message.edit_text(
+            f"✅ {PAIR_CONFIG[pair_key]['display']} selected.\n\n"
+            f"🚀 <b>Account Flip setup (1/6)</b>\n\n"
+            f"Send your <b>starting lot size</b> for the first layer "
+            f"(e.g. 0.01):",
+            parse_mode=ParseMode.HTML
         )
         return
 
@@ -13959,6 +14597,176 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
         schedule_auto_delete(sent_lot_saved.chat_id, sent_lot_saved.message_id)
         return
 
+    if mode == "mt5_awaiting_flip_base":
+        try:
+            flip_base = float(message.strip())
+            if flip_base <= 0:
+                raise ValueError
+        except ValueError:
+            sent_bad = await update.message.reply_text("⚠️ Please send a positive number, e.g. 0.01")
+            schedule_auto_delete(sent_bad.chat_id, sent_bad.message_id)
+            return
+        mt5_signup_state.setdefault(user_id, {})["flip_base_lot"] = flip_base
+        user_modes[user_id] = "mt5_awaiting_flip_step"
+        sent = await update.message.reply_text(
+            "🚀 <b>Account Flip setup (2/6)</b>\n\n"
+            "Send how much bigger each <b>new layer</b> should be than the "
+            f"last one (e.g. 0.01 means each added layer is 0.01 lots bigger):",
+            parse_mode=ParseMode.HTML
+        )
+        schedule_auto_delete(sent.chat_id, sent.message_id)
+        return
+
+    if mode == "mt5_awaiting_flip_step":
+        try:
+            flip_step = float(message.strip())
+            if flip_step <= 0:
+                raise ValueError
+        except ValueError:
+            sent_bad = await update.message.reply_text("⚠️ Please send a positive number, e.g. 0.01")
+            schedule_auto_delete(sent_bad.chat_id, sent_bad.message_id)
+            return
+        mt5_signup_state.setdefault(user_id, {})["flip_step"] = flip_step
+        user_modes[user_id] = "mt5_awaiting_flip_max"
+        base = mt5_signup_state[user_id].get("flip_base_lot", 0.01)
+        sent = await update.message.reply_text(
+            "🚀 <b>Account Flip setup (3/6)</b>\n\n"
+            "Send a <b>max lot size cap per layer</b> - no single layer "
+            f"will ever be bigger than this, no matter how many stack up "
+            f"(must be at least your starting size of {base}):",
+            parse_mode=ParseMode.HTML
+        )
+        schedule_auto_delete(sent.chat_id, sent.message_id)
+        return
+
+    if mode == "mt5_awaiting_flip_max":
+        signup = mt5_signup_state.setdefault(user_id, {})
+        base = float(signup.get("flip_base_lot", 0.01))
+        try:
+            flip_max = float(message.strip())
+            if flip_max < base:
+                raise ValueError
+        except ValueError:
+            sent_bad = await update.message.reply_text(
+                f"⚠️ Please send a number of at least {base} (your starting size)."
+            )
+            schedule_auto_delete(sent_bad.chat_id, sent_bad.message_id)
+            return
+        signup["flip_max_lot"] = flip_max
+        user_modes[user_id] = "mt5_awaiting_flip_trigger"
+        sent = await update.message.reply_text(
+            "🚀 <b>Account Flip setup (4/6)</b>\n\n"
+            "Send how many <b>pips in profit</b> a trade needs to move "
+            f"before it adds the next layer (tight spacing = more layers, "
+            f"e.g. 10):",
+            parse_mode=ParseMode.HTML
+        )
+        schedule_auto_delete(sent.chat_id, sent.message_id)
+        return
+
+    if mode == "mt5_awaiting_flip_trigger":
+        try:
+            flip_trigger = float(message.strip())
+            if flip_trigger <= 0:
+                raise ValueError
+        except ValueError:
+            sent_bad = await update.message.reply_text("⚠️ Please send a positive number of pips, e.g. 10")
+            schedule_auto_delete(sent_bad.chat_id, sent_bad.message_id)
+            return
+        mt5_signup_state.setdefault(user_id, {})["flip_trigger_pips"] = flip_trigger
+        user_modes[user_id] = "mt5_awaiting_flip_layers"
+        sent = await update.message.reply_text(
+            "🚀 <b>Account Flip setup (5/6)</b>\n\n"
+            "Send the <b>max number of layers</b> it can stack on one "
+            f"trade before it stops adding more (e.g. 3):",
+            parse_mode=ParseMode.HTML
+        )
+        schedule_auto_delete(sent.chat_id, sent.message_id)
+        return
+
+    if mode == "mt5_awaiting_flip_layers":
+        try:
+            flip_layers = int(float(message.strip()))
+            if flip_layers < 1:
+                raise ValueError
+        except ValueError:
+            sent_bad = await update.message.reply_text("⚠️ Please send a whole number of at least 1, e.g. 3")
+            schedule_auto_delete(sent_bad.chat_id, sent_bad.message_id)
+            return
+        mt5_signup_state.setdefault(user_id, {})["flip_max_layers"] = flip_layers
+        user_modes[user_id] = "mt5_awaiting_flip_trail"
+        sent = await update.message.reply_text(
+            "🚀 <b>Account Flip setup (6/6)</b>\n\n"
+            "Send the <b>trailing stop distance in pips</b> - once the "
+            f"stack is in profit, it closes everything together if price "
+            f"pulls back this many pips from its best point (e.g. 10):",
+            parse_mode=ParseMode.HTML
+        )
+        schedule_auto_delete(sent.chat_id, sent.message_id)
+        return
+
+    if mode == "mt5_awaiting_flip_trail":
+        signup = mt5_signup_state.setdefault(user_id, {})
+        try:
+            flip_trail = float(message.strip())
+            if flip_trail <= 0:
+                raise ValueError
+        except ValueError:
+            sent_bad = await update.message.reply_text("⚠️ Please send a positive number of pips, e.g. 10")
+            schedule_auto_delete(sent_bad.chat_id, sent_bad.message_id)
+            return
+        user_modes[user_id] = None
+        signup["flip_trail_pips"] = flip_trail
+        signup["risk_mode"] = "account_flip"
+        signup["bot_choice"] = "account_flip"
+
+        base = signup.get("flip_base_lot")
+        step = signup.get("flip_step")
+        max_lot = signup.get("flip_max_lot")
+        trigger = signup.get("flip_trigger_pips")
+        layers = signup.get("flip_max_layers")
+
+        summary = (
+            f"Pair: {PAIR_CONFIG.get(signup.get('pair_choice'), {}).get('display', '—')}\n"
+            f"Start: {base} lots | +{step}/layer | caps at {max_lot} per layer\n"
+            f"New layer every {trigger} pips in profit | max {layers} layers\n"
+            f"Trailing stop: {flip_trail} pips across the whole stack"
+        )
+
+        if signup.get("flow") == "switch":
+            upsert_mt5_autotrade_account(user_id, {
+                "bot_choice": "account_flip",
+                "pair_choice": signup.get("pair_choice"),
+                "risk_mode": "account_flip",
+                "flip_base_lot": base,
+                "flip_step": step,
+                "flip_max_lot": max_lot,
+                "flip_trigger_pips": trigger,
+                "flip_max_layers": layers,
+                "flip_trail_pips": flip_trail,
+                "flip_disclaimer_accepted": True,
+            })
+            sent_done = await update.message.reply_text(
+                f"✅ <b>Switched to Account Flip.</b>\n\n{summary}\n\n"
+                f"Tap 🤖 Exness Auto-Trade anytime to check status or switch again.",
+                parse_mode=ParseMode.HTML, reply_markup=main_keyboard
+            )
+            schedule_auto_delete(sent_done.chat_id, sent_done.message_id)
+            return
+
+        # presetup flow - store and move to the "ready to pay" step,
+        # same pattern as the lot/risk % paths above.
+        sent_ready = await update.message.reply_text(
+            f"✅ <b>Setup complete:</b>\n\n🚀 Account Flip\n{summary}\n\n"
+            f"Tap below to pay and unlock your MT5 connection:",
+            parse_mode=ParseMode.HTML,
+            reply_markup=InlineKeyboardMarkup([
+                [InlineKeyboardButton("➡️ Continue to Payment", callback_data="mt5auto_continue")]
+            ])
+        )
+        schedule_auto_delete(sent_ready.chat_id, sent_ready.message_id)
+        return
+
     if mode == "mt5_awaiting_risk_value":
         try:
             risk_percent = float(message.strip())
@@ -15158,6 +15966,10 @@ async def check_mt5_autotrade_closed_orders(context: ContextTypes.DEFAULT_TYPE):
             continue  # still open, or lookup failed - retry next sweep
 
         mark_mt5_autotrade_order_closed(order_id, profit)
+        try:
+            await update_flip_lot_after_close(user_id, profit)
+        except Exception as e:
+            print(f"[MT5 AUTOTRADE] Account Flip lot update failed for {user_id}: {e}")
 
 # ============================================
 # AUTO-COPY TRADE MONITOR (NEW)
@@ -15770,6 +16582,29 @@ def main():
         interval=900,
         first=90,
         name="mt5_autotrade_close_monitor"
+    )
+
+    # Account Flip entry scan - checks each subscriber's one chosen
+    # pair on M15 for a fresh price-action signal (Engulfing/Pin Bar/
+    # Inside Bar Breakout) and opens the first layer of a new stack.
+    # 5 minutes matches the M15 candle-close cadence closely enough
+    # without re-checking on every tick.
+    job_queue.run_repeating(
+        run_account_flip_entry_scan,
+        interval=300,
+        first=100,
+        name="account_flip_entry_scan"
+    )
+
+    # Account Flip stack manager - runs every 60 seconds (much tighter
+    # than the entry scan) since this is what adds layers on profit
+    # triggers and runs the trailing stop close - both need to react
+    # to live floating price, not just candle closes.
+    job_queue.run_repeating(
+        manage_account_flip_stacks,
+        interval=60,
+        first=50,
+        name="account_flip_stack_manager"
     )
 
     # Auto-delete sweep - performs the actual deletion for anything

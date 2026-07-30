@@ -384,6 +384,24 @@ def is_mt5_autotrade_active(user_id):
         return False
 
 
+async def deprovision_mt5_account(metaapi_account_id):
+    """
+    Removes a MetaAPI-managed account resource entirely - used when a
+    customer chooses to CONNECT A NEW account instead of keeping their
+    current one on renewal, per explicit instruction, so the old one
+    doesn't sit around as an orphaned, unused resource. Best-effort:
+    logs on failure but never raises, since a failed cleanup shouldn't
+    block the customer from connecting their new account.
+    """
+    try:
+        api = MetaApi(token=METAAPI_TOKEN)
+        account = await api.metatrader_account_api.get_account(account_id=metaapi_account_id)
+        await account.remove()
+        print(f"[MT5 PROVISION] Removed old account {metaapi_account_id}")
+    except Exception as e:
+        print(f"[MT5 PROVISION] Couldn't remove old account {metaapi_account_id}: {e}")
+
+
 async def provision_mt5_account(login, password, server, platform="mt5", account_name=None):
     """
     Creates a NEW MetaAPI-managed trading account for a CLIENT'S OWN
@@ -1067,9 +1085,15 @@ async def process_confirmed_korapay_payments(context: ContextTypes.DEFAULT_TYPE)
                     text=(
                         "✅ <b>Payment confirmed!</b>\n\n"
                         f"Your MT5 auto-trade subscription is active "
-                        f"for {MT5_SUBSCRIPTION_DAYS} more days."
+                        f"for {MT5_SUBSCRIPTION_DAYS} more days.\n\n"
+                        "Keep using your current trading account, or "
+                        "connect a different one?"
                     ),
-                    parse_mode=ParseMode.HTML
+                    parse_mode=ParseMode.HTML,
+                    reply_markup=InlineKeyboardMarkup([
+                        [InlineKeyboardButton("✅ Keep current account", callback_data="mt5renew_keep")],
+                        [InlineKeyboardButton("🔄 Connect a new account", callback_data="mt5renew_new")],
+                    ])
                 )
             else:
                 user_modes[user_id] = "mt5_awaiting_account_number"
@@ -11936,8 +11960,17 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 "Following channel signals" if bot_choice == "follow_channel"
                 else MT5_AUTOTRADE_BOTS.get(bot_choice, {}).get("label", bot_choice)
             )
+            # Account name/server come straight from the saved row;
+            # balance is a live fetch since it changes constantly and
+            # was never something worth caching - per explicit
+            # instruction.
+            balance = await get_client_mt5_balance(account["metaapi_account_id"])
+            balance_display = f"${balance:,.2f}" if balance is not None else "unavailable right now"
             await query.message.edit_text(
                 f"🤖 <b>Exness Auto-Trade — Active</b>\n\n"
+                f"Account: {account.get('account_name') or account.get('account_number', 'N/A')}\n"
+                f"Server: {account.get('server', 'N/A')}\n"
+                f"Balance: {balance_display}\n\n"
                 f"Subscription: {days_left} day(s) left\n"
                 f"Mode: {bot_label}"
                 + (f" on {account.get('pair_choice', '').upper()}" if account.get("pair_choice") else "")
@@ -12186,7 +12219,126 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             reply_markup=InlineKeyboardMarkup([
                 [InlineKeyboardButton("📏 Fixed lot size", callback_data="mt5settings_lot")],
                 [InlineKeyboardButton("📊 Risk %", callback_data="mt5settings_risk")],
+                [InlineKeyboardButton("🔄 Switch bot / signal mode", callback_data="mt5switch_menu")],
             ])
+        )
+        return
+
+    # SWITCH MODE flow, per explicit instruction - lets an ALREADY
+    # connected, already-subscribed customer change between "Follow
+    # Channel Signals" and a specific bot (or switch which bot/pair)
+    # at any time, without touching their account connection, lot
+    # size, or payment at all. Deliberately a SEPARATE set of
+    # callback_data values from the original signup flow
+    # (mt5auto_follow_channel / mt5auto_choose_bot / etc.) - those
+    # accumulate choices in mt5_signup_state on the way to a NEW
+    # payment, which doesn't apply here; this saves directly to
+    # Supabase at the final step since the subscription is already
+    # active.
+    if data == "mt5renew_keep":
+        user_id = str(query.from_user.id)
+        await query.message.edit_text(
+            "✅ <b>Keeping your current account.</b> All set for the next "
+            f"{MT5_SUBSCRIPTION_DAYS} days.",
+            parse_mode=ParseMode.HTML
+        )
+        return
+
+    if data == "mt5renew_new":
+        user_id = str(query.from_user.id)
+        account = get_mt5_autotrade_account(user_id)
+        old_metaapi_id = account.get("metaapi_account_id") if account else None
+        upsert_mt5_autotrade_account(user_id, {
+            "account_number": None,
+            "encrypted_password": None,
+            "server": None,
+            "account_name": None,
+            "metaapi_account_id": None,
+        })
+        if old_metaapi_id:
+            asyncio.create_task(deprovision_mt5_account(old_metaapi_id))
+        user_modes[user_id] = "mt5_awaiting_account_number"
+        await query.message.edit_text(
+            "🔄 <b>Let's connect your new account.</b>\n\n"
+            "Send your Exness <b>account number</b>:",
+            parse_mode=ParseMode.HTML
+        )
+        return
+
+    if data == "mt5switch_menu":
+        user_id = str(query.from_user.id)
+        await query.message.edit_text(
+            "🔄 <b>Switch how Exness Auto-Trade decides your trades:</b>\n\n"
+            "📡 <b>Follow Channel Signals</b> — auto-copies whatever "
+            "the main channel already posts (XAUUSD, GBPJPY, BTCUSD, etc).\n\n"
+            "🎯 <b>Pick a Bot</b> — choose one of 4 dedicated strategy "
+            "bots and one specific pair for it to trade.",
+            parse_mode=ParseMode.HTML,
+            reply_markup=InlineKeyboardMarkup([
+                [InlineKeyboardButton("📡 Follow Channel Signals", callback_data="mt5switch_follow_channel")],
+                [InlineKeyboardButton("🎯 Pick a Bot", callback_data="mt5switch_choose_bot")],
+            ])
+        )
+        return
+
+    if data == "mt5switch_follow_channel":
+        user_id = str(query.from_user.id)
+        upsert_mt5_autotrade_account(user_id, {"bot_choice": "follow_channel", "pair_choice": None})
+        await query.message.edit_text(
+            "✅ <b>Switched to Following Channel Signals.</b>\n\n"
+            "Tap 🤖 Exness Auto-Trade anytime to check your status or switch again.",
+            parse_mode=ParseMode.HTML
+        )
+        return
+
+    if data == "mt5switch_choose_bot":
+        user_id = str(query.from_user.id)
+        buttons = [
+            [InlineKeyboardButton(bot["label"], callback_data=f"mt5switch_bot_{key}")]
+            for key, bot in MT5_AUTOTRADE_BOTS.items()
+        ]
+        await query.message.edit_text(
+            "🎯 <b>Choose a bot:</b>\n\n" + "\n".join(
+                f"{bot['label']} — {bot['description']}" for bot in MT5_AUTOTRADE_BOTS.values()
+            ),
+            parse_mode=ParseMode.HTML,
+            reply_markup=InlineKeyboardMarkup(buttons)
+        )
+        return
+
+    if data.startswith("mt5switch_bot_"):
+        user_id = str(query.from_user.id)
+        bot_key = data.replace("mt5switch_bot_", "")
+        if bot_key not in MT5_AUTOTRADE_BOTS:
+            return
+        buttons = [
+            [InlineKeyboardButton(PAIR_CONFIG[p]["display"], callback_data=f"mt5switch_pair_{bot_key}_{p}")]
+            for p in MT5_AUTOTRADE_PAIRS
+        ]
+        await query.message.edit_text(
+            f"✅ {MT5_AUTOTRADE_BOTS[bot_key]['label']} selected.\n\n"
+            f"📌 <b>Now choose which pair to trade it on:</b>",
+            parse_mode=ParseMode.HTML,
+            reply_markup=InlineKeyboardMarkup(buttons)
+        )
+        return
+
+    if data.startswith("mt5switch_pair_"):
+        user_id = str(query.from_user.id)
+        remainder = data.replace("mt5switch_pair_", "")
+        # bot_key values themselves contain underscores (e.g.
+        # "aggressive_scalper"), so a naive split on "_" would break -
+        # match against the known bot keys directly instead.
+        bot_key = next((k for k in MT5_AUTOTRADE_BOTS if remainder.startswith(k + "_")), None)
+        pair_key = remainder[len(bot_key) + 1:] if bot_key else None
+        if not bot_key or pair_key not in MT5_AUTOTRADE_PAIRS:
+            return
+        upsert_mt5_autotrade_account(user_id, {"bot_choice": bot_key, "pair_choice": pair_key})
+        await query.message.edit_text(
+            f"✅ <b>Switched to {MT5_AUTOTRADE_BOTS[bot_key]['label']} on "
+            f"{PAIR_CONFIG[pair_key]['display']}.</b>\n\n"
+            f"Tap 🤖 Exness Auto-Trade anytime to check your status or switch again.",
+            parse_mode=ParseMode.HTML
         )
         return
 

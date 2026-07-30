@@ -56,6 +56,7 @@ from telegram.error import TimedOut
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
 OPENROUTER_API_KEY = os.getenv("OPENROUTER_API_KEY")
+GROQ_API_KEY = os.getenv("GROQ_API_KEY")
 TWELVEDATA_API_KEY = os.getenv("TWELVEDATA_API_KEY")
 ALPHA_VANTAGE_API_KEY = os.getenv("ALPHA_VANTAGE_API_KEY")
 GNEWS_API_KEY = os.getenv("GNEWS_API_KEY")
@@ -1344,7 +1345,7 @@ SYNTHETIC_SCHEDULE = [
 # (same pricing tier, still free-tier eligible).
 # ============================================
 
-GEMINI_MODEL = "gemini-2.5-flash-lite"
+GEMINI_MODEL = "gemini-3.1-flash-lite"
 
 GEMINI_URL = (
     f"https://generativelanguage.googleapis.com/v1beta/models/"
@@ -1352,6 +1353,7 @@ GEMINI_URL = (
 )
 
 OPENROUTER_URL = "https://openrouter.ai/api/v1/chat/completions"
+GROQ_URL = "https://api.groq.com/openai/v1/chat/completions"
 
 # ============================================
 # KEYBOARDS
@@ -11343,7 +11345,11 @@ async def ask_gemini(prompt):
         return result["candidates"][0]["content"]["parts"][0]["text"]
     except Exception as e:
         print(f"[NEWS AI] Gemini failed ({e}), trying OpenRouter...")
-        return await ask_openrouter(prompt)
+        result = await ask_openrouter(prompt)
+        if result.strip() in KNOWN_AI_FAILURE_STRINGS:
+            print(f"[NEWS AI] OpenRouter also failed ('{result.strip()}'), trying Groq...")
+            return await ask_groq(prompt)
+        return result
 
 # ============================================
 # GEMINI AI — FOR BIAS GENERATION (NEW)
@@ -11368,7 +11374,11 @@ async def ask_gemini_for_bias(prompt):
         return result["candidates"][0]["content"]["parts"][0]["text"]
     except Exception as e:
         print(f"[AI BIAS] Gemini failed, trying OpenRouter: {e}")
-        return await ask_openrouter(prompt)
+        result = await ask_openrouter(prompt)
+        if result.strip() in KNOWN_AI_FAILURE_STRINGS:
+            print(f"[AI BIAS] OpenRouter also failed ('{result.strip()}'), trying Groq...")
+            return await ask_groq(prompt)
+        return result
 
 # ============================================
 # OPENROUTER FALLBACK
@@ -11382,7 +11392,16 @@ async def ask_openrouter(prompt):
         "Content-Type": "application/json"
     }
     data = {
-        "model": "deepseek/deepseek-chat",
+        # SWITCHED per explicit instruction - "deepseek/deepseek-chat"
+        # is a PAID model, which is exactly what was consuming your
+        # OpenRouter credits. Confirmed via current research: DeepSeek's
+        # free tier on OpenRouter was discontinued entirely as of July
+        # 2026. "openrouter/free" is OpenRouter's own auto-router
+        # (introduced Feb 2026) - it automatically picks whichever
+        # free model is currently available, rather than pinning to
+        # one specific free model that could get discontinued the
+        # same way DeepSeek's just did.
+        "model": "openrouter/free",
         "messages": [{"role": "user", "content": prompt}]
     }
     try:
@@ -11396,6 +11415,42 @@ async def ask_openrouter(prompt):
         return result["choices"][0]["message"]["content"]
     except Exception as e:
         print(f"OpenRouter Error: {e}")
+        return "⚠️ AI servers unavailable."
+
+
+async def ask_groq(prompt):
+    """
+    Third, genuinely independent free fallback, per explicit
+    instruction - Groq's free tier requires no credit card and is
+    consistently ranked among the most reliable free LLM tiers
+    available. Uses openai/gpt-oss-120b rather than the commonly-
+    cited llama-3.3-70b-versatile, since current research confirmed
+    Groq has been actively RETIRING that exact model (and
+    llama-3.1-8b-instant) - openai/gpt-oss-120b is their own named
+    migration target, avoiding the same "pinned to a model that just
+    got discontinued" mistake already found and fixed for Gemini.
+    """
+    if not GROQ_API_KEY:
+        return "⚠️ AI service unavailable."
+    headers = {
+        "Authorization": f"Bearer {GROQ_API_KEY}",
+        "Content-Type": "application/json"
+    }
+    data = {
+        "model": "openai/gpt-oss-120b",
+        "messages": [{"role": "user", "content": prompt}]
+    }
+    try:
+        response = requests.post(
+            GROQ_URL, headers=headers, json=data, timeout=30
+        )
+        if response.status_code != 200:
+            print(f"[GROQ] Failed with status {response.status_code} | body: {response.text[:300]}")
+            return "⚠️ AI server busy."
+        result = response.json()
+        return result["choices"][0]["message"]["content"]
+    except Exception as e:
+        print(f"Groq Error: {e}")
         return "⚠️ AI servers unavailable."
 
 # ============================================

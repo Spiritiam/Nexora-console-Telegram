@@ -139,7 +139,7 @@ MT5_SUBSCRIPTION_DAYS = 30
 # were before. No strategies were removed or added for this test;
 # only the final direction gets flipped, at the last possible moment,
 # right before it's displayed or traded on.
-EXPERIMENTAL_INVERT_SIGNALS = True
+EXPERIMENTAL_INVERT_SIGNALS = False
 
 
 def maybe_invert_direction(direction):

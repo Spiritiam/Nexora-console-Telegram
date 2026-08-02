@@ -247,7 +247,7 @@ DERIV_AUTOTRADE_BOTS = {
         "description": "Fast, frequent entries - fires on just 1 agreeing strategy.",
     },
     "conservative": {
-        "label": "🛡️ Conservative",
+        "label": "🛡️Conservative",
         "min_agree": 3,
         "description": "Slower, higher-conviction entries - needs 3+ strategies to agree.",
     },
@@ -4062,13 +4062,14 @@ def match_synthetic_key(question):
 SYNTHETIC_CANDLE_CACHE_SECONDS = {"1m": 30, "5m": 120, "1h": 300, "4h": 14400}
 synthetic_candle_cache = {}
 
-async def deriv_get_candles(symbol, granularity, count=60):
+async def _deriv_get_candles_once(symbol, granularity, count):
     """
-    Fetches real candle history directly from Deriv using the
-    service token, via the exact same OTP connection flow already
-    confirmed in Phase 1. Returns a list of {open, high, low, close}
-    dicts already oldest-to-newest (confirmed live - no reversal
-    needed, unlike TwelveData), or None on any failure.
+    One full attempt at fetching candles - the entire account-lookup
+    + OTP-exchange + WebSocket round trip that deriv_get_candles used
+    to do inline. Split out so deriv_get_candles can retry the WHOLE
+    thing (not just the WebSocket step) on failure, since a timeout
+    or hiccup can happen at any one of those stages, not just the
+    final connection.
     """
     if not DERIV_SERVICE_TOKEN:
         print("[SYNTH] No DERIV_SERVICE_TOKEN set")
@@ -4146,6 +4147,32 @@ async def deriv_get_candles(symbol, granularity, count=60):
     except Exception as e:
         print(f"[SYNTH] Connection error: {e}")
         return None
+
+
+async def deriv_get_candles(symbol, granularity, count=60):
+    """
+    Fetches real candle history directly from Deriv using the
+    service token, via the exact same OTP connection flow already
+    confirmed in Phase 1. Returns a list of {open, high, low, close}
+    dicts already oldest-to-newest (confirmed live - no reversal
+    needed, unlike TwelveData), or None on any failure.
+
+    Retries once after a short delay before giving up - the account-
+    lookup/OTP/WebSocket round trip this needs has no margin for a
+    single transient timeout or hiccup, and a manual signal request
+    fetches this same round trip up to 4 times in a row (H1/H4/daily/
+    M1) for whichever index wasn't already cached, so one bad attempt
+    out of those 4 was enough to fail the whole signal. A real,
+    persistent problem (bad token, wrong symbol, Deriv actually down)
+    will still fail on the retry too and correctly return None.
+    """
+    result = await _deriv_get_candles_once(symbol, granularity, count)
+    if result:
+        return result
+
+    print(f"[SYNTH] First attempt failed for {symbol} ({granularity}s) - retrying once...")
+    await asyncio.sleep(2)
+    return await _deriv_get_candles_once(symbol, granularity, count)
 
 async def deriv_get_tick_count(symbol, seconds_window=60):
     """
@@ -13722,8 +13749,12 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         await query.message.edit_text(
             f"✅ <b>Auto-Trade turned back on.</b>\n\n"
-            f"Resumed with your saved settings: {mode_label}.",
-            parse_mode=ParseMode.HTML
+            f"Resumed with your saved settings: {mode_label}.\n\n"
+            f"To change bot, tap ⚙️ Manage Bot below.",
+            parse_mode=ParseMode.HTML,
+            reply_markup=InlineKeyboardMarkup([
+                [InlineKeyboardButton("⚙️ Manage Bot", callback_data="derivauto_menu")]
+            ])
         )
         return
 

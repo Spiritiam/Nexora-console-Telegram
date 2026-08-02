@@ -228,6 +228,35 @@ MT5_AUTOTRADE_BOTS = {
 # to keep the choice simple and recognizable.
 MT5_AUTOTRADE_PAIRS = ["xauusd", "gbpjpy", "btcusd", "eurusd", "gbpusd", "usdjpy"]
 
+# Deriv's mirror of MT5_AUTOTRADE_BOTS. IMPORTANT DIFFERENCE, stated
+# plainly rather than glossed over: synthetic indices already run
+# their OWN dedicated strategy roster (SYNTHETIC_STRATEGY_BANK, via
+# run_strategy_bank_synthetic) rather than the forex STRATEGY_BANK
+# the MT5 bots pull named subsets from - ICT/SMC and session-based
+# strategies are deliberately excluded there since their assumptions
+# don't hold on an RNG-generated instrument. So "same entry logic"
+# here means the same STRUCTURAL idea (one shared strategy universe,
+# tiers differ by how much agreement is required), not literally the
+# same named functions - Aggressive fires on just 1 agreeing
+# strategy (fast, frequent), Conservative needs 3+ to agree (slower,
+# higher-conviction), both drawing from the full synthetic pool.
+DERIV_AUTOTRADE_BOTS = {
+    "aggressive": {
+        "label": "🐆 Aggressive",
+        "min_agree": 1,
+        "description": "Fast, frequent entries - fires on just 1 agreeing strategy.",
+    },
+    "conservative": {
+        "label": "🛡️ Conservative",
+        "min_agree": 3,
+        "description": "Slower, higher-conviction entries - needs 3+ strategies to agree.",
+    },
+}
+# DERIV_AUTOTRADE_PAIRS is defined further down, right after
+# SYNTHETIC_CONFIG/AUTO_COPY_EXCLUDED_INDICES exist - this dict here
+# doesn't depend on it, but that list does, and SYNTHETIC_CONFIG
+# isn't defined yet at this point in the file.
+
 _fernet = Fernet(CREDENTIAL_ENCRYPTION_KEY.encode()) if CREDENTIAL_ENCRYPTION_KEY else None
 
 def encrypt_credential(plain_text):
@@ -1816,6 +1845,7 @@ user_modes = {}
 # they're encrypted and written to Supabase. Cleared as soon as
 # signup completes or fails - never persisted here across restarts.
 mt5_signup_state = {}
+deriv_flip_signup_state = {}
 
 # user_id (str) -> (chat_id, message_id) of their most recent
 # "Welcome back... what would you like to do today?" message - per
@@ -3476,6 +3506,162 @@ def set_token_invalid_notified(user_id, notified):
 
 
 
+def update_deriv_account_fields(user_id, fields):
+    """
+    Generic PATCH onto a user's existing deriv_accounts row - same
+    pattern as save_auto_copy_settings but for the newer bot_choice/
+    pair_choice/flip_* columns, which don't need their own named
+    setter since there's nothing bespoke about how they're saved.
+    """
+    try:
+        url = f"{SUPABASE_URL}/rest/v1/deriv_accounts?user_id=eq.{user_id}"
+        requests.patch(url, headers=sb_headers(), json=fields, timeout=10)
+    except Exception as e:
+        print(f"[DERIV] update_deriv_account_fields error for {user_id}: {e}")
+
+
+async def get_deriv_trading_ws_url(token):
+    """
+    Resolves a token down to its real (non-virtual) account's
+    short-lived trading WebSocket URL - the same two-step lookup
+    deriv_execute_multiplier_trade already does inline, factored out
+    here so get_deriv_contract_live_profit and deriv_sell_contract
+    (which need a real account_id too, not None) can share it instead
+    of duplicating - or worse, skipping - that resolution step.
+    Returns None on any failure.
+    """
+    try:
+        accounts_data = await deriv_get_options_accounts(token)
+        if not accounts_data:
+            return None
+        accounts_list = accounts_data.get("data")
+        if not isinstance(accounts_list, list):
+            accounts_list = accounts_data.get("accounts")
+        if not accounts_list:
+            return None
+        real_account = None
+        for acct in accounts_list:
+            is_virtual = bool(
+                acct.get("is_virtual")
+                or str(acct.get("account_type", "")).lower() in ("demo", "virtual")
+            )
+            if not is_virtual:
+                real_account = acct
+                break
+        if not real_account:
+            return None
+        account_id = (
+            real_account.get("account_id")
+            or real_account.get("loginid")
+            or real_account.get("id")
+        )
+        return await deriv_get_otp_url(token, account_id)
+    except Exception as e:
+        print(f"[DERIV] get_deriv_trading_ws_url error: {e}")
+        return None
+
+
+async def get_deriv_contract_live_profit(token, contract_id):
+    """
+    Live profit + is_sold for one open contract, via the same
+    proposal_open_contract call get_deriv_contract_outcome already
+    uses - a lighter sibling that just wants the current numbers
+    rather than a final win/loss outcome. Returns (profit, is_sold)
+    or (None, None) on any failure - callers treat None as "couldn't
+    read it this round, try again next sweep" rather than a real 0.
+    """
+    try:
+        ws_url = await get_deriv_trading_ws_url(token)
+        if not ws_url:
+            return None, None
+        async with websockets.connect(ws_url, open_timeout=10, close_timeout=10) as ws:
+            await ws.send(json.dumps({"proposal_open_contract": 1, "contract_id": contract_id}))
+            raw = json.loads(await ws.recv())
+            contract = raw.get("proposal_open_contract", {})
+            if not contract:
+                return None, None
+            profit = contract.get("profit")
+            is_sold = bool(contract.get("is_sold"))
+            return (float(profit) if profit is not None else None), is_sold
+    except Exception as e:
+        print(f"[DERIV FLIP] Live profit read failed for {contract_id}: {e}")
+        return None, None
+
+
+async def deriv_sell_contract(token, contract_id):
+    """
+    Sells one open contract at market ({"price": 0} = accept any
+    price, confirmed against Deriv's own API docs) - how Account
+    Flip closes each layer when the stack's trailing stop triggers.
+    """
+    try:
+        ws_url = await get_deriv_trading_ws_url(token)
+        if not ws_url:
+            return False
+        async with websockets.connect(ws_url, open_timeout=10, close_timeout=10) as ws:
+            await ws.send(json.dumps({"sell": contract_id, "price": 0}))
+            raw = json.loads(await ws.recv())
+            if "error" in raw:
+                print(f"[DERIV FLIP] Sell failed for {contract_id}: {raw['error'].get('message')}")
+                return False
+            return True
+    except Exception as e:
+        print(f"[DERIV FLIP] Sell exception for {contract_id}: {e}")
+        return False
+
+
+def get_open_deriv_flip_stack(user_id):
+    try:
+        url = (
+            f"{SUPABASE_URL}/rest/v1/deriv_flip_stacks"
+            f"?user_id=eq.{user_id}&status=eq.OPEN&select=*&limit=1"
+        )
+        response = requests.get(url, headers=sb_headers(), timeout=10)
+        rows = response.json()
+        return rows[0] if rows else None
+    except Exception as e:
+        print(f"[DERIV FLIP] Error fetching open stack for {user_id}: {e}")
+        return None
+
+
+def get_all_open_deriv_flip_stacks():
+    try:
+        url = f"{SUPABASE_URL}/rest/v1/deriv_flip_stacks?status=eq.OPEN&select=*"
+        response = requests.get(url, headers=sb_headers(), timeout=10)
+        return response.json()
+    except Exception as e:
+        print(f"[DERIV FLIP] Error fetching open stacks: {e}")
+        return []
+
+
+def create_deriv_flip_stack(user_id, index_key, symbol, direction, contract_type, contract_id):
+    try:
+        url = f"{SUPABASE_URL}/rest/v1/deriv_flip_stacks"
+        payload = {
+            "user_id": str(user_id),
+            "index_key": index_key,
+            "symbol": symbol,
+            "direction": direction,
+            "contract_type": contract_type,
+            "contract_ids": [contract_id],
+            "layer_count": 1,
+            "last_layer_profit": 0,
+            "peak_profit": 0,
+            "status": "OPEN",
+        }
+        requests.post(url, headers=sb_headers(), json=payload, timeout=10)
+    except Exception as e:
+        print(f"[DERIV FLIP] Error creating stack for {user_id}: {e}")
+
+
+def update_deriv_flip_stack(stack_id, fields):
+    try:
+        url = f"{SUPABASE_URL}/rest/v1/deriv_flip_stacks?id=eq.{stack_id}"
+        requests.patch(url, headers=sb_headers(), json=fields, timeout=10)
+    except Exception as e:
+        print(f"[DERIV FLIP] Error updating stack {stack_id}: {e}")
+
+
 def get_all_auto_copy_accounts():
     """
     Returns every deriv_accounts row with auto_copy_enabled = true,
@@ -3582,6 +3768,13 @@ SYNTHETIC_CONFIG = {
 # set (not deleted entirely) so this history stays documented and any
 # future index can still be excluded the same way if needed.
 AUTO_COPY_EXCLUDED_INDICES = set()
+
+# All 5 Volatility indices, minus anything in AUTO_COPY_EXCLUDED_INDICES
+# (currently empty - see that set's own comment above for why R_75
+# stays in despite its known tighter stop-distance risk). Used by the
+# Deriv "Choose a Bot" / Account Flip pair pickers, mirroring
+# MT5_AUTOTRADE_PAIRS's role for the Exness side.
+DERIV_AUTOTRADE_PAIRS = [k for k in SYNTHETIC_CONFIG if k not in AUTO_COPY_EXCLUDED_INDICES]
 
 SYNTHETIC_ALIASES = {
     "r10": ["r10", "r_10", "r 10", "volatility 10", "volatility10", "vol 10", "vol10", "v10"],
@@ -5343,6 +5536,318 @@ async def run_auto_copy_scan(context: ContextTypes.DEFAULT_TYPE):
         except Exception as e:
             print(f"[AUTO-COPY SCAN] ❌ Unexpected error for {user_id}: {e}")
             continue
+
+
+async def run_deriv_autotrade_bot_scan(context: ContextTypes.DEFAULT_TYPE):
+    """
+    Deriv's mirror of run_mt5_autotrade_bot_scan - for every account
+    with deriv_bot_choice in ("aggressive", "conservative") and a
+    chosen index, runs run_strategy_bank_synthetic at that bot's own
+    min_agree threshold (see DERIV_AUTOTRADE_BOTS) and trades it if a
+    signal fires. Batches by (bot_choice, index_key) combo so the
+    strategy bank only runs once per combo per round, not once per
+    subscriber, same efficiency reasoning as the MT5 version.
+    """
+    accounts = get_all_auto_copy_accounts()
+    bot_accounts = [
+        a for a in accounts
+        if a.get("deriv_autotrade_enabled") and a.get("deriv_bot_choice") in DERIV_AUTOTRADE_BOTS and a.get("deriv_pair_choice")
+    ]
+    if not bot_accounts:
+        return
+
+    combos = {}
+    for account in bot_accounts:
+        key = (account["deriv_bot_choice"], account["deriv_pair_choice"])
+        combos.setdefault(key, []).append(account)
+
+    bot = context.bot
+
+    for (bot_choice, index_key), subscribers in combos.items():
+        config = SYNTHETIC_CONFIG.get(index_key)
+        if not config or index_key in AUTO_COPY_EXCLUDED_INDICES:
+            continue
+        try:
+            symbol = config["symbol"]
+            h1_candles = await get_cached_synthetic_candles(index_key, symbol, "1h", 3600, 210)
+            h4_candles = await get_cached_synthetic_candles(index_key, symbol, "4h", 14400, 60)
+            daily_candles = await get_cached_synthetic_candles(index_key, symbol, "1day", 86400, 10)
+            m1_candles = await get_cached_synthetic_candles(index_key, symbol, "1m", 60, 60)
+            min_agree = DERIV_AUTOTRADE_BOTS[bot_choice]["min_agree"]
+            result = await run_strategy_bank_synthetic(
+                index_key, config, h1_candles, h4_candles, daily_candles,
+                m1_candles=m1_candles, min_agree=min_agree
+            )
+            if not result:
+                continue
+            direction, confidence, reason, agreeing_strategies, _winning_votes = result
+            contract_type = "MULTUP" if direction == "BUY" else "MULTDOWN"
+
+            for account in subscribers:
+                user_id = account.get("user_id")
+                token = account.get("api_token")
+                if not user_id or not token:
+                    continue
+                if has_open_auto_copy_trade(user_id, symbol):
+                    continue
+
+                trade_context = {
+                    "symbol": symbol, "direction": direction, "contract_type": contract_type,
+                    "multiplier": config["default_multiplier"], "risk": DEFAULT_RISK, "win": DEFAULT_WIN,
+                }
+                snapshot = await deriv_fetch_account_snapshot(token)
+                if not snapshot or snapshot.get("balance") is None:
+                    continue
+                balance = snapshot["balance"]
+                stake, risk, win, was_reduced = get_auto_copy_trade_amounts(account, trade_context, balance)
+                if stake is None:
+                    continue
+
+                buy_data, error = await deriv_execute_multiplier_trade(
+                    token, symbol, contract_type, config["default_multiplier"], stake, risk, win
+                )
+                if error:
+                    log_auto_copy_failure(user_id, symbol, friendly_trade_error(error, auto_copy_context=True))
+                    continue
+
+                contract_id = buy_data.get("contract_id", "—")
+                log_auto_copy_trade(user_id, symbol, contract_id, direction, stake, risk, win)
+                try:
+                    await bot.send_message(
+                        chat_id=int(user_id),
+                        text=(
+                            f"{DERIV_AUTOTRADE_BOTS[bot_choice]['label']} — "
+                            f"{direction} {config['display']}\n\n"
+                            f"Stake: ${stake} | Risk: ${risk} | Target: ${win}\n"
+                            f"{agreeing_strategies} strategies agreed."
+                        )
+                    )
+                except Exception as e:
+                    print(f"[DERIV BOT SCAN] Couldn't notify {user_id}: {e}")
+        except Exception as e:
+            print(f"[DERIV BOT SCAN] ❌ Error for {bot_choice}/{index_key}: {e}")
+
+
+async def run_deriv_flip_entry_scan(context: ContextTypes.DEFAULT_TYPE):
+    """
+    Deriv's mirror of run_account_flip_entry_scan - reuses the SAME
+    pure price-action pool (account_flip_signal) as the Exness side,
+    on M15 synthetic candles, since that strategy is instrument-
+    agnostic (works off raw OHLC, not anything forex-specific). Opens
+    the first layer with a real stop_loss (via Deriv's own limit_order
+    on the buy request) if no stack is already open for that account.
+    """
+    accounts = get_all_auto_copy_accounts()
+    flip_accounts = [
+        a for a in accounts
+        if a.get("deriv_autotrade_enabled") and a.get("deriv_bot_choice") == "account_flip" and a.get("deriv_pair_choice")
+    ]
+    if not flip_accounts:
+        return
+
+    combos = {}
+    for account in flip_accounts:
+        combos.setdefault(account["deriv_pair_choice"], []).append(account)
+
+    bot = context.bot
+
+    for index_key, subscribers in combos.items():
+        config = SYNTHETIC_CONFIG.get(index_key)
+        if not config or index_key in AUTO_COPY_EXCLUDED_INDICES:
+            continue
+        try:
+            symbol = config["symbol"]
+            candles = await get_cached_synthetic_candles(index_key, symbol, "15m", 900, 210)
+            if not candles or len(candles) < 5:
+                continue
+            vote = account_flip_signal(index_key, config, candles)
+            if not vote:
+                continue
+            direction = vote["direction"]
+            contract_type = "MULTUP" if direction == "BUY" else "MULTDOWN"
+
+            for account in subscribers:
+                user_id = account.get("user_id")
+                token = account.get("api_token")
+                if not user_id or not token:
+                    continue
+                if get_open_deriv_flip_stack(user_id):
+                    continue
+                if has_open_auto_copy_trade(user_id, symbol):
+                    continue
+
+                base_stake = float(account.get("deriv_flip_base_stake") or DEFAULT_SYNTHETIC_STAKE)
+                buy_data, error = await deriv_execute_multiplier_trade(
+                    token, symbol, contract_type, config["default_multiplier"],
+                    base_stake, DEFAULT_RISK, None
+                )
+                if error:
+                    log_auto_copy_failure(user_id, symbol, friendly_trade_error(error, auto_copy_context=True))
+                    continue
+
+                contract_id = buy_data.get("contract_id", "—")
+                create_deriv_flip_stack(user_id, index_key, symbol, direction, contract_type, contract_id)
+                try:
+                    await bot.send_message(
+                        chat_id=int(user_id),
+                        text=(
+                            f"🚀 <b>Account Flip — {direction} {config['display']}</b>\n\n"
+                            f"Pattern: {vote['strategy']}\n"
+                            f"Stake: ${base_stake} (layer 1) | Risk: ${DEFAULT_RISK}\n\n"
+                            f"No take-profit set - this position rides on a trailing "
+                            f"profit stop across the whole stack as layers get added."
+                        ),
+                        parse_mode=ParseMode.HTML
+                    )
+                except Exception as e:
+                    print(f"[DERIV FLIP] Couldn't notify {user_id}: {e}")
+        except Exception as e:
+            print(f"[DERIV FLIP] ❌ Entry scan error for {index_key}: {e}")
+
+
+async def manage_deriv_flip_stacks(context: ContextTypes.DEFAULT_TYPE):
+    """
+    Deriv's mirror of manage_account_flip_stacks - same shape, but
+    working in DOLLAR PROFIT rather than pips, since that's the unit
+    Deriv's own contract data already reports in (no clean "pip"
+    concept for a synthetic index). Adds a layer once the stack's
+    total live profit has grown by flip_trigger_amount since the last
+    layer, tracks peak_profit for the trailing stop, and sells every
+    contract in the stack together once profit pulls back
+    flip_trail_amount from that peak - same "only after real profit
+    has been shown once" gate as the MT5 version.
+    """
+    stacks = get_all_open_deriv_flip_stacks()
+    if not stacks:
+        return
+
+    bot = context.bot
+
+    for stack in stacks:
+        try:
+            stack_id = stack["id"]
+            user_id = stack["user_id"]
+            index_key = stack["index_key"]
+            symbol = stack["symbol"]
+            direction = stack["direction"]
+            contract_type = stack["contract_type"]
+            contract_ids = stack.get("contract_ids") or []
+            config = SYNTHETIC_CONFIG.get(index_key)
+            if not config or not contract_ids:
+                continue
+
+            account = get_deriv_account(user_id)
+            if not account or account.get("deriv_bot_choice") != "account_flip":
+                continue  # user switched modes mid-stack - stop managing it further
+            token = account.get("api_token")
+            if not token:
+                continue
+
+            total_profit = 0.0
+            any_still_open = False
+            for cid in contract_ids:
+                profit, is_sold = await get_deriv_contract_live_profit(token, cid)
+                if profit is None:
+                    continue
+                total_profit += profit
+                if not is_sold:
+                    any_still_open = True
+
+            if not any_still_open:
+                # Every layer closed already (one hit its own stop
+                # loss, or was closed manually) - reconcile and stop.
+                update_deriv_flip_stack(stack_id, {
+                    "status": "CLOSED", "total_profit": total_profit,
+                    "closed_at": datetime.utcnow().isoformat(),
+                })
+                try:
+                    await bot.send_message(
+                        chat_id=int(user_id),
+                        text=(
+                            f"🚀 <b>Account Flip stack closed</b> — {config['display']}\n\n"
+                            f"No contracts left open (stop loss hit, or closed manually). "
+                            f"Total P&L: {total_profit:.2f}\n\n"
+                            f"A new stack can start on the next fresh signal."
+                        ),
+                        parse_mode=ParseMode.HTML
+                    )
+                except Exception as e:
+                    print(f"[DERIV FLIP] Couldn't notify {user_id} of stack close: {e}")
+                continue
+
+            trigger_amount = float(account.get("deriv_flip_trigger_amount") or 2)
+            trail_amount = float(account.get("deriv_flip_trail_amount") or 2)
+            max_layers = int(account.get("deriv_flip_max_layers") or 10)
+            step = float(account.get("deriv_flip_step") or 1)
+            max_stake = float(account.get("deriv_flip_max_stake") or account.get("deriv_flip_base_stake") or 10)
+
+            layer_count = stack["layer_count"]
+            last_layer_profit = float(stack["last_layer_profit"])
+            peak_profit = max(float(stack["peak_profit"]), total_profit)
+            trigger_reached = stack.get("trigger_reached", False)
+
+            since_last_layer = total_profit - last_layer_profit
+            updates = {"peak_profit": peak_profit}
+
+            if peak_profit >= trigger_amount:
+                trigger_reached = True
+                updates["trigger_reached"] = True
+
+            if since_last_layer >= trigger_amount and layer_count < max_layers:
+                new_stake = round(
+                    min(float(account.get("deriv_flip_base_stake") or 10) + step * layer_count, max_stake), 2
+                )
+                buy_data, error = await deriv_execute_multiplier_trade(
+                    token, symbol, contract_type, config["default_multiplier"], new_stake, None, None
+                )
+                if buy_data and not error:
+                    new_contract_id = buy_data.get("contract_id")
+                    contract_ids = contract_ids + [new_contract_id]
+                    layer_count += 1
+                    updates["contract_ids"] = contract_ids
+                    updates["layer_count"] = layer_count
+                    updates["last_layer_profit"] = total_profit
+                    try:
+                        await bot.send_message(
+                            chat_id=int(user_id),
+                            text=(
+                                f"🚀 <b>Account Flip — layer {layer_count} added</b> "
+                                f"({config['display']})\n\n"
+                                f"Added ${new_stake} stake - stack up {since_last_layer:.2f} "
+                                f"in profit since the last layer."
+                            ),
+                            parse_mode=ParseMode.HTML
+                        )
+                    except Exception as e:
+                        print(f"[DERIV FLIP] Couldn't notify {user_id} of new layer: {e}")
+
+            if trigger_reached and (peak_profit - total_profit) >= trail_amount:
+                for cid in contract_ids:
+                    await deriv_sell_contract(token, cid)
+                update_deriv_flip_stack(stack_id, {
+                    "status": "CLOSED", "total_profit": total_profit,
+                    "closed_at": datetime.utcnow().isoformat(),
+                })
+                try:
+                    await bot.send_message(
+                        chat_id=int(user_id),
+                        text=(
+                            f"🚀 <b>Account Flip — trailing stop closed the stack</b> "
+                            f"({config['display']})\n\n"
+                            f"{layer_count} layer(s) closed together.\n"
+                            f"Total P&L: {total_profit:.2f}\n\n"
+                            f"A new stack can start on the next fresh signal."
+                        ),
+                        parse_mode=ParseMode.HTML
+                    )
+                except Exception as e:
+                    print(f"[DERIV FLIP] Couldn't notify {user_id} of stack close: {e}")
+                continue
+
+            update_deriv_flip_stack(stack_id, updates)
+        except Exception as e:
+            print(f"[DERIV FLIP] ❌ Stack manager error for stack {stack.get('id')}: {e}")
+
 
 # ============================================
 # TICK BURST AUTO-COPY SCAN (NEW)
@@ -7143,6 +7648,29 @@ def detect_inside_bar_breakout(candles):
     if breakout["close"] < inside["low"]:
         return "SELL"
     return None
+
+
+def get_deriv_flip_defaults(base_stake):
+    """
+    Deriv's mirror of get_account_flip_defaults - same "only the
+    starting size is a real choice" philosophy, but in dollar profit
+    terms instead of pips (no pair-specific volatility split like
+    XAUUSD/BTCUSD vs others, since every Volatility index here is
+    already deliberately similar in character - all synthetic, all
+    RNG-generated - so one flat rule fits everywhere: trigger/trail
+    set to 20% of the starting stake, with a $1 floor so a very small
+    stake doesn't produce a trigger of a few cents).
+    """
+    max_layers = 10
+    step = round(max(base_stake * 0.2, 1), 2)
+    trigger_amount = round(max(base_stake * 0.2, 1), 2)
+    return {
+        "flip_step": step,
+        "flip_max_layers": max_layers,
+        "flip_max_stake": round(base_stake * max_layers, 2),
+        "flip_trigger_amount": trigger_amount,
+        "flip_trail_amount": trigger_amount,
+    }
 
 
 def get_account_flip_defaults(pair_key, base_lot):
@@ -12357,6 +12885,7 @@ async def send_exness_autotrade_intro(bot, chat_id):
     schedule_auto_delete(sent_info.chat_id, sent_info.message_id)
 
 
+
 async def handle_buttons(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     user_id = str(update.message.from_user.id)
@@ -12387,12 +12916,33 @@ async def handle_buttons(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     if auto_on else
                     InlineKeyboardButton("🤖 Turn Auto-Copy ON", callback_data="autocopy_setup_start")
                 )
+
+                autotrade_on = bool(existing.get("deriv_autotrade_enabled"))
+                autotrade_bot_choice = existing.get("deriv_bot_choice")
+                if autotrade_on and autotrade_bot_choice in DERIV_AUTOTRADE_BOTS:
+                    autotrade_mode_label = DERIV_AUTOTRADE_BOTS[autotrade_bot_choice]["label"]
+                elif autotrade_on and autotrade_bot_choice == "account_flip":
+                    autotrade_mode_label = "🚀 Account Flip"
+                else:
+                    autotrade_mode_label = None
+                autotrade_status_line = (
+                    f"🎲 <b>Auto-Trade:</b> ON ({autotrade_mode_label})"
+                    if autotrade_on and autotrade_mode_label else
+                    "🎲 <b>Auto-Trade:</b> OFF"
+                )
+                autotrade_button = (
+                    InlineKeyboardButton("⚙️ Manage Auto-Trade", callback_data="derivauto_menu")
+                    if autotrade_on else
+                    InlineKeyboardButton("🎲 Turn On Auto-Trade", callback_data="derivauto_menu")
+                )
+
                 await update.message.reply_text(
                     f"🔗 <b>Linked Deriv Options Account</b>\n\n"
                     f"<b>Account:</b> {snapshot['loginid']}\n"
                     f"<b>Balance:</b> {snapshot['balance']} {snapshot['currency']}\n"
                     f"<b>Open Positions:</b> {open_count}\n"
-                    f"{status_line}\n\n"
+                    f"{status_line}\n"
+                    f"{autotrade_status_line}\n\n"
                     f"ℹ️ <i>This shows your Options account only. Your MT5 "
                     f"and cTrader balances aren't connected yet.</i>",
                     parse_mode=ParseMode.HTML,
@@ -12400,7 +12950,7 @@ async def handle_buttons(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 )
                 await update.message.reply_text(
                     "Want to change your trading mode?",
-                    reply_markup=InlineKeyboardMarkup([[toggle_button]])
+                    reply_markup=InlineKeyboardMarkup([[toggle_button], [autotrade_button]])
                 )
             else:
                 reconnect_markup, oauth_state = await build_deriv_login_button(user_id)
@@ -12653,6 +13203,7 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             reply_markup=InlineKeyboardMarkup([
                 [InlineKeyboardButton("📏 Fixed lot size", callback_data="mt5auto_mode_lot")],
                 [InlineKeyboardButton("📊 Risk %", callback_data="mt5auto_mode_risk")],
+                [InlineKeyboardButton("⬅️ Back", callback_data="mt5auto_start")],
             ])
         )
         return
@@ -12694,6 +13245,7 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             [InlineKeyboardButton(PAIR_CONFIG[p]["display"], callback_data=f"mt5auto_flippair_{p}")]
             for p in MT5_AUTOTRADE_PAIRS
         ]
+        buttons.append([InlineKeyboardButton("⬅️ Back", callback_data="mt5auto_account_flip")])
         await query.message.edit_text(
             "🚀 <b>Account Flip</b> — choose the one pair it should trade:",
             parse_mode=ParseMode.HTML,
@@ -12724,6 +13276,7 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             [InlineKeyboardButton(bot["label"], callback_data=f"mt5auto_bot_{key}")]
             for key, bot in MT5_AUTOTRADE_BOTS.items()
         ]
+        buttons.append([InlineKeyboardButton("⬅️ Back", callback_data="mt5auto_start")])
         await query.message.edit_text(
             "🎯 <b>Choose a bot:</b>\n\n" + "\n".join(
                 f"{bot['label']} — {bot['description']}" for bot in MT5_AUTOTRADE_BOTS.values()
@@ -12746,6 +13299,7 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             [InlineKeyboardButton(PAIR_CONFIG[p]["display"], callback_data=f"mt5auto_pair_{p}")]
             for p in MT5_AUTOTRADE_PAIRS
         ]
+        buttons.append([InlineKeyboardButton("⬅️ Back", callback_data="mt5auto_choose_bot")])
         await query.message.edit_text(
             f"✅ {MT5_AUTOTRADE_BOTS[bot_key]['label']} selected.\n\n"
             f"📌 <b>Now choose which pair to trade it on:</b>",
@@ -12762,6 +13316,8 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if user_id not in mt5_signup_state:
             mt5_signup_state[user_id] = {"flow": "presetup"}
         mt5_signup_state[user_id]["pair_choice"] = pair_key
+        bot_choice = mt5_signup_state[user_id].get("bot_choice", "follow_channel")
+        back_target = "mt5auto_start" if bot_choice == "follow_channel" else f"mt5auto_bot_{bot_choice}"
         await query.message.edit_text(
             f"✅ {PAIR_CONFIG[pair_key]['display']} selected.\n\n"
             f"📏 <b>Choose how trades should be sized:</b>",
@@ -12769,6 +13325,7 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             reply_markup=InlineKeyboardMarkup([
                 [InlineKeyboardButton("📏 Fixed lot size", callback_data="mt5auto_mode_lot")],
                 [InlineKeyboardButton("📊 Risk %", callback_data="mt5auto_mode_risk")],
+                [InlineKeyboardButton("⬅️ Back", callback_data=back_target)],
             ])
         )
         return
@@ -13019,6 +13576,7 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             [InlineKeyboardButton(PAIR_CONFIG[p]["display"], callback_data=f"mt5switch_flippair_{p}")]
             for p in MT5_AUTOTRADE_PAIRS
         ]
+        buttons.append([InlineKeyboardButton("⬅️ Back", callback_data="mt5switch_account_flip")])
         await query.message.edit_text(
             "🚀 <b>Account Flip</b> — choose the one pair it should trade:",
             parse_mode=ParseMode.HTML,
@@ -13057,6 +13615,7 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             [InlineKeyboardButton(bot["label"], callback_data=f"mt5switch_bot_{key}")]
             for key, bot in MT5_AUTOTRADE_BOTS.items()
         ]
+        buttons.append([InlineKeyboardButton("⬅️ Back", callback_data="mt5switch_menu")])
         await query.message.edit_text(
             "🎯 <b>Choose a bot:</b>\n\n" + "\n".join(
                 f"{bot['label']} — {bot['description']}" for bot in MT5_AUTOTRADE_BOTS.values()
@@ -13075,6 +13634,7 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             [InlineKeyboardButton(PAIR_CONFIG[p]["display"], callback_data=f"mt5switch_pair_{bot_key}_{p}")]
             for p in MT5_AUTOTRADE_PAIRS
         ]
+        buttons.append([InlineKeyboardButton("⬅️ Back", callback_data="mt5switch_choose_bot")])
         await query.message.edit_text(
             f"✅ {MT5_AUTOTRADE_BOTS[bot_key]['label']} selected.\n\n"
             f"📌 <b>Now choose which pair to trade it on:</b>",
@@ -13107,6 +13667,153 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         user_modes[user_id] = "mt5_awaiting_lot_value"
         await query.message.edit_text(
             "📏 Send your desired <b>lot size</b> (e.g. 0.01):",
+            parse_mode=ParseMode.HTML
+        )
+        return
+
+    if data == "derivauto_menu":
+        user_id = str(query.from_user.id)
+        account = get_deriv_account(user_id)
+        autotrade_on = bool(account.get("deriv_autotrade_enabled")) if account else False
+
+        buttons = [
+            [InlineKeyboardButton("🎯 Pick a Bot", callback_data="derivauto_choose_bot")],
+            [InlineKeyboardButton("🚀 Account Flip", callback_data="derivauto_account_flip")],
+        ]
+        if autotrade_on:
+            buttons.append([InlineKeyboardButton("🛑 Turn Auto-Trade OFF", callback_data="derivauto_turnoff")])
+
+        await query.message.edit_text(
+            "🎲 <b>How should Deriv Auto-Trade decide your trades?</b>\n\n"
+            "🎯 <b>Pick a Bot</b> — choose Aggressive or Conservative "
+            "and one Volatility index for it to trade.\n\n"
+            "🚀 <b>Account Flip</b> — its own standalone price-action "
+            "strategy that layers in bigger stakes while winning, with "
+            "a trailing stop across the whole stack. Higher risk.",
+            parse_mode=ParseMode.HTML,
+            reply_markup=InlineKeyboardMarkup(buttons)
+        )
+        return
+
+    if data == "derivauto_turnoff":
+        user_id = str(query.from_user.id)
+        update_deriv_account_fields(user_id, {"deriv_autotrade_enabled": False})
+        await query.message.edit_text(
+            "🛑 <b>Auto-Trade turned off.</b>\n\n"
+            "Your bot/mode settings are kept, so turning it back on "
+            "later won't need reconfiguring. Check status anytime from "
+            "🔗 Connect Deriv.",
+            parse_mode=ParseMode.HTML
+        )
+        return
+
+    if data == "derivauto_choose_bot":
+        user_id = str(query.from_user.id)
+        buttons = [
+            [InlineKeyboardButton(bot["label"], callback_data=f"derivauto_bot_{key}")]
+            for key, bot in DERIV_AUTOTRADE_BOTS.items()
+        ]
+        buttons.append([InlineKeyboardButton("⬅️ Back", callback_data="derivauto_menu")])
+        await query.message.edit_text(
+            "🎯 <b>Choose a bot:</b>\n\n" + "\n".join(
+                f"{bot['label']} — {bot['description']}" for bot in DERIV_AUTOTRADE_BOTS.values()
+            ),
+            parse_mode=ParseMode.HTML,
+            reply_markup=InlineKeyboardMarkup(buttons)
+        )
+        return
+
+    if data.startswith("derivauto_bot_"):
+        user_id = str(query.from_user.id)
+        bot_key = data.replace("derivauto_bot_", "")
+        if bot_key not in DERIV_AUTOTRADE_BOTS:
+            return
+        buttons = [
+            [InlineKeyboardButton(SYNTHETIC_CONFIG[p]["display"], callback_data=f"derivauto_pair_{bot_key}_{p}")]
+            for p in DERIV_AUTOTRADE_PAIRS
+        ]
+        buttons.append([InlineKeyboardButton("⬅️ Back", callback_data="derivauto_choose_bot")])
+        await query.message.edit_text(
+            f"✅ {DERIV_AUTOTRADE_BOTS[bot_key]['label']} selected.\n\n"
+            f"📌 <b>Now choose which index to trade it on:</b>",
+            parse_mode=ParseMode.HTML,
+            reply_markup=InlineKeyboardMarkup(buttons)
+        )
+        return
+
+    if data.startswith("derivauto_pair_"):
+        user_id = str(query.from_user.id)
+        remainder = data.replace("derivauto_pair_", "")
+        bot_key = next((k for k in DERIV_AUTOTRADE_BOTS if remainder.startswith(k + "_")), None)
+        pair_key = remainder[len(bot_key) + 1:] if bot_key else None
+        if not bot_key or pair_key not in DERIV_AUTOTRADE_PAIRS:
+            return
+        update_deriv_account_fields(user_id, {
+            "deriv_bot_choice": bot_key,
+            "deriv_pair_choice": pair_key,
+            "deriv_autotrade_enabled": True,
+        })
+        await query.message.edit_text(
+            f"✅ <b>Auto-Trade connected successfully.</b>\n\n"
+            f"Mode: {DERIV_AUTOTRADE_BOTS[bot_key]['label']}\n"
+            f"Index: {SYNTHETIC_CONFIG[pair_key]['display']}\n"
+            f"Stake defaults to ${DEFAULT_SYNTHETIC_STAKE}/trade unless you've already "
+            f"set a stake via 🔗 Connect Deriv's Auto-Copy setup.\n\n"
+            f"Check status or switch modes anytime from 🔗 Connect Deriv.",
+            parse_mode=ParseMode.HTML
+        )
+        return
+
+    if data == "derivauto_account_flip":
+        user_id = str(query.from_user.id)
+        await query.message.edit_text(
+            "⚠️ <b>Account Flip — Read Before Enabling</b>\n\n"
+            "This mode compounds stake size while a trade is winning, "
+            "adding bigger positions as it moves further your way. It "
+            "is built to grow fast, not to protect capital the way "
+            "Pick a Bot does. A sudden reversal after several layers "
+            "have stacked can hand back a large chunk of the run's "
+            "gains at once. Every layer beyond the first only exists "
+            "because the trade is already in profit — nothing is "
+            "added while losing — but this is still meaningfully "
+            "higher-risk and is not suitable for money you aren't "
+            "prepared to see swing hard in both directions.\n\n"
+            "It also runs its own standalone strategy — pure price "
+            "action (Engulfing / Pin Bar / Inside Bar Breakout).",
+            parse_mode=ParseMode.HTML,
+            reply_markup=InlineKeyboardMarkup([
+                [InlineKeyboardButton("✅ I Understand, Continue", callback_data="derivauto_flip_accept")],
+                [InlineKeyboardButton("⬅️ Back", callback_data="derivauto_menu")],
+            ])
+        )
+        return
+
+    if data == "derivauto_flip_accept":
+        user_id = str(query.from_user.id)
+        deriv_flip_signup_state[user_id] = {}
+        buttons = [
+            [InlineKeyboardButton(SYNTHETIC_CONFIG[p]["display"], callback_data=f"derivauto_flippair_{p}")]
+            for p in DERIV_AUTOTRADE_PAIRS
+        ]
+        buttons.append([InlineKeyboardButton("⬅️ Back", callback_data="derivauto_account_flip")])
+        await query.message.edit_text(
+            "🚀 <b>Account Flip</b> — choose the one index it should trade:",
+            parse_mode=ParseMode.HTML,
+            reply_markup=InlineKeyboardMarkup(buttons)
+        )
+        return
+
+    if data.startswith("derivauto_flippair_"):
+        user_id = str(query.from_user.id)
+        pair_key = data.replace("derivauto_flippair_", "")
+        if pair_key not in DERIV_AUTOTRADE_PAIRS:
+            return
+        deriv_flip_signup_state.setdefault(user_id, {})["pair_choice"] = pair_key
+        user_modes[user_id] = "deriv_awaiting_flip_base"
+        await query.message.edit_text(
+            f"✅ {SYNTHETIC_CONFIG[pair_key]['display']} selected.\n\n"
+            f"🚀 <b>Account Flip — last step</b>\n\n"
+            f"Send your <b>starting stake</b> in $ (e.g. 10):",
             parse_mode=ParseMode.HTML
         )
         return
@@ -14676,6 +15383,49 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
             ])
         )
         schedule_auto_delete(sent_ready.chat_id, sent_ready.message_id)
+        return
+
+    if mode == "deriv_awaiting_flip_base":
+        signup = deriv_flip_signup_state.setdefault(user_id, {})
+        try:
+            flip_base = float(message.strip())
+            if flip_base <= 0:
+                raise ValueError
+        except ValueError:
+            sent_bad = await update.message.reply_text("⚠️ Please send a positive number, e.g. 10")
+            schedule_auto_delete(sent_bad.chat_id, sent_bad.message_id)
+            return
+
+        user_modes[user_id] = None
+        pair_key = signup.get("pair_choice")
+        defaults = get_deriv_flip_defaults(flip_base)
+
+        update_deriv_account_fields(user_id, {
+            "deriv_bot_choice": "account_flip",
+            "deriv_pair_choice": pair_key,
+            "deriv_autotrade_enabled": True,
+            "deriv_flip_base_stake": flip_base,
+            "deriv_flip_step": defaults["flip_step"],
+            "deriv_flip_max_stake": defaults["flip_max_stake"],
+            "deriv_flip_trigger_amount": defaults["flip_trigger_amount"],
+            "deriv_flip_max_layers": defaults["flip_max_layers"],
+            "deriv_flip_trail_amount": defaults["flip_trail_amount"],
+            "deriv_flip_disclaimer_accepted": True,
+        })
+
+        summary = (
+            f"Index: {SYNTHETIC_CONFIG.get(pair_key, {}).get('display', '—')}\n"
+            f"Start: ${flip_base} | +${defaults['flip_step']}/layer "
+            f"(caps at ${defaults['flip_max_stake']} after {defaults['flip_max_layers']} layers)\n"
+            f"New layer every ${defaults['flip_trigger_amount']} profit\n"
+            f"Trailing stop: ${defaults['flip_trail_amount']} across the whole stack"
+        )
+        sent_done = await update.message.reply_text(
+            f"✅ <b>Auto-Trade connected successfully.</b>\n\n🚀 Account Flip\n{summary}\n\n"
+            f"Check status or switch modes anytime from 🔗 Connect Deriv.",
+            parse_mode=ParseMode.HTML, reply_markup=main_keyboard
+        )
+        schedule_auto_delete(sent_done.chat_id, sent_done.message_id)
         return
 
     if mode == "mt5_awaiting_risk_value":
@@ -16516,6 +17266,34 @@ def main():
         interval=60,
         first=50,
         name="account_flip_stack_manager"
+    )
+
+    # Deriv Aggressive/Conservative bot scan - mirrors the MT5 bot
+    # scan, on synthetic indices via run_strategy_bank_synthetic.
+    job_queue.run_repeating(
+        run_deriv_autotrade_bot_scan,
+        interval=300,
+        first=110,
+        name="deriv_autotrade_bot_scan"
+    )
+
+    # Deriv Account Flip entry scan - same M15 price-action signal as
+    # the Exness side, executed as a Deriv multiplier contract instead
+    # of an MT5 trade.
+    job_queue.run_repeating(
+        run_deriv_flip_entry_scan,
+        interval=300,
+        first=120,
+        name="deriv_flip_entry_scan"
+    )
+
+    # Deriv Account Flip stack manager - dollar-profit-based layering/
+    # trailing-stop, checked every 60 seconds same as the MT5 version.
+    job_queue.run_repeating(
+        manage_deriv_flip_stacks,
+        interval=60,
+        first=55,
+        name="deriv_flip_stack_manager"
     )
 
     # Auto-delete sweep - performs the actual deletion for anything

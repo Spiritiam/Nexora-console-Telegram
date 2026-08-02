@@ -12908,21 +12908,26 @@ async def handle_buttons(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
                 autotrade_on = bool(existing.get("deriv_autotrade_enabled"))
                 autotrade_bot_choice = existing.get("deriv_bot_choice")
+                already_configured = autotrade_bot_choice in DERIV_AUTOTRADE_BOTS or autotrade_bot_choice == "account_flip"
                 if autotrade_on and autotrade_bot_choice in DERIV_AUTOTRADE_BOTS:
-                    autotrade_mode_label = DERIV_AUTOTRADE_BOTS[autotrade_bot_choice]["label"]
+                    autotrade_mode_label = f"{DERIV_AUTOTRADE_BOTS[autotrade_bot_choice]['label']} Bot"
                 elif autotrade_on and autotrade_bot_choice == "account_flip":
                     autotrade_mode_label = "🚀 Account Flip"
                 else:
                     autotrade_mode_label = None
                 autotrade_status_line = (
-                    f"🎯 <b>Strategy Bot / Account Flip:</b> ON ({autotrade_mode_label})"
+                    f"🎯 <b>Auto-Trade:</b> ON ({autotrade_mode_label})"
                     if autotrade_on and autotrade_mode_label else
-                    "🎯 <b>Strategy Bot / Account Flip:</b> OFF"
+                    "🎯 <b>Auto-Trade:</b> OFF"
                 )
-                autotrade_button = (
-                    InlineKeyboardButton("🎯 Strategy Bot / Account Flip: Manage", callback_data="derivauto_menu")
+                manage_button = InlineKeyboardButton("⚙️ Manage Bot", callback_data="derivauto_menu")
+                toggle_button = (
+                    InlineKeyboardButton("🔴 Turn Bot OFF", callback_data="derivauto_turnoff")
                     if autotrade_on else
-                    InlineKeyboardButton("🎯 Strategy Bot / Account Flip: Turn ON", callback_data="derivauto_menu")
+                    InlineKeyboardButton(
+                        "🟢 Turn Bot ON",
+                        callback_data="derivauto_turnon" if already_configured else "derivauto_menu"
+                    )
                 )
 
                 await update.message.reply_text(
@@ -12938,7 +12943,7 @@ async def handle_buttons(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 )
                 await update.message.reply_text(
                     "Want to change or set up trading?",
-                    reply_markup=InlineKeyboardMarkup([[autotrade_button]])
+                    reply_markup=InlineKeyboardMarkup([[manage_button], [toggle_button]])
                 )
             else:
                 reconnect_markup, oauth_state = await build_deriv_login_button(user_id)
@@ -13669,7 +13674,7 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             [InlineKeyboardButton("🚀 Account Flip", callback_data="derivauto_account_flip")],
         ]
         if autotrade_on:
-            buttons.append([InlineKeyboardButton("🛑 Turn Auto-Trade OFF", callback_data="derivauto_turnoff")])
+            buttons.append([InlineKeyboardButton("🔴 Turn Bot OFF", callback_data="derivauto_turnoff")])
 
         await query.message.edit_text(
             "🎲 <b>How should Deriv Auto-Trade decide your trades?</b>\n\n"
@@ -13691,6 +13696,33 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             "Your bot/mode settings are kept, so turning it back on "
             "later won't need reconfiguring. Check status anytime from "
             "🔗 Connect Deriv.",
+            parse_mode=ParseMode.HTML
+        )
+        return
+
+    if data == "derivauto_turnon":
+        user_id = str(query.from_user.id)
+        account = get_deriv_account(user_id)
+        bot_choice = account.get("deriv_bot_choice") if account else None
+        if bot_choice not in DERIV_AUTOTRADE_BOTS and bot_choice != "account_flip":
+            # Never configured before - can't just flip it on, needs a mode picked first.
+            await query.message.edit_text(
+                "🎯 <b>Pick a mode first:</b>",
+                parse_mode=ParseMode.HTML,
+                reply_markup=InlineKeyboardMarkup([
+                    [InlineKeyboardButton("🎯 Pick a Bot", callback_data="derivauto_choose_bot")],
+                    [InlineKeyboardButton("🚀 Account Flip", callback_data="derivauto_account_flip")],
+                ])
+            )
+            return
+        update_deriv_account_fields(user_id, {"deriv_autotrade_enabled": True})
+        mode_label = (
+            f"{DERIV_AUTOTRADE_BOTS[bot_choice]['label']} Bot" if bot_choice in DERIV_AUTOTRADE_BOTS
+            else "🚀 Account Flip"
+        )
+        await query.message.edit_text(
+            f"✅ <b>Auto-Trade turned back on.</b>\n\n"
+            f"Resumed with your saved settings: {mode_label}.",
             parse_mode=ParseMode.HTML
         )
         return

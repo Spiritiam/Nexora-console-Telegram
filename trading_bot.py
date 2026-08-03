@@ -9951,6 +9951,37 @@ def is_company_specific_news(article):
     return any(indicator in text for indicator in COMPANY_SPECIFIC_INDICATORS)
 
 async def generate_fundamental_context(pair_name, direction):
+    # Check what today's own news briefing already told subscribers
+    # about this SAME pair, BEFORE falling back to a fresh, possibly
+    # unrelated article - this is the actual fix for signals silently
+    # contradicting a briefing already posted hours earlier the same
+    # day. If today's briefing gave this pair an explicit direction:
+    #   - it agrees with this signal -> reuse THAT exact reasoning
+    #     (perfect consistency, not a freshly-generated second angle)
+    #   - it disagrees -> show no fundamental at all, full stop. Per
+    #     explicit instruction: a signal should never be paired with
+    #     fundamental reasoning that fights its own direction, and it
+    #     also should never contradict what the channel ALREADY told
+    #     the same subscribers that same day. Does not fall through
+    #     to the general logic below in this case - the briefing is
+    #     the more specific, already-public source of truth for this
+    #     pair today, so a second, different-sounding narrative from
+    #     a fresh Gemini call would just create a second contradiction
+    #     instead of fixing the first one.
+    todays_bias = get_todays_news_bias(pair_name)
+    if todays_bias:
+        bias_direction = todays_bias.get("direction")
+        if bias_direction == direction:
+            headline_snippet = todays_bias.get("headline_text", "").strip()
+            if not headline_snippet:
+                headline_snippet = "see this morning's market update."
+            return (
+                f"Today's briefing already flagged this: {headline_snippet} "
+                f"This lines up with today's news direction."
+            )
+        else:
+            return None
+
     article = get_cached_news_context()
     if not is_article_relevant_to_pair(article, pair_name) or is_company_specific_news(article):
         article = None
@@ -11911,6 +11942,121 @@ def get_relevant_calendar_events(pair_name, limit=2):
 # 2 bullet points instead of 3
 # ============================================
 
+def extract_and_strip_pairs_trailer(summary_text):
+    """
+    Pulls the internal "PAIRS: XAUUSD=SELL, USDJPY=SELL" trailer line
+    off the end of a generated news summary, returning (display_text,
+    pairs_dict) - display_text has the trailer removed entirely (it
+    was never meant for subscribers), pairs_dict maps pair_name ->
+    (direction, matching_bullet_text). matching_bullet_text is
+    whichever of the (up to 2) bullet lines actually mentions that
+    pair, so a later signal quotes ONLY the relevant line instead of
+    the whole briefing - falls back to the full display text if no
+    single bullet can be matched. Tolerant of the AI omitting the
+    PAIRS line, wording it slightly differently, or returning
+    PAIRS: NONE - all resolve to an empty dict rather than raising.
+    """
+    if not summary_text:
+        return summary_text, {}
+
+    lines = summary_text.strip().split("\n")
+    raw_pairs = {}
+    kept_lines = []
+    known_pairs = {
+        "XAUUSD", "BTCUSD", "GBPUSD", "GBPJPY", "EURUSD",
+        "USDJPY", "AUDUSD", "USDCAD", "USDCHF", "NZDUSD",
+    }
+    for line in lines:
+        stripped = line.strip()
+        if stripped.upper().startswith("PAIRS:"):
+            body = stripped.split(":", 1)[1].strip()
+            if body.upper() != "NONE":
+                for entry in body.split(","):
+                    entry = entry.strip()
+                    if "=" not in entry:
+                        continue
+                    pair, direction = entry.split("=", 1)
+                    pair = pair.strip().upper()
+                    direction = direction.strip().upper()
+                    if pair in known_pairs and direction in ("BUY", "SELL"):
+                        raw_pairs[pair] = direction
+            continue  # never keep the trailer line in the displayed text
+        kept_lines.append(line)
+
+    display_text = "\n".join(kept_lines).strip()
+    bullets = [b.strip() for b in display_text.split("🔹") if b.strip()]
+
+    # Loose keyword match per pair - good enough to pick the right
+    # one of only 2 bullets; falls back to the whole text if neither
+    # bullet contains a recognizable mention of that pair.
+    keyword_map = {
+        "XAUUSD": ["gold", "xau"],
+        "BTCUSD": ["btc", "bitcoin"],
+        "GBPUSD": ["gbp/usd", "gbpusd", "pound"],
+        "GBPJPY": ["gbp/jpy", "gbpjpy"],
+        "EURUSD": ["eur/usd", "eurusd", "euro"],
+        "USDJPY": ["usd/jpy", "usdjpy", "yen"],
+        "AUDUSD": ["aud/usd", "audusd", "aussie"],
+        "USDCAD": ["usd/cad", "usdcad", "loonie"],
+        "USDCHF": ["usd/chf", "usdchf", "franc"],
+        "NZDUSD": ["nzd/usd", "nzdusd", "kiwi"],
+    }
+    pairs = {}
+    for pair, direction in raw_pairs.items():
+        matching_bullet = next(
+            (b for b in bullets if any(kw in b.lower() for kw in keyword_map.get(pair, []))),
+            display_text  # fall back to the whole thing if no single bullet matches
+        )
+        pairs[pair] = (direction, matching_bullet)
+
+    return display_text, pairs
+
+
+def save_daily_news_bias(pair_name, direction, headline_text, session_type):
+    """
+    Upserts today's briefing-derived bias for one pair - UNIQUE on
+    (bias_date, pair_name), so a later same-day briefing mentioning
+    the same pair again simply overwrites with the newer read rather
+    than erroring, keeping only the most recent same-day take.
+    """
+    try:
+        today_str = datetime.utcnow().strftime("%Y-%m-%d")
+        url = f"{SUPABASE_URL}/rest/v1/daily_news_bias?on_conflict=bias_date,pair_name"
+        headers = sb_headers()
+        headers["Prefer"] = "resolution=merge-duplicates"
+        payload = {
+            "bias_date": today_str,
+            "pair_name": pair_name,
+            "direction": direction,
+            "headline_text": headline_text,
+            "session_type": session_type,
+        }
+        requests.post(url, headers=headers, json=payload, timeout=10)
+    except Exception as e:
+        print(f"[NEWS BIAS] Error saving bias for {pair_name}: {e}")
+
+
+def get_todays_news_bias(pair_name):
+    """
+    Looks up whether TODAY's news briefing already gave a specific
+    BUY/SELL read on this pair - the same-day source of truth a
+    signal's own fundamental text should never contradict. Returns
+    the row dict, or None if nothing was recorded for this pair today.
+    """
+    try:
+        today_str = datetime.utcnow().strftime("%Y-%m-%d")
+        url = (
+            f"{SUPABASE_URL}/rest/v1/daily_news_bias"
+            f"?bias_date=eq.{today_str}&pair_name=eq.{pair_name}&select=*&limit=1"
+        )
+        response = requests.get(url, headers=sb_headers(), timeout=10)
+        rows = response.json()
+        return rows[0] if rows else None
+    except Exception as e:
+        print(f"[NEWS BIAS] Error fetching bias for {pair_name}: {e}")
+        return None
+
+
 async def generate_news_summary(article, session_type):
 
     title = article.get("title", "")
@@ -11943,6 +12089,8 @@ FORMAT EXACTLY LIKE THIS — NO EXCEPTIONS:
 
 🔹 [One line news item 2] — [Bullish/Bearish] for [instrument], [direct BUY/SELL read]
 
+PAIRS: [comma-separated list, e.g. XAUUSD=SELL, USDJPY=SELL]
+
 STRICT RULES:
 - Maximum 2 bullet points ONLY
 - Each bullet point MAX 25 words INCLUDING the sentiment tag and BUY/SELL read
@@ -11964,6 +12112,16 @@ STRICT RULES:
 - No markdown symbols like ** or ##
 - No hashtags
 - Make each point punchy, direct, and immediately actionable
+- The PAIRS line is INTERNAL ONLY (stripped before posting, never
+  shown to subscribers) - it exists so a later trading signal on the
+  same pair, same day, can check its own direction against what this
+  briefing already told subscribers, instead of contradicting it.
+  Only include a pair here if a bullet gave it a real, specific,
+  actionable BUY or SELL read (not just "the Dollar" alone, and not
+  a Neutral read) - use ONLY these exact tickers, matching a bullet
+  you actually wrote: XAUUSD, BTCUSD, GBPUSD, GBPJPY, EURUSD, USDJPY,
+  AUDUSD, USDCAD, USDCHF, NZDUSD. If neither bullet maps to any of
+  these specific tickers, write exactly: PAIRS: NONE
 """
     return await ask_gemini(prompt)
 
@@ -12094,6 +12252,14 @@ async def post_news(context: ContextTypes.DEFAULT_TYPE):
         print(f"[NEWS] AI judged article ('{article.get('title', '')}') not relevant to major FX/Gold/BTC.")
         await post_calendar_only("article judged not relevant")
         return
+
+    # Pull out the internal PAIRS: trailer (never shown to
+    # subscribers) and save each pair's read for today, so a later
+    # signal on the same pair can check itself against what this
+    # briefing already told the channel instead of contradicting it.
+    summary, briefing_pairs = extract_and_strip_pairs_trailer(summary)
+    for pair_name_key, (briefing_direction, bullet_text) in briefing_pairs.items():
+        save_daily_news_bias(pair_name_key, briefing_direction, bullet_text, session_type)
 
     # Calendar text NO LONGER appended here, per explicit instruction -
     # "it shouldn't post at all, whether successful or not." The

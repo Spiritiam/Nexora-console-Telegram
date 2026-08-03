@@ -3668,6 +3668,13 @@ def get_all_auto_copy_accounts():
     for the signal-posting loop to iterate over. Each row already
     carries its own api_token, so no separate lookup is needed per
     user.
+
+    IMPORTANT: this is the legacy Auto-Copy-specific fetch - it
+    excludes anyone who hasn't opted into that specific old feature.
+    Since Auto-Copy is no longer offered as a UI option, nobody new
+    can ever satisfy this filter. Do NOT use this for the newer bot-
+    scan / Account Flip engines - use get_all_deriv_accounts_with_token
+    instead, which doesn't pre-filter by auto_copy_enabled at all.
     """
     try:
         url = (
@@ -3679,6 +3686,31 @@ def get_all_auto_copy_accounts():
         return data if isinstance(data, list) else []
     except Exception as e:
         print(f"[DERIV] get_all_auto_copy_accounts error: {e}")
+        return []
+
+
+def get_all_deriv_accounts_with_token():
+    """
+    Returns every deriv_accounts row that has a linked api_token,
+    with NO pre-filter on auto_copy_enabled - the account-source for
+    the Aggressive/Conservative bot scan and Account Flip, both of
+    which are gated by their own deriv_autotrade_enabled flag in
+    Python, not by the old Auto-Copy toggle. Fixes a real bug: both
+    engines were previously calling get_all_auto_copy_accounts, whose
+    auto_copy_enabled=eq.true filter silently excluded every Pick-a-
+    Bot/Account-Flip user, since that flag belongs to the now-removed
+    Auto-Copy feature and nobody can ever satisfy it going forward.
+    """
+    try:
+        url = (
+            f"{SUPABASE_URL}/rest/v1/deriv_accounts"
+            f"?api_token=not.is.null&select=*"
+        )
+        response = requests.get(url, headers=sb_headers(), timeout=15)
+        data = response.json()
+        return data if isinstance(data, list) else []
+    except Exception as e:
+        print(f"[DERIV] get_all_deriv_accounts_with_token error: {e}")
         return []
 
 # ============================================
@@ -5575,7 +5607,7 @@ async def run_deriv_autotrade_bot_scan(context: ContextTypes.DEFAULT_TYPE):
     strategy bank only runs once per combo per round, not once per
     subscriber, same efficiency reasoning as the MT5 version.
     """
-    accounts = get_all_auto_copy_accounts()
+    accounts = get_all_deriv_accounts_with_token()
     bot_accounts = [
         a for a in accounts
         if a.get("deriv_autotrade_enabled") and a.get("deriv_bot_choice") in DERIV_AUTOTRADE_BOTS and a.get("deriv_pair_choice")
@@ -5618,11 +5650,17 @@ async def run_deriv_autotrade_bot_scan(context: ContextTypes.DEFAULT_TYPE):
                 if has_open_auto_copy_trade(user_id, symbol):
                     continue
 
-                stake = account.get("deriv_bot_stake")
-                risk = account.get("deriv_bot_risk")
-                win = account.get("deriv_bot_win")
-                if not stake:
+                raw_stake = account.get("deriv_bot_stake")
+                if not raw_stake:
                     continue  # hasn't finished setup (no stake tier chosen yet)
+                # Supabase/PostgREST returns "numeric" columns as JSON
+                # strings, not native numbers - comparing a raw string
+                # against snapshot["balance"] (a real float from
+                # Deriv's own API) below would raise TypeError every
+                # time, silently killing the whole scan for this combo.
+                stake = float(raw_stake)
+                risk = float(account.get("deriv_bot_risk")) if account.get("deriv_bot_risk") else None
+                win = float(account.get("deriv_bot_win")) if account.get("deriv_bot_win") else None
 
                 snapshot = await deriv_fetch_account_snapshot(token)
                 if not snapshot or snapshot.get("balance") is None:
@@ -5664,7 +5702,7 @@ async def run_deriv_flip_entry_scan(context: ContextTypes.DEFAULT_TYPE):
     the first layer with a real stop_loss (via Deriv's own limit_order
     on the buy request) if no stack is already open for that account.
     """
-    accounts = get_all_auto_copy_accounts()
+    accounts = get_all_deriv_accounts_with_token()
     flip_accounts = [
         a for a in accounts
         if a.get("deriv_autotrade_enabled") and a.get("deriv_bot_choice") == "account_flip" and a.get("deriv_pair_choice")

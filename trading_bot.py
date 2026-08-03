@@ -5666,7 +5666,29 @@ async def run_deriv_autotrade_bot_scan(context: ContextTypes.DEFAULT_TYPE):
                 if not snapshot or snapshot.get("balance") is None:
                     continue
                 if snapshot["balance"] < stake:
+                    # This alert existed for the old Auto-Copy paths
+                    # but was never added here when this engine was
+                    # built - real gap, now fixed, using the same
+                    # tell-once-per-episode gate those paths already use.
+                    if should_send_low_balance_notification(account):
+                        try:
+                            await bot.send_message(
+                                chat_id=int(user_id),
+                                text=(
+                                    f"⚠️ <b>Auto-Trade paused — balance too low.</b>\n\n"
+                                    f"Your balance (${snapshot['balance']}) is below your "
+                                    f"${stake} stake for {DERIV_AUTOTRADE_BOTS[bot_choice]['label']} "
+                                    f"on {config['display']}. Top up to resume."
+                                ),
+                                parse_mode=ParseMode.HTML
+                            )
+                            set_low_balance_notified(user_id, True)
+                        except Exception as e:
+                            print(f"[DERIV BOT SCAN] Couldn't send low-balance alert to {user_id}: {e}")
                     continue  # insufficient balance - skip this round rather than trade a smaller size than chosen
+
+                if account.get("low_balance_notified"):
+                    set_low_balance_notified(user_id, False)
 
                 buy_data, error = await deriv_execute_multiplier_trade(
                     token, symbol, contract_type, config["default_multiplier"], stake, risk, win
@@ -5742,6 +5764,30 @@ async def run_deriv_flip_entry_scan(context: ContextTypes.DEFAULT_TYPE):
                     continue
 
                 base_stake = float(account.get("deriv_flip_base_stake") or DEFAULT_SYNTHETIC_STAKE)
+
+                snapshot = await deriv_fetch_account_snapshot(token)
+                if not snapshot or snapshot.get("balance") is None:
+                    continue
+                if snapshot["balance"] < base_stake:
+                    if should_send_low_balance_notification(account):
+                        try:
+                            await bot.send_message(
+                                chat_id=int(user_id),
+                                text=(
+                                    f"⚠️ <b>Account Flip paused — balance too low.</b>\n\n"
+                                    f"Your balance (${snapshot['balance']}) is below your "
+                                    f"${base_stake} starting stake on {config['display']}. "
+                                    f"Top up to resume."
+                                ),
+                                parse_mode=ParseMode.HTML
+                            )
+                            set_low_balance_notified(user_id, True)
+                        except Exception as e:
+                            print(f"[DERIV FLIP] Couldn't send low-balance alert to {user_id}: {e}")
+                    continue
+                if account.get("low_balance_notified"):
+                    set_low_balance_notified(user_id, False)
+
                 buy_data, error = await deriv_execute_multiplier_trade(
                     token, symbol, contract_type, config["default_multiplier"],
                     base_stake, DEFAULT_RISK, None
@@ -16914,7 +16960,13 @@ async def check_open_auto_copy_trades(context: ContextTypes.DEFAULT_TYPE):
     if not open_trades:
         return
 
-    accounts_by_user = {a["user_id"]: a for a in get_all_auto_copy_accounts()}
+    # Fixed: this used to build its account lookup from
+    # get_all_auto_copy_accounts(), which only returns accounts with
+    # the legacy Auto-Copy flag on - any trade placed by the newer
+    # Pick-a-Bot/Account-Flip engines would never find its account
+    # here and could stay stuck OPEN forever, exactly the bug already
+    # found in the two scan jobs themselves.
+    accounts_by_user = {a["user_id"]: a for a in get_all_deriv_accounts_with_token()}
 
     for trade in open_trades:
         user_id = trade.get("user_id")

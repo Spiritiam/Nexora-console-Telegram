@@ -8222,18 +8222,35 @@ def strategy_support_resistance_bounce(pair_key, config, h1_candles, h4_candles,
     if candle_range == 0:
         return None
 
+    # FIX: both checks below used to only have a LOWER bound (>= for
+    # resistance, <= for support), meaning a level price had already
+    # moved well past days ago could still "qualify" as a fresh
+    # rejection, since nothing capped how FAR beyond the level the
+    # current candle was allowed to be. Confirmed live - a real signal
+    # cited a resistance level ~0.75-0.9 price away from the actual
+    # entry, days after price had already broken through it. Added a
+    # proximity band (0.5%) on the far side too, so this now requires
+    # the candle to genuinely be AT the level, not just anywhere past
+    # it.
+    proximity = 0.005
+
     for level, touches in tested_levels.items():
         level_type = touches[0]["type"]
-        if level_type == "low" and last["low"] <= level * (1 + tolerance) and (last["close"] - last["low"]) / candle_range >= 0.6:
+        near_support = level_type == "low" and level * (1 - proximity) <= last["low"] <= level * (1 + tolerance)
+        near_resistance = level_type == "high" and level * (1 - tolerance) <= last["high"] <= level * (1 + proximity)
+
+        if near_support and (last["close"] - last["low"]) / candle_range >= 0.6:
             return {
                 "strategy_name": "Support/Resistance Bounce",
                 "direction": "BUY",
+                "level": level,
                 "detail": f"price bounced off a well-tested support level (~{level:.2f})",
             }
-        if level_type == "high" and last["high"] >= level * (1 - tolerance) and (last["high"] - last["close"]) / candle_range >= 0.6:
+        if near_resistance and (last["high"] - last["close"]) / candle_range >= 0.6:
             return {
                 "strategy_name": "Support/Resistance Bounce",
                 "direction": "SELL",
+                "level": level,
                 "detail": f"price rejected a well-tested resistance level (~{level:.2f})",
             }
 
@@ -10517,7 +10534,42 @@ def generate_signal_chart(display_name, strategy_name, direction, candles, entry
                 print(f"[CHART] {display_name}/{strategy_name}: only {len(candles)} candles, need 11+ - breakout lines skipped")
 
         elif strategy_name == "Support/Resistance Bounce":
-            sr_level = candles[-1]["low"] if direction == "BUY" else candles[-1]["high"]
+            # FIX: this used to just plot the last candle's own high/low
+            # as a placeholder - not the real tested level the strategy
+            # actually detected and traded on, which could show (and
+            # did, confirmed live) a completely different, misleading
+            # number on the chart than the one in the signal's own
+            # text. Recomputes the exact same swing/tested-level logic
+            # strategy_support_resistance_bounce uses, so the chart and
+            # the text can never disagree again.
+            if len(candles) >= 30:
+                swings = find_swing_points(candles, strength=2)
+                sr_tolerance = 0.0015
+                level_touches = {}
+                for s in swings:
+                    matched = False
+                    for lvl in list(level_touches.keys()):
+                        if abs(s["price"] - lvl) / lvl <= sr_tolerance:
+                            level_touches[lvl].append(s)
+                            matched = True
+                            break
+                    if not matched:
+                        level_touches[s["price"]] = [s]
+                tested = {lvl: t for lvl, t in level_touches.items() if len(t) >= 2}
+                wanted_type = "low" if direction == "BUY" else "high"
+                proximity = 0.005
+                last_c = candles[-1]
+                for lvl, touches in tested.items():
+                    if touches[0]["type"] != wanted_type:
+                        continue
+                    if wanted_type == "low" and lvl * (1 - proximity) <= last_c["low"] <= lvl * (1 + sr_tolerance):
+                        sr_level = lvl
+                        break
+                    if wanted_type == "high" and lvl * (1 - sr_tolerance) <= last_c["high"] <= lvl * (1 + proximity):
+                        sr_level = lvl
+                        break
+            else:
+                print(f"[CHART] {display_name}/{strategy_name}: only {len(candles)} candles, need 30+ - level overlay skipped")
 
         elif strategy_name == "RSI Extreme Reversal":
             rsi_values = calculate_rsi(candles, period=14)

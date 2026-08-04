@@ -12605,9 +12605,37 @@ async def place_mt5_trade(signal_data):
             f"https://mt-client-api-v1.london.agiliumtrade.ai"
             f"/users/current/accounts/{METAAPI_ACCOUNT_ID}/trade"
         )
-        response = requests.post(
-            url, headers=headers, json=payload, timeout=30
-        )
+
+        # FIX: confirmed live via Railway logs - a real trade silently
+        # never made it to MT5 because MetaAPI returned 429 (rate
+        # limited) at that exact moment, and this had zero retry -
+        # one bad-timing moment meant the trade was gone for good,
+        # with only a bare status code logged and no way to see why.
+        # Retries transient failures (429 rate-limit, and 502/503/504
+        # which are typically momentary upstream issues, not real
+        # rejections) up to 2 extra times with a short backoff. A
+        # genuine rejection (bad symbol, invalid volume, market
+        # closed, insufficient margin, etc.) returns a 4xx that isn't
+        # 429 and is NOT retried - retrying a real rejection would
+        # just fail the same way 3 times instead of once.
+        transient_statuses = (429, 502, 503, 504)
+        max_attempts = 3
+        last_response = None
+        for attempt in range(1, max_attempts + 1):
+            response = requests.post(url, headers=headers, json=payload, timeout=30)
+            last_response = response
+            if response.status_code in (200, 201):
+                break
+            if response.status_code not in transient_statuses or attempt == max_attempts:
+                break
+            wait_seconds = 2 * attempt
+            print(
+                f"[MT5] ⚠️ Trade request got {response.status_code} "
+                f"(attempt {attempt}/{max_attempts}) - retrying in {wait_seconds}s..."
+            )
+            await asyncio.sleep(wait_seconds)
+
+        response = last_response
         if response.status_code in [200, 201]:
             result = response.json()
             order_id = result.get("orderId", "unknown")
@@ -12631,7 +12659,13 @@ async def place_mt5_trade(signal_data):
                 print(f"[MT5] ✅ Trade placed — Order ID: {order_id}")
             return order_id
         else:
-            print(f"[MT5] ❌ Trade failed: {response.status_code}")
+            # FIX: used to only log the status code, discarding the
+            # actual response body - meaning a real rejection reason
+            # (bad symbol, invalid volume, market closed, insufficient
+            # margin, etc.) was never visible anywhere, only ever a
+            # bare number. Logging the full body now so a future
+            # failure is actually diagnosable instead of another guess.
+            print(f"[MT5] ❌ Trade failed after {max_attempts} attempt(s): {response.status_code} | {response.text}")
             return None
     except Exception as e:
         print(f"[MT5] ❌ Exception: {e}")

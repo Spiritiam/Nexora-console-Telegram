@@ -9902,31 +9902,23 @@ async def run_strategy_bank_synthetic(index_key, config, h1_candles, h4_candles,
     winning_votes = buy_votes if len(buy_votes) >= len(sell_votes) else sell_votes
     direction = "BUY" if winning_votes is buy_votes else "SELL"
 
-    # REAL hard-gate, per explicit instruction - the check below this
-    # comment used to only print a log line, never actually stopping
-    # anything from sending even on just 1 vote. That was fine when
-    # every group had only 1-2 strategies (1 vote WAS the realistic
-    # ceiling), but r75/r100 and r10/r25/r50 were just expanded to 4
-    # and 3 strategies respectively - without a real floor, a bigger
-    # candidate pool directly means more chances for a single stray
-    # vote to fire a trade, i.e. higher raw trade frequency, not just
-    # better odds on a fixed number of attempts. Groups with only 1-2
-    # strategies are UNCHANGED - this only tightens the ones that grew.
-    group_size = len(SYNTHETIC_INDEX_STRATEGY_GROUPS.get(index_key, SYNTHETIC_STRATEGY_BANK))
-    if group_size > 2 and len(winning_votes) < 2:
-        print(
-            f"[STRATEGY BANK SYNTH] {index_key} - only {len(winning_votes)} of {group_size} "
-            f"strategies agreed on {direction} - needs 2+ agreement now that this group has "
-            f"more than 2 strategies, skipping this round"
-        )
-        return None
-
+    # FIX: the group_size>2-requires-2+ special case that used to sit
+    # here directly defeated the whole point of Aggressive (min_agree=1)
+    # vs Conservative (min_agree=3) - it silently forced at least 2
+    # agreeing votes on any bigger group (r75/r100, r10/r25/r50)
+    # regardless of what the caller actually asked for, so Aggressive
+    # could never fire on a single vote like it's supposed to.
+    # min_agree is now the ONE real, ENFORCED gate (previously it only
+    # logged a note and sent anyway on any vote count, which would
+    # have made Conservative barely different from Aggressive once
+    # the hard-coded override above was removed - both would fire on
+    # just 1 vote, only differing in the reported confidence number).
     if len(winning_votes) < min_agree:
         print(
             f"[STRATEGY BANK SYNTH] {index_key} only {len(winning_votes)} strategy(ies) "
-            f"agreed on {direction} (below preferred {min_agree}) - sending anyway, every "
-            f"strategy in this bank is independently trusted"
+            f"agreed on {direction} (needs {min_agree}) - skipping this round"
         )
+        return None
 
     agreeing_names = [v["strategy_name"] for v in winning_votes]
     confidence = min(95, 70 + len(winning_votes) * 6)

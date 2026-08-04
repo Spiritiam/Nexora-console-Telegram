@@ -17961,10 +17961,17 @@ def main():
     # Deriv OAuth: picks up what deriv_oauth_callback_handler already
     # resolved and wrote to the database, saves the account, notifies
     # the user - same pattern as the KoraPay job above.
+    #
+    # FIX: interval was 20s, meaning the confirmation message in
+    # Telegram could lag up to ~18s behind the page's own redirect
+    # back into the app - a real, reported gap where the user lands
+    # back in Telegram to nothing yet. This check is cheap (usually
+    # an empty result), so 3s is safe and closes that gap to
+    # something that reads as immediate.
     job_queue.run_repeating(
         process_pending_deriv_oauth_connections,
-        interval=20,
-        first=15,
+        interval=3,
+        first=3,
         name="deriv_oauth_connection_processing"
     )
 

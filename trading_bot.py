@@ -5733,6 +5733,12 @@ async def run_deriv_autotrade_bot_scan(context: ContextTypes.DEFAULT_TYPE):
                 m1_candles=m1_candles, min_agree=min_agree
             )
             if not result:
+                # Added for parity with Account Flip's own heartbeat -
+                # same real "is it even running?" question came up
+                # again with no way to answer it from logs, since this
+                # job only ever logged on a successful trade or a real
+                # error, never on "checked, nothing qualified."
+                print(f"[DERIV BOT SCAN] {bot_choice}/{index_key.upper()} checked - no qualifying setup this round.")
                 continue
             direction, confidence, reason, agreeing_strategies, _winning_votes = result
             contract_type = "MULTUP" if direction == "BUY" else "MULTDOWN"

@@ -12654,9 +12654,9 @@ async def place_mt5_trade(signal_data):
                 # response now whenever this happens, so the real
                 # field name/shape/error can be seen directly instead
                 # of guessed at.
-                print(f"[MT5] ⚠️ Trade response had no real orderId - full raw response: {result!r}")
+                print(f"[MT5 PERSONAL COPY] ⚠️ Trade response had no real orderId - full raw response: {result!r}")
             else:
-                print(f"[MT5] ✅ Trade placed — Order ID: {order_id}")
+                print(f"[MT5 PERSONAL COPY] ✅ Trade placed — Order ID: {order_id}")
             return order_id
         else:
             # FIX: used to only log the status code, discarding the
@@ -12665,10 +12665,10 @@ async def place_mt5_trade(signal_data):
             # margin, etc.) was never visible anywhere, only ever a
             # bare number. Logging the full body now so a future
             # failure is actually diagnosable instead of another guess.
-            print(f"[MT5] ❌ Trade failed after {max_attempts} attempt(s): {response.status_code} | {response.text}")
+            print(f"[MT5 PERSONAL COPY] ❌ Trade failed after {max_attempts} attempt(s): {response.status_code} | {response.text}")
             return None
     except Exception as e:
-        print(f"[MT5] ❌ Exception: {e}")
+        print(f"[MT5 PERSONAL COPY] ❌ Exception: {e}")
         return None
 
 # ============================================

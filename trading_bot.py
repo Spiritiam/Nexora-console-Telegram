@@ -1333,7 +1333,11 @@ def render_deriv_oauth_page(heading, message, kind="info", emoji=None):
     default text on mobile Safari, since none of these had a viewport
     meta tag or any CSS at all before). One template, one visual
     language (color + icon by kind) across all 5 outcomes instead of
-    5 different bare <h2>/<p> snippets.
+    5 different bare <h2>/<p> snippets. Also includes a real tappable
+    "Back to Telegram" button (deep link to the bot chat) - every one
+    of these pages already told the person to go back to Telegram in
+    plain text; this makes that an actual one-tap action instead of
+    something they have to do manually (switch apps, find the chat).
     """
     colors = {
         "success": "#16a34a", "error": "#dc2626",
@@ -1342,6 +1346,7 @@ def render_deriv_oauth_page(heading, message, kind="info", emoji=None):
     icons = {"success": "✅", "error": "❌", "warning": "⚠️", "info": "ℹ️"}
     color = colors.get(kind, colors["info"])
     icon = emoji or icons.get(kind, icons["info"])
+    telegram_url = f"https://t.me/{BOT_USERNAME}"
 
     return f"""<!DOCTYPE html>
 <html>
@@ -1376,6 +1381,12 @@ def render_deriv_oauth_page(heading, message, kind="info", emoji=None):
     height: 4px; width: 48px; background: {color};
     border-radius: 2px; margin: 0 auto 20px;
   }}
+  .btn {{
+    display: inline-block; margin-top: 20px;
+    background: {color}; color: #ffffff !important;
+    text-decoration: none; font-weight: 600; font-size: 16px;
+    padding: 14px 28px; border-radius: 12px;
+  }}
 </style>
 </head>
 <body>
@@ -1384,7 +1395,16 @@ def render_deriv_oauth_page(heading, message, kind="info", emoji=None):
     <div class="bar"></div>
     <h1>{heading}</h1>
     <p>{message}</p>
+    <a class="btn" href="{telegram_url}">↩ Back to Telegram</a>
   </div>
+  <script>
+    // Auto-redirect on the success page specifically, after a short
+    // pause so the checkmark is actually visible first rather than
+    // vanishing instantly - the button above still covers every case
+    // where a browser blocks the auto-redirect (Safari sometimes
+    // does), so nobody gets stuck either way.
+    {"setTimeout(function(){ window.location.href = '" + telegram_url + "'; }, 1800);" if kind == "success" else ""}
+  </script>
 </body>
 </html>"""
 

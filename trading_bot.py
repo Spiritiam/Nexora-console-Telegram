@@ -9321,45 +9321,46 @@ def strategy_heikin_ashi_trend(pair_key, config, h1_candles, h4_candles, daily_c
 
 
 STRATEGY_BANK = [
-    # strategy_rsi_extreme_reversal REMOVED per explicit instruction -
-    # too subjective/complex a concept for a simple candle feed. Still
-    # used elsewhere (Exness Auto-Trade's Aggressive Breakout bot,
-    # SYNTHETIC_STRATEGY_BANK) - only removed from THIS list.
-    # strategy_unicorn_model REMOVED per explicit instruction - all
-    # ICT/SMC influence taken out of channel and manual signals. The
-    # function itself is untouched and still used by MT5 auto-trade's
-    # Conservative Structure bot (a separate, explicitly out-of-scope
-    # system) - only removed from THIS list.
+    # RESTORED per explicit instruction, after the earlier removal
+    # (below) turned out to hurt real signal quality rather than help
+    # it - ICT/SMC and these 3 were pulled out in a prior session,
+    # then found to be genuinely missed once real losses accumulated
+    # with the replacement roster. The functions themselves were never
+    # deleted, just re-added to this active list.
+    strategy_unicorn_model,  # ICT/SMC
+    strategy_support_resistance_bounce,  # demand/supply zones
+    strategy_fibonacci_retracement,
+    strategy_rsi_extreme_reversal,
     strategy_previous_day_high_low_manipulation,
-    # strategy_london_session_orb REMOVED per explicit instruction -
-    # same reason (too subjective/complex). Nothing else uses this
-    # function, so it's now fully unused - left in place rather than
-    # deleted in case it's wanted again later.
+    # strategy_london_session_orb NOT restored - wasn't part of this
+    # request, left available (function untouched) if wanted later.
     strategy_trend_following,
     strategy_breakout,
-    # strategy_support_resistance_bounce REMOVED per explicit
-    # instruction - relied on find_swing_points, the same
-    # swing-confirmation blind spot the momentum veto existed to
-    # catch. Removed alongside the veto itself for consistency,
-    # rather than leaving the exact risk the veto was protecting
-    # against in place with no protection at all.
     strategy_momentum_macd,
-    # strategy_fibonacci_retracement REMOVED per explicit instruction -
-    # same reason as Support/Resistance Bounce above.
     strategy_ema_pullback_scalper,  # per explicit instruction - already existed for synthetics only, now also runs on forex/crypto (falls back to h1_candles since m1_candles is never passed here)
-    strategy_volume_profile_poc,  # diagnostic only right now, always returns None - see docstring
-    strategy_rsi_trend_continuation,  # NEW - genuinely different concept from the removed RSI Extreme Reversal (continuation, not reversal)
-    strategy_bollinger_squeeze_breakout,  # NEW
-    strategy_atr_volatility_breakout,  # NEW
-    strategy_supertrend,  # NEW
-    strategy_parabolic_sar,  # NEW
-    strategy_ichimoku_breakout,  # NEW
-    strategy_keltner_breakout,  # NEW
-    strategy_ema_ribbon,  # NEW
-    strategy_rate_of_change,  # NEW
-    strategy_cci_breakout,  # NEW
-    strategy_williams_r,  # NEW
-    strategy_heikin_ashi_trend,  # NEW
+    # strategy_volume_profile_poc REMOVED from this active list -
+    # still exists as a function (diagnostic-only, always returns
+    # None - real Point of Control needs genuine traded volume, which
+    # forex/gold pairs don't reliably have), no longer occupying a
+    # slot in the bank pretending to contribute a vote it never casts.
+    #
+    # TRIMMED from 12 new additions down to 4 kept per explicit
+    # instruction - the other 8 were conceptually redundant with each
+    # other (multiple trend-following variants, multiple breakout
+    # variants, multiple momentum oscillators all tending to move
+    # together), which inflates apparent "agreement" without adding
+    # real signal diversity. One representative kept per category:
+    strategy_supertrend,  # trend
+    strategy_atr_volatility_breakout,  # breakout
+    strategy_williams_r,  # momentum
+    strategy_heikin_ashi_trend,  # candle-structure trend
+    # REMOVED (redundant with the above or with restored classics):
+    # strategy_rsi_trend_continuation (redundant with restored RSI
+    # Extreme Reversal), strategy_bollinger_squeeze_breakout,
+    # strategy_parabolic_sar, strategy_ichimoku_breakout,
+    # strategy_keltner_breakout, strategy_ema_ribbon,
+    # strategy_rate_of_change, strategy_cci_breakout - all still
+    # exist as functions, untouched, just not in this active list.
 ]
 
 # Distinct roster for synthetic (Deriv) indices - per explicit

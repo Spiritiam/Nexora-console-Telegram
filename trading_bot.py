@@ -1326,6 +1326,69 @@ async def korapay_webhook_handler(request):
     return web.Response(status=200, text="ok")
 
 
+def render_deriv_oauth_page(heading, message, kind="info", emoji=None):
+    """
+    Shared styled page for every deriv_oauth_callback_handler response
+    below - added after real user confusion (tiny, unstyled system-
+    default text on mobile Safari, since none of these had a viewport
+    meta tag or any CSS at all before). One template, one visual
+    language (color + icon by kind) across all 5 outcomes instead of
+    5 different bare <h2>/<p> snippets.
+    """
+    colors = {
+        "success": "#16a34a", "error": "#dc2626",
+        "warning": "#d97706", "info": "#2563eb",
+    }
+    icons = {"success": "✅", "error": "❌", "warning": "⚠️", "info": "ℹ️"}
+    color = colors.get(kind, colors["info"])
+    icon = emoji or icons.get(kind, icons["info"])
+
+    return f"""<!DOCTYPE html>
+<html>
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>{heading}</title>
+<style>
+  body {{
+    margin: 0; padding: 32px 20px; min-height: 100vh;
+    display: flex; align-items: center; justify-content: center;
+    background: #f4f5f7;
+    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+    box-sizing: border-box;
+  }}
+  .card {{
+    max-width: 420px; width: 100%; background: #ffffff;
+    border-radius: 16px; padding: 32px 24px;
+    box-shadow: 0 2px 12px rgba(0,0,0,0.08);
+    text-align: center;
+  }}
+  .icon {{ font-size: 48px; line-height: 1; margin-bottom: 16px; }}
+  h1 {{
+    font-size: 22px; font-weight: 700; margin: 0 0 12px;
+    color: {color};
+  }}
+  p {{
+    font-size: 17px; line-height: 1.5; color: #374151;
+    margin: 0 0 8px;
+  }}
+  .bar {{
+    height: 4px; width: 48px; background: {color};
+    border-radius: 2px; margin: 0 auto 20px;
+  }}
+</style>
+</head>
+<body>
+  <div class="card">
+    <div class="icon">{icon}</div>
+    <div class="bar"></div>
+    <h1>{heading}</h1>
+    <p>{message}</p>
+  </div>
+</body>
+</html>"""
+
+
 async def deriv_oauth_callback_handler(request):
     """
     Deriv redirects here after a user logs in via the modern PKCE flow
@@ -1350,8 +1413,11 @@ async def deriv_oauth_callback_handler(request):
     if not user_id or not code_verifier:
         return web.Response(
             status=400, content_type="text/html",
-            text="<h2>This login link has expired or was already used.</h2>"
-                 "<p>Go back to Telegram and tap Connect Deriv again.</p>"
+            text=render_deriv_oauth_page(
+                "This login link has expired or was already used.",
+                "Go back to Telegram and tap Connect Deriv again.",
+                kind="warning",
+            )
         )
 
     if not code:
@@ -1359,16 +1425,22 @@ async def deriv_oauth_callback_handler(request):
         print(f"[DERIV OAUTH] No code in callback for user {user_id}: {error}")
         return web.Response(
             status=200, content_type="text/html",
-            text=f"<h2>Login didn't complete.</h2><p>{error}</p>"
-                 "<p>Go back to Telegram and try again.</p>"
+            text=render_deriv_oauth_page(
+                "Login didn't complete.",
+                f"{error}<br>Go back to Telegram and try again.",
+                kind="error",
+            )
         )
 
     access_token = exchange_deriv_oauth_code(code, code_verifier)
     if not access_token:
         return web.Response(
             status=200, content_type="text/html",
-            text="<h2>Something went wrong finishing the login.</h2>"
-                 "<p>Go back to Telegram and try again, or paste an API token instead.</p>"
+            text=render_deriv_oauth_page(
+                "Something went wrong finishing the login.",
+                "Go back to Telegram and try again, or paste an API token instead.",
+                kind="error",
+            )
         )
 
     accounts_data = await deriv_get_options_accounts(access_token)
@@ -1393,11 +1465,13 @@ async def deriv_oauth_callback_handler(request):
     if not real_loginid:
         return web.Response(
             status=200, content_type="text/html",
-            text="<h2>No real Deriv account found.</h2>"
-                 "<p>Only demo accounts were found on this login. "
-                 "Go back to Telegram, and either paste a real-account "
-                 "API token manually, or log in with an account that "
-                 "has a real Deriv account too.</p>"
+            text=render_deriv_oauth_page(
+                "No real Deriv account found.",
+                "Only demo accounts were found on this login. Go back to Telegram, and "
+                "either paste a real-account API token manually, or log in with an "
+                "account that has a real Deriv account too.",
+                kind="warning",
+            )
         )
 
     save_pending_deriv_oauth_connection(
@@ -1407,8 +1481,11 @@ async def deriv_oauth_callback_handler(request):
 
     return web.Response(
         status=200, content_type="text/html",
-        text="<h2>✅ Deriv account connected!</h2>"
-             "<p>Go back to Telegram - you'll get a confirmation message there in a few seconds.</p>"
+        text=render_deriv_oauth_page(
+            "Deriv account connected!",
+            "Go back to Telegram - you'll get a confirmation message there in a few seconds.",
+            kind="success",
+        )
     )
 
 

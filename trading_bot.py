@@ -11998,9 +11998,20 @@ def extract_and_strip_pairs_trailer(summary_text):
     whichever of the (up to 2) bullet lines actually mentions that
     pair, so a later signal quotes ONLY the relevant line instead of
     the whole briefing - falls back to the full display text if no
-    single bullet can be matched. Tolerant of the AI omitting the
-    PAIRS line, wording it slightly differently, or returning
-    PAIRS: NONE - all resolve to an empty dict rather than raising.
+    single bullet can be matched.
+
+    FIX: the PAIRS: trailer was never actually showing up in practice
+    (confirmed live - zero rows ever landed in daily_news_bias despite
+    briefings clearly naming pairs in their bullets), and failed
+    completely silently since this was pure text parsing with no
+    exception to catch. Now falls back to reading the pair + direction
+    straight off each bullet's own actionable-read phrase ("favors
+    buying/selling X") when the trailer line isn't found - the prompt
+    already requires every bullet to end with exactly that phrase, so
+    this is arguably the more reliable source anyway, not just a
+    backup. Logs which path produced the result (or that neither did)
+    so a future miss is diagnosable from Railway logs instead of
+    invisible like this one was.
     """
     if not summary_text:
         return summary_text, {}
@@ -12014,8 +12025,8 @@ def extract_and_strip_pairs_trailer(summary_text):
     }
     for line in lines:
         stripped = line.strip()
-        if stripped.upper().startswith("PAIRS:"):
-            body = stripped.split(":", 1)[1].strip()
+        if stripped.upper().startswith("PAIRS:") or stripped.upper().startswith("PAIRS "):
+            body = stripped.split(":", 1)[1].strip() if ":" in stripped else ""
             if body.upper() != "NONE":
                 for entry in body.split(","):
                     entry = entry.strip()
@@ -12047,6 +12058,24 @@ def extract_and_strip_pairs_trailer(summary_text):
         "USDCHF": ["usd/chf", "usdchf", "franc"],
         "NZDUSD": ["nzd/usd", "nzdusd", "kiwi"],
     }
+
+    source = "trailer"
+    if not raw_pairs:
+        # Fallback: read directly off each bullet's own actionable
+        # read - "favors buying X" / "favors selling X" (also accepts
+        # "favor" without the s, and "may see upside/downside" as a
+        # softer phrasing the prompt's examples also use).
+        source = "bullet-fallback"
+        for bullet in bullets:
+            lower = bullet.lower()
+            for pair, keywords in keyword_map.items():
+                if not any(kw in lower for kw in keywords):
+                    continue
+                if "favors selling" in lower or "favor selling" in lower or "downside" in lower:
+                    raw_pairs[pair] = "SELL"
+                elif "favors buying" in lower or "favor buying" in lower or "upside" in lower:
+                    raw_pairs[pair] = "BUY"
+
     pairs = {}
     for pair, direction in raw_pairs.items():
         matching_bullet = next(
@@ -12054,6 +12083,11 @@ def extract_and_strip_pairs_trailer(summary_text):
             display_text  # fall back to the whole thing if no single bullet matches
         )
         pairs[pair] = (direction, matching_bullet)
+
+    if pairs:
+        print(f"[NEWS BIAS] Extracted via {source}: {[(p, d) for p, (d, _) in pairs.items()]}")
+    else:
+        print(f"[NEWS BIAS] ⚠️ No pairs extracted from briefing (neither trailer nor bullet-fallback matched). Raw text: {summary_text[:300]!r}")
 
     return display_text, pairs
 

@@ -2376,7 +2376,7 @@ def is_first_time_user(user_id):
 # TP/SL monitor and the weekly performance report.
 # ============================================
 
-def log_signal(signal_data):
+def log_signal(signal_data, source="scheduled"):
     try:
         url = f"{SUPABASE_URL}/rest/v1/signal_log"
         payload = {
@@ -2387,6 +2387,17 @@ def log_signal(signal_data):
             "take_profit": signal_data["take_profit"],
             "posted_at": datetime.utcnow().isoformat(),
             "status": "OPEN",
+            # Per-strategy performance tracking - see signal_data's own
+            # comment for why this was added.
+            "agreeing_strategies": signal_data.get("agreeing_strategies", []),
+            "confidence": signal_data.get("confidence"),
+            # "manual" (DM-requested) signals are logged for stats only
+            # - has_open_signal_for_pair below is scoped to
+            # source=scheduled specifically so a manual request can
+            # never block/delay the scheduled channel signal for the
+            # same pair, which would be a real behavior change, not
+            # just added tracking.
+            "source": source,
         }
         headers = sb_headers()
         headers["Prefer"] = "return=representation"
@@ -2634,16 +2645,23 @@ def get_open_signals():
 
 def has_open_signal_for_pair(pair_name):
     """
-    True if this pair already has a signal sitting OPEN in signal_log -
-    used to stop a fresh scheduled signal (e.g. BTCUSD) from posting/
-    trading while the previous one on the same pair hasn't closed in
-    profit or loss yet (see get_mt5_trade_outcome / check_open_signals
-    for how a signal eventually closes).
+    True if this pair already has a SCHEDULED signal sitting OPEN in
+    signal_log - used to stop a fresh scheduled signal (e.g. BTCUSD)
+    from posting/trading while the previous one on the same pair
+    hasn't closed in profit or loss yet (see get_mt5_trade_outcome /
+    check_open_signals for how a signal eventually closes).
+
+    Scoped to source=scheduled specifically - manual (DM-requested)
+    signals are now also logged (for per-strategy performance
+    tracking), but must never be able to block or delay the scheduled
+    channel signal for the same pair just because a user happened to
+    ask for one manually - that would be a real change to channel
+    posting behavior, not just added tracking.
     """
     try:
         url = (
             f"{SUPABASE_URL}/rest/v1/signal_log"
-            f"?status=eq.OPEN&pair_name=eq.{pair_name}&select=id&limit=1"
+            f"?status=eq.OPEN&pair_name=eq.{pair_name}&source=eq.scheduled&select=id&limit=1"
         )
         response = requests.get(url, headers=sb_headers(), timeout=10)
         data = response.json()
@@ -5749,6 +5767,11 @@ async def run_deriv_flip_entry_scan(context: ContextTypes.DEFAULT_TYPE):
                 continue
             vote = account_flip_signal(index_key, config, candles)
             if not vote:
+                # Added per explicit instruction, after a real "is it
+                # even running?" question with no way to answer it from
+                # logs alone - this fires once per pair per 5-minute
+                # cycle, not once per subscriber, so it stays cheap.
+                print(f"[ACCOUNT FLIP] {index_key.upper()} checked - no Engulfing/Pin Bar/Inside Bar setup this round.")
                 continue
             direction = vote["direction"]
             contract_type = "MULTUP" if direction == "BUY" else "MULTDOWN"
@@ -11049,6 +11072,13 @@ async def build_signal_response(question, user_id=None):
         "stop_loss": stop_loss,
         "take_profit": take_profit,
         "config": config,
+        # Added for per-strategy performance tracking - joined against
+        # this signal's eventual TP_HIT/SL_HIT status (already tracked
+        # separately), this is what makes "which strategies are
+        # actually working" an answerable question with real numbers
+        # instead of a guess, the next time it comes up.
+        "agreeing_strategies": agreeing_strategies if bank_result else [],
+        "confidence": confidence,
     }
 
     print(
@@ -15421,6 +15451,14 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
         image_file_id, direction, signal, signal_data = (
             await build_signal_response(message, user_id=user_id)
         )
+
+        # ADDED: manual/DM-generated signals were never logged at all -
+        # only the scheduled auto-post path was, meaning per-strategy
+        # performance tracking would have silently missed every signal
+        # a user requested directly. Same log_signal call as the
+        # scheduled path, just added here too for complete data.
+        if signal_data is not None:
+            log_signal(signal_data, source="manual")
 
         await wait_message.delete()
 

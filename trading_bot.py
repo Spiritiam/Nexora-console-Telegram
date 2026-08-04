@@ -2859,37 +2859,67 @@ async def deriv_get_options_accounts(token):
     response if it can't find an account in the shape it expects,
     so the actual shape can be adjusted from real output rather
     than another guess.
+
+    FIX: confirmed live - a real, valid token (proven working just 3
+    minutes earlier) got reported to the user as "may have expired or
+    been revoked" with zero retry on a single momentary failure, same
+    class of bug as the MetaAPI 429 issue fixed earlier today. Retries
+    transient failures (timeouts/exceptions and 429/502/503/504) up to
+    2 extra times - a genuine auth failure (401/403, meaning the token
+    really is dead) is NOT retried, so a truly revoked token still
+    reports correctly without unnecessary delay.
     """
     if not DERIV_APP_ID:
         print("[DERIV] No DERIV_APP_ID set")
         return None
-    try:
-        url = f"{DERIV_API_BASE}/trading/v1/options/accounts"
-        response = requests.get(url, headers=deriv_api_headers(token), timeout=10)
-        if response.status_code != 200:
-            print(f"[DERIV] Accounts lookup failed {response.status_code}: {response.text}")
-            return None
-        return response.json()
-    except Exception as e:
-        print(f"[DERIV] deriv_get_options_accounts error: {e}")
-        return None
+    url = f"{DERIV_API_BASE}/trading/v1/options/accounts"
+    transient_statuses = (429, 502, 503, 504)
+    max_attempts = 3
+    for attempt in range(1, max_attempts + 1):
+        try:
+            response = requests.get(url, headers=deriv_api_headers(token), timeout=10)
+            if response.status_code == 200:
+                return response.json()
+            if response.status_code not in transient_statuses or attempt == max_attempts:
+                print(f"[DERIV] Accounts lookup failed {response.status_code}: {response.text}")
+                return None
+            print(f"[DERIV] Accounts lookup got {response.status_code} (attempt {attempt}/{max_attempts}) - retrying...")
+        except Exception as e:
+            if attempt == max_attempts:
+                print(f"[DERIV] deriv_get_options_accounts error: {e}")
+                return None
+            print(f"[DERIV] deriv_get_options_accounts transient error (attempt {attempt}/{max_attempts}): {e} - retrying...")
+        await asyncio.sleep(1.5 * attempt)
+    return None
 
 async def deriv_get_otp_url(token, account_id):
     """
     Step 2: exchanges the token + a specific account ID for the
     short-lived WebSocket URL with the one-time code embedded.
+
+    Same retry fix as deriv_get_options_accounts above, for the same
+    confirmed reason.
     """
-    try:
-        url = f"{DERIV_API_BASE}/trading/v1/options/accounts/{account_id}/otp"
-        response = requests.post(url, headers=deriv_api_headers(token), timeout=10)
-        if response.status_code != 200:
-            print(f"[DERIV] OTP request failed {response.status_code}: {response.text}")
-            return None
-        data = response.json()
-        return data.get("data", {}).get("url")
-    except Exception as e:
-        print(f"[DERIV] deriv_get_otp_url error: {e}")
-        return None
+    url = f"{DERIV_API_BASE}/trading/v1/options/accounts/{account_id}/otp"
+    transient_statuses = (429, 502, 503, 504)
+    max_attempts = 3
+    for attempt in range(1, max_attempts + 1):
+        try:
+            response = requests.post(url, headers=deriv_api_headers(token), timeout=10)
+            if response.status_code == 200:
+                data = response.json()
+                return data.get("data", {}).get("url")
+            if response.status_code not in transient_statuses or attempt == max_attempts:
+                print(f"[DERIV] OTP request failed {response.status_code}: {response.text}")
+                return None
+            print(f"[DERIV] OTP request got {response.status_code} (attempt {attempt}/{max_attempts}) - retrying...")
+        except Exception as e:
+            if attempt == max_attempts:
+                print(f"[DERIV] deriv_get_otp_url error: {e}")
+                return None
+            print(f"[DERIV] deriv_get_otp_url transient error (attempt {attempt}/{max_attempts}): {e} - retrying...")
+        await asyncio.sleep(1.5 * attempt)
+    return None
 
 async def deriv_fetch_account_snapshot(token):
     """

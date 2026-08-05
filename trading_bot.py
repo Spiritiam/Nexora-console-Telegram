@@ -2850,6 +2850,130 @@ def deriv_api_headers(token):
         "Deriv-App-ID": DERIV_APP_ID or "",
     }
 
+def record_deriv_service_token_failure():
+    """
+    Marks DERIV_SERVICE_TOKEN as currently failing - only called for
+    a genuine 401/403 on THIS specific token (not any individual
+    subscriber's own token failing, which is normal/expected and not
+    an outage). Doesn't overwrite failure_detected_at if already
+    marked failing, so the alert job below can tell how long it's
+    actually been down, not just that it failed once again.
+    """
+    try:
+        existing = get_service_credential("deriv_service_token")
+        if existing and existing.get("currently_failing"):
+            return  # already flagged, don't reset the detection timestamp
+        url = f"{SUPABASE_URL}/rest/v1/service_credentials?on_conflict=credential_name"
+        headers = sb_headers()
+        headers["Prefer"] = "resolution=merge-duplicates"
+        payload = {
+            "credential_name": "deriv_service_token",
+            "currently_failing": True,
+            "failure_detected_at": datetime.utcnow().isoformat(),
+        }
+        requests.post(url, headers=headers, json=payload, timeout=10)
+    except Exception as e:
+        print(f"[SERVICE CREDENTIALS] Error recording failure: {e}")
+
+
+def record_deriv_service_token_success():
+    """
+    Clears the failing flag once DERIV_SERVICE_TOKEN works again -
+    only does the write if it was actually flagged, to avoid a
+    pointless DB write on literally every single successful call.
+    """
+    try:
+        existing = get_service_credential("deriv_service_token")
+        if not existing or not existing.get("currently_failing"):
+            return
+        url = f"{SUPABASE_URL}/rest/v1/service_credentials?credential_name=eq.deriv_service_token"
+        requests.patch(url, headers=sb_headers(), json={"currently_failing": False}, timeout=10)
+    except Exception as e:
+        print(f"[SERVICE CREDENTIALS] Error clearing failure flag: {e}")
+
+
+def get_service_credential(name):
+    try:
+        url = f"{SUPABASE_URL}/rest/v1/service_credentials?credential_name=eq.{name}&select=*&limit=1"
+        response = requests.get(url, headers=sb_headers(), timeout=10)
+        rows = response.json()
+        return rows[0] if rows else None
+    except Exception as e:
+        print(f"[SERVICE CREDENTIALS] Error fetching {name}: {e}")
+        return None
+
+
+async def check_deriv_service_token_health(context: ContextTypes.DEFAULT_TYPE):
+    """
+    Runs every 15 minutes. Two separate jobs in one function:
+    1. If DERIV_SERVICE_TOKEN is currently flagged as failing, DM
+       ADMIN_USER_ID - but only once every 2 hours while it stays
+       broken, not on every single check, so a multi-hour outage
+       sends a handful of reminders rather than spamming.
+    2. If the tracked expiry date is within 3 days, DM ADMIN_USER_ID
+       once per calendar day until it's renewed.
+    """
+    if not ADMIN_USER_ID:
+        return
+    cred = get_service_credential("deriv_service_token")
+    if not cred:
+        return
+
+    if cred.get("currently_failing"):
+        last_alert = cred.get("last_failure_alert_at")
+        should_alert = True
+        if last_alert:
+            last_alert_dt = datetime.fromisoformat(last_alert.replace("Z", "+00:00"))
+            if (datetime.now(last_alert_dt.tzinfo) - last_alert_dt) < timedelta(hours=2):
+                should_alert = False
+        if should_alert:
+            try:
+                failure_since = cred.get("failure_detected_at", "unknown time")
+                await context.bot.send_message(
+                    chat_id=int(ADMIN_USER_ID),
+                    text=(
+                        f"🚨 <b>DERIV_SERVICE_TOKEN is down.</b>\n\n"
+                        f"Failing since: {failure_since}\n\n"
+                        f"Every Deriv synthetic index (channel signals, manual "
+                        f"signals, Aggressive/Conservative, Account Flip) has "
+                        f"zero real price data while this is broken. Generate "
+                        f"a fresh token from Deriv's API tokens page (Trade + "
+                        f"Account management scopes) and send it over."
+                    ),
+                    parse_mode=ParseMode.HTML
+                )
+                update_url = f"{SUPABASE_URL}/rest/v1/service_credentials?credential_name=eq.deriv_service_token"
+                requests.patch(update_url, headers=sb_headers(), json={"last_failure_alert_at": datetime.utcnow().isoformat()}, timeout=10)
+            except Exception as e:
+                print(f"[SERVICE CREDENTIALS] Couldn't send failure alert: {e}")
+
+    expires_at = cred.get("expires_at")
+    if expires_at:
+        expiry_date = datetime.strptime(expires_at, "%Y-%m-%d").date()
+        days_left = (expiry_date - datetime.utcnow().date()).days
+        already_reminded_today = cred.get("last_expiry_reminder_sent") == datetime.utcnow().date().isoformat()
+        if 0 <= days_left <= 3 and not already_reminded_today:
+            try:
+                await context.bot.send_message(
+                    chat_id=int(ADMIN_USER_ID),
+                    text=(
+                        f"⏰ <b>DERIV_SERVICE_TOKEN expires in {days_left} day(s)</b> "
+                        f"({expires_at}).\n\n"
+                        f"Generate a fresh one now from Deriv's API tokens page "
+                        f"(Trade + Account management scopes, up to 90 days) and "
+                        f"send it over before it lapses."
+                    ),
+                    parse_mode=ParseMode.HTML
+                )
+                update_url = f"{SUPABASE_URL}/rest/v1/service_credentials?credential_name=eq.deriv_service_token"
+                requests.patch(
+                    update_url, headers=sb_headers(),
+                    json={"last_expiry_reminder_sent": datetime.utcnow().date().isoformat()}, timeout=10
+                )
+            except Exception as e:
+                print(f"[SERVICE CREDENTIALS] Couldn't send expiry reminder: {e}")
+
+
 async def deriv_get_options_accounts(token):
     """
     Step 1: lists every account (real and virtual) tied to this
@@ -2879,9 +3003,13 @@ async def deriv_get_options_accounts(token):
         try:
             response = requests.get(url, headers=deriv_api_headers(token), timeout=10)
             if response.status_code == 200:
+                if token == DERIV_SERVICE_TOKEN:
+                    record_deriv_service_token_success()
                 return response.json()
             if response.status_code not in transient_statuses or attempt == max_attempts:
                 print(f"[DERIV] Accounts lookup failed {response.status_code}: {response.text}")
+                if token == DERIV_SERVICE_TOKEN and response.status_code in (401, 403):
+                    record_deriv_service_token_failure()
                 return None
             print(f"[DERIV] Accounts lookup got {response.status_code} (attempt {attempt}/{max_attempts}) - retrying...")
         except Exception as e:
@@ -17965,6 +18093,20 @@ def main():
         interval=3,
         first=3,
         name="deriv_oauth_connection_processing"
+    )
+
+    # DERIV_SERVICE_TOKEN health check - added after a real, hours-long
+    # silent outage (401 invalid/expired token, zero price data for
+    # every Deriv synthetic index) that only got noticed because the
+    # user happened to ask why nothing was trading. Checks every 15
+    # minutes: alerts the admin if the token is currently failing
+    # (max once per 2 hours while it stays broken), and separately
+    # alerts once a day starting 3 days before its tracked expiry.
+    job_queue.run_repeating(
+        check_deriv_service_token_health,
+        interval=900,
+        first=60,
+        name="deriv_service_token_health_check"
     )
 
     # MT5 auto-trade: daily expiry check - clients automatically

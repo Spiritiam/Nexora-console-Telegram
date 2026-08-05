@@ -5558,6 +5558,158 @@ def detect_accumulation_zone_breakout(candles):
     }
 
 
+def find_historical_vah_val_zones(candles, max_zones=5):
+    """
+    Sibling of detect_accumulation_zone_breakout - EXACT same EWMA
+    zone-detection loop and _accum_zone_build_profile binning (no
+    duplicated/reimplemented math, reuses both directly), but instead
+    of only checking whether the very last candle just broke OUT of
+    the most recently finalized zone, this collects EVERY zone that
+    finalized anywhere in the supplied window and returns the last
+    `max_zones` of them - the "last 5 VAH/VAL levels" a trader would
+    mark on their own chart, kept as ongoing REACTION levels rather
+    than a one-shot breakout trigger.
+
+    Same candle-order assumption as its sibling (oldest -> newest,
+    candles[-1] = most recent), same volume fallback (real volume if
+    present, else equal-weighted 1.0 per bar).
+
+    Returns a list of {vah, val, poc, end_index} dicts, most recent
+    zone first, or [] if none completed in this window.
+    """
+    n = len(candles)
+    if n < ACCUM_ZONE_DIST_LEN + ACCUM_ZONE_MIN_BARS:
+        return []
+
+    closes = [c["close"] for c in candles]
+
+    ema_var = 0.0
+    stats_init = False
+    m1 = m2 = 0.0
+
+    zone_active = False
+    zone_bars = []
+    zone_sum_r = 0.0
+    zone_sum_abs_r = 0.0
+    zone_exit_count = 0
+
+    completed_zones = []
+    eps = 1e-10
+
+    for i in range(1, n):
+        c0 = closes[i]
+        c1 = closes[i - 1]
+        if c1 <= 0:
+            continue
+        lr = math.log(c0 / c1)
+
+        alpha_fast = _accum_zone_alpha(ACCUM_ZONE_FAST_LEN)
+        ema_var = (lr * lr) if not stats_init else (alpha_fast * (lr * lr) + (1.0 - alpha_fast) * ema_var)
+
+        vol = math.sqrt(max(ema_var, 0.0))
+        log_vol = math.log(vol + eps)
+
+        alpha_dist = _accum_zone_alpha(ACCUM_ZONE_DIST_LEN)
+        if not stats_init:
+            m1 = log_vol
+            m2 = log_vol * log_vol
+            stats_init = True
+        else:
+            m1 = alpha_dist * log_vol + (1.0 - alpha_dist) * m1
+            m2 = alpha_dist * (log_vol * log_vol) + (1.0 - alpha_dist) * m2
+
+        sigma = math.sqrt(max(m2 - m1 * m1, eps))
+        z = (log_vol - m1) / sigma
+
+        low_now = z <= -ACCUM_ZONE_ENTER_Z
+        high_now = z >= -ACCUM_ZONE_EXIT_Z
+
+        bar_high = candles[i]["high"]
+        bar_low = candles[i]["low"]
+        bar_vol = candles[i].get("volume") or 1.0
+
+        if not zone_active:
+            if low_now:
+                zone_active = True
+                zone_bars = [(bar_high, bar_low, bar_vol)]
+                zone_sum_r = lr
+                zone_sum_abs_r = abs(lr)
+                zone_exit_count = 0
+        else:
+            zone_bars.append((bar_high, bar_low, bar_vol))
+            zone_sum_r += lr
+            zone_sum_abs_r += abs(lr)
+            zone_exit_count = zone_exit_count + 1 if high_now else 0
+
+            exit_by_confirm = zone_exit_count >= ACCUM_ZONE_EXIT_BARS
+            exit_by_max = len(zone_bars) >= ACCUM_ZONE_MAX_BARS
+
+            if exit_by_confirm or exit_by_max:
+                if exit_by_confirm and len(zone_bars) > ACCUM_ZONE_EXIT_BARS:
+                    zone_bars = zone_bars[:-ACCUM_ZONE_EXIT_BARS]
+                drift = (abs(zone_sum_r) / max(zone_sum_abs_r, eps)) if zone_sum_abs_r > 0 else 0
+                if len(zone_bars) >= ACCUM_ZONE_MIN_BARS and drift <= ACCUM_ZONE_MAX_DRIFT:
+                    vah, val, poc = _accum_zone_build_profile(zone_bars)
+                    completed_zones.append({"vah": vah, "val": val, "poc": poc, "end_index": i})
+                zone_active = False
+
+    return list(reversed(completed_zones[-max_zones:]))
+
+
+def strategy_vah_val_reaction(pair_key, config, h1_candles, h4_candles, daily_candles):
+    """
+    Entry-tier strategy, per explicit instruction: marks the last 5
+    completed Volume Profile zones' VAH/VAL as ongoing institutional
+    reaction levels (not a one-shot breakout trigger like its sibling
+    detect_accumulation_zone_breakout) - "Location First, Confirmation
+    Second." No signal away from one of these levels, regardless of
+    what any other strategy says; deliberately sits alongside the
+    other 10 entry-tier strategies rather than gating them, after
+    finding that gating the WHOLE bank on this would starve it down
+    to the weak fallback most rounds (real, discussed tradeoff, not
+    an oversight).
+
+    Confirmation is a single, real signal (bullish/bearish engulfing)
+    rather than the full weighted multi-confirmation scoring engine
+    from the original reference design - deliberately descoped, per
+    explicit instruction, to match this bank's existing single-
+    trigger-per-strategy pattern rather than duplicating a second
+    scoring system inside one strategy function.
+    """
+    if not h1_candles or len(h1_candles) < ACCUM_ZONE_DIST_LEN + ACCUM_ZONE_MIN_BARS:
+        return None
+
+    zones = find_historical_vah_val_zones(h1_candles, max_zones=5)
+    if not zones:
+        return None
+
+    atr = _accum_zone_atr(h1_candles, ACCUM_ZONE_ATR_PERIOD)
+    if not atr or atr <= 0:
+        return None
+
+    last = h1_candles[-1]
+    reaction_zone = atr * 0.2  # same default as the reference indicator
+
+    for zone in zones:
+        near_val = abs(last["low"] - zone["val"]) <= reaction_zone or (last["low"] <= zone["val"] <= last["high"])
+        near_vah = abs(last["high"] - zone["vah"]) <= reaction_zone or (last["low"] <= zone["vah"] <= last["high"])
+
+        if near_val and detect_bullish_engulfing(h1_candles):
+            return {
+                "strategy_name": "VAH/VAL Reaction",
+                "direction": "BUY",
+                "detail": f"price returned to a historical VAL ({zone['val']:.2f}) from one of the last 5 volume profile zones, bullish engulfing confirmed",
+            }
+        if near_vah and detect_bearish_engulfing(h1_candles):
+            return {
+                "strategy_name": "VAH/VAL Reaction",
+                "direction": "SELL",
+                "detail": f"price returned to a historical VAH ({zone['vah']:.2f}) from one of the last 5 volume profile zones, bearish engulfing confirmed",
+            }
+
+    return None
+
+
 async def run_auto_copy_for_signal(bot, trade_context):
     """
     Fires the same signal's trade automatically for every user with
@@ -7830,7 +7982,7 @@ def analyze_smc_structure(pair_key, config):
     # requesting 210 here costs nothing functionally - it just lets
     # this call and build_signal_response's collapse back into ONE
     # shared cache entry/API call instead of two.
-    h1_candles = get_cached_candles(pair_key, config, "1h", outputsize=210)
+    h1_candles = get_cached_candles(pair_key, config, "1h", outputsize=1500)
     h4_candles = get_cached_candles(pair_key, config, "4h", outputsize=60)
 
     h1_factors = analyze_timeframe(h1_candles)
@@ -9694,6 +9846,7 @@ STRATEGY_BANK_ENTRIES = [
     strategy_williams_r,
     strategy_previous_day_high_low_manipulation,
     strategy_unicorn_model,
+    strategy_vah_val_reaction,
 ]
 
 # Distinct roster for synthetic (Deriv) indices - per explicit
@@ -11177,7 +11330,7 @@ async def build_signal_response(question, user_id=None):
     used_smc = False
     used_ai_layer = False
 
-    h1_candles = get_cached_candles(matched_key, config, "1h", outputsize=210)
+    h1_candles = get_cached_candles(matched_key, config, "1h", outputsize=1500)
     h4_candles = get_cached_candles(matched_key, config, "4h", outputsize=60)
     daily_candles = get_cached_candles(matched_key, config, "1day", outputsize=10)
 

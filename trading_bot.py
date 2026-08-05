@@ -1754,24 +1754,21 @@ SL_HIT_IMAGE_FILE_ID = "AgACAgQAAxkBAAIBIWowI9Lxu93CIKFD5YSHFbJ8_MB-AAJBD2sbbT2B
 # "13:00 UTC" = 2PM Lagos, "17:00 UTC" = 6PM
 # Lagos, "11:00 UTC" = 12PM Lagos, matching how
 # the team actually thinks about these slots.
+#
 # Per explicit instruction (schedule rebuilt again
-# 2026-07-11): weekdays (Mon-Fri) now carry ONLY
-# XAUUSD (8AM), GBPJPY (12PM, Monday-Thursday
-# only), and BTCUSD (6PM) - NO synthetic index
-# post on any weekday anymore (the old Friday 12PM
-# synthetic slot is removed). Saturday keeps its
-# existing synthetic-morning (8AM) + BTCUSD-evening
-# (6PM) pattern, untouched. Sunday now gets a
-# single synthetic post at 2PM (see SYNTHETIC_
-# SCHEDULE's sunday_only entry) - safe to add
-# since synthetic signals never touch signal_log,
-# so this has zero effect on the weekly performance
-# report's stats. NOTE - the GBPJPY-every-weekday
-# change (made 2026-07-08) reverses an earlier
-# real-testing finding that GBPJPY alone every
-# weekday was too slow/illiquid on TwelveData; if
-# that issue resurfaces, it wasn't fixed, just
-# knowingly re-accepted per that instruction.
+# with XAGUSD/USOIL added, post-MetaAPI-candles
+# fix): weekdays now rotate XAUUSD, XAGUSD, USOIL,
+# and BTCUSD across the 3 daily slots, a different
+# combination each weekday (Mon-Fri) - see the 3
+# dicts below for the exact per-day mapping.
+# GBPJPY no longer has a fixed schedule slot at
+# all - still reachable via manual DM "Signal"
+# only. Saturday/Sunday UNCHANGED from before this
+# rebuild: Saturday = synthetic-morning (8AM) +
+# BTCUSD-evening (6PM), no midday; Sunday = single
+# synthetic post at 2PM only (see SYNTHETIC_
+# SCHEDULE's sunday_only entry), no morning/midday/
+# evening major-pair posts at all.
 #
 # MORNING_PAIR_BY_WEEKDAY / MIDDAY_PAIR_BY_WEEKDAY
 # / EVENING_PAIR_BY_WEEKDAY use Python's
@@ -1787,52 +1784,40 @@ SL_HIT_IMAGE_FILE_ID = "AgACAgQAAxkBAAIBIWowI9Lxu93CIKFD5YSHFbJ8_MB-AAJBD2sbbT2B
 # mechanism can't vary the pair by day, only
 # include/exclude whole days.
 #
-# A day with no pair for a given slot (e.g. midday
-# Thursday/Friday, evening Sat/Sun) maps to None -
+# A day with no pair for a given slot maps to None -
 # the job simply does nothing that slot.
 # ============================================
 
 MORNING_PAIR_BY_WEEKDAY = {
     0: "xauusd",  # Monday
-    1: "xauusd",  # Tuesday
-    2: "xauusd",  # Wednesday
-    3: "xauusd",  # Thursday
+    1: "xagusd",  # Tuesday
+    2: "usoil",   # Wednesday
+    3: "usoil",   # Thursday
     4: "xauusd",  # Friday
-    5: None,      # Saturday - volatility/synthetic index instead, see SYNTHETIC_SCHEDULE's saturday_only entry
-    6: None,      # Sunday - no MORNING post (Sunday's only post is the 2PM synthetic, see SYNTHETIC_SCHEDULE's sunday_only entry)
+    5: None,      # Saturday - unchanged, volatility/synthetic index instead, see SYNTHETIC_SCHEDULE's saturday_only entry
+    6: None,      # Sunday - unchanged, no MORNING post (Sunday's only post is the 2PM synthetic, see SYNTHETIC_SCHEDULE's sunday_only entry)
 }
 
-# 11:00 UTC / 12PM Lagos midday slot - per explicit instruction,
-# GBPJPY now runs every weekday Monday-Thursday (replacing the old
-# "different major each day" rotation entirely). Friday maps to None
-# here since Friday now has NO midday post at all (the old Friday
-# synthetic slot at this same time was removed - see SYNTHETIC_
-# SCHEDULE, which now only fires Saturday morning and Sunday
-# afternoon). Saturday and Sunday also map to None here - Saturday's
-# schedule is morning-synthetic + evening-BTCUSD only, and Sunday's
-# is a single 2PM synthetic post only, neither has a midday slot.
+# 11:00 UTC / 12PM Lagos midday slot.
 MIDDAY_PAIR_BY_WEEKDAY = {
-    0: "gbpjpy",  # Monday
-    1: "gbpjpy",  # Tuesday
-    2: "gbpjpy",  # Wednesday
-    3: "gbpjpy",  # Thursday
-    4: None,      # Friday - no midday post at all, per explicit instruction
-    5: None,      # Saturday - no midday post, per explicit instruction
-    6: None,      # Sunday - no midday post (Sunday's only post is the 2PM synthetic)
+    0: "usoil",   # Monday
+    1: "usoil",   # Tuesday
+    2: "btcusd",  # Wednesday
+    3: "xauusd",  # Thursday
+    4: "usoil",   # Friday
+    5: None,      # Saturday - unchanged, no midday post
+    6: None,      # Sunday - unchanged, no midday post
 }
 
 EVENING_PAIR_BY_WEEKDAY = {
     0: "btcusd",  # Monday
-    1: "btcusd",  # Tuesday - XAGUSD removed from this slot per explicit
-                  # instruction. XAGUSD no longer has any fixed daily/
-                  # weekly channel slot - still reachable via manual DM
-                  # "Signal" only.
-    2: "btcusd",  # Wednesday
+    1: "xauusd",  # Tuesday
+    2: "xagusd",  # Wednesday
     3: "btcusd",  # Thursday
-    4: "btcusd",  # Friday
-    5: "btcusd",  # Saturday - per explicit instruction: synthetic in the
+    4: "xagusd",  # Friday
+    5: "btcusd",  # Saturday - unchanged, per explicit instruction: synthetic in the
                   # morning, BTCUSD in the evening, no midday post.
-    6: None,      # Sunday - no posts at all, per explicit instruction
+    6: None,      # Sunday - unchanged, no posts at all
 }
 
 DAILY_SCHEDULE = [
@@ -7710,6 +7695,93 @@ def get_candle_symbol_candidates(config):
         return ["WTI/USD"]
     return [config.get("td_symbol", config["symbol"])]
 
+def get_candles_metaapi(mt5_symbol, interval, outputsize):
+    """
+    Pulls historical candles directly from the connected MT5 account
+    via MetaAPI - primary data source for XAGUSD/USOIL specifically,
+    per explicit instruction: TwelveData's plan doesn't support either
+    at all (confirmed live - both 404/reject at every symbol spelling
+    tried, see get_candle_symbol_candidates), so this isn't replacing
+    a working path, it's filling a real gap. TwelveData stays as
+    fallback for these two, and as the only source for every other
+    pair - testing MetaAPI on just these 2 before considering it more
+    broadly, since it ties data availability to ONE broker account's
+    connection staying healthy (a real tradeoff against TwelveData's
+    provider-agnostic reliability, not a strict upgrade).
+
+    IMPORTANT: this is a genuinely different hostname/region from the
+    trade-execution endpoints elsewhere in this file (which use the
+    london region) - MetaAPI's own docs state this specific market-
+    data API is valid for the new-york region only, regardless of
+    which region the account's trading endpoints use.
+
+    tickVolume (not real "volume") is used deliberately - it's the
+    one volume field guaranteed present on every MT5 candle regardless
+    of broker data-feed setup, the same standard proxy already used
+    for the VAH/VAL Reaction strategy's zone detection.
+    """
+    if not METAAPI_TOKEN or not METAAPI_ACCOUNT_ID:
+        print("[METAAPI CANDLES] Credentials not set")
+        return None
+
+    timeframe_map = {"1h": "1h", "4h": "4h", "1day": "1d"}
+    mt5_timeframe = timeframe_map.get(interval)
+    if not mt5_timeframe:
+        print(f"[METAAPI CANDLES] No mapping for internal timeframe '{interval}'")
+        return None
+
+    url = (
+        f"https://mt-market-data-client-api-v1.new-york.agiliumtrade.ai"
+        f"/users/current/accounts/{METAAPI_ACCOUNT_ID}"
+        f"/historical-market-data/symbols/{mt5_symbol}/timeframes/{mt5_timeframe}/candles"
+        f"?limit={min(outputsize, 1000)}"
+    )
+    headers = {"auth-token": METAAPI_TOKEN, "Accept": "application/json"}
+
+    for attempt, timeout in enumerate((15, 30), start=1):
+        try:
+            response = requests.get(url, headers=headers, timeout=timeout)
+            if response.status_code == 200:
+                raw = response.json()
+                if not raw:
+                    print(f"[METAAPI CANDLES] Empty response for {mt5_symbol} {mt5_timeframe}")
+                    return None
+                candles = []
+                for c in raw:
+                    candles.append({
+                        "time": c.get("time"),
+                        "open": float(c["open"]),
+                        "high": float(c["high"]),
+                        "low": float(c["low"]),
+                        "close": float(c["close"]),
+                        "volume": float(c.get("tickVolume") or 0),
+                    })
+                # MetaAPI loads "in backwards direction" when startTime
+                # is omitted (newest first) - reverse to match this
+                # codebase's oldest->newest convention everywhere else.
+                candles.reverse()
+                return candles
+            if response.status_code in (429, 502, 503, 504) and attempt == 1:
+                print(f"[METAAPI CANDLES] {mt5_symbol} got {response.status_code}, retrying...")
+                continue
+            print(f"[METAAPI CANDLES] {mt5_symbol} {mt5_timeframe} failed {response.status_code}: {response.text[:300]}")
+            return None
+        except Exception as e:
+            if attempt == 1:
+                print(f"[METAAPI CANDLES] {mt5_symbol} attempt 1 error: {e} - retrying with longer timeout...")
+                continue
+            print(f"[METAAPI CANDLES] {mt5_symbol} error: {e}")
+            return None
+    return None
+
+
+# Pairs where MetaAPI is tried FIRST, TwelveData as fallback - see
+# get_candles_metaapi's docstring for why. Scoped to exactly these 2
+# per explicit instruction (test before any wider rollout), not a
+# blanket default for every pair.
+METAAPI_FIRST_PAIRS = {"xagusd", "usoil"}
+
+
 def get_cached_candles(pair_key, config, interval, outputsize=60):
     """
     CONFIRMED REAL BUG FIX: cache_key previously omitted outputsize
@@ -7738,6 +7810,13 @@ def get_cached_candles(pair_key, config, interval, outputsize=60):
     if cached and (now - cached["timestamp"] < ttl):
         return cached["candles"]
 
+    if pair_key in METAAPI_FIRST_PAIRS and config.get("mt5_symbol"):
+        candles = get_candles_metaapi(config["mt5_symbol"], interval, outputsize)
+        if candles:
+            candle_cache[cache_key] = {"candles": candles, "timestamp": now}
+            return candles
+        print(f"[CANDLES] MetaAPI failed for {pair_key} ({interval}) - falling back to TwelveData")
+
     candidates = get_candle_symbol_candidates(config)
     for symbol in candidates:
         candles = get_candles_twelvedata(symbol, interval, outputsize)
@@ -7747,6 +7826,7 @@ def get_cached_candles(pair_key, config, interval, outputsize=60):
 
     print(f"[CANDLES] All symbol candidates failed for {pair_key} ({interval}, outputsize={outputsize}): tried {candidates}")
     return None
+
 
 def find_swing_points(candles, strength=2):
     """
@@ -11441,16 +11521,24 @@ async def build_signal_response(question, user_id=None):
             )
             confidence = random.randint(80, 94)
 
-    # AI fundamental layer (capped). Scheduled channel signals pass
-    # user_id=None and are always allowed - negligible cost, only 3
-    # cron slots/day. DM signals are capped by the exact same
-    # per-user/global limits used elsewhere in this file, so the
-    # shared Gemini quota stays protected at 100k users. AI NEVER
-    # decides or contradicts the direction - it's told the technical
-    # call up front and only writes a supporting/caveat sentence for
-    # the separate Fundamental Analysis row below.
+    # AI fundamental layer (capped) - per explicit instruction, REMOVED
+    # from scheduled channel signals entirely now (user_id=None means
+    # scheduled - see the comment this replaced). This system has been
+    # the source of several real bugs this session (a level cited in
+    # the text not matching the level actually detected/plotted,
+    # signals contradicting that same day's own morning briefing,
+    # near-identical phrasing across unrelated pairs reading as
+    # scripted) - pulling it from the highest-visibility path (every
+    # subscriber sees every scheduled post) while keeping it for
+    # manual DM requests (lower volume, opt-in, someone specifically
+    # wants the extra context) is a deliberate risk reduction, not an
+    # oversight. DM signals stay capped by the exact same per-user/
+    # global limits used elsewhere in this file. AI NEVER decides or
+    # contradicts the direction - it's told the technical call up
+    # front and only writes a supporting/caveat sentence for the
+    # separate Fundamental Analysis row below.
     fundamental_reason = None
-    if can_use_ai_bias(user_id):
+    if user_id is not None and can_use_ai_bias(user_id):
         fundamental_reason = await generate_fundamental_context(pair_name, direction)
         if fundamental_reason:
             record_ai_bias_usage(user_id)
@@ -17923,7 +18011,7 @@ async def send_auto_copy_daily_digest(context: ContextTypes.DEFAULT_TYPE):
 # silently treated as $0.
 # ============================================
 
-SCHEDULED_DAILY_PAIRS = ("XAUUSD", "GBPJPY", "BTCUSD")
+SCHEDULED_DAILY_PAIRS = ("XAUUSD", "XAGUSD", "USOIL", "BTCUSD")
 
 # Fixed SL/TP pip distances per pair, per explicit instruction (added
 # alongside the dollar P&L above so pip-focused traders can see both).
@@ -17934,12 +18022,18 @@ SCHEDULED_DAILY_PAIRS = ("XAUUSD", "GBPJPY", "BTCUSD")
 # NOT round numbers - they're the exact real values of pip_size=165.3
 # * 3/6 / pip_value=1.0, kept precise rather than rounded to "496/992"
 # so this always matches the real, current live SL/TP setting exactly.
+# XAGUSD/USOIL added the same way: pip_size=0.1667 * 4.2/8.4
+# multipliers / pip_value=0.01 = 70.014/140.028 (both pairs share the
+# identical pip_size, pip_value, and multiplier bucket, so their pip
+# distances are identical too - not a copy-paste mistake).
 SCHEDULED_PAIR_PIPS = {
     "XAUUSD": (150, 300),
     "EURUSD": (30, 60),
     "GBPUSD": (30, 60),
     "GBPJPY": (50, 100),
     "BTCUSD": (495.9, 991.8),
+    "XAGUSD": (70.014, 140.028),
+    "USOIL": (70.014, 140.028),
 }
 
 def get_week_start():
@@ -18069,6 +18163,130 @@ async def post_weekly_report(context: ContextTypes.DEFAULT_TYPE):
             print(f"[WEEKLY REPORT] ✅ Posted to {channel_id}")
         except Exception as e:
             print(f"[WEEKLY REPORT] ❌ Failed for {channel_id}: {e}")
+
+
+def get_day_start():
+    now = datetime.utcnow()
+    return now.replace(hour=0, minute=0, second=0, microsecond=0)
+
+
+async def post_daily_report(context: ContextTypes.DEFAULT_TYPE):
+    """
+    New, per explicit instruction: a same-day summary of today's
+    scheduled signals, sent at 9PM Lagos (20:00 UTC) - separate from
+    and BEFORE the existing weekly report, which still runs unchanged
+    at its own Sunday slot. Reuses the exact same TP/SL/pip/P&L
+    calculation post_weekly_report uses, just scoped to today
+    (midnight UTC -> now), and lists each of today's signals
+    individually by pair - the weekly report only ever shows
+    aggregate totals, never itemizes, but with up to 3 (or fewer on
+    weekends) signals a day, per-signal detail is the more useful
+    view, per explicit instruction.
+
+    A signal still OPEN at send time isn't a bug or a missed report -
+    it's noted individually as still running, excluded from today's
+    P&L math (which only covers what's actually closed), and folded
+    into the following weekend's report once it does close, exactly
+    like the existing weekly logic already handles it - this doesn't
+    change how the weekly report counts anything, only adds a same-
+    day preview on top of it.
+    """
+    day_start = get_day_start()
+    now = datetime.utcnow()
+    date_label = now.strftime("%d %b %Y")
+
+    all_signals = get_signals_since(day_start)
+    signals = [s for s in all_signals if s.get("pair_name") in SCHEDULED_DAILY_PAIRS]
+
+    if not signals:
+        report = (
+            f"📊 <b>DAILY SIGNAL REPORT</b>\n"
+            f"<i>#NexoraAI — {date_label}</i>\n\n"
+            f"No scheduled signals were issued today.\n\n"
+            f"<i>Trade safe 💼🔥</i>"
+        )
+        for channel_id in [CHANNEL_1_ID, CHANNEL_2_ID, CHANNEL_3_ID]:
+            try:
+                await context.bot.send_message(chat_id=channel_id, text=report, parse_mode=ParseMode.HTML)
+                print(f"[DAILY REPORT] ✅ Posted (no signals) to {channel_id}")
+            except Exception as e:
+                print(f"[DAILY REPORT] ❌ Failed for {channel_id}: {e}")
+        return
+
+    total_pips_won = 0.0
+    total_pips_lost = 0.0
+    total_profit_usd = 0.0
+    missing_pnl_count = 0
+    still_running_pairs = []
+    line_items = []
+
+    for sig in signals:
+        pair_name = sig.get("pair_name")
+        status = sig.get("status")
+        direction = sig.get("direction", "")
+        sl_pips, tp_pips = SCHEDULED_PAIR_PIPS.get(pair_name, (0, 0))
+
+        if status == "TP_HIT":
+            total_pips_won += tp_pips
+            line_items.append(f"✅ <b>{pair_name}</b> ({direction}) — TP Hit, +{tp_pips:.1f} pips")
+        elif status == "SL_HIT":
+            total_pips_lost += sl_pips
+            line_items.append(f"❌ <b>{pair_name}</b> ({direction}) — SL Hit, -{sl_pips:.1f} pips")
+        else:
+            still_running_pairs.append(pair_name)
+            line_items.append(f"⏳ <b>{pair_name}</b> ({direction}) — Still running")
+            continue  # no realized P&L yet - excluded from today's math, picked up by the weekend report once closed
+
+        order_id = sig.get("mt5_order_id")
+        if not order_id:
+            missing_pnl_count += 1
+            continue
+        outcome, profit = await get_mt5_trade_outcome(order_id)
+        if outcome != "CLOSED" or profit is None:
+            missing_pnl_count += 1
+            continue
+        total_profit_usd += profit
+
+    profit_sign = "-" if total_profit_usd < 0 else "+"
+    profit_abs = abs(total_profit_usd)
+    profit_emoji = "📈" if total_profit_usd >= 0 else "📉"
+
+    report = (
+        f"📊 <b>DAILY SIGNAL REPORT</b>\n"
+        f"<i>#NexoraAI — {date_label}</i>\n\n"
+        f"━━━━━━━━━━━━━━━━━━━━━\n\n"
+        + "\n".join(line_items) + "\n\n"
+        f"━━━━━━━━━━━━━━━━━━━━━\n\n"
+        f"📐 <b>Pips Won:</b> +{total_pips_won:.1f}\n"
+        f"📐 <b>Pips Lost:</b> -{total_pips_lost:.1f}\n\n"
+        f"{profit_emoji} <b>Closed Net P&L (0.1 lot):</b> {profit_sign}${profit_abs:.2f}\n\n"
+    )
+    if still_running_pairs:
+        report += (
+            f"⏳ <i>{', '.join(still_running_pairs)} still running — "
+            f"will be included in the full weekend report once closed.</i>\n\n"
+        )
+    report += "<i>Trade safe 💼🔥</i>"
+
+    # Same reasoning as the weekly report - internal diagnostic info,
+    # not shown to subscribers, just logged.
+    if missing_pnl_count:
+        print(
+            f"[DAILY REPORT] ⚠️ {missing_pnl_count} closed signal(s) couldn't be "
+            f"matched to a real MT5 trade today - excluded from P&L total, "
+            f"not shown in public report."
+        )
+
+    for channel_id in [CHANNEL_1_ID, CHANNEL_2_ID, CHANNEL_3_ID]:
+        try:
+            await context.bot.send_message(
+                chat_id=channel_id,
+                text=report,
+                parse_mode=ParseMode.HTML
+            )
+            print(f"[DAILY REPORT] ✅ Posted to {channel_id}")
+        except Exception as e:
+            print(f"[DAILY REPORT] ❌ Failed for {channel_id}: {e}")
 
 # ============================================
 # MAIN
@@ -18468,6 +18686,18 @@ def main():
         job_kwargs={"misfire_grace_time": 300}
     )
 
+    # Daily signal report - every day at 20:00 UTC (9PM Lagos), per
+    # explicit instruction. Runs EVERY day (including weekends) -
+    # post_daily_report itself handles the "no signals today" case
+    # gracefully (Sunday has none at all; Saturday only has the
+    # evening BTCUSD slot), so no days= restriction is needed here.
+    job_queue.run_daily(
+        post_daily_report,
+        time=parse_time("20:00"),
+        name="daily_report",
+        job_kwargs={"misfire_grace_time": 300}
+    )
+
     print("Nexora AI Running...")
     print("Daily schedule (UTC):")
     for utc_time, post_type, data in DAILY_SCHEDULE:
@@ -18483,6 +18713,7 @@ def main():
         }.get(schedule_type, schedule_type)
         print(f"  ⚡ {utc_time} UTC — SYNTHETIC ROTATION ({note}, slot {slot_number})")
     print("  🔁 TP/SL monitor — every 15 minutes")
+    print("  📊 20:00 UTC daily — DAILY SIGNAL REPORT")
     print("  📊 23:00 UTC Sunday — WEEKLY REPORT")
     print(f"Channel 1 (Public): {CHANNEL_1_ID}")
     print(f"Channel 2 (Inner Circle): {CHANNEL_2_ID}")

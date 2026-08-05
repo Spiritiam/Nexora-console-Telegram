@@ -18199,7 +18199,16 @@ async def post_weekly_report(context: ContextTypes.DEFAULT_TYPE):
     now = datetime.utcnow()
 
     all_signals = get_signals_since(week_start)
-    signals = [s for s in all_signals if s.get("pair_name") in SCHEDULED_DAILY_PAIRS]
+    signals = [
+        s for s in all_signals
+        if s.get("pair_name") in SCHEDULED_DAILY_PAIRS
+        # FIX: CONFIRMED REAL BUG - neither report filtered by
+        # source before, so today's 47 manual test signals would
+        # have swamped a report that only actually had 1 real
+        # scheduled signal. source IS NULL is treated as scheduled
+        # too, for any row logged before this column existed.
+        and s.get("source") in ("scheduled", None)
+    ]
 
     total = len(signals)
     tp_hit = sum(1 for s in signals if s.get("status") == "TP_HIT")
@@ -18349,7 +18358,16 @@ async def post_daily_report(context: ContextTypes.DEFAULT_TYPE):
     date_label = now.strftime("%d %b %Y")
 
     all_signals = get_signals_since(day_start)
-    signals = [s for s in all_signals if s.get("pair_name") in SCHEDULED_DAILY_PAIRS]
+    signals = [
+        s for s in all_signals
+        if s.get("pair_name") in SCHEDULED_DAILY_PAIRS
+        # FIX: CONFIRMED REAL BUG - neither report filtered by
+        # source before, so today's 47 manual test signals would
+        # have swamped a report that only actually had 1 real
+        # scheduled signal. source IS NULL is treated as scheduled
+        # too, for any row logged before this column existed.
+        and s.get("source") in ("scheduled", None)
+    ]
 
     if not signals:
         report = (

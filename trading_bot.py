@@ -865,41 +865,79 @@ async def run_mt5_autotrade_bot_scan(context: ContextTypes.DEFAULT_TYPE):
             if not primary_candles:
                 continue
 
-            # Collect votes from EVERY strategy in this bot's list,
-            # per explicit instruction - previously this was
-            # first-match-wins (fire on whichever strategy confirmed
-            # FIRST, ignoring the rest). Now that every bot has 10
-            # strategies instead of 2, first-match-wins would mean
-            # far more trades firing on just 1 confirmation out of a
-            # much bigger pool - the same overtrading risk already
-            # fixed for synthetics, applied here for the same reason.
-            votes = []
-            for strategy_fn in strategy_fns:
-                try:
-                    result = strategy_fn(pair_key, pair_config, primary_candles, h4_candles, daily_candles)
-                    if result:
-                        votes.append(result)
-                except Exception as e:
-                    print(f"[MT5 AUTOTRADE] {strategy_fn.__name__} failed for {pair_key}: {e}")
-                    continue
+            # Two-tier per explicit instruction, mirroring the exact
+            # filter/entry split already built for channel/manual
+            # forex signals - a lagging trend-confirming strategy
+            # (Trend Following, Heikin-Ashi, Supertrend, Parabolic SAR,
+            # EMA Ribbon) can no longer trigger a trade alone; it only
+            # sets the direction lean, and a real entry-tier trigger
+            # in that same direction is required to actually fire.
+            #
+            # FALLBACK, per explicit instruction ("leave a gap so we
+            # don't miss any auto-trade calls"): if this bot's own
+            # strategy list doesn't have a genuine mix of both roles,
+            # or the two-tier check finds nothing this round, this
+            # falls back to the ORIGINAL flat "2+ of everything must
+            # agree" system as a safety net - real trading money, so
+            # the fallback is a real, already-proven mechanism (not a
+            # weak guess), never a coin flip.
+            filter_fns, entry_fns = split_strategies_by_role(strategy_fns)
+            direction = None
+            winning_votes = []
 
-            if not votes:
-                continue
+            if filter_fns and entry_fns:
+                filter_votes = []
+                for fn in filter_fns:
+                    try:
+                        result = fn(pair_key, pair_config, primary_candles, h4_candles, daily_candles)
+                        if result:
+                            filter_votes.append(result)
+                    except Exception as e:
+                        print(f"[MT5 AUTOTRADE] filter {fn.__name__} failed for {pair_key}: {e}")
 
-            buy_votes = [v for v in votes if v["direction"] == "BUY"]
-            sell_votes = [v for v in votes if v["direction"] == "SELL"]
-            winning_votes = buy_votes if len(buy_votes) >= len(sell_votes) else sell_votes
-            direction = "BUY" if winning_votes is buy_votes else "SELL"
+                f_buy = [v for v in filter_votes if v["direction"] == "BUY"]
+                f_sell = [v for v in filter_votes if v["direction"] == "SELL"]
+                if filter_votes and len(f_buy) != len(f_sell):
+                    filter_direction = "BUY" if len(f_buy) > len(f_sell) else "SELL"
+                    entry_votes = []
+                    for fn in entry_fns:
+                        try:
+                            result = fn(pair_key, pair_config, primary_candles, h4_candles, daily_candles)
+                            if result:
+                                entry_votes.append(result)
+                        except Exception as e:
+                            print(f"[MT5 AUTOTRADE] entry {fn.__name__} failed for {pair_key}: {e}")
+                    matching_entries = [v for v in entry_votes if v["direction"] == filter_direction]
+                    if matching_entries:
+                        direction = filter_direction
+                        winning_votes = matching_entries
 
-            # REAL hard-gate, per explicit instruction - genuinely
-            # require 2+ agreement now that there's a real pool to
-            # draw from, mirroring the exact fix already applied to
-            # synthetics for the same reason.
-            if len(winning_votes) < 2:
-                print(
-                    f"[MT5 AUTOTRADE] {bot_key}/{pair_key} - only {len(winning_votes)} of "
-                    f"{len(strategy_fns)} strategies agreed on {direction} - needs 2+, skipping this round"
-                )
+            if not direction:
+                # Fallback tier - the original flat system, run fresh
+                # (not reusing the two-tier votes above, since those
+                # were split into separate filter/entry calls) against
+                # ALL of this bot's strategies as one pool.
+                votes = []
+                for strategy_fn in strategy_fns:
+                    try:
+                        result = strategy_fn(pair_key, pair_config, primary_candles, h4_candles, daily_candles)
+                        if result:
+                            votes.append(result)
+                    except Exception as e:
+                        print(f"[MT5 AUTOTRADE] {strategy_fn.__name__} failed for {pair_key}: {e}")
+                        continue
+
+                if votes:
+                    buy_votes = [v for v in votes if v["direction"] == "BUY"]
+                    sell_votes = [v for v in votes if v["direction"] == "SELL"]
+                    fallback_winning = buy_votes if len(buy_votes) >= len(sell_votes) else sell_votes
+                    fallback_direction = "BUY" if fallback_winning is buy_votes else "SELL"
+                    if len(fallback_winning) >= 2:
+                        direction = fallback_direction
+                        winning_votes = fallback_winning
+
+            if not direction:
+                print(f"[MT5 AUTOTRADE] {bot_key}/{pair_key} - no qualifying setup (two-tier or fallback) this round")
                 continue
 
             vote = winning_votes[0]
@@ -10134,6 +10172,61 @@ STRATEGY_BANK_ENTRIES = [
     strategy_vah_val_reaction,
 ]
 
+# Shared "which role does this strategy play" lookup, per explicit
+# instruction - extends the filter/entry split beyond the forex
+# STRATEGY_BANK to Exness Auto-Trade (run_mt5_autotrade_bot_scan) and
+# Deriv's SYNTHETIC_STRATEGY_BANK (run_strategy_bank_synthetic, which
+# covers Deriv Auto-Trade AND Deriv manual/scheduled signals - one
+# dispatcher, three callers). Keyed by function NAME (not the
+# function object) since Exness bots store their strategy list as
+# name strings (bot_info["strategy_functions"]), while the forex/
+# synthetic banks store the functions directly - this one dict works
+# against both by looking up __name__ either way.
+#
+# Same "ongoing state vs specific triggering event" principle as
+# before. Any function NOT in this dict defaults to "entry" (the
+# safer default - being left out of the filter tier just means it
+# can't set the trend lean, not that it's silently excluded).
+STRATEGY_ROLE = {
+    # FILTER - ongoing state / lagging trend confirmation
+    "strategy_trend_following": "filter",
+    "strategy_heikin_ashi_trend": "filter",
+    "strategy_supertrend": "filter",
+    "strategy_parabolic_sar": "filter",
+    "strategy_ema_ribbon": "filter",
+    # ENTRY - specific triggering moment/event
+    "strategy_support_resistance_bounce": "entry",
+    "strategy_fibonacci_retracement": "entry",
+    "strategy_rsi_extreme_reversal": "entry",
+    "strategy_ema_pullback_scalper": "entry",
+    "strategy_breakout": "entry",
+    "strategy_atr_volatility_breakout": "entry",
+    "strategy_momentum_macd": "entry",
+    "strategy_williams_r": "entry",
+    "strategy_previous_day_high_low_manipulation": "entry",
+    "strategy_unicorn_model": "entry",
+    "strategy_vah_val_reaction": "entry",
+    "strategy_ichimoku_breakout": "entry",
+    "strategy_keltner_breakout": "entry",
+    "strategy_rate_of_change": "entry",
+    "strategy_cci_breakout": "entry",
+    "strategy_volatility_breakout_scalper": "entry",
+    "strategy_bollinger_squeeze_breakout": "entry",
+    "strategy_rsi_trend_continuation": "entry",
+    "strategy_bollinger_rsi_mean_reversion": "entry",
+}
+
+
+def split_strategies_by_role(strategy_fns):
+    """
+    Splits a list of strategy functions into (filter_fns, entry_fns)
+    using STRATEGY_ROLE. Shared by run_mt5_autotrade_bot_scan and
+    run_strategy_bank_synthetic so both apply the exact same rule.
+    """
+    filter_fns = [fn for fn in strategy_fns if STRATEGY_ROLE.get(fn.__name__) == "filter"]
+    entry_fns = [fn for fn in strategy_fns if STRATEGY_ROLE.get(fn.__name__, "entry") == "entry"]
+    return filter_fns, entry_fns
+
 # Distinct roster for synthetic (Deriv) indices - per explicit
 # instruction, removes every ICT/FVG-dependent strategy (ICT/SMC,
 # Unicorn Model, Previous Day H/L Manipulation, London Session ORB),
@@ -10469,7 +10562,6 @@ async def run_strategy_bank_synthetic(index_key, config, h1_candles, h4_candles,
     "couldn't analyze this index right now" case, not a disagreement,
     since there's nothing whatsoever to fall back to.
     """
-    votes = []
 
     # Diagnostic: confirm what candle data actually arrived for THIS
     # index before blaming the strategies themselves. Added after a
@@ -10512,52 +10604,97 @@ async def run_strategy_bank_synthetic(index_key, config, h1_candles, h4_candles,
             f"{h1_closes} | times: {h1_times}"
         )
 
-    for strategy_fn in SYNTHETIC_INDEX_STRATEGY_GROUPS.get(index_key, SYNTHETIC_STRATEGY_BANK):
-        try:
-            sig = inspect.signature(strategy_fn)
-            if "m1_candles" in sig.parameters:
-                result = strategy_fn(index_key, config, h1_candles, h4_candles, daily_candles, m1_candles=m1_candles)
-            else:
-                result = strategy_fn(index_key, config, h1_candles, h4_candles, daily_candles)
-            if result:
-                votes.append(result)
-        except Exception as e:
-            print(f"[STRATEGY BANK SYNTH] {strategy_fn.__name__} failed for {index_key}: {e}")
-            continue
+    def _run_strategy(strategy_fn):
+        sig = inspect.signature(strategy_fn)
+        if "m1_candles" in sig.parameters:
+            return strategy_fn(index_key, config, h1_candles, h4_candles, daily_candles, m1_candles=m1_candles)
+        return strategy_fn(index_key, config, h1_candles, h4_candles, daily_candles)
 
-    if not votes:
-        print(f"[STRATEGY BANK SYNTH] {index_key} - no strategy cast any vote this round, falling back")
-        return None
+    strategy_pool = SYNTHETIC_INDEX_STRATEGY_GROUPS.get(index_key, SYNTHETIC_STRATEGY_BANK)
 
-    buy_votes = [v for v in votes if v["direction"] == "BUY"]
-    sell_votes = [v for v in votes if v["direction"] == "SELL"]
+    # Two-tier per explicit instruction, mirroring the exact filter/
+    # entry split already built for channel/manual forex signals and
+    # Exness Auto-Trade - a lagging trend-confirming strategy can no
+    # longer trigger a trade alone; it only sets the direction lean,
+    # and a real entry-tier trigger in that same direction is
+    # required to actually fire. Covers Deriv Auto-Trade (via
+    # min_agree), Deriv manual signals, AND Deriv scheduled signals
+    # all at once, since all three call this one function.
+    #
+    # FALLBACK, per explicit instruction ("leave a gap so we don't
+    # miss any signal or auto-trade calls"): if this index's own
+    # strategy group doesn't have a genuine mix of both roles, or the
+    # two-tier check finds nothing this round, this falls back to the
+    # ORIGINAL flat vote-pool system (min_agree-gated) as a safety
+    # net - a real, already-proven mechanism, not a weak guess.
+    filter_fns, entry_fns = split_strategies_by_role(strategy_pool)
+    direction = None
+    winning_votes = []
+    used_fallback = False
 
-    winning_votes = buy_votes if len(buy_votes) >= len(sell_votes) else sell_votes
-    direction = "BUY" if winning_votes is buy_votes else "SELL"
+    if filter_fns and entry_fns:
+        filter_votes = []
+        for fn in filter_fns:
+            try:
+                result = _run_strategy(fn)
+                if result:
+                    filter_votes.append(result)
+            except Exception as e:
+                print(f"[STRATEGY BANK SYNTH] filter {fn.__name__} failed for {index_key}: {e}")
 
-    # FIX: the group_size>2-requires-2+ special case that used to sit
-    # here directly defeated the whole point of Aggressive (min_agree=1)
-    # vs Conservative (min_agree=3) - it silently forced at least 2
-    # agreeing votes on any bigger group (r75/r100, r10/r25/r50)
-    # regardless of what the caller actually asked for, so Aggressive
-    # could never fire on a single vote like it's supposed to.
-    # min_agree is now the ONE real, ENFORCED gate (previously it only
-    # logged a note and sent anyway on any vote count, which would
-    # have made Conservative barely different from Aggressive once
-    # the hard-coded override above was removed - both would fire on
-    # just 1 vote, only differing in the reported confidence number).
-    if len(winning_votes) < min_agree:
-        print(
-            f"[STRATEGY BANK SYNTH] {index_key} only {len(winning_votes)} strategy(ies) "
-            f"agreed on {direction} (needs {min_agree}) - skipping this round"
-        )
-        return None
+        f_buy = [v for v in filter_votes if v["direction"] == "BUY"]
+        f_sell = [v for v in filter_votes if v["direction"] == "SELL"]
+        if filter_votes and len(f_buy) != len(f_sell):
+            filter_direction = "BUY" if len(f_buy) > len(f_sell) else "SELL"
+            entry_votes = []
+            for fn in entry_fns:
+                try:
+                    result = _run_strategy(fn)
+                    if result:
+                        entry_votes.append(result)
+                except Exception as e:
+                    print(f"[STRATEGY BANK SYNTH] entry {fn.__name__} failed for {index_key}: {e}")
+            matching_entries = [v for v in entry_votes if v["direction"] == filter_direction]
+            if matching_entries:
+                direction = filter_direction
+                winning_votes = matching_entries
+
+    if not direction:
+        used_fallback = True
+        votes = []
+        for strategy_fn in strategy_pool:
+            try:
+                result = _run_strategy(strategy_fn)
+                if result:
+                    votes.append(result)
+            except Exception as e:
+                print(f"[STRATEGY BANK SYNTH] {strategy_fn.__name__} failed for {index_key}: {e}")
+                continue
+
+        if not votes:
+            print(f"[STRATEGY BANK SYNTH] {index_key} - no strategy cast any vote this round (two-tier or fallback), falling back")
+            return None
+
+        buy_votes = [v for v in votes if v["direction"] == "BUY"]
+        sell_votes = [v for v in votes if v["direction"] == "SELL"]
+        winning_votes = buy_votes if len(buy_votes) >= len(sell_votes) else sell_votes
+        direction = "BUY" if winning_votes is buy_votes else "SELL"
+
+        # min_agree still applies in fallback mode - Aggressive (1)
+        # stays permissive, Conservative (3) stays strict, even here.
+        if len(winning_votes) < min_agree:
+            print(
+                f"[STRATEGY BANK SYNTH] {index_key} only {len(winning_votes)} strategy(ies) "
+                f"agreed on {direction} (needs {min_agree}, fallback tier) - skipping this round"
+            )
+            return None
 
     agreeing_names = [v["strategy_name"] for v in winning_votes]
     confidence = min(95, 70 + len(winning_votes) * 6)
 
     print(
-        f"[STRATEGY BANK SYNTH] {index_key} -> {direction} (true consensus) | "
+        f"[STRATEGY BANK SYNTH] {index_key} -> {direction} "
+        f"({'fallback pool' if used_fallback else 'two-tier'}) | "
         f"{len(winning_votes)} agreeing: {', '.join(agreeing_names)}"
     )
 

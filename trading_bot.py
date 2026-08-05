@@ -5656,6 +5656,48 @@ def find_historical_vah_val_zones(candles, max_zones=5):
     return list(reversed(completed_zones[-max_zones:]))
 
 
+_vah_val_zone_cache = {}
+VAH_VAL_ZONE_CACHE_SECONDS = 20 * 3600  # 20h - zones only meaningfully change over days/weeks anyway
+
+
+def get_vah_val_zones_cached(pair_key, config):
+    """
+    CONFIRMED REAL INCIDENT, now fixed: the first version of this
+    strategy used the shared h1_candles (bumped 210->1500 for
+    everyone) to find zones, which meant EVERY signal request -
+    scheduled and manual alike, for every pair - paid for a full
+    1500-candle TwelveData pull. TwelveData charges API credits
+    proportional to outputsize, and this blew through the account's
+    credit budget within hours of deploying, breaking manual signal
+    generation entirely across every pair (confirmed live - reverted
+    the shared candle count back to 210 immediately).
+
+    This decouples the two: the shared h1_candles used by every other
+    strategy stays cheap (210, unchanged from before this feature
+    ever existed). This function does its OWN separate 1500-candle
+    pull, but caches the result for 20 hours per pair - completed
+    volume-profile zones don't change meaningfully within a day
+    anyway (each one takes 30-300 H1 bars just to form), so there's
+    no real cost to only refreshing this once a day, and it turns
+    ~13 pairs x however-many-signals-per-day expensive pulls into
+    at most ~13 a day, total.
+    """
+    now = time.time()
+    cached = _vah_val_zone_cache.get(pair_key)
+    if cached and (now - cached["timestamp"] < VAH_VAL_ZONE_CACHE_SECONDS):
+        return cached["zones"]
+
+    large_h1_candles = get_cached_candles(pair_key, config, "1h", outputsize=1500)
+    if not large_h1_candles:
+        # Serve stale data rather than nothing at all if we have it -
+        # a day-old set of zones is still far more useful than none.
+        return cached["zones"] if cached else []
+
+    zones = find_historical_vah_val_zones(large_h1_candles, max_zones=5)
+    _vah_val_zone_cache[pair_key] = {"zones": zones, "timestamp": now}
+    return zones
+
+
 def strategy_vah_val_reaction(pair_key, config, h1_candles, h4_candles, daily_candles):
     """
     Entry-tier strategy, per explicit instruction: marks the last 5
@@ -5676,10 +5718,10 @@ def strategy_vah_val_reaction(pair_key, config, h1_candles, h4_candles, daily_ca
     trigger-per-strategy pattern rather than duplicating a second
     scoring system inside one strategy function.
     """
-    if not h1_candles or len(h1_candles) < ACCUM_ZONE_DIST_LEN + ACCUM_ZONE_MIN_BARS:
+    if not h1_candles or len(h1_candles) < 15:
         return None
 
-    zones = find_historical_vah_val_zones(h1_candles, max_zones=5)
+    zones = get_vah_val_zones_cached(pair_key, config)
     if not zones:
         return None
 
@@ -7982,7 +8024,7 @@ def analyze_smc_structure(pair_key, config):
     # requesting 210 here costs nothing functionally - it just lets
     # this call and build_signal_response's collapse back into ONE
     # shared cache entry/API call instead of two.
-    h1_candles = get_cached_candles(pair_key, config, "1h", outputsize=1500)
+    h1_candles = get_cached_candles(pair_key, config, "1h", outputsize=210)
     h4_candles = get_cached_candles(pair_key, config, "4h", outputsize=60)
 
     h1_factors = analyze_timeframe(h1_candles)
@@ -11330,7 +11372,7 @@ async def build_signal_response(question, user_id=None):
     used_smc = False
     used_ai_layer = False
 
-    h1_candles = get_cached_candles(matched_key, config, "1h", outputsize=1500)
+    h1_candles = get_cached_candles(matched_key, config, "1h", outputsize=210)
     h4_candles = get_cached_candles(matched_key, config, "4h", outputsize=60)
     daily_candles = get_cached_candles(matched_key, config, "1day", outputsize=10)
 

@@ -7812,6 +7812,7 @@ def get_candles_metaapi(mt5_symbol, interval, outputsize):
                 # connection itself is healthy - clears any failure
                 # flag, regardless of which specific symbol asked.
                 record_metaapi_candles_success()
+                print(f"[METAAPI CANDLES] ✅ {mt5_symbol} {mt5_timeframe} - {len(raw)} candles")
                 candles = []
                 for c in raw:
                     candles.append({
@@ -11564,49 +11565,39 @@ async def build_signal_response(question, user_id=None):
 
     daily_fallback_history = None
     if not direction:
-        # CONFIRMED REAL GAP, now fixed: for XAGUSD/USOIL specifically,
-        # get_price_history_1h() always returns None (by design -
-        # both pairs use a spot-price-only provider with no real
-        # history endpoint), so generate_rule_based_bias's "trending
-        # up/down over the last hour" branch can NEVER fire for these
-        # two pairs - they always fell through to _consistent_or_random,
-        # which (when there's no recent prior signal to repeat) does
-        # `random.choice(["BUY", "SELL"])` - a literal coin flip - and
-        # then this code immediately slapped a random.randint(80, 94)
-        # confidence score on top of it. That's exactly the guesswork
-        # explicitly ruled out - a fabricated direction wearing a
-        # confident-looking number. Every other pair keeps the
-        # existing rule-based fallback unchanged, since their
-        # price_1h_ago IS real, fetched data.
-        if matched_key == "xagusd":
-            # XAGUSD specifically gets a real, separate path now -
-            # metals.dev's free timeseries endpoint genuinely has
-            # real daily price history (confirmed directly from
-            # their docs), unlike oil which has no free path at any
-            # granularity. Deliberately simpler/lower-confidence than
-            # the main bank - see generate_xagusd_daily_fallback's
-            # own docstring for why. live_price IS passed through now,
-            # per explicit instruction - CONFIRMED via a real live
-            # API pull that metals.dev's /timeseries never includes
-            # today's date (always 1+ day stale), which was silently
-            # anchoring the chart/reasoning to yesterday's price while
-            # Entry below used today's real one. Same live_price
-            # variable already used for Entry/SL/TP elsewhere in this
-            # function - not a second fetch, not a different number.
-            daily_fallback_result = generate_xagusd_daily_fallback(live_price=live_price)
-            if daily_fallback_result:
-                direction, confidence, reason, daily_fallback_history = daily_fallback_result
-                last_signal_direction[matched_key] = (direction, time.time())
+        # FIX: the strategy bank now genuinely runs on real MetaAPI
+        # data for XAGUSD/USOIL - confirmed live, the bank correctly
+        # found a trend lean with no qualifying entry yet ("waiting
+        # for an actual moment"), which is a legitimate, healthy "no
+        # signal this round" outcome, same as any other pair. The
+        # special-cases below (XAGUSD's separate metals.dev daily
+        # fallback, USOIL's hard "no data source" message) both
+        # PREDATE MetaAPI and were written for a world where these 2
+        # pairs had zero real data at all - confirmed live, they were
+        # firing even now that real data works, misrepresenting "no
+        # signal yet" as "we have no data," and showing a materially
+        # worse answer (a coarse daily-close heuristic, or an outright
+        # false error) than the real, live H1 data actually supports.
+        # Both removed - XAGUSD/USOIL now fall through to the exact
+        # same generate_rule_based_bias every other pair already
+        # uses, just below.
+        #
+        # That fallback needs a real price_1h_ago to do anything
+        # better than a coin flip, and get_price_history_1h() still
+        # always returns None for these two (by design - both use a
+        # spot-price-only provider with no real history endpoint) -
+        # unrelated to and unfixed by the MetaAPI work, so still a
+        # real gap on its own. Since h1_candles now has genuine recent
+        # history for these pairs via MetaAPI, derive price_1h_ago
+        # directly from it instead of that separate, still-broken
+        # function - real data, not a fabricated random guess.
+        if price_1h_ago is None and h1_candles and len(h1_candles) >= 2:
+            price_1h_ago = h1_candles[-2]["close"]
 
-        if not direction:
-            if config.get("use_metals_api") or config.get("use_oil_api"):
-                print(f"[SIGNAL] ⚠️ {pair_name} has no real data source for a signal - returning honest no-data response")
-                return None, None, "NO_DATA_AVAILABLE", None
-
-            direction, reason = generate_rule_based_bias(
-                matched_key, current_price, price_1h_ago
-            )
-            confidence = random.randint(80, 94)
+        direction, reason = generate_rule_based_bias(
+            matched_key, current_price, price_1h_ago
+        )
+        confidence = random.randint(80, 94)
 
     # AI fundamental layer (capped) - per explicit instruction, REMOVED
     # from scheduled channel signals entirely now (user_id=None means

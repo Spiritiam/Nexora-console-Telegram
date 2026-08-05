@@ -7525,6 +7525,13 @@ def get_price_twelvedata(symbol):
         data = response.json()
         if "price" in data:
             return float(data["price"])
+        # FIX: this used to just return None here with zero logging -
+        # TwelveData returns a normal 200 JSON response for rate-limit
+        # and other API errors (not a Python exception), so the real
+        # reason ("price" missing) was being silently discarded every
+        # time. Confirmed live - couldn't tell a rate limit apart from
+        # any other failure without this.
+        print(f"[TWELVEDATA] No price in response for {symbol}: {data}")
         return None
     except Exception as e:
         print(f"[TWELVEDATA] Error for {symbol}: {e}")
@@ -7813,6 +7820,16 @@ def get_candles_metaapi(mt5_symbol, interval, outputsize):
                 # flag, regardless of which specific symbol asked.
                 record_metaapi_candles_success()
                 print(f"[METAAPI CANDLES] ✅ {mt5_symbol} {mt5_timeframe} - {len(raw)} candles")
+                # FIX: CONFIRMED via live chart evidence - candles were
+                # showing newest-date-on-the-left (backwards from every
+                # other pair's chart). MetaAPI's own docs describe
+                # candles as "loaded in backwards direction" but that
+                # describes the FETCH mechanism (starts from latest,
+                # works backward to build the set), not necessarily the
+                # returned array's order - the actual array order was
+                # already oldest-first, matching this codebase's
+                # convention, so the .reverse() call here was flipping
+                # already-correct data into the wrong order. Removed.
                 candles = []
                 for c in raw:
                     candles.append({
@@ -7823,10 +7840,6 @@ def get_candles_metaapi(mt5_symbol, interval, outputsize):
                         "close": float(c["close"]),
                         "volume": float(c.get("tickVolume") or 0),
                     })
-                # MetaAPI loads "in backwards direction" when startTime
-                # is omitted (newest first) - reverse to match this
-                # codebase's oldest->newest convention everywhere else.
-                candles.reverse()
                 return candles
             if response.status_code in (401, 403):
                 # Genuinely systemic (account disconnected/revoked, not

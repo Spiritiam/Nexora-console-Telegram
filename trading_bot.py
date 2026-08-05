@@ -9664,6 +9664,38 @@ STRATEGY_BANK = [
     # exist as functions, untouched, just not in this active list.
 ]
 
+# Two-tier split of STRATEGY_BANK, per explicit instruction after a
+# real signal (XAUUSD, Heikin-Ashi Trend) was 100% right about
+# direction but entered right at the top of a sharp impulsive leg,
+# with a normal pullback immediately putting it underwater - a
+# lagging trend-confirmation strategy is good at "which way," bad at
+# "is THIS the moment." The split:
+#
+# FILTER tier - describes an ONGOING STATE (is price trending up/down
+# right now), never allowed to trigger a trade on its own anymore:
+STRATEGY_BANK_FILTERS = [
+    strategy_trend_following,
+    strategy_heikin_ashi_trend,
+    strategy_supertrend,
+]
+
+# ENTRY tier - fires on a specific MOMENT/EVENT (a pullback into a
+# real zone, a level bounce, a fresh cross, a breakout, a reversal at
+# an extreme) - this is what's now actually allowed to trigger a
+# trade, and only when it agrees with the filter tier's direction.
+STRATEGY_BANK_ENTRIES = [
+    strategy_support_resistance_bounce,
+    strategy_fibonacci_retracement,
+    strategy_rsi_extreme_reversal,
+    strategy_ema_pullback_scalper,
+    strategy_breakout,
+    strategy_atr_volatility_breakout,
+    strategy_momentum_macd,
+    strategy_williams_r,
+    strategy_previous_day_high_low_manipulation,
+    strategy_unicorn_model,
+]
+
 # Distinct roster for synthetic (Deriv) indices - per explicit
 # instruction, removes every ICT/FVG-dependent strategy (ICT/SMC,
 # Unicorn Model, Previous Day H/L Manipulation, London Session ORB),
@@ -9820,72 +9852,107 @@ def check_fresh_momentum_veto(pair_key, config, h1_candles, direction):
 
 def run_strategy_bank(pair_key, config, h1_candles, h4_candles, daily_candles, min_agree=2):
     """
-    Runs every strategy in STRATEGY_BANK and prefers at least
-    `min_agree` of them to independently agree on the SAME direction.
+    Two-tier dispatcher, per explicit instruction after a real signal
+    (XAUUSD, Heikin-Ashi Trend) was 100% right about direction but
+    entered right at the top of an already-extended move - a lagging
+    trend-confirmation strategy is good at "which way," bad at "is
+    THIS the moment." Previously ran all 13 strategies as one flat
+    vote pool where any of them, trend-readers included, could
+    directly trigger a trade alone.
 
-    ICT/SMC REMOVED ENTIRELY per explicit instruction - this used to
-    also run a separate analyze_smc_structure call (XAUUSD-only) plus
-    a special-case rule demoting it whenever it was the sole winning
-    vote. Both are gone now: strategy_unicorn_model was already taken
-    out of STRATEGY_BANK itself, and analyze_smc_structure is no
-    longer called from here at all. No ICT/SMC-influenced vote can
-    reach a channel or manual signal through this function anymore.
+    Now: STRATEGY_BANK_FILTERS only ever answers "which way is this
+    trending" - it can no longer trigger a trade by itself.
+    STRATEGY_BANK_ENTRIES answers "is this an actual entry moment"
+    (a pullback, a level bounce, a breakout, a reversal at an
+    extreme). A trade only fires when BOTH agree: the filter tier has
+    a clear directional lean, AND at least one entry-tier strategy
+    fires in that SAME direction. If the trend is clear but nothing
+    has actually triggered yet, this now correctly waits instead of
+    entering on trend confirmation alone - the exact discipline this
+    was built to add.
 
-    min_agree=2 is the PREFERRED bar, not a hard gate - per explicit
-    instruction, every strategy in this bank is individually
-    pre-verified/trusted, so even 1 agreeing strategy is an acceptable
-    signal to send, just at a lower, honestly-scaled confidence
-    (1 agreeing -> 76%, 2 -> 82%, 3 -> 88%, etc.) rather than falling
-    back to the much weaker rule-based bias. The bank only returns
-    None when literally NO strategy cast any vote at all (votes is
-    empty) - a real "couldn't analyze this pair right now" case, not
-    a disagreement, since there's nothing to fall back to.
+    min_agree now applies to the ENTRY tier specifically (how many
+    independent entry triggers confirm this exact moment), same
+    "preferred bar, not a hard gate" philosophy as before - even 1
+    entry-tier vote is sent, just at lower confidence.
 
     Returns (direction, confidence, reason, agreeing_strategies) or
-    None if no strategy produced any result at all. confidence scales
-    with how many strategies agreed.
+    None if either tier has nothing to say, or the two tiers disagree.
     """
-    votes = []
-
-    for strategy_fn in STRATEGY_BANK:
+    filter_votes = []
+    for strategy_fn in STRATEGY_BANK_FILTERS:
         try:
             result = strategy_fn(pair_key, config, h1_candles, h4_candles, daily_candles)
             if result:
-                votes.append(result)
+                filter_votes.append(result)
         except Exception as e:
-            print(f"[STRATEGY BANK] {strategy_fn.__name__} failed for {pair_key}: {e}")
+            print(f"[STRATEGY BANK] filter {strategy_fn.__name__} failed for {pair_key}: {e}")
             continue
 
-    if not votes:
-        print(f"[STRATEGY BANK] {pair_key} - no strategy cast any vote this round, falling back")
+    if not filter_votes:
+        print(f"[STRATEGY BANK] {pair_key} - no trend filter has a read right now, skipping")
         return None
 
-    buy_votes = [v for v in votes if v["direction"] == "BUY"]
-    sell_votes = [v for v in votes if v["direction"] == "SELL"]
+    filter_buy = [v for v in filter_votes if v["direction"] == "BUY"]
+    filter_sell = [v for v in filter_votes if v["direction"] == "SELL"]
+    if len(filter_buy) == len(filter_sell):
+        print(f"[STRATEGY BANK] {pair_key} - trend filters split evenly, no clear lean, skipping")
+        return None
+    filter_direction = "BUY" if len(filter_buy) > len(filter_sell) else "SELL"
+    winning_filter_votes = filter_buy if filter_direction == "BUY" else filter_sell
 
-    winning_votes = buy_votes if len(buy_votes) >= len(sell_votes) else sell_votes
-    direction = "BUY" if winning_votes is buy_votes else "SELL"
+    entry_votes = []
+    for strategy_fn in STRATEGY_BANK_ENTRIES:
+        try:
+            result = strategy_fn(pair_key, config, h1_candles, h4_candles, daily_candles)
+            if result:
+                entry_votes.append(result)
+        except Exception as e:
+            print(f"[STRATEGY BANK] entry {strategy_fn.__name__} failed for {pair_key}: {e}")
+            continue
+
+    matching_entries = [v for v in entry_votes if v["direction"] == filter_direction]
+    if not matching_entries:
+        print(
+            f"[STRATEGY BANK] {pair_key} - trend filters lean {filter_direction} "
+            f"({len(winning_filter_votes)} agreeing) but no entry trigger has fired "
+            f"yet in that direction - waiting for an actual moment, not trading the trend alone"
+        )
+        return None
+
+    direction = filter_direction
+    winning_votes = matching_entries
 
     if len(winning_votes) < min_agree:
         print(
-            f"[STRATEGY BANK] {pair_key} only {len(winning_votes)} strategy(ies) "
+            f"[STRATEGY BANK] {pair_key} only {len(winning_votes)} entry trigger(s) "
             f"agreed on {direction} (below preferred {min_agree}) - sending anyway, every "
             f"strategy in this bank is independently trusted"
         )
 
     agreeing_names = [v["strategy_name"] for v in winning_votes]
-    confidence = min(95, 70 + len(winning_votes) * 6)
+    filter_names = [v["strategy_name"] for v in winning_filter_votes]
+    # Small bonus for filter-tier agreement on top of the entry-tier
+    # base, same ceiling as before - multiple confirming trend reads
+    # plus a real entry trigger is genuinely higher-conviction than
+    # either alone, but the entry trigger itself still does most of
+    # the work in this number, matching its role as the actual reason
+    # a trade fires now.
+    confidence = min(95, 70 + len(winning_votes) * 6 + (len(winning_filter_votes) - 1) * 2)
 
-    # Short bullet points, one per agreeing strategy, instead of one
-    # long run-on sentence - reads cleanly even with 2-3 strategies
-    # stacked together, rather than risking a wall of text that
-    # looks bogus or padded.
-    bullet_lines = [f"• {v['strategy_name']}: {v['detail']}" for v in winning_votes]
-    reason = "\n".join(bullet_lines)
+    # Reasoning text now names the filter tier separately from the
+    # entry trigger, so it reads as "why THIS pair is in a real
+    # direction" followed by "why THIS exact moment" - not one
+    # undifferentiated list where a lagging trend read and a genuine
+    # entry trigger look equally weighted.
+    reason = (
+        f"Trend filters ({len(winning_filter_votes)}): {', '.join(filter_names)} all {direction.lower()}.\n"
+        + "\n".join(f"• Entry — {v['strategy_name']}: {v['detail']}" for v in winning_votes)
+    )
 
     print(
         f"[STRATEGY BANK] {pair_key} -> {direction} | "
-        f"{len(winning_votes)} agreeing: {', '.join(agreeing_names)}"
+        f"filters: {', '.join(filter_names)} | entries: {', '.join(agreeing_names)}"
     )
 
     # EXPERIMENTAL flip, per explicit instruction - see

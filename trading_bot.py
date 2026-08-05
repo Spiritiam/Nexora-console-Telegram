@@ -2888,50 +2888,111 @@ def get_service_credential(name):
         return None
 
 
+def record_metaapi_candles_failure():
+    """
+    Same pattern as record_deriv_service_token_failure, for MetaAPI's
+    candle-fetching specifically - per explicit instruction, added so
+    a disconnected MT5 account or exhausted MetaAPI credit gets
+    flagged proactively, even though TwelveData's fallback means
+    signals themselves keep working either way. Doesn't overwrite
+    failure_detected_at if already flagged, so the alert can say how
+    long it's actually been down.
+    """
+    try:
+        existing = get_service_credential("metaapi_candles")
+        if existing and existing.get("currently_failing"):
+            return
+        url = f"{SUPABASE_URL}/rest/v1/service_credentials?on_conflict=credential_name"
+        headers = sb_headers()
+        headers["Prefer"] = "resolution=merge-duplicates"
+        payload = {
+            "credential_name": "metaapi_candles",
+            "currently_failing": True,
+            "failure_detected_at": datetime.utcnow().isoformat(),
+        }
+        requests.post(url, headers=headers, json=payload, timeout=10)
+    except Exception as e:
+        print(f"[SERVICE CREDENTIALS] Error recording MetaAPI candles failure: {e}")
+
+
+def record_metaapi_candles_success():
+    try:
+        existing = get_service_credential("metaapi_candles")
+        if not existing or not existing.get("currently_failing"):
+            return
+        url = f"{SUPABASE_URL}/rest/v1/service_credentials?credential_name=eq.metaapi_candles"
+        requests.patch(url, headers=sb_headers(), json={"currently_failing": False}, timeout=10)
+    except Exception as e:
+        print(f"[SERVICE CREDENTIALS] Error clearing MetaAPI candles failure flag: {e}")
+
+
+async def _alert_if_credential_failing(context, cred_name, human_label, impact_text):
+    """
+    Shared failure-alert logic, extracted so both DERIV_SERVICE_TOKEN
+    and MetaAPI candle-fetching use the exact same alerting behavior
+    (max once every 2 hours while broken) instead of two near-
+    identical copies of the same function.
+    """
+    cred = get_service_credential(cred_name)
+    if not cred or not cred.get("currently_failing"):
+        return
+    last_alert = cred.get("last_failure_alert_at")
+    if last_alert:
+        last_alert_dt = datetime.fromisoformat(last_alert.replace("Z", "+00:00"))
+        if (datetime.now(last_alert_dt.tzinfo) - last_alert_dt) < timedelta(hours=2):
+            return
+    try:
+        failure_since = cred.get("failure_detected_at", "unknown time")
+        await context.bot.send_message(
+            chat_id=int(ADMIN_USER_ID),
+            text=(
+                f"🚨 <b>{human_label} is down.</b>\n\n"
+                f"Failing since: {failure_since}\n\n"
+                f"{impact_text}"
+            ),
+            parse_mode=ParseMode.HTML
+        )
+        update_url = f"{SUPABASE_URL}/rest/v1/service_credentials?credential_name=eq.{cred_name}"
+        requests.patch(update_url, headers=sb_headers(), json={"last_failure_alert_at": datetime.utcnow().isoformat()}, timeout=10)
+    except Exception as e:
+        print(f"[SERVICE CREDENTIALS] Couldn't send failure alert for {cred_name}: {e}")
+
+
 async def check_deriv_service_token_health(context: ContextTypes.DEFAULT_TYPE):
     """
-    Runs every 15 minutes. Two separate jobs in one function:
-    1. If DERIV_SERVICE_TOKEN is currently flagged as failing, DM
-       ADMIN_USER_ID - but only once every 2 hours while it stays
-       broken, not on every single check, so a multi-hour outage
-       sends a handful of reminders rather than spamming.
-    2. If the tracked expiry date is within 3 days, DM ADMIN_USER_ID
-       once per calendar day until it's renewed.
+    Runs every 15 minutes. Checks TWO independent credentials now,
+    per explicit instruction (MetaAPI candle-fetching added alongside
+    the original Deriv check - same underlying mechanism, just two
+    things being watched instead of one):
+
+    1. DERIV_SERVICE_TOKEN failing -> alert (max once/2h while broken)
+    2. DERIV_SERVICE_TOKEN expiring within 3 days -> alert once/day
+    3. MetaAPI candle-fetching failing (disconnected MT5 account,
+       exhausted credit, etc.) -> alert (max once/2h while broken).
+       No expiry concept for this one - MetaAPI credentials don't
+       expire the way Deriv's do, so only the failure check applies.
     """
     if not ADMIN_USER_ID:
         return
+
+    await _alert_if_credential_failing(
+        context, "deriv_service_token", "DERIV_SERVICE_TOKEN",
+        "Every Deriv synthetic index (channel signals, manual signals, "
+        "Aggressive/Conservative, Account Flip) has zero real price data "
+        "while this is broken. Generate a fresh token from Deriv's API "
+        "tokens page (Trade + Account management scopes) and send it over."
+    )
+    await _alert_if_credential_failing(
+        context, "metaapi_candles", "MetaAPI candle-fetching",
+        "Every pair is still generating signals (TwelveData is covering "
+        "as fallback), but MetaAPI itself isn't providing price data right "
+        "now - worth checking whether the MT5 account got disconnected "
+        "from MetaAPI or ran out of credit."
+    )
+
     cred = get_service_credential("deriv_service_token")
     if not cred:
         return
-
-    if cred.get("currently_failing"):
-        last_alert = cred.get("last_failure_alert_at")
-        should_alert = True
-        if last_alert:
-            last_alert_dt = datetime.fromisoformat(last_alert.replace("Z", "+00:00"))
-            if (datetime.now(last_alert_dt.tzinfo) - last_alert_dt) < timedelta(hours=2):
-                should_alert = False
-        if should_alert:
-            try:
-                failure_since = cred.get("failure_detected_at", "unknown time")
-                await context.bot.send_message(
-                    chat_id=int(ADMIN_USER_ID),
-                    text=(
-                        f"🚨 <b>DERIV_SERVICE_TOKEN is down.</b>\n\n"
-                        f"Failing since: {failure_since}\n\n"
-                        f"Every Deriv synthetic index (channel signals, manual "
-                        f"signals, Aggressive/Conservative, Account Flip) has "
-                        f"zero real price data while this is broken. Generate "
-                        f"a fresh token from Deriv's API tokens page (Trade + "
-                        f"Account management scopes) and send it over."
-                    ),
-                    parse_mode=ParseMode.HTML
-                )
-                update_url = f"{SUPABASE_URL}/rest/v1/service_credentials?credential_name=eq.deriv_service_token"
-                requests.patch(update_url, headers=sb_headers(), json={"last_failure_alert_at": datetime.utcnow().isoformat()}, timeout=10)
-            except Exception as e:
-                print(f"[SERVICE CREDENTIALS] Couldn't send failure alert: {e}")
-
     expires_at = cred.get("expires_at")
     if expires_at:
         expiry_date = datetime.strptime(expires_at, "%Y-%m-%d").date()
@@ -7722,6 +7783,7 @@ def get_candles_metaapi(mt5_symbol, interval, outputsize):
     """
     if not METAAPI_TOKEN or not METAAPI_ACCOUNT_ID:
         print("[METAAPI CANDLES] Credentials not set")
+        record_metaapi_candles_failure()
         return None
 
     timeframe_map = {"1h": "1h", "4h": "4h", "1day": "1d"}
@@ -7746,6 +7808,10 @@ def get_candles_metaapi(mt5_symbol, interval, outputsize):
                 if not raw:
                     print(f"[METAAPI CANDLES] Empty response for {mt5_symbol} {mt5_timeframe}")
                     return None
+                # A real 200 with real data proves the account/
+                # connection itself is healthy - clears any failure
+                # flag, regardless of which specific symbol asked.
+                record_metaapi_candles_success()
                 candles = []
                 for c in raw:
                     candles.append({
@@ -7761,6 +7827,17 @@ def get_candles_metaapi(mt5_symbol, interval, outputsize):
                 # codebase's oldest->newest convention everywhere else.
                 candles.reverse()
                 return candles
+            if response.status_code in (401, 403):
+                # Genuinely systemic (account disconnected/revoked, not
+                # a symbol-specific issue) - the ONLY status worth
+                # flagging as a real outage. A 404 or other 4xx for one
+                # specific symbol doesn't mean the whole account is
+                # down, so those are deliberately NOT flagged here -
+                # would cause false "MetaAPI is down" alarms for what's
+                # really just one instrument's normal data gap.
+                print(f"[METAAPI CANDLES] {mt5_symbol} {mt5_timeframe} failed {response.status_code}: {response.text[:300]}")
+                record_metaapi_candles_failure()
+                return None
             if response.status_code in (429, 502, 503, 504) and attempt == 1:
                 print(f"[METAAPI CANDLES] {mt5_symbol} got {response.status_code}, retrying...")
                 continue
@@ -7779,7 +7856,17 @@ def get_candles_metaapi(mt5_symbol, interval, outputsize):
 # get_candles_metaapi's docstring for why. Scoped to exactly these 2
 # per explicit instruction (test before any wider rollout), not a
 # blanket default for every pair.
-METAAPI_FIRST_PAIRS = {"xagusd", "usoil"}
+# Pairs where MetaAPI is tried FIRST, TwelveData as fallback - see
+# get_candles_metaapi's docstring for why. Per explicit instruction,
+# expanded from the original XAGUSD/USOIL-only test to every pair
+# currently offered - the XAGUSD/USOIL test confirmed the mechanism
+# works, so this is now the real default for both scheduled and
+# manual signals across the board, not a limited trial anymore.
+METAAPI_FIRST_PAIRS = {
+    "xauusd", "btcusd", "xagusd", "usoil",
+    "gbpusd", "gbpjpy", "eurusd", "usdjpy",
+    "audusd", "usdcad", "eurjpy", "usdchf", "nzdusd",
+}
 
 
 def get_cached_candles(pair_key, config, interval, outputsize=60):

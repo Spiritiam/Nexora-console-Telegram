@@ -18518,8 +18518,7 @@ async def post_daily_report(context: ContextTypes.DEFAULT_TYPE):
 
     total_pips_won = 0.0
     total_pips_lost = 0.0
-    total_profit_usd = 0.0
-    missing_pnl_count = 0
+    any_still_running = False
     line_items = []
 
     for sig in signals:
@@ -18535,41 +18534,37 @@ async def post_daily_report(context: ContextTypes.DEFAULT_TYPE):
             total_pips_lost += sl_pips
             line_items.append(f"❌ {pair_name} {direction} -{sl_pips:.0f} pips")
         else:
-            # Still running - noted inline, no separate paragraph.
-            # Excluded from today's P&L math, picked up by the
-            # weekend report once it actually closes.
+            # Still running - excluded from today's pip math, picked
+            # up by the weekend report once it actually closes.
+            any_still_running = True
             line_items.append(f"⏳ {pair_name} running")
-            continue
 
-        order_id = sig.get("mt5_order_id")
-        if not order_id:
-            missing_pnl_count += 1
-            continue
-        outcome, profit = await get_mt5_trade_outcome(order_id)
-        if outcome != "CLOSED" or profit is None:
-            missing_pnl_count += 1
-            continue
-        total_profit_usd += profit
-
-    profit_sign = "-" if total_profit_usd < 0 else "+"
-    profit_abs = abs(total_profit_usd)
-    profit_emoji = "📈" if total_profit_usd >= 0 else "📉"
-    pips_summary = f"+{total_pips_won:.0f} / -{total_pips_lost:.0f} pips"
+    # Per explicit instruction: dropped the dollar P&L entirely - it
+    # was computed at a fixed 0.1 lot, but real subscribers trade
+    # different lot sizes, so a single dollar figure was never
+    # actually accurate for anyone reading it. Pips are lot-size-
+    # independent, so they're the fair number to show.
+    #
+    # Per explicit instruction: only show the side(s) that actually
+    # happened - "+0 / -150 pips" wastes space stating a zero that
+    # adds nothing. One-sided days show just that one number; a mixed
+    # day shows both.
+    if total_pips_won and total_pips_lost:
+        pips_summary = f"+{total_pips_won:.0f} / -{total_pips_lost:.0f} pips"
+    elif total_pips_won:
+        pips_summary = f"+{total_pips_won:.0f} pips"
+    elif total_pips_lost:
+        pips_summary = f"-{total_pips_lost:.0f} pips"
+    else:
+        pips_summary = "0 pips"
 
     report = (
         f"📊 <b>DAILY REPORT — {date_label}</b>\n\n"
         + "\n".join(line_items) + "\n\n"
-        f"{profit_emoji} <b>{profit_sign}${profit_abs:.2f}</b> ({pips_summary}) | <i>Trade safe 🔥</i>"
+        f"<b>{pips_summary}</b> | <i>Trade safe 🔥</i>"
     )
-
-    # Same reasoning as the weekly report - internal diagnostic info,
-    # not shown to subscribers, just logged.
-    if missing_pnl_count:
-        print(
-            f"[DAILY REPORT] ⚠️ {missing_pnl_count} closed signal(s) couldn't be "
-            f"matched to a real MT5 trade today - excluded from P&L total, "
-            f"not shown in public report."
-        )
+    if any_still_running:
+        report += "\n<i>⏳ Running signals will be included in the weekend report once closed.</i>"
 
     for channel_id in [CHANNEL_1_ID, CHANNEL_2_ID, CHANNEL_3_ID]:
         try:

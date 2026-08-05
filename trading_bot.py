@@ -18492,7 +18492,7 @@ async def post_daily_report(context: ContextTypes.DEFAULT_TYPE):
     """
     day_start = get_day_start()
     now = datetime.utcnow()
-    date_label = now.strftime("%d %b %Y")
+    date_label = now.strftime("%d %b")
 
     all_signals = get_signals_since(day_start)
     signals = [
@@ -18507,12 +18507,7 @@ async def post_daily_report(context: ContextTypes.DEFAULT_TYPE):
     ]
 
     if not signals:
-        report = (
-            f"📊 <b>DAILY SIGNAL REPORT</b>\n"
-            f"<i>#NexoraAI — {date_label}</i>\n\n"
-            f"No scheduled signals were issued today.\n\n"
-            f"<i>Trade safe 💼🔥</i>"
-        )
+        report = f"📊 <b>DAILY REPORT — {date_label}</b>\n\nNo scheduled signals today. <i>Trade safe 🔥</i>"
         for channel_id in [CHANNEL_1_ID, CHANNEL_2_ID, CHANNEL_3_ID]:
             try:
                 await context.bot.send_message(chat_id=channel_id, text=report, parse_mode=ParseMode.HTML)
@@ -18525,7 +18520,6 @@ async def post_daily_report(context: ContextTypes.DEFAULT_TYPE):
     total_pips_lost = 0.0
     total_profit_usd = 0.0
     missing_pnl_count = 0
-    still_running_pairs = []
     line_items = []
 
     for sig in signals:
@@ -18536,14 +18530,16 @@ async def post_daily_report(context: ContextTypes.DEFAULT_TYPE):
 
         if status == "TP_HIT":
             total_pips_won += tp_pips
-            line_items.append(f"✅ <b>{pair_name}</b> ({direction}) — TP Hit, +{tp_pips:.1f} pips")
+            line_items.append(f"✅ {pair_name} {direction} +{tp_pips:.0f} pips")
         elif status == "SL_HIT":
             total_pips_lost += sl_pips
-            line_items.append(f"❌ <b>{pair_name}</b> ({direction}) — SL Hit, -{sl_pips:.1f} pips")
+            line_items.append(f"❌ {pair_name} {direction} -{sl_pips:.0f} pips")
         else:
-            still_running_pairs.append(pair_name)
-            line_items.append(f"⏳ <b>{pair_name}</b> ({direction}) — Still running")
-            continue  # no realized P&L yet - excluded from today's math, picked up by the weekend report once closed
+            # Still running - noted inline, no separate paragraph.
+            # Excluded from today's P&L math, picked up by the
+            # weekend report once it actually closes.
+            line_items.append(f"⏳ {pair_name} running")
+            continue
 
         order_id = sig.get("mt5_order_id")
         if not order_id:
@@ -18558,23 +18554,13 @@ async def post_daily_report(context: ContextTypes.DEFAULT_TYPE):
     profit_sign = "-" if total_profit_usd < 0 else "+"
     profit_abs = abs(total_profit_usd)
     profit_emoji = "📈" if total_profit_usd >= 0 else "📉"
+    pips_summary = f"+{total_pips_won:.0f} / -{total_pips_lost:.0f} pips"
 
     report = (
-        f"📊 <b>DAILY SIGNAL REPORT</b>\n"
-        f"<i>#NexoraAI — {date_label}</i>\n\n"
-        f"━━━━━━━━━━━━━━━━━━━━━\n\n"
+        f"📊 <b>DAILY REPORT — {date_label}</b>\n\n"
         + "\n".join(line_items) + "\n\n"
-        f"━━━━━━━━━━━━━━━━━━━━━\n\n"
-        f"📐 <b>Pips Won:</b> +{total_pips_won:.1f}\n"
-        f"📐 <b>Pips Lost:</b> -{total_pips_lost:.1f}\n\n"
-        f"{profit_emoji} <b>Closed Net P&L (0.1 lot):</b> {profit_sign}${profit_abs:.2f}\n\n"
+        f"{profit_emoji} <b>{profit_sign}${profit_abs:.2f}</b> ({pips_summary}) | <i>Trade safe 🔥</i>"
     )
-    if still_running_pairs:
-        report += (
-            f"⏳ <i>{', '.join(still_running_pairs)} still running — "
-            f"will be included in the full weekend report once closed.</i>\n\n"
-        )
-    report += "<i>Trade safe 💼🔥</i>"
 
     # Same reasoning as the weekly report - internal diagnostic info,
     # not shown to subscribers, just logged.

@@ -7571,7 +7571,69 @@ def get_price_alphavantage(config):
 # LIVE PRICE — COMBINED
 # ============================================
 
+def get_price_metaapi(mt5_symbol):
+    """
+    Live bid/ask price straight from the connected MT5 account -
+    primary live-price source now, per explicit instruction, matching
+    the same MetaAPI-first approach already used for candles. Unlike
+    the historical candles endpoint, this one is NOT region-locked to
+    new-york - MetaAPI's own docs don't have the "different hostname"
+    note on this endpoint, so it uses the same london-region trading
+    hostname already used for actual trade placement elsewhere in
+    this file. Returns the bid/ask midpoint, matching what a single
+    "price" quote conventionally means everywhere else in this file.
+
+    Reuses the same success/failure recording as get_candles_metaapi
+    (record_metaapi_candles_success/failure) - one shared health
+    signal for "is MetaAPI working right now" across both candles and
+    price, not two separate flags for the same underlying account
+    connection.
+    """
+    if not METAAPI_TOKEN or not METAAPI_ACCOUNT_ID:
+        return None
+    url = (
+        f"https://mt-client-api-v1.london.agiliumtrade.ai"
+        f"/users/current/accounts/{METAAPI_ACCOUNT_ID}/symbols/{mt5_symbol}/current-price"
+    )
+    headers = {"auth-token": METAAPI_TOKEN, "Accept": "application/json"}
+    try:
+        response = requests.get(url, headers=headers, timeout=10)
+        if response.status_code == 200:
+            data = response.json()
+            bid, ask = data.get("bid"), data.get("ask")
+            if bid is not None and ask is not None:
+                record_metaapi_candles_success()
+                return (bid + ask) / 2
+            print(f"[METAAPI PRICE] {mt5_symbol} response missing bid/ask: {data}")
+            return None
+        if response.status_code in (401, 403):
+            print(f"[METAAPI PRICE] {mt5_symbol} failed {response.status_code}: {response.text[:300]}")
+            record_metaapi_candles_failure()
+            return None
+        print(f"[METAAPI PRICE] {mt5_symbol} failed {response.status_code}: {response.text[:300]}")
+        return None
+    except Exception as e:
+        print(f"[METAAPI PRICE] {mt5_symbol} error: {e}")
+        return None
+
+
 def get_live_price(symbol="XAU/USD", config=None):
+    # FIX: per explicit instruction, MetaAPI is now the PRIMARY live-
+    # price source for every pair that has an mt5_symbol - not just
+    # candles. Confirmed live: XAUUSD's signal generation went down
+    # entirely when TwelveData's free daily quota (800 credits) ran
+    # out, even though real, working candle data was available via
+    # MetaAPI the whole time - the live price check happens FIRST and
+    # gates everything after it, so it alone being TwelveData-only was
+    # a real single point of failure. Every existing fallback below is
+    # completely unchanged, still runs exactly as before if MetaAPI
+    # has any issue.
+    if config and config.get("mt5_symbol"):
+        price = get_price_metaapi(config["mt5_symbol"])
+        if price is not None:
+            return price
+        print(f"[PRICE] MetaAPI failed for {symbol} - falling back to existing sources")
+
     if config and config.get("use_metals_api"):
         price = get_silver_price()
         if price:

@@ -17709,6 +17709,16 @@ def parse_broadcast_button_syntax(message_text):
     message_lines = []
     skip_next_link_check = False
 
+    # Per explicit instruction: LINK: is meant to be typed as a plain
+    # human-readable phrase, not the literal goto_ keyword or a full
+    # URL - "News Calendar" is easier to type correctly from a phone
+    # than "newscalendar" every time, especially under autocorrect.
+    # Add more aliases here as new destinations get added.
+    DESTINATION_ALIASES = {
+        "news calendar": "newscalendar",
+        "newscalendar": "newscalendar",
+    }
+
     for line in lines:
         stripped = line.strip()
         if stripped.lower().startswith("button:"):
@@ -17716,7 +17726,8 @@ def parse_broadcast_button_syntax(message_text):
             skip_next_link_check = True
             continue
         if skip_next_link_check and stripped.lower().startswith("link:"):
-            destination = stripped[len("link:"):].strip().lower()
+            raw_destination = stripped[len("link:"):].strip().lower()
+            destination = DESTINATION_ALIASES.get(raw_destination, raw_destination.replace(" ", ""))
             continue
         message_lines.append(line)
 
@@ -17745,7 +17756,7 @@ async def _handle_broadcast_request(update: Update, context: ContextTypes.DEFAUL
             "With a button, add these on their own lines at the end:\n"
             "BUTTON: <button label>\n"
             "LINK: <destination>\n\n"
-            "Destinations: exness (default), deriv, signal, nexora (just opens the bot directly).\n\n"
+            "Destinations: exness (default), deriv, signal, news calendar, nexora (just opens the bot directly).\n\n"
             "Attach a photo (with this as its caption) to send it as "
             "an image with caption instead of plain text.\n\n"
             "Sends to every known user, with the current keyboard "
@@ -17791,7 +17802,7 @@ async def _handle_broadcastchannels_request(update: Update, context: ContextType
             "With a button, add these on their own lines at the end:\n"
             "BUTTON: <button label>\n"
             "LINK: <destination>\n\n"
-            "Destinations: exness (default), deriv, signal, nexora (just opens the bot directly).\n\n"
+            "Destinations: exness (default), deriv, signal, news calendar, nexora (just opens the bot directly).\n\n"
             "Attach a photo (with this as its caption) to post it as "
             "an image with caption instead of plain text.\n\n"
             "Posts to all 3 channels at once. Channels have no "

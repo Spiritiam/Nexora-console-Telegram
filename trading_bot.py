@@ -14070,6 +14070,27 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 ),
                 parse_mode=ParseMode.HTML
             )
+        elif destination == "newscalendar":
+            if get_user_utc_offset_minutes(user_id) is None:
+                user_modes[user_id] = "awaiting_timezone_location"
+                sent_tz_prompt = await context.bot.send_message(
+                    chat_id=update.effective_chat.id,
+                    text=(
+                        "🌍 <b>Quick one-time setup:</b> share your location so news "
+                        "and event times always show in <b>your own local time</b>, "
+                        "wherever you are.\n\n"
+                        "Or tap <b>Skip</b> to use West Africa Time (GMT+1) instead."
+                    ),
+                    parse_mode=ParseMode.HTML,
+                    reply_markup=ReplyKeyboardMarkup(
+                        [[KeyboardButton("📍 Share My Location", request_location=True)], ["Skip"]],
+                        resize_keyboard=True,
+                        one_time_keyboard=True
+                    )
+                )
+                schedule_auto_delete(sent_tz_prompt.chat_id, sent_tz_prompt.message_id)
+            else:
+                await send_news_calendar(context.bot, update.effective_chat.id, user_id)
         return
 
     # Channel-follow gate - genuine first-time users ONLY, per explicit
@@ -14165,6 +14186,78 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
 # ============================================
 # HANDLE BUTTONS
 # ============================================
+
+async def send_news_calendar(bot, chat_id, user_id):
+    """
+    Standalone version of the newsmenu_calendar callback's calendar-
+    fetch logic, for the goto_newscalendar deep link specifically
+    (used by broadcast buttons) - added rather than reusing the
+    existing callback handler because that one calls
+    query.message.edit_text on an EXISTING message, which doesn't
+    exist in a fresh /start deep-link context. Sends a new message
+    instead. Kept as its own function rather than refactoring the
+    existing (already-working) callback handler to share code, to
+    avoid any risk of changing live, already-tested behavior for
+    something this small.
+    """
+    events = get_todays_high_impact_events()
+    if not events:
+        next_date = get_next_high_impact_event_date()
+        no_news_text = (
+            "📅 <b>No high-impact USD, EUR, GBP, or JPY news "
+            "scheduled for today.</b>\n\n"
+        )
+        if next_date:
+            no_news_text += f"Next one: <b>{next_date}</b>.\n\n"
+        no_news_text += (
+            "Try <b>News Breakdown</b> instead for a live read "
+            "on any specific pair or currency you're curious about."
+        )
+        await bot.send_message(chat_id=chat_id, text=no_news_text, parse_mode=ParseMode.HTML)
+        return
+
+    list_id = store_news_events_batch(events)
+    today_display = datetime.utcnow().strftime("%A, %d %B %Y")
+    now_utc = datetime.utcnow()
+    user_offset = get_user_utc_offset_minutes(user_id)
+    if user_offset is None:
+        user_offset = DEFAULT_UTC_OFFSET_MINUTES
+    tz_label = format_gmt_label(user_offset)
+
+    released_count = 0
+    buttons = []
+    for i, event in enumerate(events):
+        flag = {"USD": "🇺🇸", "EUR": "🇪🇺", "GBP": "🇬🇧", "JPY": "🇯🇵"}.get(event["currency"], "🌍")
+        status_label, is_released = format_event_status(event, now_utc)
+        if is_released:
+            released_count += 1
+        local_time = format_local_time(event.get("event_dt_utc", ""), user_offset)
+        label = f"{flag} {event['title'][:32]}"
+        if local_time:
+            label += f" ({local_time})"
+        if status_label:
+            label += f" — {status_label}"
+        buttons.append([InlineKeyboardButton(label, callback_data=f"newsevent_{list_id}_{i}")])
+
+    upcoming_count = len(events) - released_count
+    if upcoming_count > 0:
+        summary_line = f"✅ {released_count} released • 🔜 {upcoming_count} upcoming"
+    else:
+        summary_line = f"✅ All {released_count} released — nothing left scheduled today"
+
+    await bot.send_message(
+        chat_id=chat_id,
+        text=(
+            f"📅 <b>High-Impact News — {today_display}</b>\n"
+            f"{summary_line}\n"
+            f"<i>Times shown in your local time ({tz_label})</i>\n\n"
+            f"Tap any event below for a direct BUY/SELL call, "
+            f"fundamentals-first:"
+        ),
+        parse_mode=ParseMode.HTML,
+        reply_markup=InlineKeyboardMarkup(buttons)
+    )
+
 
 async def send_exness_autotrade_intro(bot, chat_id):
     """

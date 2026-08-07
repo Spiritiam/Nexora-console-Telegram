@@ -12488,14 +12488,37 @@ def get_next_high_impact_event_date():
 # bug: a user's own "News" button could go stale seconds after being
 # shown, well before the event itself was actually gone. Not meant to
 # persist across restarts - old batches are trimmed as new ones come in.
+#
+# FIX: CONFIRMED REAL, URGENT BUG - eviction used to be purely COUNT-
+# based (keep only the 50 most recent batches total, evict oldest),
+# with no regard for actual age at all. During a high-traffic moment
+# (NFP, everyone tapping News Calendar individually at once), enough
+# NEW batches got created within minutes to evict the CHANNEL alert's
+# batch - a link meant to stay valid for hours - while people were
+# actively tapping it. list_id is already a millisecond timestamp
+# (see below), so real age can be read directly from it - eviction is
+# now based on that real age (2 hours, per explicit instruction), not
+# how many OTHER batches happened to get created in between. The
+# count cap stays too, just raised much higher, purely as a backstop
+# against a pathological runaway case, not the everyday mechanism.
 NEWS_EVENTS_STORE = {}
-NEWS_EVENTS_STORE_MAX_BATCHES = 50
+NEWS_EVENTS_STORE_MAX_AGE_SECONDS = 2 * 3600
+NEWS_EVENTS_STORE_MAX_BATCHES = 1000
 
 
 def store_news_events_batch(events):
     """Stores a batch of events under a fresh list_id and returns that id."""
     list_id = str(int(time.time() * 1000))
     NEWS_EVENTS_STORE[list_id] = events
+
+    now_ms = time.time() * 1000
+    expired_keys = [
+        key for key in NEWS_EVENTS_STORE
+        if now_ms - int(key) > NEWS_EVENTS_STORE_MAX_AGE_SECONDS * 1000
+    ]
+    for key in expired_keys:
+        NEWS_EVENTS_STORE.pop(key, None)
+
     while len(NEWS_EVENTS_STORE) > NEWS_EVENTS_STORE_MAX_BATCHES:
         oldest_key = next(iter(NEWS_EVENTS_STORE))
         NEWS_EVENTS_STORE.pop(oldest_key, None)

@@ -12530,6 +12530,26 @@ async def generate_currency_direction(event):
     actual_line = f"Actual: {event['actual']}" if event.get("actual") else ""
     data_lines = "\n".join(l for l in [forecast_line, previous_line, actual_line] if l)
 
+    # FIX: CONFIRMED REAL, SERIOUS BUG - this function is only ever
+    # called on an event BEFORE it releases (send_news_direction_analysis
+    # gates on is_released and shows a plain notice instead of calling
+    # this for anything already out), so event['actual'] is ALWAYS
+    # empty in every real, legitimate call - actual_line above is
+    # effectively dead code, always "". The old prompt's REASON
+    # instruction said "explicitly reference the actual Forecast/
+    # Previous/Actual numbers" regardless - telling the model to cite
+    # a real "Actual" figure that can NEVER exist at call time. Live
+    # result, confirmed directly: the AI fabricated a specific,
+    # plausible-sounding "actual result of 114K" out of nothing and
+    # stated it as settled fact, for an event hours from releasing.
+    # That's exactly the kind of invented-numbers-presented-as-real
+    # harm this whole system is built to avoid - a real, not
+    # hypothetical, instance of it reaching a subscriber.
+    #
+    # Fixed with an explicit, unambiguous instruction never to state
+    # or imply a specific actual result, and anticipatory framing
+    # instead (what a beat/miss vs forecast WOULD mean, not what
+    # already happened).
     prompt = f"""
 You are a forex fundamental analyst. Judge ONLY whether this news
 event is likely BULLISH or BEARISH for its own currency - nothing
@@ -12537,20 +12557,30 @@ else, no pair, no trade call.
 
 Also judge HOW STRONGLY the data favors that direction, as a
 percentage between 51 and 95 - use a number close to 51 when the data
-is only mildly one-sided (e.g. actual barely beat forecast), and
-closer to 95 only when the data is a large, unambiguous surprise
-versus forecast/previous. Never output 50 or below (that wouldn't be
-a direction at all) and never output 100 (fundamentals are never a
+is only mildly one-sided (e.g. forecast barely above previous), and
+closer to 95 only when the data implies a large, unambiguous move
+versus previous. Never output 50 or below (that wouldn't be a
+direction at all) and never output 100 (fundamentals are never a
 certainty).
 
 EVENT: {event['title']}
 CURRENCY: {event['currency']}
 {data_lines}
 
+This event has NOT been released yet - there is no real "Actual"
+result available, regardless of what the data above shows. You MUST
+NOT state, imply, or invent any specific actual/released figure (do
+not write things like "the actual result of X" or "came in at X") -
+that would be fabricating a real economic data point that has not
+happened. Base your read ONLY on comparing Forecast against Previous,
+framed as anticipation of the release (e.g. "a forecast above the
+previous reading would signal..."), never as something that has
+already occurred.
+
 Respond in EXACTLY this format, nothing else, no markdown:
 DIRECTION: BULLISH or BEARISH
 STRENGTH: [a number 51-95]
-REASON: [one sentence, max 25 words - explicitly reference the actual Forecast/Previous/Actual numbers above, not just a general statement. Plain and beginner-friendly.]
+REASON: [one sentence, max 25 words - reference the real Forecast/Previous numbers above anticipating the release, never an actual/released figure. Plain and beginner-friendly.]
 """
     try:
         # NO outer retry loop here (there used to be one, 15s + 30s

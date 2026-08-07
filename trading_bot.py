@@ -13317,14 +13317,16 @@ async def post_news(context: ContextTypes.DEFAULT_TYPE):
     for pair_name_key, (briefing_direction, bullet_text) in briefing_pairs.items():
         save_daily_news_bias(pair_name_key, briefing_direction, bullet_text, session_type)
 
-    # Calendar text NO LONGER appended here, per explicit instruction -
-    # "it shouldn't post at all, whether successful or not." The
-    # standalone fallback post (post_calendar_only above) was already
-    # disabled; this was the one remaining path where "CALENDAR TODAY"
-    # content could still appear, tacked onto a real article's caption.
-    # fetch_economic_calendar() itself is untouched (still computed
-    # above, still available if needed elsewhere) - just no longer
-    # used for any channel-facing content.
+    # Per explicit instruction (re-added, morning-only this time):
+    # today's high-impact calendar events now get appended to the
+    # MORNING briefing specifically, when there are any. This was
+    # previously removed entirely ("it shouldn't post at all") - this
+    # is a narrower re-add, not a full reversal: midday/afternoon
+    # briefings still never include it, and mornings with no real
+    # high-impact events today post exactly as before (calendar is
+    # None in that case, nothing gets appended).
+    if session_type == "morning" and calendar:
+        summary += calendar
 
     for channel_id in [CHANNEL_1_ID, CHANNEL_2_ID, CHANNEL_3_ID]:
         try:
@@ -18649,12 +18651,15 @@ async def post_daily_report(context: ContextTypes.DEFAULT_TYPE):
     # actually accurate for anyone reading it. Pips are lot-size-
     # independent, so they're the fair number to show.
     #
-    # Per explicit instruction: only show the side(s) that actually
-    # happened - "+0 / -150 pips" wastes space stating a zero that
-    # adds nothing. One-sided days show just that one number; a mixed
-    # day shows both.
+    # Per explicit instruction: "+300 / -70" read as confusing (looks
+    # like two separate figures, not obviously related) - now shows
+    # the actual arithmetic so the net result is unambiguous at a
+    # glance. One-sided days still show just that one number, no
+    # pointless "+0" or "= " on a single figure.
     if total_pips_won and total_pips_lost:
-        pips_summary = f"+{total_pips_won:.0f} / -{total_pips_lost:.0f} pips"
+        net = total_pips_won - total_pips_lost
+        net_str = f"+{net:.0f}" if net >= 0 else f"{net:.0f}"
+        pips_summary = f"+{total_pips_won:.0f}, -{total_pips_lost:.0f} = {net_str} pips"
     elif total_pips_won:
         pips_summary = f"+{total_pips_won:.0f} pips"
     elif total_pips_lost:

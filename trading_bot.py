@@ -12758,6 +12758,7 @@ async def check_released_high_impact_news(context: ContextTypes.DEFAULT_TYPE):
     """
     events = get_todays_calendar_events_fresh()
     if not events:
+        print("[NEWS RELEASE REACTION] Checked - no high-impact USD/EUR/GBP/JPY events today")
         return
 
     bot = context.bot
@@ -12781,6 +12782,11 @@ async def check_released_high_impact_news(context: ContextTypes.DEFAULT_TYPE):
 
         headliner = min(group_events, key=lambda e: _headliner_rank(e["title"]))
         if not headliner.get("actual"):
+            # FIX: this used to be a silent skip with zero logging -
+            # made a real diagnosis impossible when a subscriber asked
+            # why NFP's reaction never posted (couldn't tell "checked,
+            # actual not in feed yet" apart from "never ran at all").
+            print(f"[NEWS RELEASE REACTION] {headliner['title']} ({headliner['currency']}) checked - actual not in feed yet")
             continue  # the group's headliner hasn't released yet - wait for it specifically
 
         # Mark EVERY event in this group as handled together, whether

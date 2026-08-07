@@ -12684,12 +12684,13 @@ REASON: [one sentence, max 25 words, explicitly citing the real Actual vs Foreca
 async def check_released_high_impact_news(context: ContextTypes.DEFAULT_TYPE):
     """
     Runs every 5 minutes, per explicit instruction - posts a real,
-    data-grounded BUY/SELL reaction to all 3 channels the moment an
-    event's actual result appears in the feed, whatever the real-
-    world delay on that turns out to be (the feed itself, not this
-    job's cadence, is the limiting factor - see
-    get_todays_calendar_events_fresh's docstring). Broadcasts to
-    channels only, per explicit instruction - not a per-user DM.
+    data-grounded BUY/SELL reaction to all 3 channels AND every known
+    user's DM (so anyone who's muted or left a channel still gets it,
+    per explicit instruction) the moment an event's actual result
+    appears in the feed, whatever the real-world delay on that turns
+    out to be (the feed itself, not this job's cadence, is the
+    limiting factor - see get_todays_calendar_events_fresh's
+    docstring).
     """
     events = get_todays_calendar_events_fresh()
     if not events:
@@ -12727,6 +12728,10 @@ async def check_released_high_impact_news(context: ContextTypes.DEFAULT_TYPE):
             data_parts.append(f"Previous: {event['previous']}")
         data_line = " | ".join(data_parts)
 
+        # No per-user personalization needed here (unlike the pre-
+        # release alert) - this is an immediate "just released"
+        # reaction with no future event time to convert per timezone,
+        # so channel and DM copy are identical.
         text = (
             f"🚨 {flag} <b>{event['title']} — JUST RELEASED</b>\n\n"
             + (f"📊 {data_line}\n\n" if data_line else "")
@@ -12742,7 +12747,20 @@ async def check_released_high_impact_news(context: ContextTypes.DEFAULT_TYPE):
             except Exception as e:
                 print(f"[NEWS RELEASE REACTION] Channel post failed for {channel_id}: {e}")
 
-        print(f"[NEWS RELEASE REACTION] ✅ Posted {event['title']} ({event['currency']}) -> {final_direction} {pair_display}")
+        # Per-user DMs, per explicit instruction - reuses the exact
+        # same text computed above, same safe ~20/sec pacing already
+        # proven elsewhere for broadcasting to potentially many users.
+        user_ids = await get_all_known_user_ids()
+        sent = failed = 0
+        for uid in user_ids:
+            try:
+                await bot.send_message(chat_id=int(uid), text=text, parse_mode=ParseMode.HTML)
+                sent += 1
+            except Exception:
+                failed += 1
+            await asyncio.sleep(0.05)
+
+        print(f"[NEWS RELEASE REACTION] ✅ Posted {event['title']} ({event['currency']}) -> {final_direction} {pair_display} | DMs sent {sent}, failed {failed}")
 
 
 async def generate_currency_direction(event):
@@ -13093,40 +13111,43 @@ async def check_upcoming_high_impact_news(context: ContextTypes.DEFAULT_TYPE):
     if grounding_article:
         news_context = f"{grounding_article.get('title', '')}. {grounding_article.get('description', '')}".strip()
 
-    # Per-event real bias line - forecast/previous + real news
-    # context, never a fabricated actual figure (generate_pre_release_
-    # bias enforces this in its own prompt).
-    bias_lines = []
+    # Per-event real bias - forecast/previous + real news context,
+    # never a fabricated actual figure (generate_pre_release_bias
+    # enforces this in its own prompt). Computed ONCE per event here,
+    # then reused for both the channel post AND every user's DM below -
+    # calling the AI once per recipient instead would be wasteful and
+    # slow, and the bias itself doesn't vary by user, only the
+    # displayed TIME does.
+    event_bias_results = []  # (event, direction_or_None, reason_or_None)
     for _, event in group:
-        flag = flag_by_currency.get(event["currency"], "🌍")
         direction, reason = await generate_pre_release_bias(event, news_context)
+        event_bias_results.append((event, direction, reason))
+
+    def _format_event_bias_line(event, direction, reason, offset_minutes, tz_label):
+        flag = flag_by_currency.get(event["currency"], "🌍")
+        time_str = f"{format_local_time(event.get('event_dt_utc', ''), offset_minutes)} {tz_label}"
+        header_line = f"{flag} <b>{event['title']}</b> ({event['currency']}) — {time_str}"
         if direction and reason:
             lean_emoji = "🟢" if direction == "BULLISH" else "🔴"
-            bias_lines.append(
-                f"{flag} <b>{event['title']}</b> ({event['currency']}) — "
-                f"{format_local_time(event.get('event_dt_utc', ''), DEFAULT_UTC_OFFSET_MINUTES)} GMT+1\n"
-                f"{lean_emoji} {reason}"
-            )
-        else:
-            # AI call failed for this one event - still show it with
-            # its real time, just without a bias line, rather than
-            # dropping it from the alert entirely.
-            bias_lines.append(
-                f"{flag} <b>{event['title']}</b> ({event['currency']}) — "
-                f"{format_local_time(event.get('event_dt_utc', ''), DEFAULT_UTC_OFFSET_MINUTES)} GMT+1"
-            )
+            return f"{header_line}\n{lean_emoji} {reason}"
+        # AI call failed for this one event - still show it with its
+        # real time, just without a bias line, rather than dropping
+        # it from the alert entirely.
+        return header_line
 
     channel_alert_text = (
         f"⏰ <b>{header}</b>\n\n"
-        + "\n\n".join(bias_lines) +
-        f"\n\nWe'll post the real BUY/SELL call the moment actual results are out."
+        + "\n\n".join(
+            _format_event_bias_line(event, direction, reason, DEFAULT_UTC_OFFSET_MINUTES, "GMT+1")
+            for event, direction, reason in event_bias_results
+        )
+        + f"\n\nWe'll post the real BUY/SELL call the moment actual results are out."
     )
 
     print(f"[NEWS ALERT] Notifying for {len(group)} event(s) today, first at {earliest_time}: {[e['title'] for _, e in group]}")
 
-    # Channel-only, per explicit instruction ("should go to channel
-    # not individual") - the per-user DM broadcast that used to run
-    # after this has been removed entirely, not just left unused.
+    # Per explicit instruction: both channels AND every known user's
+    # DM, so anyone who's muted or left a channel still gets it.
     for channel_id in [CHANNEL_1_ID, CHANNEL_2_ID, CHANNEL_3_ID]:
         try:
             await bot.send_photo(
@@ -13135,6 +13156,37 @@ async def check_upcoming_high_impact_news(context: ContextTypes.DEFAULT_TYPE):
             )
         except Exception as e:
             print(f"[NEWS ALERT] Channel post failed for {channel_id}: {e}")
+
+    # Per-user DMs, restored per explicit instruction. Each user's own
+    # saved offset (falling back to WAT for anyone who never set one)
+    # is looked up once here in bulk, rather than one DB round-trip
+    # per recipient inside the send loop. Reuses the SAME AI results
+    # computed above - only the time formatting changes per user.
+    user_offsets = get_all_user_utc_offsets()
+    user_ids = await get_all_known_user_ids()
+    sent = failed = 0
+    for uid in user_ids:
+        try:
+            offset_minutes = user_offsets.get(uid, DEFAULT_UTC_OFFSET_MINUTES)
+            tz_label = format_gmt_label(offset_minutes)
+            personal_alert_text = (
+                f"⏰ <b>{header}</b>\n\n"
+                + "\n\n".join(
+                    _format_event_bias_line(event, direction, reason, offset_minutes, tz_label)
+                    for event, direction, reason in event_bias_results
+                )
+                + f"\n\nWe'll post the real BUY/SELL call the moment actual results are out."
+            )
+            await bot.send_photo(
+                chat_id=int(uid), photo=image_url, caption=personal_alert_text,
+                parse_mode=ParseMode.HTML, reply_markup=dm_markup
+            )
+            sent += 1
+        except Exception:
+            failed += 1
+        await asyncio.sleep(0.05)  # ~20/sec, same safe pacing as _run_broadcast
+
+    print(f"[NEWS ALERT] Done — sent {sent}, failed {failed}")
 
 # ============================================
 # FUNDAMENTAL GROUNDING DATA (NEW)

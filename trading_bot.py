@@ -12977,17 +12977,24 @@ async def send_news_direction_analysis(bot, chat_id, event, batch_events=None):
 
     # Technical cross-check REMOVED entirely, per explicit instruction -
     # it could (and did) contradict the fundamental call outright
-    # ("Technicals read SELL" right under "DIRECT CALL: BUY"), which
+    # ("Technicals read SELL" right under "BIAS CALL: BUY"), which
     # read as confusing and undermined the whole point of a direct
     # call. Confidence is now the AI's own fundamental strength
     # percentage (see generate_currency_direction) - one clear number,
     # not two that can disagree with each other.
+    # Renamed DIRECT CALL -> BIAS CALL, per explicit instruction -
+    # this fires before the event releases (no real actual figure
+    # exists yet, enforced in generate_currency_direction's own
+    # prompt), so "Direct Call" implied a certainty this doesn't
+    # actually have. The POST-release reaction (check_released_
+    # high_impact_news) correctly keeps "DIRECT CALL" - that one IS
+    # grounded in a real, confirmed actual result.
     emoji = "🟢" if final_direction == "BUY" else "🔴"
     response = (
         f"📰 <b>{event['title']}</b> ({event['currency']})\n\n"
         + (f"📊 {data_line}\n\n" if data_line else "")
         + f"<b>Fundamental read:</b> {ai_reason}\n\n"
-        f"{emoji} <b>DIRECT CALL: {final_direction} {pair_display}</b>\n"
+        f"{emoji} <b>BIAS CALL: {final_direction} {pair_display}</b>\n"
         f"<b>Confidence:</b> {ai_strength}%\n\n"
         f"<i>Trade safe 💼🔥</i>"
     )

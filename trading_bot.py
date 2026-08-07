@@ -12509,6 +12509,241 @@ def store_news_events_batch(events):
 # resets itself day to day without needing an explicit clear.
 NOTIFIED_EVENTS_TODAY = set()
 
+# Same idea, separate set - tracks which events have already had their
+# POST-release actual-result reaction posted to channels, per explicit
+# instruction. Deliberately separate from NOTIFIED_EVENTS_TODAY above -
+# an event needs to fire the pre-release notification AND (later,
+# independently) the post-release one, so one set marking "handled"
+# for both would incorrectly suppress whichever came second.
+RELEASED_NOTIFIED_EVENTS_TODAY = set()
+
+
+def get_todays_calendar_events_fresh():
+    """
+    Same event list/shape as get_todays_high_impact_events, but
+    bypasses the normal 1-hour cache (get_cached_calendar_data) -
+    used ONLY by check_released_high_impact_news below, per explicit
+    instruction ("post the actual result whenever we get it,
+    regardless of feed delay"). A 1-hour-stale cache would mean up to
+    an hour's delay on top of whatever the feed itself takes, which
+    defeats the purpose of a dedicated release-detection job. This
+    fetches directly AND updates the shared cache with what it gets,
+    so other callers within that window opportunistically benefit
+    from fresher data too, rather than spending a second, separate
+    request. Runs every 5 minutes (see job registration), which is
+    exactly this feed's own documented rate budget (2 requests/5min
+    total, across every caller combined) - this job alone uses 1 of
+    those 2, leaving headroom for everything else that touches the
+    same feed.
+    """
+    try:
+        url = "https://nfs.faireconomy.media/ff_calendar_thisweek.json"
+        response = requests.get(url, timeout=10)
+        data = response.json()
+        calendar_data_cache["data"] = data
+        calendar_data_cache["timestamp"] = time.time()
+    except Exception as e:
+        print(f"[NEWS RELEASE CHECK] Fresh calendar fetch error: {e}")
+        data = calendar_data_cache["data"] or []
+
+    today_str = datetime.utcnow().strftime("%Y-%m-%d")
+    events = []
+    for event in data:
+        event_date = event.get("date", "")[:10]
+        if event_date != today_str:
+            continue
+        if event.get("impact", "").lower() != "high":
+            continue
+        currency = event.get("country", "")
+        if currency not in CURRENCY_PAIR_MAP:
+            continue
+        events.append({
+            "title": event.get("title", ""),
+            "currency": currency,
+            "forecast": event.get("forecast", ""),
+            "previous": event.get("previous", ""),
+            "actual": event.get("actual", ""),
+            "event_dt_utc": event.get("date", ""),
+            "event_key": f"{today_str}_{currency}_{event.get('title', '')}",
+        })
+    return events
+
+
+async def generate_pre_release_bias(event, news_context):
+    """
+    Pre-release channel bias, per explicit instruction: grounded in
+    real Forecast/Previous numbers AND real fetched news context (a
+    genuine recent article, same source the regular briefings use -
+    NOT the AI's own free-associated "geopolitical awareness", which
+    would just be a second version of the exact fabrication problem
+    already found and fixed once). If no real article is available
+    this round, news_context is empty and the AI is told to reason
+    from the calendar numbers alone rather than invent context to
+    fill the gap.
+
+    Same hard rule as generate_currency_direction: this always runs
+    BEFORE release, so it must never state or imply a specific actual
+    figure.
+    """
+    forecast_line = f"Forecast: {event['forecast']}" if event.get("forecast") else ""
+    previous_line = f"Previous: {event['previous']}" if event.get("previous") else ""
+    data_lines = "\n".join(l for l in [forecast_line, previous_line] if l)
+
+    news_block = (
+        f"\nRELEVANT REAL NEWS CONTEXT (from a real, recently fetched article - "
+        f"use only if genuinely relevant to this event/currency, ignore otherwise):\n"
+        f"\"{news_context}\"\n"
+        if news_context else ""
+    )
+
+    prompt = f"""
+You are a forex fundamental analyst previewing a high-impact event
+BEFORE it releases, for a Telegram trading channel.
+
+EVENT: {event['title']}
+CURRENCY: {event['currency']}
+{data_lines}
+{news_block}
+This event has NOT released yet - there is no actual result. Do not
+state, imply, or invent one. Judge only whether the SETUP (forecast
+vs previous, plus the real news context if relevant) leans BULLISH or
+BEARISH for {event['currency']}, framed as anticipation only (e.g.
+"a forecast above the previous reading would signal...").
+
+Respond in EXACTLY this format, nothing else, no markdown:
+DIRECTION: BULLISH or BEARISH
+REASON: [one sentence, max 22 words, plain and beginner-friendly, anticipatory framing only]
+"""
+    try:
+        result = await ask_gemini(prompt)
+        if result.strip() in KNOWN_AI_FAILURE_STRINGS:
+            return None, None
+        direction_match = re.search(r"DIRECTION:\s*(BULLISH|BEARISH)", result, re.IGNORECASE)
+        reason_match = re.search(r"REASON:\s*(.+)", result)
+        if not direction_match:
+            print(f"[NEWS PRE-RELEASE] AI responded but format didn't match - raw: {result!r}")
+            return None, None
+        return direction_match.group(1).upper(), (reason_match.group(1).strip() if reason_match else "")
+    except Exception as e:
+        print(f"[NEWS PRE-RELEASE] AI call failed: {e}")
+        return None, None
+
+
+async def generate_actual_result_reaction(event):
+    """
+    Post-release channel reaction, per explicit instruction: only
+    called once event['actual'] is genuinely populated (real data,
+    not invented). Judges direction from the real actual vs forecast/
+    previous comparison - the exact thing generate_currency_direction
+    and generate_pre_release_bias are explicitly forbidden from doing,
+    now safe because the number is real.
+    """
+    forecast_line = f"Forecast: {event['forecast']}" if event.get("forecast") else ""
+    previous_line = f"Previous: {event['previous']}" if event.get("previous") else ""
+    actual_line = f"Actual: {event['actual']}"
+    data_lines = "\n".join(l for l in [actual_line, forecast_line, previous_line] if l)
+
+    prompt = f"""
+You are a forex fundamental analyst. This event has JUST been
+released with a real actual result - judge whether it's BULLISH or
+BEARISH for its own currency based on the real Actual vs Forecast/
+Previous comparison below.
+
+Also judge HOW STRONGLY the actual result favors that direction, as a
+percentage between 51 and 95 - close to 51 for a narrow beat/miss,
+closer to 95 for a large, unambiguous surprise vs forecast.
+
+EVENT: {event['title']}
+CURRENCY: {event['currency']}
+{data_lines}
+
+Respond in EXACTLY this format, nothing else, no markdown:
+DIRECTION: BULLISH or BEARISH
+STRENGTH: [a number 51-95]
+REASON: [one sentence, max 25 words, explicitly citing the real Actual vs Forecast/Previous numbers above. Plain and beginner-friendly.]
+"""
+    try:
+        result = await ask_gemini(prompt)
+        if result.strip() in KNOWN_AI_FAILURE_STRINGS:
+            return None, None, None
+        direction_match = re.search(r"DIRECTION:\s*(BULLISH|BEARISH)", result, re.IGNORECASE)
+        strength_match = re.search(r"STRENGTH:\s*(\d+)", result)
+        reason_match = re.search(r"REASON:\s*(.+)", result)
+        if not direction_match:
+            print(f"[NEWS RELEASE REACTION] AI responded but format didn't match - raw: {result!r}")
+            return None, None, None
+        direction = direction_match.group(1).upper()
+        strength_pct = min(95, max(51, int(strength_match.group(1)))) if strength_match else 65
+        reason = reason_match.group(1).strip() if reason_match else ""
+        return direction, strength_pct, reason
+    except Exception as e:
+        print(f"[NEWS RELEASE REACTION] AI call failed: {e}")
+        return None, None, None
+
+
+async def check_released_high_impact_news(context: ContextTypes.DEFAULT_TYPE):
+    """
+    Runs every 5 minutes, per explicit instruction - posts a real,
+    data-grounded BUY/SELL reaction to all 3 channels the moment an
+    event's actual result appears in the feed, whatever the real-
+    world delay on that turns out to be (the feed itself, not this
+    job's cadence, is the limiting factor - see
+    get_todays_calendar_events_fresh's docstring). Broadcasts to
+    channels only, per explicit instruction - not a per-user DM.
+    """
+    events = get_todays_calendar_events_fresh()
+    if not events:
+        return
+
+    bot = context.bot
+    flag_by_currency = {"USD": "🇺🇸", "EUR": "🇪🇺", "GBP": "🇬🇧", "JPY": "🇯🇵"}
+
+    for event in events:
+        if not event.get("actual"):
+            continue
+        if event["event_key"] in RELEASED_NOTIFIED_EVENTS_TODAY:
+            continue
+        RELEASED_NOTIFIED_EVENTS_TODAY.add(event["event_key"])
+
+        ai_direction, ai_strength, ai_reason = await generate_actual_result_reaction(event)
+        if not ai_direction:
+            print(f"[NEWS RELEASE REACTION] Couldn't get a read for {event['title']} - skipping this event's post")
+            continue
+
+        mapping = CURRENCY_PAIR_MAP[event["currency"]]
+        pair_key = mapping["pair_key"]
+        inverted = mapping["inverted"]
+        final_direction = "BUY" if (ai_direction == "BULLISH") != inverted else "SELL"
+        pair_display = PAIR_CONFIG[pair_key]["display"]
+        emoji = "🟢" if final_direction == "BUY" else "🔴"
+        flag = flag_by_currency.get(event["currency"], "🌍")
+
+        data_parts = []
+        if event.get("actual"):
+            data_parts.append(f"Actual: {event['actual']}")
+        if event.get("forecast"):
+            data_parts.append(f"Forecast: {event['forecast']}")
+        if event.get("previous"):
+            data_parts.append(f"Previous: {event['previous']}")
+        data_line = " | ".join(data_parts)
+
+        text = (
+            f"🚨 {flag} <b>{event['title']} — JUST RELEASED</b>\n\n"
+            + (f"📊 {data_line}\n\n" if data_line else "")
+            + f"{ai_reason}\n\n"
+            f"{emoji} <b>DIRECT CALL: {final_direction} {pair_display}</b>\n"
+            f"<b>Confidence:</b> {ai_strength}%\n\n"
+            f"<i>Trade safe 💼🔥</i>"
+        )
+
+        for channel_id in [CHANNEL_1_ID, CHANNEL_2_ID, CHANNEL_3_ID]:
+            try:
+                await bot.send_message(chat_id=channel_id, text=text, parse_mode=ParseMode.HTML)
+            except Exception as e:
+                print(f"[NEWS RELEASE REACTION] Channel post failed for {channel_id}: {e}")
+
+        print(f"[NEWS RELEASE REACTION] ✅ Posted {event['title']} ({event['currency']}) -> {final_direction} {pair_display}")
+
 
 async def generate_currency_direction(event):
     """
@@ -12847,23 +13082,51 @@ async def check_upcoming_high_impact_news(context: ContextTypes.DEFAULT_TYPE):
         for idx, event in group
     ])
 
-    # A channel post is one single message seen by everyone, so it
-    # genuinely can't show each viewer's own local time - showing WAT
-    # (this bot's home base) for every event's own time gives every
-    # reader a fixed, unambiguous anchor to convert from.
-    channel_event_lines = "\n".join(
-        f"{flag_by_currency.get(event['currency'], '🌍')} <b>{event['title']}</b> ({event['currency']}) — "
-        f"{format_local_time(event.get('event_dt_utc', ''), DEFAULT_UTC_OFFSET_MINUTES)} GMT+1"
-        for _, event in group
-    )
+    # Real news context, fetched ONCE for this whole batch (not per
+    # event) - same source the regular briefings already use, per
+    # explicit instruction ("use real life news not just AI"). A
+    # single shared article is enough context for the AI to draw on
+    # if genuinely relevant; the prompt itself tells it to ignore this
+    # context entirely if it doesn't actually relate to a given event.
+    grounding_article = fetch_market_news()
+    news_context = ""
+    if grounding_article:
+        news_context = f"{grounding_article.get('title', '')}. {grounding_article.get('description', '')}".strip()
+
+    # Per-event real bias line - forecast/previous + real news
+    # context, never a fabricated actual figure (generate_pre_release_
+    # bias enforces this in its own prompt).
+    bias_lines = []
+    for _, event in group:
+        flag = flag_by_currency.get(event["currency"], "🌍")
+        direction, reason = await generate_pre_release_bias(event, news_context)
+        if direction and reason:
+            lean_emoji = "🟢" if direction == "BULLISH" else "🔴"
+            bias_lines.append(
+                f"{flag} <b>{event['title']}</b> ({event['currency']}) — "
+                f"{format_local_time(event.get('event_dt_utc', ''), DEFAULT_UTC_OFFSET_MINUTES)} GMT+1\n"
+                f"{lean_emoji} {reason}"
+            )
+        else:
+            # AI call failed for this one event - still show it with
+            # its real time, just without a bias line, rather than
+            # dropping it from the alert entirely.
+            bias_lines.append(
+                f"{flag} <b>{event['title']}</b> ({event['currency']}) — "
+                f"{format_local_time(event.get('event_dt_utc', ''), DEFAULT_UTC_OFFSET_MINUTES)} GMT+1"
+            )
+
     channel_alert_text = (
         f"⏰ <b>{header}</b>\n\n"
-        f"{channel_event_lines}\n\n"
-        f"Tap any event below to see the likely direction before it drops:"
+        + "\n\n".join(bias_lines) +
+        f"\n\nWe'll post the real BUY/SELL call the moment actual results are out."
     )
 
     print(f"[NEWS ALERT] Notifying for {len(group)} event(s) today, first at {earliest_time}: {[e['title'] for _, e in group]}")
 
+    # Channel-only, per explicit instruction ("should go to channel
+    # not individual") - the per-user DM broadcast that used to run
+    # after this has been removed entirely, not just left unused.
     for channel_id in [CHANNEL_1_ID, CHANNEL_2_ID, CHANNEL_3_ID]:
         try:
             await bot.send_photo(
@@ -12872,40 +13135,6 @@ async def check_upcoming_high_impact_news(context: ContextTypes.DEFAULT_TYPE):
             )
         except Exception as e:
             print(f"[NEWS ALERT] Channel post failed for {channel_id}: {e}")
-
-    # Private DMs DO get personalized per-recipient - each user's own
-    # saved offset (falling back to WAT for anyone who never set one)
-    # is looked up once here in bulk, rather than one DB round-trip
-    # per recipient inside the send loop below. Each event's own line
-    # is reformatted per-user too, since they're spread across the
-    # day at different times, not all sharing one moment anymore.
-    user_offsets = get_all_user_utc_offsets()
-    user_ids = await get_all_known_user_ids()
-    sent = failed = 0
-    for uid in user_ids:
-        try:
-            offset_minutes = user_offsets.get(uid, DEFAULT_UTC_OFFSET_MINUTES)
-            tz_label = format_gmt_label(offset_minutes)
-            personal_event_lines = "\n".join(
-                f"{flag_by_currency.get(event['currency'], '🌍')} <b>{event['title']}</b> ({event['currency']}) — "
-                f"{format_local_time(event.get('event_dt_utc', ''), offset_minutes)} {tz_label}"
-                for _, event in group
-            )
-            personal_alert_text = (
-                f"⏰ <b>{header}</b>\n\n"
-                f"{personal_event_lines}\n\n"
-                f"Tap any event below to see the likely direction before it drops:"
-            )
-            await bot.send_photo(
-                chat_id=int(uid), photo=image_url, caption=personal_alert_text,
-                parse_mode=ParseMode.HTML, reply_markup=dm_markup
-            )
-            sent += 1
-        except Exception:
-            failed += 1
-        await asyncio.sleep(0.05)  # ~20/sec, same safe pacing as _run_broadcast
-
-    print(f"[NEWS ALERT] Done — sent {sent}, failed {failed}")
 
 # ============================================
 # FUNDAMENTAL GROUNDING DATA (NEW)
@@ -18966,13 +19195,28 @@ def main():
 
     # High-impact news alert - checks every 5 minutes for any USD/
     # EUR/GBP/JPY high-impact event landing in ~30 minutes, notifying
-    # every known user and all 3 channels with a "Know the Direction"
-    # button. Per explicit instruction.
+    # all 3 channels with a real pre-release bias per event. Per
+    # explicit instruction.
     job_queue.run_repeating(
         check_upcoming_high_impact_news,
         interval=300,
         first=30,
         name="high_impact_news_alert"
+    )
+
+    # Post-release reaction - checks every 5 minutes for any today's
+    # high-impact event whose actual result has now appeared in the
+    # feed, posting a real, data-grounded BUY/SELL call to all 3
+    # channels the moment it does. Per explicit instruction - separate
+    # job from the pre-release one above (different trigger condition
+    # entirely: event time vs actual-result-appearing), offset by 150s
+    # so the two don't both hit the shared calendar feed at the exact
+    # same moment every cycle.
+    job_queue.run_repeating(
+        check_released_high_impact_news,
+        interval=300,
+        first=180,
+        name="high_impact_news_release_reaction"
     )
 
     # MT5 auto-trade: payment processing (picks up what the KoraPay

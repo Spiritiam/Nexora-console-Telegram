@@ -12477,52 +12477,120 @@ def get_next_high_impact_event_date():
         return None
 
 
-# Keyed store of news-event batches, NOT a single shared global -
-# each batch (whether from a manual "News" tap or the proactive
-# 30-minutes-before job) gets its own list_id, so one batch being
-# refreshed can never invalidate the button indices of a DIFFERENT
-# batch a user is still looking at. The old approach used one single
-# GLOBAL_NEWS_EVENTS list for everything - since check_upcoming_
-# high_impact_news silently overwrites it every 5 minutes regardless
-# of whether anyone's mid-tap on an older batch, that produced a real
-# bug: a user's own "News" button could go stale seconds after being
-# shown, well before the event itself was actually gone. Not meant to
-# persist across restarts - old batches are trimmed as new ones come in.
-#
-# FIX: CONFIRMED REAL, URGENT BUG - eviction used to be purely COUNT-
-# based (keep only the 50 most recent batches total, evict oldest),
-# with no regard for actual age at all. During a high-traffic moment
-# (NFP, everyone tapping News Calendar individually at once), enough
-# NEW batches got created within minutes to evict the CHANNEL alert's
-# batch - a link meant to stay valid for hours - while people were
-# actively tapping it. list_id is already a millisecond timestamp
-# (see below), so real age can be read directly from it - eviction is
-# now based on that real age (2 hours, per explicit instruction), not
-# how many OTHER batches happened to get created in between. The
-# count cap stays too, just raised much higher, purely as a backstop
-# against a pathological runaway case, not the everyday mechanism.
-NEWS_EVENTS_STORE = {}
-NEWS_EVENTS_STORE_MAX_AGE_SECONDS = 2 * 3600
-NEWS_EVENTS_STORE_MAX_BATCHES = 1000
+# FIX: CONFIRMED REAL, PERMANENT ROOT CAUSE, now actually fixed -
+# this used to be a plain in-memory dict, which meant ANY deploy/
+# restart wiped it completely regardless of how good the expiry logic
+# was. That's exactly what broke a live channel link during an actual
+# NFP window - the fix at the time (switching count-based eviction to
+# real time-based expiry) was real and correct, but incomplete: it
+# couldn't survive a process restart, which happens on every code
+# deploy. Now persisted to Supabase (news_events_store table) instead -
+# a restart can no longer touch it at all. Retention is 24h (see
+# NEWS_EVENTS_STORE_MAX_AGE_SECONDS), matching the news_event_
+# reactions result-visibility window below, so the list itself is
+# never the limiting factor before that separate, business-logic
+# window kicks in.
+NEWS_EVENTS_STORE_MAX_AGE_SECONDS = 24 * 3600
 
 
 def store_news_events_batch(events):
     """Stores a batch of events under a fresh list_id and returns that id."""
     list_id = str(int(time.time() * 1000))
-    NEWS_EVENTS_STORE[list_id] = events
+    try:
+        url = f"{SUPABASE_URL}/rest/v1/news_events_store"
+        requests.post(url, headers=sb_headers(), json={"list_id": list_id, "events": events}, timeout=10)
+    except Exception as e:
+        print(f"[NEWS EVENTS STORE] Error storing batch {list_id}: {e}")
 
-    now_ms = time.time() * 1000
-    expired_keys = [
-        key for key in NEWS_EVENTS_STORE
-        if now_ms - int(key) > NEWS_EVENTS_STORE_MAX_AGE_SECONDS * 1000
-    ]
-    for key in expired_keys:
-        NEWS_EVENTS_STORE.pop(key, None)
+    # Prune anything past the retention window - runs on every store
+    # call, so no separate cleanup job is needed.
+    try:
+        cutoff = (datetime.utcnow() - timedelta(seconds=NEWS_EVENTS_STORE_MAX_AGE_SECONDS)).isoformat()
+        prune_url = f"{SUPABASE_URL}/rest/v1/news_events_store?created_at=lt.{cutoff}"
+        requests.delete(prune_url, headers=sb_headers(), timeout=10)
+    except Exception as e:
+        print(f"[NEWS EVENTS STORE] Error pruning old batches: {e}")
 
-    while len(NEWS_EVENTS_STORE) > NEWS_EVENTS_STORE_MAX_BATCHES:
-        oldest_key = next(iter(NEWS_EVENTS_STORE))
-        NEWS_EVENTS_STORE.pop(oldest_key, None)
     return list_id
+
+
+def get_news_events_batch(list_id):
+    """
+    Reads a stored batch back by list_id. Returns None if it doesn't
+    exist or has aged past NEWS_EVENTS_STORE_MAX_AGE_SECONDS - the
+    caller treats either case as "expired, show a fresh-list prompt".
+    """
+    try:
+        cutoff = (datetime.utcnow() - timedelta(seconds=NEWS_EVENTS_STORE_MAX_AGE_SECONDS)).isoformat()
+        url = f"{SUPABASE_URL}/rest/v1/news_events_store?list_id=eq.{list_id}&created_at=gte.{cutoff}&select=events"
+        response = requests.get(url, headers=sb_headers(), timeout=10)
+        rows = response.json()
+        if not rows:
+            return None
+        return rows[0]["events"]
+    except Exception as e:
+        print(f"[NEWS EVENTS STORE] Error reading batch {list_id}: {e}")
+        return None
+
+
+# How long a real, actual-grounded reaction stays visible when someone
+# taps an event after it's released, per explicit instruction (asked
+# for my view on going beyond 1h - people checking back later the same
+# day or next morning to see how a call played out is a real, common
+# use case, and this is just a display window on tap, not a broadcast/
+# spam concern, so there's no real cost to being generous with it).
+# Outside this window, tapping the event shows a plain "already
+# released, direction call window has passed" notice instead.
+NEWS_REACTION_VISIBLE_HOURS = 24
+
+
+def record_news_event_reaction(event, direction, strength, reason):
+    """
+    Persists a computed post-release reaction, per explicit
+    instruction - written once by check_released_high_impact_news
+    right when it posts the broadcast, then read back by the tap
+    handler (get_news_event_reaction) so tapping the SAME event later
+    shows the identical real DIRECT CALL instead of re-running the AI,
+    for up to NEWS_REACTION_VISIBLE_HOURS.
+    """
+    try:
+        url = f"{SUPABASE_URL}/rest/v1/news_event_reactions?on_conflict=event_key"
+        headers = sb_headers()
+        headers["Prefer"] = "resolution=merge-duplicates"
+        payload = {
+            "event_key": event["event_key"],
+            "title": event["title"],
+            "currency": event["currency"],
+            "forecast": event.get("forecast", ""),
+            "previous": event.get("previous", ""),
+            "actual": event.get("actual", ""),
+            "direction": direction,
+            "strength": strength,
+            "reason": reason,
+            "actual_posted_at": datetime.utcnow().isoformat(),
+        }
+        requests.post(url, headers=headers, json=payload, timeout=10)
+    except Exception as e:
+        print(f"[NEWS EVENT REACTIONS] Error recording {event.get('event_key')}: {e}")
+
+
+def get_news_event_reaction(event_key):
+    """
+    Looks up a persisted reaction by event_key. Returns None if none
+    exists yet (actual hasn't appeared/been processed) - the tap
+    handler shows the pre-release BIAS CALL in that case. If one
+    exists, the caller compares actual_posted_at against
+    NEWS_REACTION_VISIBLE_HOURS itself to decide between showing the
+    real DIRECT CALL or a "window passed" notice.
+    """
+    try:
+        url = f"{SUPABASE_URL}/rest/v1/news_event_reactions?event_key=eq.{event_key}&select=*"
+        response = requests.get(url, headers=sb_headers(), timeout=10)
+        rows = response.json()
+        return rows[0] if rows else None
+    except Exception as e:
+        print(f"[NEWS EVENT REACTIONS] Error reading {event_key}: {e}")
+        return None
 
 
 # Tracks which events have already triggered their 30-minutes-before
@@ -12811,6 +12879,8 @@ async def check_released_high_impact_news(context: ContextTypes.DEFAULT_TYPE):
         emoji = "🟢" if final_direction == "BUY" else "🔴"
         flag = flag_by_currency.get(event["currency"], "🌍")
 
+        record_news_event_reaction(event, final_direction, ai_strength, ai_reason)
+
         data_parts = []
         if event.get("actual"):
             data_parts.append(f"Actual: {event['actual']}")
@@ -13014,22 +13084,62 @@ async def send_news_direction_analysis(bot, chat_id, event, batch_events=None):
     guessing when to check back.
     """
     now_utc = datetime.utcnow()
-    _, is_released = format_event_status(event, now_utc)
 
-    if is_released:
+    # FIX: replaced the old scheduled-TIME-based gate (is_released,
+    # from format_event_status) with a real actual-EXISTENCE-based
+    # one, per explicit instruction. The old version showed "already
+    # released" the instant the scheduled time passed, even if the
+    # feed hadn't actually posted a real actual value yet - exactly
+    # backwards from what should happen (no actual yet = still show
+    # the pre-release BIAS CALL, regardless of whether the clock time
+    # has technically passed). This also now shows the REAL, actual-
+    # grounded DIRECT CALL (identical to what the channel/DM broadcast
+    # already posted - see record_news_event_reaction) for
+    # NEWS_REACTION_VISIBLE_HOURS after it releases, instead of just a
+    # plain "already released" notice with no real content at all.
+    event_key = event.get("event_key")
+    reaction = get_news_event_reaction(event_key) if event_key else None
+
+    if reaction:
+        posted_at = datetime.fromisoformat(reaction["actual_posted_at"].replace("Z", "+00:00")).replace(tzinfo=None)
+        hours_since = (now_utc - posted_at).total_seconds() / 3600
+
+        if hours_since <= NEWS_REACTION_VISIBLE_HOURS:
+            mapping = CURRENCY_PAIR_MAP[reaction["currency"]]
+            pair_display = PAIR_CONFIG[mapping["pair_key"]]["display"]
+            emoji = "🟢" if reaction["direction"] == "BUY" else "🔴"
+            data_parts = []
+            if reaction.get("actual"):
+                data_parts.append(f"Actual: {reaction['actual']}")
+            if reaction.get("forecast"):
+                data_parts.append(f"Forecast: {reaction['forecast']}")
+            if reaction.get("previous"):
+                data_parts.append(f"Previous: {reaction['previous']}")
+            data_line = " | ".join(data_parts)
+            text = (
+                f"📰 <b>{reaction['title']}</b> ({reaction['currency']})\n\n"
+                + (f"📊 {data_line}\n\n" if data_line else "")
+                + f"{reaction['reason']}\n\n"
+                f"{emoji} <b>DIRECT CALL: {reaction['direction']} {pair_display}</b>\n"
+                f"<b>Confidence:</b> {reaction['strength']}%\n\n"
+                f"<i>Trade safe 💼🔥</i>"
+            )
+            await bot.send_message(chat_id=chat_id, text=text, parse_mode=ParseMode.HTML)
+            return
+
+        # Real result exists but the visibility window has passed.
         text = (
             f"📰 <b>{event['title']}</b> ({event['currency']})\n\n"
-            f"✅ This news has already been released — we only call "
-            f"direction <b>before</b> a high-impact event drops, not "
-            f"after it's out.\n\n"
+            f"✅ This event released more than {NEWS_REACTION_VISIBLE_HOURS} hours ago "
+            f"and its call window has passed.\n\n"
         )
         has_other_upcoming = False
         if batch_events:
             has_other_upcoming = any(
-                not format_event_status(e, now_utc)[1] for e in batch_events
+                not get_news_event_reaction(e.get("event_key")) for e in batch_events if e.get("event_key")
             )
         if has_other_upcoming:
-            text += "Tap another event above that's still upcoming."
+            text += "Tap another event above that hasn't released yet."
         else:
             next_date = get_next_high_impact_event_date()
             if next_date:
@@ -13039,7 +13149,6 @@ async def send_news_direction_analysis(bot, chat_id, event, batch_events=None):
         await bot.send_message(chat_id=chat_id, text=text, parse_mode=ParseMode.HTML)
         return
 
-    event_key = event.get("event_key")
     if event_key and event_key in NEWS_DIRECTION_CACHE:
         await bot.send_message(chat_id=chat_id, text=NEWS_DIRECTION_CACHE[event_key], parse_mode=ParseMode.HTML)
         return
@@ -14430,7 +14539,10 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         try:
             list_id, idx_str = remainder.rsplit("_", 1)
             idx = int(idx_str)
-            event = NEWS_EVENTS_STORE[list_id][idx]
+            batch = get_news_events_batch(list_id)
+            event = batch[idx] if batch else None
+            if event is None:
+                raise IndexError
         except (ValueError, IndexError, KeyError):
             sent_expired_news = await update.message.reply_text(
                 "⚠️ <b>This news list has expired.</b>\n\n"
@@ -14450,7 +14562,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
         await send_news_direction_analysis(
             context.bot, update.effective_chat.id, event,
-            batch_events=NEWS_EVENTS_STORE.get(list_id)
+            batch_events=batch
         )
 
         if not is_verified(user_id):
@@ -15815,7 +15927,10 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             remainder = data.replace("newsevent_", "")
             list_id, idx_str = remainder.rsplit("_", 1)
             idx = int(idx_str)
-            event = NEWS_EVENTS_STORE[list_id][idx]
+            batch = get_news_events_batch(list_id)
+            event = batch[idx] if batch else None
+            if event is None:
+                raise IndexError
         except (ValueError, IndexError, KeyError):
             await query.message.reply_text(
                 "⚠️ This news list has expired - tap 📰 News again for a fresh list.",
@@ -15825,7 +15940,7 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
         await send_news_direction_analysis(
             context.bot, query.message.chat_id, event,
-            batch_events=NEWS_EVENTS_STORE.get(list_id)
+            batch_events=batch
         )
 
         if not is_verified(user_id):

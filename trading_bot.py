@@ -12681,16 +12681,57 @@ REASON: [one sentence, max 25 words, explicitly citing the real Actual vs Foreca
         return None, None, None
 
 
+# Ranks well-known "headliner" events above the component data that
+# routinely releases at the exact same time alongside them (e.g. NFP,
+# Average Hourly Earnings, and Unemployment Rate all drop at 8:30am
+# ET together every month) - per explicit instruction, used to pick
+# ONE event to post a reaction for when several cluster at the same
+# time and currency, instead of posting once per event for what's
+# really one single market-moving moment. Lower index = higher
+# priority. Matched by substring against the event's own title
+# (case-insensitive), so it's tolerant of the feed's exact wording
+# varying slightly. Anything not matching any entry here is treated
+# as lowest priority (component/secondary data).
+EVENT_HEADLINER_PRIORITY = [
+    "non-farm employment change", "nonfarm payrolls", "nfp",
+    "cpi", "consumer price index",
+    "interest rate decision", "fed funds rate", "official bank rate", "monetary policy statement",
+    "gdp",
+    "core retail sales", "retail sales",
+    "pce price index",
+    "ism manufacturing pmi", "ism services pmi",
+    "employment change",
+]
+
+
+def _headliner_rank(event_title):
+    title_lower = event_title.lower()
+    for i, keyword in enumerate(EVENT_HEADLINER_PRIORITY):
+        if keyword in title_lower:
+            return i
+    return len(EVENT_HEADLINER_PRIORITY)  # lowest priority - no match
+
+
 async def check_released_high_impact_news(context: ContextTypes.DEFAULT_TYPE):
     """
     Runs every 5 minutes, per explicit instruction - posts a real,
     data-grounded BUY/SELL reaction to all 3 channels AND every known
-    user's DM (so anyone who's muted or left a channel still gets it,
-    per explicit instruction) the moment an event's actual result
-    appears in the feed, whatever the real-world delay on that turns
-    out to be (the feed itself, not this job's cadence, is the
-    limiting factor - see get_todays_calendar_events_fresh's
-    docstring).
+    user's DM (so anyone who's muted or left a channel still gets it)
+    the moment an event's actual result appears in the feed, whatever
+    the real-world delay on that turns out to be (the feed itself,
+    not this job's cadence, is the limiting factor - see
+    get_todays_calendar_events_fresh's docstring).
+
+    Groups events by (exact scheduled time, currency) first, per
+    explicit instruction - several high-impact events routinely share
+    one release moment (classic case: NFP, Average Hourly Earnings,
+    and Unemployment Rate all at 8:30am ET) - posting a separate
+    reaction for each is really 3 messages about one single moment.
+    Only the highest-priority event in each group (EVENT_HEADLINER_
+    PRIORITY) gets an actual reaction posted; the rest are marked
+    handled alongside it without their own post, whether their own
+    actual value has appeared yet or not - waiting on the group's
+    headliner specifically is the whole point.
     """
     events = get_todays_calendar_events_fresh()
     if not events:
@@ -12699,16 +12740,38 @@ async def check_released_high_impact_news(context: ContextTypes.DEFAULT_TYPE):
     bot = context.bot
     flag_by_currency = {"USD": "🇺🇸", "EUR": "🇪🇺", "GBP": "🇬🇧", "JPY": "🇯🇵"}
 
+    # Group by (currency, exact scheduled time) - same clustering the
+    # pre-release alert already does visually by listing them
+    # together, just applied here to decide what actually gets posted.
+    groups = {}
     for event in events:
-        if not event.get("actual"):
-            continue
-        if event["event_key"] in RELEASED_NOTIFIED_EVENTS_TODAY:
-            continue
-        RELEASED_NOTIFIED_EVENTS_TODAY.add(event["event_key"])
+        group_key = (event["currency"], event.get("event_dt_utc", ""))
+        groups.setdefault(group_key, []).append(event)
 
+    for group_key, group_events in groups.items():
+        # Skip a group entirely if every event in it has already been
+        # handled (posted or absorbed into a prior post) - avoids
+        # redoing the ranking/lookup on every single 5-minute pass
+        # once a group's done.
+        if all(e["event_key"] in RELEASED_NOTIFIED_EVENTS_TODAY for e in group_events):
+            continue
+
+        headliner = min(group_events, key=lambda e: _headliner_rank(e["title"]))
+        if not headliner.get("actual"):
+            continue  # the group's headliner hasn't released yet - wait for it specifically
+
+        # Mark EVERY event in this group as handled together, whether
+        # or not this is the headliner - the non-headliner ones never
+        # get their own post, regardless of whether their own actual
+        # value shows up before, at the same time as, or after the
+        # headliner's.
+        for e in group_events:
+            RELEASED_NOTIFIED_EVENTS_TODAY.add(e["event_key"])
+
+        event = headliner
         ai_direction, ai_strength, ai_reason = await generate_actual_result_reaction(event)
         if not ai_direction:
-            print(f"[NEWS RELEASE REACTION] Couldn't get a read for {event['title']} - skipping this event's post")
+            print(f"[NEWS RELEASE REACTION] Couldn't get a read for {event['title']} - skipping this group's post")
             continue
 
         mapping = CURRENCY_PAIR_MAP[event["currency"]]
@@ -12728,6 +12791,15 @@ async def check_released_high_impact_news(context: ContextTypes.DEFAULT_TYPE):
             data_parts.append(f"Previous: {event['previous']}")
         data_line = " | ".join(data_parts)
 
+        # Note when this represents a cluster, so readers understand
+        # why (say) Average Hourly Earnings and Unemployment Rate
+        # aren't getting their own separate posts today.
+        other_titles = [e["title"] for e in group_events if e is not headliner]
+        cluster_note = (
+            f"\n<i>Also released at the same time: {', '.join(other_titles)}</i>"
+            if other_titles else ""
+        )
+
         # No per-user personalization needed here (unlike the pre-
         # release alert) - this is an immediate "just released"
         # reaction with no future event time to convert per timezone,
@@ -12737,7 +12809,8 @@ async def check_released_high_impact_news(context: ContextTypes.DEFAULT_TYPE):
             + (f"📊 {data_line}\n\n" if data_line else "")
             + f"{ai_reason}\n\n"
             f"{emoji} <b>DIRECT CALL: {final_direction} {pair_display}</b>\n"
-            f"<b>Confidence:</b> {ai_strength}%\n\n"
+            f"<b>Confidence:</b> {ai_strength}%"
+            f"{cluster_note}\n\n"
             f"<i>Trade safe 💼🔥</i>"
         )
 

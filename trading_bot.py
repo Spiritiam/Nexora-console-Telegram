@@ -877,10 +877,10 @@ async def run_mt5_autotrade_bot_scan(context: ContextTypes.DEFAULT_TYPE):
             # don't miss any auto-trade calls"): if this bot's own
             # strategy list doesn't have a genuine mix of both roles,
             # or the two-tier check finds nothing this round, this
-            # falls back to the ORIGINAL flat "2+ of everything must
-            # agree" system as a safety net - real trading money, so
-            # the fallback is a real, already-proven mechanism (not a
-            # weak guess), never a coin flip.
+            # falls straight through to the rule-based price-trend
+            # fallback below - per explicit instruction, the flat "2+
+            # of everything must agree" middle tier that used to sit
+            # here has been removed entirely, not just deprioritized.
             filter_fns, entry_fns = split_strategies_by_role(strategy_fns)
             direction = None
             winning_votes = []
@@ -911,30 +911,6 @@ async def run_mt5_autotrade_bot_scan(context: ContextTypes.DEFAULT_TYPE):
                     if matching_entries:
                         direction = filter_direction
                         winning_votes = matching_entries
-
-            if not direction:
-                # Fallback tier - the original flat system, run fresh
-                # (not reusing the two-tier votes above, since those
-                # were split into separate filter/entry calls) against
-                # ALL of this bot's strategies as one pool.
-                votes = []
-                for strategy_fn in strategy_fns:
-                    try:
-                        result = strategy_fn(pair_key, pair_config, primary_candles, h4_candles, daily_candles)
-                        if result:
-                            votes.append(result)
-                    except Exception as e:
-                        print(f"[MT5 AUTOTRADE] {strategy_fn.__name__} failed for {pair_key}: {e}")
-                        continue
-
-                if votes:
-                    buy_votes = [v for v in votes if v["direction"] == "BUY"]
-                    sell_votes = [v for v in votes if v["direction"] == "SELL"]
-                    fallback_winning = buy_votes if len(buy_votes) >= len(sell_votes) else sell_votes
-                    fallback_direction = "BUY" if fallback_winning is buy_votes else "SELL"
-                    if len(fallback_winning) >= 2:
-                        direction = fallback_direction
-                        winning_votes = fallback_winning
 
             if not direction:
                 # THIRD tier, per explicit instruction (confirmed
@@ -10581,24 +10557,28 @@ async def check_fresh_momentum_veto_synthetic(index_key, config, h1_candles, dir
 async def run_strategy_bank_synthetic(index_key, config, h1_candles, h4_candles, daily_candles, m1_candles=None, min_agree=2):
     """
     Async sibling of run_strategy_bank, for synthetic (Deriv)
-    indices - but with a DELIBERATELY DIFFERENT roster
-    (SYNTHETIC_STRATEGY_BANK, not STRATEGY_BANK) and NO ICT/SMC vote
-    at all. Per explicit instruction: synthetics have no real
-    liquidity, sessions, or institutional order flow, so ICT/SMC,
-    Unicorn Model, Previous Day H/L Manipulation, and London Session
-    ORB are all excluded here - those strategies' underlying
-    assumptions don't hold on an RNG-generated instrument, even
-    though their pattern-matching would still technically run.
+    indices. Per explicit instruction, now uses EXACTLY the same
+    strategy roster as forex/gold/oil (SYNTHETIC_STRATEGY_BANK is the
+    identical 13 strategies as STRATEGY_BANK_FILTERS + STRATEGY_BANK_
+    ENTRIES) - no more synthetics-only extras, no more exclusions.
+    The one remaining exception is strategy_vah_val_reaction, left out
+    because it does its own internal candle fetch through the forex-
+    specific MetaAPI/TwelveData pipeline, which has no working path
+    for a synthetic index symbol.
 
-    min_agree=2 is the PREFERRED bar, not a hard gate - per explicit
-    instruction, every strategy in SYNTHETIC_STRATEGY_BANK is
-    individually pre-verified/trusted, so 1 agreeing strategy is also
-    an acceptable signal to send, just at a lower, honestly-scaled
-    confidence (see the formula below: 1 agreeing -> 76%, 2 -> 82%,
-    3 -> 88%, etc.). The bank only returns None when literally NO
-    strategy cast any vote at all (votes is empty) - that's a real
-    "couldn't analyze this index right now" case, not a disagreement,
-    since there's nothing whatsoever to fall back to.
+    Two-tier only, per explicit instruction - the flat vote-pool
+    fallback that used to live here has been removed entirely.
+    min_agree is enforced directly on the entry-tier match count
+    (Aggressive=1 fires on any 1 matching entry trigger, Conservative=3
+    needs 3+ agreeing within the entry tier) - moved here out of
+    necessity when the fallback tier (its only previous home) was
+    removed, otherwise Aggressive and Conservative would have become
+    functionally identical. Returns None whenever the filter tier has
+    no clear lean, or no entry trigger matches it (at the min_agree
+    bar) - every real caller of this function has its own rule-based
+    price-trend fallback for that case now (manual/scheduled signals,
+    Deriv Auto-Trade); Auto-Copy is the one caller that doesn't, since
+    it has no strategy of its own to begin with.
     """
 
     # Diagnostic: confirm what candle data actually arrived for THIS
@@ -10659,16 +10639,18 @@ async def run_strategy_bank_synthetic(index_key, config, h1_candles, h4_candles,
     # min_agree), Deriv manual signals, AND Deriv scheduled signals
     # all at once, since all three call this one function.
     #
-    # FALLBACK, per explicit instruction ("leave a gap so we don't
-    # miss any signal or auto-trade calls"): if this index's own
-    # strategy group doesn't have a genuine mix of both roles, or the
-    # two-tier check finds nothing this round, this falls back to the
-    # ORIGINAL flat vote-pool system (min_agree-gated) as a safety
-    # net - a real, already-proven mechanism, not a weak guess.
+    # Per explicit instruction: the flat vote-pool fallback that used
+    # to sit here (ALL strategies as one pool, min_agree-gated) has
+    # been REMOVED entirely - two-tier failing now returns None
+    # directly. Every caller of this function now has its own rule-
+    # based price-trend fallback for that case (build_synthetic_
+    # signal_response for manual/scheduled signals, the Deriv Auto-
+    # Trade bot scan for real money) - Auto-Copy is the one caller
+    # that doesn't, and correctly just skips the round, since it has
+    # no strategy of its own to fall back from in the first place.
     filter_fns, entry_fns = split_strategies_by_role(strategy_pool)
     direction = None
     winning_votes = []
-    used_fallback = False
 
     if filter_fns and entry_fns:
         filter_votes = []
@@ -10693,46 +10675,27 @@ async def run_strategy_bank_synthetic(index_key, config, h1_candles, h4_candles,
                 except Exception as e:
                     print(f"[STRATEGY BANK SYNTH] entry {fn.__name__} failed for {index_key}: {e}")
             matching_entries = [v for v in entry_votes if v["direction"] == filter_direction]
-            if matching_entries:
+            # min_agree moved here, per necessity - it used to only be
+            # enforced in the flat-vote fallback tier, which no longer
+            # exists. Without moving it, Aggressive (min_agree=1) and
+            # Conservative (min_agree=3) would have become functionally
+            # identical (both would fire on just 1 matching entry
+            # trigger). Now Aggressive fires on any 1 matching entry,
+            # Conservative needs 3+ matching entries agreeing within
+            # the entry tier - same distinction, new home.
+            if len(matching_entries) >= min_agree:
                 direction = filter_direction
                 winning_votes = matching_entries
 
     if not direction:
-        used_fallback = True
-        votes = []
-        for strategy_fn in strategy_pool:
-            try:
-                result = _run_strategy(strategy_fn)
-                if result:
-                    votes.append(result)
-            except Exception as e:
-                print(f"[STRATEGY BANK SYNTH] {strategy_fn.__name__} failed for {index_key}: {e}")
-                continue
-
-        if not votes:
-            print(f"[STRATEGY BANK SYNTH] {index_key} - no strategy cast any vote this round (two-tier or fallback), falling back")
-            return None
-
-        buy_votes = [v for v in votes if v["direction"] == "BUY"]
-        sell_votes = [v for v in votes if v["direction"] == "SELL"]
-        winning_votes = buy_votes if len(buy_votes) >= len(sell_votes) else sell_votes
-        direction = "BUY" if winning_votes is buy_votes else "SELL"
-
-        # min_agree still applies in fallback mode - Aggressive (1)
-        # stays permissive, Conservative (3) stays strict, even here.
-        if len(winning_votes) < min_agree:
-            print(
-                f"[STRATEGY BANK SYNTH] {index_key} only {len(winning_votes)} strategy(ies) "
-                f"agreed on {direction} (needs {min_agree}, fallback tier) - skipping this round"
-            )
-            return None
+        print(f"[STRATEGY BANK SYNTH] {index_key} - trend filters found no matching entry trigger this round")
+        return None
 
     agreeing_names = [v["strategy_name"] for v in winning_votes]
     confidence = min(95, 70 + len(winning_votes) * 6)
 
     print(
-        f"[STRATEGY BANK SYNTH] {index_key} -> {direction} "
-        f"({'fallback pool' if used_fallback else 'two-tier'}) | "
+        f"[STRATEGY BANK SYNTH] {index_key} -> {direction} (two-tier) | "
         f"{len(winning_votes)} agreeing: {', '.join(agreeing_names)}"
     )
 

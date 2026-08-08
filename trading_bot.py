@@ -10261,6 +10261,27 @@ SYNTHETIC_STRATEGY_BANK = [
     strategy_cci_breakout,
     strategy_williams_r,
     strategy_heikin_ashi_trend,
+    # 5 MORE added per explicit instruction, for real parity with the
+    # forex/gold bank now that it's producing noticeably better
+    # results there - these were simply never carried over when
+    # synthetics got its own bank. All 5 operate purely on the
+    # h1/h4/daily candles already passed in as arguments, same as
+    # every strategy above - no forex-session or forex-only-data
+    # dependency, genuinely index-agnostic.
+    strategy_supertrend,
+    strategy_support_resistance_bounce,
+    strategy_fibonacci_retracement,
+    strategy_atr_volatility_breakout,
+    strategy_previous_day_high_low_manipulation,
+    strategy_unicorn_model,
+    # strategy_vah_val_reaction DELIBERATELY EXCLUDED - it does its
+    # own internal candle fetch through the forex-specific MetaAPI/
+    # TwelveData pipeline (get_vah_val_zones_cached -> get_cached_
+    # candles), which has no real symbol/config path for a synthetic
+    # index like "r75" - it would silently contribute nothing rather
+    # than crash, but including it would be fake parity, not real
+    # parity. Would need its own Deriv-candle-sourced version to
+    # genuinely work here - a separate build, not a copy-paste.
 ]
 
 # Per-index strategy groups, mirroring the Nexora AI Trading App's
@@ -10294,36 +10315,58 @@ SYNTHETIC_STRATEGY_BANK = [
 # reference app's "Volatility Pro" bot) plus all 8 new strategies.
 # r10/r25/r50 keep their original Bollinger+RSI Mean Reversion
 # (matches "Synthetic DCA") plus all 8 new strategies.
+#
+# ALL 5 GROUPS further expanded with the same 5 additional strategies
+# added to SYNTHETIC_STRATEGY_BANK above (Supertrend, Support/
+# Resistance Bounce, Fibonacci Retracement, ATR Volatility Breakout,
+# Previous Day High/Low Manipulation, Unicorn Model), per explicit
+# instruction - r75/r100 already had Supertrend individually, it's
+# now consistent across every group instead of only 2 of 5.
 SYNTHETIC_INDEX_STRATEGY_GROUPS = {
     "r75": [
         strategy_trend_following, strategy_momentum_macd, strategy_supertrend,
         strategy_parabolic_sar, strategy_ichimoku_breakout, strategy_keltner_breakout,
         strategy_ema_ribbon, strategy_rate_of_change, strategy_cci_breakout,
         strategy_williams_r, strategy_heikin_ashi_trend,
+        strategy_support_resistance_bounce, strategy_fibonacci_retracement,
+        strategy_atr_volatility_breakout, strategy_previous_day_high_low_manipulation,
+        strategy_unicorn_model,
     ],
     "r100": [
         strategy_trend_following, strategy_momentum_macd, strategy_supertrend,
         strategy_parabolic_sar, strategy_ichimoku_breakout, strategy_keltner_breakout,
         strategy_ema_ribbon, strategy_rate_of_change, strategy_cci_breakout,
         strategy_williams_r, strategy_heikin_ashi_trend,
+        strategy_support_resistance_bounce, strategy_fibonacci_retracement,
+        strategy_atr_volatility_breakout, strategy_previous_day_high_low_manipulation,
+        strategy_unicorn_model,
     ],
     "r10": [
-        strategy_bollinger_rsi_mean_reversion,
+        strategy_bollinger_rsi_mean_reversion, strategy_supertrend,
         strategy_parabolic_sar, strategy_ichimoku_breakout, strategy_keltner_breakout,
         strategy_ema_ribbon, strategy_rate_of_change, strategy_cci_breakout,
         strategy_williams_r, strategy_heikin_ashi_trend,
+        strategy_support_resistance_bounce, strategy_fibonacci_retracement,
+        strategy_atr_volatility_breakout, strategy_previous_day_high_low_manipulation,
+        strategy_unicorn_model,
     ],
     "r25": [
-        strategy_bollinger_rsi_mean_reversion,
+        strategy_bollinger_rsi_mean_reversion, strategy_supertrend,
         strategy_parabolic_sar, strategy_ichimoku_breakout, strategy_keltner_breakout,
         strategy_ema_ribbon, strategy_rate_of_change, strategy_cci_breakout,
         strategy_williams_r, strategy_heikin_ashi_trend,
+        strategy_support_resistance_bounce, strategy_fibonacci_retracement,
+        strategy_atr_volatility_breakout, strategy_previous_day_high_low_manipulation,
+        strategy_unicorn_model,
     ],
     "r50": [
-        strategy_bollinger_rsi_mean_reversion,
+        strategy_bollinger_rsi_mean_reversion, strategy_supertrend,
         strategy_parabolic_sar, strategy_ichimoku_breakout, strategy_keltner_breakout,
         strategy_ema_ribbon, strategy_rate_of_change, strategy_cci_breakout,
         strategy_williams_r, strategy_heikin_ashi_trend,
+        strategy_support_resistance_bounce, strategy_fibonacci_retracement,
+        strategy_atr_volatility_breakout, strategy_previous_day_high_low_manipulation,
+        strategy_unicorn_model,
     ],
 }
 

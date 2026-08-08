@@ -6202,13 +6202,36 @@ async def run_deriv_autotrade_bot_scan(context: ContextTypes.DEFAULT_TYPE):
             continue
         try:
             symbol = config["symbol"]
-            h1_candles = await get_cached_synthetic_candles(index_key, symbol, "1h", 3600, 210)
+            # Per explicit instruction: Aggressive/Conservative now
+            # differ by PRIMARY analysis timeframe (M1 vs M5), not by
+            # how many strategies must agree - the min_agree-based
+            # distinction is intentionally gone for Auto-Trade
+            # specifically. Passed in as primary_candles (the h1_
+            # candles argument slot) - run_strategy_bank_synthetic
+            # itself is completely unchanged, it has no idea this is
+            # M1/M5 instead of true H1, it just runs the bank against
+            # whatever candles it's given. Scoped to ONLY this Deriv
+            # Auto-Trade call site - manual/scheduled signals
+            # (build_synthetic_signal_response) still fetch and pass
+            # real H1 data, untouched by this at all.
+            primary_seconds = 60 if bot_choice == "aggressive" else 300
+            primary_label = "1min_primary" if bot_choice == "aggressive" else "5min_primary"
+            primary_candles = await get_cached_synthetic_candles(index_key, symbol, primary_label, primary_seconds, 210)
             h4_candles = await get_cached_synthetic_candles(index_key, symbol, "4h", 14400, 60)
             daily_candles = await get_cached_synthetic_candles(index_key, symbol, "1day", 86400, 10)
+            # Real M1 regardless of mode - the 3 strategies that
+            # specifically require m1_candles (EMA Pullback Scalper,
+            # Bollinger+RSI Mean Reversion, Volatility Breakout
+            # Scalper) are tuned for genuine M1-scale action; only the
+            # bank's own primary timeframe changes with the mode.
             m1_candles = await get_cached_synthetic_candles(index_key, symbol, "1m", 60, 60)
-            min_agree = DERIV_AUTOTRADE_BOTS[bot_choice]["min_agree"]
+            # Fixed for both modes now, per explicit instruction ("I
+            # don't want that agreeing") - any 1 real matching entry
+            # trigger is enough either way, same floor the two-tier
+            # bank already uses for manual/scheduled signals.
+            min_agree = 1
             result = await run_strategy_bank_synthetic(
-                index_key, config, h1_candles, h4_candles, daily_candles,
+                index_key, config, primary_candles, h4_candles, daily_candles,
                 m1_candles=m1_candles, min_agree=min_agree
             )
             if not result:
@@ -6220,11 +6243,10 @@ async def run_deriv_autotrade_bot_scan(context: ContextTypes.DEFAULT_TYPE):
                 # money Auto-Trade specifically because that was
                 # explicitly asked for and confirmed. run_strategy_
                 # bank_synthetic returning None here already means its
-                # OWN internal two-tier AND flat-vote fallback both
-                # found nothing - this is a genuine last resort.
-                if h1_candles and len(h1_candles) >= 2:
-                    current_price = h1_candles[-1]["close"]
-                    price_1h_ago = h1_candles[-2]["close"]
+                # own two-tier check found nothing this round.
+                if primary_candles and len(primary_candles) >= 2:
+                    current_price = primary_candles[-1]["close"]
+                    price_1h_ago = primary_candles[-2]["close"]
                     fallback_direction, fallback_reason = generate_rule_based_bias(
                         index_key, current_price, price_1h_ago
                     )

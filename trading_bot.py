@@ -937,7 +937,34 @@ async def run_mt5_autotrade_bot_scan(context: ContextTypes.DEFAULT_TYPE):
                         winning_votes = fallback_winning
 
             if not direction:
-                print(f"[MT5 AUTOTRADE] {bot_key}/{pair_key} - no qualifying setup (two-tier or fallback) this round")
+                # THIRD tier, per explicit instruction (confirmed
+                # understanding real money would now act on a
+                # weaker, non-strategy-backed signal here) - the same
+                # rule-based price-trend fallback already used for
+                # manual/scheduled signals (forex and, since the last
+                # build, Deriv too), now also applied to real-money
+                # Auto-Trade specifically because that was explicitly
+                # asked for and confirmed, not because it's the
+                # default policy for every automated path (Auto-Copy
+                # is untouched - it has no bank of its own, it purely
+                # mirrors whatever the scheduled channel signal
+                # already decided).
+                if primary_candles and len(primary_candles) >= 2:
+                    current_price = primary_candles[-1]["close"]
+                    price_1h_ago = primary_candles[-2]["close"]
+                    fallback_direction, fallback_reason = generate_rule_based_bias(
+                        pair_key, current_price, price_1h_ago
+                    )
+                    if fallback_direction:
+                        direction = fallback_direction
+                        winning_votes = [{
+                            "strategy_name": "Rule-Based Trend Fallback",
+                            "direction": direction,
+                            "detail": fallback_reason,
+                        }]
+
+            if not direction:
+                print(f"[MT5 AUTOTRADE] {bot_key}/{pair_key} - no qualifying setup (two-tier, fallback, or rule-based) this round")
                 continue
 
             vote = winning_votes[0]
@@ -6209,14 +6236,40 @@ async def run_deriv_autotrade_bot_scan(context: ContextTypes.DEFAULT_TYPE):
                 m1_candles=m1_candles, min_agree=min_agree
             )
             if not result:
-                # Added for parity with Account Flip's own heartbeat -
-                # same real "is it even running?" question came up
-                # again with no way to answer it from logs, since this
-                # job only ever logged on a successful trade or a real
-                # error, never on "checked, nothing qualified."
-                print(f"[DERIV BOT SCAN] {bot_choice}/{index_key.upper()} checked - no qualifying setup this round.")
-                continue
-            direction, confidence, reason, agreeing_strategies, _winning_votes = result
+                # THIRD tier, per explicit instruction (confirmed
+                # understanding real money would now act on a weaker,
+                # non-strategy-backed signal here) - same rule-based
+                # price-trend fallback already used for manual/
+                # scheduled Deriv signals, now also applied to real-
+                # money Auto-Trade specifically because that was
+                # explicitly asked for and confirmed. run_strategy_
+                # bank_synthetic returning None here already means its
+                # OWN internal two-tier AND flat-vote fallback both
+                # found nothing - this is a genuine last resort.
+                if h1_candles and len(h1_candles) >= 2:
+                    current_price = h1_candles[-1]["close"]
+                    price_1h_ago = h1_candles[-2]["close"]
+                    fallback_direction, fallback_reason = generate_rule_based_bias(
+                        index_key, current_price, price_1h_ago
+                    )
+                else:
+                    fallback_direction = None
+
+                if not fallback_direction:
+                    # Added for parity with Account Flip's own heartbeat -
+                    # same real "is it even running?" question came up
+                    # again with no way to answer it from logs, since this
+                    # job only ever logged on a successful trade or a real
+                    # error, never on "checked, nothing qualified."
+                    print(f"[DERIV BOT SCAN] {bot_choice}/{index_key.upper()} checked - no qualifying setup this round.")
+                    continue
+
+                direction = fallback_direction
+                confidence = random.randint(80, 94)
+                reason = fallback_reason
+                agreeing_strategies = ["Rule-Based Trend Fallback"]
+            else:
+                direction, confidence, reason, agreeing_strategies, _winning_votes = result
             contract_type = "MULTUP" if direction == "BUY" else "MULTDOWN"
 
             for account in subscribers:

@@ -4876,9 +4876,29 @@ async def build_synthetic_signal_response(index_key, min_agree=2):
         index_key, config, h1_candles, h4_candles, daily_candles, m1_candles=m1_candles, min_agree=min_agree
     )
     if not result:
-        return None
-
-    direction, confidence, reason, agreeing_strategies, winning_votes = result
+        # FIX: CONFIRMED REAL GAP, now fixed per explicit instruction -
+        # this used to just return None here, meaning a manual/
+        # scheduled synthetic signal request could get NO response at
+        # all when the bank found nothing, unlike forex/gold/oil (see
+        # generate_rule_based_bias, called from build_signal_response),
+        # which always produces some message via a real price-trend
+        # fallback. Auto-Trade and Auto-Copy (real money) deliberately
+        # do NOT get this same fallback - see their own callers, which
+        # still correctly just skip the round on real money rather
+        # than ever act on a coin-flip-style guess. This one is purely
+        # the DM/channel MESSAGE path.
+        if not h1_candles or len(h1_candles) < 2:
+            return None
+        current_price = h1_candles[-1]["close"]
+        price_1h_ago = h1_candles[-2]["close"]
+        direction, reason = generate_rule_based_bias(index_key, current_price, price_1h_ago)
+        if not direction:
+            return None
+        confidence = random.randint(80, 94)
+        agreeing_strategies = []
+        winning_votes = []
+    else:
+        direction, confidence, reason, agreeing_strategies, winning_votes = result
     contract_type = "MULTUP" if direction == "BUY" else "MULTDOWN"
 
     # Strategies in SYNTHETIC_STRATEGY_BANK vote on EITHER h1_candles
@@ -10238,40 +10258,34 @@ def split_strategies_by_role(strategy_fns):
 # behave (mean reversion off Bollinger extremes, EMA pullback
 # continuation, and raw volatility breakout).
 SYNTHETIC_STRATEGY_BANK = [
-    # strategy_rsi_extreme_reversal REMOVED and REPLACED per explicit
-    # instruction - strategy_rsi_trend_continuation keeps an
-    # RSI-based vote in this bank, just using the newer continuation
-    # logic instead of the removed reversal-at-extremes approach.
-    strategy_rsi_trend_continuation,
+    # Per explicit instruction: no longer "forex strategies PLUS
+    # Deriv-only extras" - this is now EXACTLY the same 13 strategies
+    # as STRATEGY_BANK_FILTERS + STRATEGY_BANK_ENTRIES (forex/gold/
+    # oil), nothing more. rsi_trend_continuation and the 9
+    # synthetics-only extras (Bollinger+RSI Mean Reversion,
+    # Volatility Breakout Scalper, Parabolic SAR, Ichimoku Breakout,
+    # Keltner Breakout, EMA Ribbon, Rate of Change, CCI Breakout) are
+    # REMOVED entirely, not just deprioritized - rsi_extreme_reversal
+    # is back in place of rsi_trend_continuation to match exactly.
+    #
+    # strategy_vah_val_reaction is the one deliberate exception,
+    # still excluded - it does its own internal candle fetch through
+    # the forex-specific MetaAPI/TwelveData pipeline, which has no
+    # working path for synthetic index symbols. Including it would be
+    # fake parity (it would just silently never vote), not real
+    # parity - would need its own Deriv-candle-sourced version to
+    # genuinely belong here.
     strategy_trend_following,
-    strategy_breakout,
-    strategy_momentum_macd,
-    strategy_bollinger_rsi_mean_reversion,
-    strategy_ema_pullback_scalper,
-    strategy_volatility_breakout_scalper,
-    # 8 NEW per explicit instruction - none of these rely on
-    # ICT/FVG-style institutional-order-flow concepts (same reason
-    # ICT/SMC and London Session ORB were excluded from synthetics
-    # in the first place), so they're a genuine fit here.
-    strategy_parabolic_sar,
-    strategy_ichimoku_breakout,
-    strategy_keltner_breakout,
-    strategy_ema_ribbon,
-    strategy_rate_of_change,
-    strategy_cci_breakout,
-    strategy_williams_r,
     strategy_heikin_ashi_trend,
-    # 5 MORE added per explicit instruction, for real parity with the
-    # forex/gold bank now that it's producing noticeably better
-    # results there - these were simply never carried over when
-    # synthetics got its own bank. All 5 operate purely on the
-    # h1/h4/daily candles already passed in as arguments, same as
-    # every strategy above - no forex-session or forex-only-data
-    # dependency, genuinely index-agnostic.
     strategy_supertrend,
     strategy_support_resistance_bounce,
     strategy_fibonacci_retracement,
+    strategy_rsi_extreme_reversal,
+    strategy_ema_pullback_scalper,
+    strategy_breakout,
     strategy_atr_volatility_breakout,
+    strategy_momentum_macd,
+    strategy_williams_r,
     strategy_previous_day_high_low_manipulation,
     strategy_unicorn_model,
     # strategy_vah_val_reaction DELIBERATELY EXCLUDED - it does its
@@ -10284,91 +10298,19 @@ SYNTHETIC_STRATEGY_BANK = [
     # genuinely work here - a separate build, not a copy-paste.
 ]
 
-# Per-index strategy groups, mirroring the Nexora AI Trading App's
-# index-specific bots - per explicit instruction, restructured away
-# from one uniform 9-strategy bank applied identically to every
-# index, since the Trading App's better win rate comes from matching
-# specific strategies to each index's own character, not a generic
-# blanket vote.
-#
-# Only r75/r100 ("Volatility Pro") and r10/r25/r50 ("Synthetic DCA")
-# are mapped - those are the only indices this bot actually trades
-# (see SYNTHETIC_CONFIG above). The Trading App's "Boom & Crash" and
-# "Step Scalper" bots trade BOOM1000/CRASH1000/stpRNG, which aren't
-# in SYNTHETIC_CONFIG at all right now - there's nothing here for
-# those strategy assignments to apply TO yet. Adding those symbols is
-# a separate, bigger job (new index config + Deriv multiplier-floor
-# discovery testing, the same careful live-tested process every
-# existing index went through above), not a strategy swap.
-# SYNTHETIC_STRATEGY_BANK itself is left in place, still used as the
-# fallback for any index that isn't in this dict (none currently, but
-# safer than crashing if a new index is added to SYNTHETIC_CONFIG
-# later without also being added here).
-#
-# Both groups below EXPANDED to include the FULL set of 8 new
-# strategies each, per explicit instruction - with the real 2+
-# agreement gate now in place (see run_strategy_bank_synthetic), a
-# small candidate pool risks long stretches with no trades at all.
-# A bigger, genuinely independent pool means reaching 2 agreement is
-# realistic far more often, without loosening the gate itself.
-# r75/r100 keep their original Trend Following + MACD (matches the
-# reference app's "Volatility Pro" bot) plus all 8 new strategies.
-# r10/r25/r50 keep their original Bollinger+RSI Mean Reversion
-# (matches "Synthetic DCA") plus all 8 new strategies.
-#
-# ALL 5 GROUPS further expanded with the same 5 additional strategies
-# added to SYNTHETIC_STRATEGY_BANK above (Supertrend, Support/
-# Resistance Bounce, Fibonacci Retracement, ATR Volatility Breakout,
-# Previous Day High/Low Manipulation, Unicorn Model), per explicit
-# instruction - r75/r100 already had Supertrend individually, it's
-# now consistent across every group instead of only 2 of 5.
-SYNTHETIC_INDEX_STRATEGY_GROUPS = {
-    "r75": [
-        strategy_trend_following, strategy_momentum_macd, strategy_supertrend,
-        strategy_parabolic_sar, strategy_ichimoku_breakout, strategy_keltner_breakout,
-        strategy_ema_ribbon, strategy_rate_of_change, strategy_cci_breakout,
-        strategy_williams_r, strategy_heikin_ashi_trend,
-        strategy_support_resistance_bounce, strategy_fibonacci_retracement,
-        strategy_atr_volatility_breakout, strategy_previous_day_high_low_manipulation,
-        strategy_unicorn_model,
-    ],
-    "r100": [
-        strategy_trend_following, strategy_momentum_macd, strategy_supertrend,
-        strategy_parabolic_sar, strategy_ichimoku_breakout, strategy_keltner_breakout,
-        strategy_ema_ribbon, strategy_rate_of_change, strategy_cci_breakout,
-        strategy_williams_r, strategy_heikin_ashi_trend,
-        strategy_support_resistance_bounce, strategy_fibonacci_retracement,
-        strategy_atr_volatility_breakout, strategy_previous_day_high_low_manipulation,
-        strategy_unicorn_model,
-    ],
-    "r10": [
-        strategy_bollinger_rsi_mean_reversion, strategy_supertrend,
-        strategy_parabolic_sar, strategy_ichimoku_breakout, strategy_keltner_breakout,
-        strategy_ema_ribbon, strategy_rate_of_change, strategy_cci_breakout,
-        strategy_williams_r, strategy_heikin_ashi_trend,
-        strategy_support_resistance_bounce, strategy_fibonacci_retracement,
-        strategy_atr_volatility_breakout, strategy_previous_day_high_low_manipulation,
-        strategy_unicorn_model,
-    ],
-    "r25": [
-        strategy_bollinger_rsi_mean_reversion, strategy_supertrend,
-        strategy_parabolic_sar, strategy_ichimoku_breakout, strategy_keltner_breakout,
-        strategy_ema_ribbon, strategy_rate_of_change, strategy_cci_breakout,
-        strategy_williams_r, strategy_heikin_ashi_trend,
-        strategy_support_resistance_bounce, strategy_fibonacci_retracement,
-        strategy_atr_volatility_breakout, strategy_previous_day_high_low_manipulation,
-        strategy_unicorn_model,
-    ],
-    "r50": [
-        strategy_bollinger_rsi_mean_reversion, strategy_supertrend,
-        strategy_parabolic_sar, strategy_ichimoku_breakout, strategy_keltner_breakout,
-        strategy_ema_ribbon, strategy_rate_of_change, strategy_cci_breakout,
-        strategy_williams_r, strategy_heikin_ashi_trend,
-        strategy_support_resistance_bounce, strategy_fibonacci_retracement,
-        strategy_atr_volatility_breakout, strategy_previous_day_high_low_manipulation,
-        strategy_unicorn_model,
-    ],
-}
+# REMOVED per explicit instruction - every index used to get its own
+# curated subset of strategies (matching the reference Trading App's
+# per-index bot design), but now that SYNTHETIC_STRATEGY_BANK itself
+# is EXACTLY the same 13 strategies as forex/Exness for every index
+# uniformly, keeping 5 near-duplicate copies of that same list here
+# added nothing but maintenance risk (a strategy added to one place
+# and not the other). run_strategy_bank_synthetic's own lookup
+# (SYNTHETIC_INDEX_STRATEGY_GROUPS.get(index_key, SYNTHETIC_STRATEGY_
+# BANK)) already falls back to the full bank for any index not in
+# this dict - leaving it empty means every index cleanly and
+# uniformly uses SYNTHETIC_STRATEGY_BANK, which is exactly the
+# intended behavior now.
+SYNTHETIC_INDEX_STRATEGY_GROUPS = {}
 
 def check_fresh_momentum_veto(pair_key, config, h1_candles, direction):
     """

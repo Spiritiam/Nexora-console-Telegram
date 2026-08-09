@@ -4969,7 +4969,15 @@ async def build_synthetic_signal_response(index_key, min_agree=2):
     # above) instead of None, so the chart draws them exactly like
     # forex/crypto charts do.
     image_file_id = fallback_image_file_id
-    chart_strategy_name = winning_votes[0]["strategy_name"] if winning_votes else None
+    # FIX: CONFIRMED REAL BUG - this used to default to None when
+    # winning_votes was empty (the rule-based fallback case), which
+    # skipped real chart generation entirely and silently fell back
+    # to the static branded SELL/BUY image instead of a real
+    # candlestick chart - confirmed live on a Volatility 50 Index
+    # signal. The forex/gold/oil path (below) already correctly
+    # defaults to "Momentum" for this exact case; this one just never
+    # got the same fix when the fallback was built.
+    chart_strategy_name = winning_votes[0]["strategy_name"] if winning_votes else "Momentum"
     if chart_strategy_name:
         chart_candles = m1_candles if chart_strategy_name in M1_BASED_STRATEGIES else h1_candles
         chart_path = os.path.join(CHART_OUTPUT_DIR, f"{index_key}_{int(time.time())}.png")

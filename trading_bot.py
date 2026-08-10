@@ -13970,7 +13970,22 @@ async def place_mt5_trade(signal_data):
         # closed, insufficient margin, etc.) returns a 4xx that isn't
         # 429 and is NOT retried - retrying a real rejection would
         # just fail the same way 3 times instead of once.
-        transient_statuses = (429, 502, 503, 504)
+        # URGENT FIX: CONFIRMED REAL LIVE INCIDENT - 3 separate real
+        # XAUUSD buy orders were placed for a single signal, seconds
+        # apart, entry prices consistent with this exact 2s/4s retry
+        # backoff. Root cause: 504 (Gateway Timeout) was in the retry
+        # list, but a 504 specifically means the RESPONSE didn't
+        # arrive in time - it does NOT mean the order failed to
+        # reach the broker. This code was blindly resubmitting a
+        # brand-new order-creation request on every retry with zero
+        # check for whether the prior attempt had actually gone
+        # through, so a slow-but-successful placement plus a retry
+        # meant a second (and a third) REAL order. 504 removed from
+        # the retry list entirely - a timeout now just fails once,
+        # rather than risk placing money-real duplicate trades. 429/
+        # 502/503 stay - those happen before the broker ever
+        # processes the order, so retrying them is genuinely safe.
+        transient_statuses = (429, 502, 503)
         max_attempts = 3
         last_response = None
         for attempt in range(1, max_attempts + 1):

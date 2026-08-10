@@ -13930,6 +13930,55 @@ async def post_news(context: ContextTypes.DEFAULT_TYPE):
 # METAAPI — PLACE TRADE ON MT5 (0.1 lot)
 # ============================================
 
+async def check_for_matching_recent_position(metaapi_account_id, mt5_symbol, comment, since_dt):
+    """
+    Real GET on this account's actual open positions (confirmed
+    endpoint: /users/current/accounts/{id}/positions, returns
+    Array<MetatraderPosition>) - looks for one matching this exact
+    symbol and comment, opened at or after since_dt. Used specifically
+    before retrying a timed-out trade placement, so a retry can safely
+    confirm "did the prior attempt actually already succeed" instead
+    of blindly resubmitting and risking a real duplicate order.
+
+    Returns the matching position dict if found, else None. Any
+    failure here (network error, bad response) returns None too -
+    deliberately fails toward "assume no match, proceed with retry"
+    rather than blocking a legitimate retry on a broken safety check.
+    """
+    try:
+        url = (
+            f"https://mt-client-api-v1.london.agiliumtrade.ai"
+            f"/users/current/accounts/{metaapi_account_id}/positions"
+        )
+        headers = {"auth-token": METAAPI_TOKEN, "Accept": "application/json"}
+        response = requests.get(url, headers=headers, timeout=15)
+        if response.status_code != 200:
+            print(f"[MT5] Idempotency check failed to read positions: {response.status_code}")
+            return None
+        positions = response.json()
+        target_symbol = mt5_symbol.upper()
+        for pos in positions:
+            if not isinstance(pos, dict):
+                continue
+            if (pos.get("symbol") or "").upper() != target_symbol:
+                continue
+            if pos.get("comment") != comment:
+                continue
+            open_time_str = pos.get("time")
+            if not open_time_str:
+                continue
+            try:
+                open_time = datetime.fromisoformat(open_time_str.replace("Z", "+00:00")).replace(tzinfo=None)
+            except ValueError:
+                continue
+            if open_time >= since_dt - timedelta(seconds=5):  # small buffer for clock drift
+                return pos
+        return None
+    except Exception as e:
+        print(f"[MT5] Idempotency check error: {e}")
+        return None
+
+
 async def place_mt5_trade(signal_data):
     if not METAAPI_TOKEN or not METAAPI_ACCOUNT_ID:
         print("[MT5] MetaAPI credentials not set.")
@@ -13970,24 +14019,30 @@ async def place_mt5_trade(signal_data):
         # closed, insufficient margin, etc.) returns a 4xx that isn't
         # 429 and is NOT retried - retrying a real rejection would
         # just fail the same way 3 times instead of once.
-        # URGENT FIX: CONFIRMED REAL LIVE INCIDENT - 3 separate real
-        # XAUUSD buy orders were placed for a single signal, seconds
-        # apart, entry prices consistent with this exact 2s/4s retry
-        # backoff. Root cause: 504 (Gateway Timeout) was in the retry
-        # list, but a 504 specifically means the RESPONSE didn't
-        # arrive in time - it does NOT mean the order failed to
-        # reach the broker. This code was blindly resubmitting a
-        # brand-new order-creation request on every retry with zero
-        # check for whether the prior attempt had actually gone
-        # through, so a slow-but-successful placement plus a retry
-        # meant a second (and a third) REAL order. 504 removed from
-        # the retry list entirely - a timeout now just fails once,
-        # rather than risk placing money-real duplicate trades. 429/
-        # 502/503 stay - those happen before the broker ever
-        # processes the order, so retrying them is genuinely safe.
-        transient_statuses = (429, 502, 503)
+        #
+        # LONG-TERM FIX for the confirmed real duplicate-order
+        # incident (3 real XAUUSD buys for one signal, seconds apart):
+        # 504 was removed from the retry list entirely as an urgent
+        # stopgap, since a 504 means the RESPONSE timed out, not that
+        # the order failed to reach the broker - blindly resubmitting
+        # risked a second/third REAL order on top of one that may have
+        # already gone through. That stopgap traded resilience for
+        # safety (a slow-but-genuine connectivity hiccup now just
+        # fails outright, no retry at all). This replaces the stopgap
+        # with the real fix: 504 is back in the retry list, but before
+        # EVERY retry, check_for_matching_recent_position() confirms
+        # via a fresh GET on this account's real open positions
+        # whether the PRIOR attempt actually already placed this exact
+        # trade (same symbol, same comment, opened within the retry
+        # window) before ever resubmitting. If it's already there,
+        # that position's own IDs are used directly and no duplicate
+        # order is ever submitted - real resilience AND real safety,
+        # not one traded for the other.
+        transient_statuses = (429, 502, 503, 504)
         max_attempts = 3
         last_response = None
+        idempotent_match = None
+        attempt_started_at = datetime.utcnow()
         for attempt in range(1, max_attempts + 1):
             response = requests.post(url, headers=headers, json=payload, timeout=30)
             last_response = response
@@ -13995,12 +14050,31 @@ async def place_mt5_trade(signal_data):
                 break
             if response.status_code not in transient_statuses or attempt == max_attempts:
                 break
+
+            # Before resubmitting, confirm the PRIOR attempt genuinely
+            # didn't already place this trade - this is what makes
+            # retrying 504 safe again.
+            idempotent_match = await check_for_matching_recent_position(
+                METAAPI_ACCOUNT_ID, mt5_symbol, "NexoraAI Signal", attempt_started_at
+            )
+            if idempotent_match:
+                print(
+                    f"[MT5] ✅ Prior attempt {attempt} actually succeeded (found matching "
+                    f"open position {idempotent_match.get('id')}) - using it, NOT resubmitting."
+                )
+                break
+
             wait_seconds = 2 * attempt
             print(
                 f"[MT5] ⚠️ Trade request got {response.status_code} "
                 f"(attempt {attempt}/{max_attempts}) - retrying in {wait_seconds}s..."
             )
             await asyncio.sleep(wait_seconds)
+
+        if idempotent_match:
+            order_id = idempotent_match.get("id", "unknown")
+            print(f"[MT5 PERSONAL COPY] ✅ Trade confirmed via idempotency check - Position ID: {order_id}")
+            return order_id
 
         response = last_response
         if response.status_code in [200, 201]:

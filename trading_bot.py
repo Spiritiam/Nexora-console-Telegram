@@ -2645,7 +2645,7 @@ async def place_and_link_mt5_trade(signal_id, signal_data):
     order_id back onto its signal_log row. Runs as a background task
     so channel posting never waits on MT5 execution.
     """
-    order_id = await place_mt5_trade(signal_data)
+    order_id = await place_mt5_trade(signal_data, signal_id=signal_id)
     attach_mt5_order_id(signal_id, order_id)
 
 async def _delete_message_job(context: ContextTypes.DEFAULT_TYPE):
@@ -13940,10 +13940,14 @@ async def check_for_matching_recent_position(metaapi_account_id, mt5_symbol, com
     confirm "did the prior attempt actually already succeed" instead
     of blindly resubmitting and risking a real duplicate order.
 
-    Returns the matching position dict if found, else None. Any
-    failure here (network error, bad response) returns None too -
-    deliberately fails toward "assume no match, proceed with retry"
-    rather than blocking a legitimate retry on a broken safety check.
+    Returns the matching position dict if found, None if the check
+    ran successfully and genuinely found nothing, or the string
+    "CHECK_FAILED" if the check itself couldn't run (network error,
+    bad response) - per explicit instruction, the caller treats
+    CHECK_FAILED as "stop, don't retry", not "assume no match and
+    proceed". A duplicate real order is worse than a missed one, so
+    when this safety check can't be trusted, the safe direction is to
+    NOT resubmit, not to fall back to the old blind-retry behavior.
     """
     try:
         url = (
@@ -13954,7 +13958,7 @@ async def check_for_matching_recent_position(metaapi_account_id, mt5_symbol, com
         response = requests.get(url, headers=headers, timeout=15)
         if response.status_code != 200:
             print(f"[MT5] Idempotency check failed to read positions: {response.status_code}")
-            return None
+            return "CHECK_FAILED"
         positions = response.json()
         target_symbol = mt5_symbol.upper()
         for pos in positions:
@@ -13976,10 +13980,10 @@ async def check_for_matching_recent_position(metaapi_account_id, mt5_symbol, com
         return None
     except Exception as e:
         print(f"[MT5] Idempotency check error: {e}")
-        return None
+        return "CHECK_FAILED"
 
 
-async def place_mt5_trade(signal_data):
+async def place_mt5_trade(signal_data, signal_id=None):
     if not METAAPI_TOKEN or not METAAPI_ACCOUNT_ID:
         print("[MT5] MetaAPI credentials not set.")
         return None
@@ -13994,13 +13998,23 @@ async def place_mt5_trade(signal_data):
             "ORDER_TYPE_BUY" if direction == "BUY"
             else "ORDER_TYPE_SELL"
         )
+        # Per explicit instruction (real gap found on review): a fixed
+        # shared comment couldn't tell two DIFFERENT signals for the
+        # SAME pair apart if they happened to fire within the same
+        # few-second retry window - the idempotency check below could
+        # in principle match the wrong signal's position to this one.
+        # A per-signal comment closes this completely; falls back to
+        # the old shared comment only if no signal_id was passed in
+        # (keeps this function callable exactly as before from
+        # anywhere that doesn't have one).
+        trade_comment = f"NexoraAI #{signal_id}" if signal_id else "NexoraAI Signal"
         payload = {
             "symbol": mt5_symbol,
             "volume": 0.1,
             "actionType": order_type,
             "stopLoss": signal_data["stop_loss"],
             "takeProfit": signal_data["take_profit"],
-            "comment": "NexoraAI Signal"
+            "comment": trade_comment
         }
         url = (
             f"https://mt-client-api-v1.london.agiliumtrade.ai"
@@ -14053,11 +14067,23 @@ async def place_mt5_trade(signal_data):
 
             # Before resubmitting, confirm the PRIOR attempt genuinely
             # didn't already place this trade - this is what makes
-            # retrying 504 safe again.
-            idempotent_match = await check_for_matching_recent_position(
-                METAAPI_ACCOUNT_ID, mt5_symbol, "NexoraAI Signal", attempt_started_at
+            # retrying 504 safe again. Matches on trade_comment (now
+            # unique per signal, not the old shared constant) so this
+            # can never cross-match a DIFFERENT signal's position for
+            # the same pair, even one that happened to open seconds
+            # earlier.
+            check_result = await check_for_matching_recent_position(
+                METAAPI_ACCOUNT_ID, mt5_symbol, trade_comment, attempt_started_at
             )
-            if idempotent_match:
+            if check_result == "CHECK_FAILED":
+                # Per explicit instruction: if the safety check itself
+                # can't be trusted, the safe direction is to STOP, not
+                # to fall back to blindly resubmitting. A missed trade
+                # is recoverable; a duplicate real order is not.
+                print(f"[MT5] ⚠️ Idempotency check itself failed - stopping rather than risk a duplicate order.")
+                break
+            if check_result:
+                idempotent_match = check_result
                 print(
                     f"[MT5] ✅ Prior attempt {attempt} actually succeeded (found matching "
                     f"open position {idempotent_match.get('id')}) - using it, NOT resubmitting."

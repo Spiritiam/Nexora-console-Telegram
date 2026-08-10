@@ -11388,6 +11388,28 @@ def generate_signal_chart(display_name, strategy_name, direction, candles, entry
     window without ever changing what was actually calculated.
     """
     try:
+        # FIX: CONFIRMED REAL, LIVE BUG - H1 candles are cached for a
+        # full hour (CANDLE_CACHE_SECONDS), but the live price used
+        # for `entry` is always fetched fresh with no caching at all.
+        # For a fast-moving instrument (BTCUSD confirmed live - a
+        # 250-450 point gap), the chart's own rightmost candles could
+        # be showing price from up to 59 minutes ago while Entry/SL/TP
+        # reflect right now, making the chart visually CONTRADICT the
+        # numbers printed next to it - not a wrong signal, a dishonest
+        # picture of one. Fixed by appending one extra "live" point
+        # using the real entry price as its open/high/low/close,
+        # BEFORE any indicator is computed (not just before drawing) -
+        # so every indicator (MA, RSI, MACD, etc.) reflects the true
+        # current price too, not just the picture. The chart can now
+        # never show a last candle that disagrees with the quoted
+        # Entry price, regardless of how stale the underlying cache is.
+        if entry and candles:
+            live_point = {
+                "open": entry, "high": entry, "low": entry, "close": entry,
+                "volume": 0,
+            }
+            candles = candles + [live_point]
+
         if not candles or len(candles) < 5:
             # FIX: this early exit was completely silent before -
             # CONFIRMED REAL CASE via live logs: a real signal

@@ -18084,21 +18084,38 @@ async def _run_broadcast(bot, message_text, admin_chat_id, button_label=None, de
             InlineKeyboardButton(button_label, url=button_url)
         ]])
 
-    # Per explicit instruction: multiple photos (sent as a Telegram
-    # album) used to silently drop everything after the first - only
-    # whichever message happened to carry the /broadcast caption ever
-    # got processed at all. The caption+button only attach to ONE
-    # photo either way (Telegram's send_media_group has no per-item
-    # reply_markup support at all, confirmed - a button can't attach
-    # to an album), so the first photo still carries caption+button
-    # exactly as before; any additional photos now go out right after
-    # as a plain uncaptioned follow-up album instead of vanishing.
+    # Per explicit instruction: two genuinely different paths now,
+    # picked automatically based on whether an explicit button was
+    # requested (checking button_label specifically, not markup -
+    # markup defaults to the persistent keyboard refresh even with no
+    # button asked for, and that default refresh is a nice-to-have
+    # worth skipping for a true unified album, not a reason to force
+    # the split - it'll refresh again on the user's next interaction
+    # regardless). Previously this ALWAYS split into "first photo
+    # separate + trailing group" no matter what, which is why removing
+    # a button alone didn't change anything (confirmed real gap).
+    #
+    # NO explicit button + multiple photos: one single, TRUE unified
+    # send_media_group call, caption on the first item - Telegram
+    # shows that as one shared caption for the whole album, a genuine
+    # single post with every photo together.
+    #
+    # Explicit button requested (any photo count) OR only 1 photo:
+    # unavoidable split - Telegram's send_media_group has zero
+    # reply_markup support at all (confirmed directly from Telegram's
+    # own bot-api issue tracker), so a button can only ever attach to
+    # a single, standalone photo message.
     first_photo = photo_file_ids[0] if photo_file_ids else None
     extra_photos = photo_file_ids[1:] if photo_file_ids and len(photo_file_ids) > 1 else []
+    use_unified_album = photo_file_ids and len(photo_file_ids) > 1 and not button_label
 
     for uid in user_ids:
         try:
-            if first_photo:
+            if use_unified_album:
+                media = [InputMediaPhoto(photo_file_ids[0], caption=message_text, parse_mode=ParseMode.HTML)]
+                media += [InputMediaPhoto(fid) for fid in photo_file_ids[1:]]
+                await bot.send_media_group(chat_id=int(uid), media=media)
+            elif first_photo:
                 await bot.send_photo(
                     chat_id=int(uid),
                     photo=first_photo,
@@ -18606,19 +18623,37 @@ async def _handle_broadcastchannels_request(update: Update, context: ContextType
             InlineKeyboardButton(button_label, url=button_url)
         ]])
 
-    # Button/caption can only ever attach to ONE photo (Telegram's
-    # send_media_group has no per-item reply_markup support at all,
-    # confirmed) - first photo carries caption+button exactly as a
-    # single-photo post always did; any additional photos post right
-    # after as a plain uncaptioned follow-up album instead of being
-    # silently dropped.
+    # Per explicit instruction: two genuinely different paths now,
+    # picked automatically based on whether a button is present -
+    # previously this ALWAYS split into "first photo separate +
+    # trailing group" regardless of button, which is why removing the
+    # button alone didn't change anything (confirmed real gap - the
+    # conditional below never actually existed until now).
+    #
+    # NO button + multiple photos: one single, TRUE unified
+    # send_media_group call, with the caption on the first item -
+    # Telegram displays that as one shared caption for the whole
+    # album, so this is a genuine single post, all photos together.
+    #
+    # Button present (any photo count) OR only 1 photo: unavoidable
+    # split - Telegram's send_media_group has zero reply_markup
+    # support at all (confirmed directly from Telegram's own bot-api
+    # issue tracker), so a button can only ever attach to a single,
+    # standalone photo message. First photo carries caption+button;
+    # any additional photos follow as a separate uncaptioned album
+    # instead of being silently dropped.
     first_photo = photo_file_ids[0] if photo_file_ids else None
     extra_photos = photo_file_ids[1:] if photo_file_ids and len(photo_file_ids) > 1 else []
+    use_unified_album = photo_file_ids and len(photo_file_ids) > 1 and not markup
 
     sent, failed = [], []
     for channel_id in [CHANNEL_1_ID, CHANNEL_2_ID, CHANNEL_3_ID]:
         try:
-            if first_photo:
+            if use_unified_album:
+                media = [InputMediaPhoto(photo_file_ids[0], caption=message_text, parse_mode=ParseMode.HTML)]
+                media += [InputMediaPhoto(fid) for fid in photo_file_ids[1:]]
+                await context.bot.send_media_group(chat_id=channel_id, media=media)
+            elif first_photo:
                 await context.bot.send_photo(
                     chat_id=channel_id, photo=first_photo, caption=message_text,
                     parse_mode=ParseMode.HTML, reply_markup=markup

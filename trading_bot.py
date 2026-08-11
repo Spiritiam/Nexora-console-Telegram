@@ -14961,6 +14961,68 @@ async def send_news_calendar(bot, chat_id, user_id):
     )
 
 
+async def build_exness_autotrade_dashboard(user_id, account, expiry, now):
+    """
+    Builds the (text, reply_markup) for an already-active Exness
+    Auto-Trade subscriber's status dashboard. Extracted per explicit
+    instruction - this used to be inline only inside the mt5auto_start
+    callback (reachable only AFTER tapping "Continue" past the generic
+    intro), meaning an already-connected user had to sit through the
+    new-user intro every time just to check their own balance. Now a
+    single shared builder both the direct button-tap handler and the
+    mt5auto_start callback call - one source of truth, so the two
+    entry points can never silently drift apart from each other.
+    """
+    days_left = (expiry - now).days
+    risk_mode = account.get("risk_mode", "lot")
+    if risk_mode == "lot":
+        risk_display = f"{account.get('lot_size', 0.01)} lots"
+    elif risk_mode == "account_flip":
+        open_stack = get_open_flip_stack(user_id)
+        if open_stack:
+            risk_display = (
+                f"🚀 Flip — stack open, {open_stack.get('layer_count', 1)} layer(s) so far "
+                f"(base {account.get('flip_base_lot', 0.01)}, +{account.get('flip_step', 0.01)}/layer, "
+                f"cap {account.get('flip_max_lot', 0.01)}, trail {account.get('flip_trail_pips', 10)} pips)"
+            )
+        else:
+            risk_display = (
+                f"🚀 Flip — no open stack right now "
+                f"(base {account.get('flip_base_lot', 0.01)}, +{account.get('flip_step', 0.01)}/layer, "
+                f"cap {account.get('flip_max_lot', 0.01)}, every {account.get('flip_trigger_pips', 10)} "
+                f"pips, max {account.get('flip_max_layers', 3)} layers)"
+            )
+    else:
+        risk_display = f"{account.get('risk_percent', 1.0)}% risk"
+    bot_choice = account.get("bot_choice", "follow_channel")
+    bot_label = (
+        "Following channel signals" if bot_choice == "follow_channel"
+        else "🚀 Account Flip (own price-action strategy)" if bot_choice == "account_flip"
+        else MT5_AUTOTRADE_BOTS.get(bot_choice, {}).get("label", bot_choice)
+    )
+    # Account name/server come straight from the saved row; balance is
+    # a live fetch since it changes constantly and was never something
+    # worth caching - per explicit instruction.
+    balance = await get_client_mt5_balance(account["metaapi_account_id"])
+    balance_display = f"${balance:,.2f}" if balance is not None else "unavailable right now"
+    text = (
+        f"🤖 <b>Exness Auto-Trade — Active</b>\n\n"
+        f"Account: {account.get('account_name') or account.get('account_number', 'N/A')}\n"
+        f"Server: {account.get('server', 'N/A')}\n"
+        f"Balance: {balance_display}\n\n"
+        f"Subscription: {days_left} day(s) left\n"
+        f"Mode: {bot_label}"
+        + (f" on {account.get('pair_choice', '').upper()}" if account.get("pair_choice") else "")
+        + f"\nRisk: {risk_display}\n\n"
+        f"Waiting on the trading strategy to be wired in before "
+        f"real trades begin - infrastructure is ready."
+    )
+    markup = InlineKeyboardMarkup([
+        [InlineKeyboardButton("⚙️ Change lot size / risk %", callback_data="mt5settings_change")],
+    ])
+    return text, markup
+
+
 async def send_exness_autotrade_intro(bot, chat_id):
     """
     Shared by the normal "🤖 Exness Auto-Trade" button tap (handle_buttons
@@ -15153,6 +15215,35 @@ async def handle_buttons(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     if "exness auto-trade" in text:
+        # FIX: CONFIRMED REAL UX BUG, per explicit instruction - an
+        # already-connected, active subscriber tapping this button was
+        # ALWAYS shown the generic intro/pricing message first, and
+        # had to tap "Continue" before their real account dashboard
+        # (balance, subscription, mode) appeared - the dashboard logic
+        # itself already existed correctly, it just lived behind an
+        # extra unnecessary tap that only new/unconnected users should
+        # ever see. Checks the exact same "already active" condition
+        # the mt5auto_start callback already uses, and goes straight
+        # to the real dashboard here too when it's true.
+        user_id = str(update.effective_user.id)
+        account = get_mt5_autotrade_account(user_id)
+        now = datetime.utcnow()
+        expiry = None
+        if account and account.get("subscription_expires_at"):
+            try:
+                expiry = datetime.fromisoformat(
+                    account["subscription_expires_at"].replace("Z", "+00:00")
+                ).replace(tzinfo=None)
+            except Exception:
+                expiry = None
+        already_active = (
+            account and expiry is not None and now < expiry
+            and account.get("metaapi_account_id")
+        )
+        if already_active:
+            dash_text, dash_markup = await build_exness_autotrade_dashboard(user_id, account, expiry, now)
+            await update.message.reply_text(dash_text, parse_mode=ParseMode.HTML, reply_markup=dash_markup)
+            return
         await send_exness_autotrade_intro(context.bot, update.message.chat_id)
         return
 
@@ -15202,55 +15293,8 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if already_active:
             # Already fully set up - no need to walk through bot/pair/
             # lot-risk selection again, just show current status.
-            days_left = (expiry - now).days
-            risk_mode = account.get("risk_mode", "lot")
-            if risk_mode == "lot":
-                risk_display = f"{account.get('lot_size', 0.01)} lots"
-            elif risk_mode == "account_flip":
-                open_stack = get_open_flip_stack(user_id)
-                if open_stack:
-                    risk_display = (
-                        f"🚀 Flip — stack open, {open_stack.get('layer_count', 1)} layer(s) so far "
-                        f"(base {account.get('flip_base_lot', 0.01)}, +{account.get('flip_step', 0.01)}/layer, "
-                        f"cap {account.get('flip_max_lot', 0.01)}, trail {account.get('flip_trail_pips', 10)} pips)"
-                    )
-                else:
-                    risk_display = (
-                        f"🚀 Flip — no open stack right now "
-                        f"(base {account.get('flip_base_lot', 0.01)}, +{account.get('flip_step', 0.01)}/layer, "
-                        f"cap {account.get('flip_max_lot', 0.01)}, every {account.get('flip_trigger_pips', 10)} "
-                        f"pips, max {account.get('flip_max_layers', 3)} layers)"
-                    )
-            else:
-                risk_display = f"{account.get('risk_percent', 1.0)}% risk"
-            bot_choice = account.get("bot_choice", "follow_channel")
-            bot_label = (
-                "Following channel signals" if bot_choice == "follow_channel"
-                else "🚀 Account Flip (own price-action strategy)" if bot_choice == "account_flip"
-                else MT5_AUTOTRADE_BOTS.get(bot_choice, {}).get("label", bot_choice)
-            )
-            # Account name/server come straight from the saved row;
-            # balance is a live fetch since it changes constantly and
-            # was never something worth caching - per explicit
-            # instruction.
-            balance = await get_client_mt5_balance(account["metaapi_account_id"])
-            balance_display = f"${balance:,.2f}" if balance is not None else "unavailable right now"
-            await query.message.edit_text(
-                f"🤖 <b>Exness Auto-Trade — Active</b>\n\n"
-                f"Account: {account.get('account_name') or account.get('account_number', 'N/A')}\n"
-                f"Server: {account.get('server', 'N/A')}\n"
-                f"Balance: {balance_display}\n\n"
-                f"Subscription: {days_left} day(s) left\n"
-                f"Mode: {bot_label}"
-                + (f" on {account.get('pair_choice', '').upper()}" if account.get("pair_choice") else "")
-                + f"\nRisk: {risk_display}\n\n"
-                f"Waiting on the trading strategy to be wired in before "
-                f"real trades begin - infrastructure is ready.",
-                parse_mode=ParseMode.HTML,
-                reply_markup=InlineKeyboardMarkup([
-                    [InlineKeyboardButton("⚙️ Change lot size / risk %", callback_data="mt5settings_change")],
-                ])
-            )
+            dash_text, dash_markup = await build_exness_autotrade_dashboard(user_id, account, expiry, now)
+            await query.message.edit_text(dash_text, parse_mode=ParseMode.HTML, reply_markup=dash_markup)
             return
 
         # REAL FIX, per explicit instruction - a confirmed case: a

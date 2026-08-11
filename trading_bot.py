@@ -13350,9 +13350,20 @@ async def check_upcoming_high_impact_news(context: ContextTypes.DEFAULT_TYPE):
     header = "First high-impact event in ~30 minutes" if len(group) == 1 else f"First high-impact event in ~30 minutes — {len(group)} today"
 
     first_event = group[0][1]
+    # FIX: CONFIRMED REAL ISSUE - the prompt relied entirely on the
+    # event title/currency text to imply financial content, with only
+    # generic "cinematic digital art, dramatic lighting" style words
+    # attached. Pollinations would happily render the LITERAL subject
+    # of a headline (a person, a building, a scene) with zero
+    # guarantee it looked anything like trading/forex - confirmed live,
+    # producing unrelated imagery. Now explicitly anchored to forex/
+    # trading visual elements every time, regardless of what the
+    # specific headline happens to be about.
     image_prompt = (
-        f"professional financial news illustration: {first_event['currency']} "
-        f"{first_event['title']}, cinematic digital art, dramatic lighting, high quality"
+        f"forex trading floor, candlestick chart screens, currency "
+        f"symbols, financial trading terminal, {first_event['currency']} "
+        f"{first_event['title']}, professional financial illustration, "
+        f"cinematic digital art, dramatic lighting, high quality"
     )
     image_url = (
         f"https://image.pollinations.ai/prompt/"
@@ -13841,9 +13852,18 @@ async def post_news(context: ContextTypes.DEFAULT_TYPE):
         return
 
     headline = article.get("title", "financial market news trading")
+    # FIX: CONFIRMED REAL ISSUE, per explicit instruction - same root
+    # cause as the pre-release news alert's image prompt (see there for
+    # the full explanation): relying on the headline text alone gave
+    # Pollinations zero guarantee the image looked like trading/forex
+    # at all, since it would happily render whatever the headline was
+    # LITERALLY about instead. Now explicitly anchored to forex/
+    # trading visual elements every time.
     image_prompt = (
-        f"professional financial news illustration: {headline}, "
-        f"cinematic digital art, dramatic lighting, high quality"
+        f"forex trading floor, candlestick chart screens, currency "
+        f"symbols, financial trading terminal, {headline}, "
+        f"professional financial illustration, cinematic digital art, "
+        f"dramatic lighting, high quality"
     )
     image_url = (
         f"https://image.pollinations.ai/prompt/"

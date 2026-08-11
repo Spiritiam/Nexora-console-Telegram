@@ -1007,7 +1007,7 @@ async def run_mt5_autotrade_bot_scan(context: ContextTypes.DEFAULT_TYPE):
 
 async def run_mt5_autotrade_follow_channel_scan(context: ContextTypes.DEFAULT_TYPE):
     """
-    Runs every 2 minutes. For "Follow Channel Signals" subscribers,
+    Runs every 2 minutes. For "Full Signal Coverage" subscribers,
     copies whatever the channel itself already posted for XAUUSD,
     GBPJPY, or BTCUSD - reuses signal_log (the same table every
     channel post already writes to) rather than re-deciding anything,
@@ -14997,7 +14997,7 @@ async def build_exness_autotrade_dashboard(user_id, account, expiry, now):
         risk_display = f"{account.get('risk_percent', 1.0)}% risk"
     bot_choice = account.get("bot_choice", "follow_channel")
     bot_label = (
-        "Following channel signals" if bot_choice == "follow_channel"
+        "📡 Full Signal Coverage (Recommended)" if bot_choice == "follow_channel"
         else "🚀 Account Flip (own price-action strategy)" if bot_choice == "account_flip"
         else MT5_AUTOTRADE_BOTS.get(bot_choice, {}).get("label", bot_choice)
     )
@@ -15329,7 +15329,7 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         mt5_signup_state[user_id] = {"flow": "presetup"}
         await query.message.edit_text(
             "🤖 <b>How should Exness Auto-Trade decide your trades?</b>\n\n"
-            "📡 <b>Follow Channel Signals</b> — auto-copies whatever "
+            "📡 <b>Full Signal Coverage (Recommended)</b> — auto-copies whatever "
             "the main channel already posts (XAUUSD, GBPJPY, BTCUSD, etc).\n\n"
             "🎯 <b>Pick a Bot</b> — choose one of 4 dedicated strategy "
             "bots and one specific pair for it to trade.\n\n"
@@ -15338,7 +15338,7 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             "with a trailing stop across the whole stack. Higher risk.",
             parse_mode=ParseMode.HTML,
             reply_markup=InlineKeyboardMarkup([
-                [InlineKeyboardButton("📡 Follow Channel Signals", callback_data="mt5auto_follow_channel")],
+                [InlineKeyboardButton("📡 Full Signal Coverage (Recommended)", callback_data="mt5auto_follow_channel")],
                 [InlineKeyboardButton("🎯 Pick a Bot", callback_data="mt5auto_choose_bot")],
                 [InlineKeyboardButton("🚀 Account Flip", callback_data="mt5auto_account_flip")],
             ])
@@ -15677,7 +15677,7 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         user_id = str(query.from_user.id)
         await query.message.edit_text(
             "🔄 <b>Switch how Exness Auto-Trade decides your trades:</b>\n\n"
-            "📡 <b>Follow Channel Signals</b> — auto-copies whatever "
+            "📡 <b>Full Signal Coverage (Recommended)</b> — auto-copies whatever "
             "the main channel already posts (XAUUSD, GBPJPY, BTCUSD, etc).\n\n"
             "🎯 <b>Pick a Bot</b> — choose one of 4 dedicated strategy "
             "bots and one specific pair for it to trade.\n\n"
@@ -15686,7 +15686,7 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             "with a trailing stop across the whole stack. Higher risk.",
             parse_mode=ParseMode.HTML,
             reply_markup=InlineKeyboardMarkup([
-                [InlineKeyboardButton("📡 Follow Channel Signals", callback_data="mt5switch_follow_channel")],
+                [InlineKeyboardButton("📡 Full Signal Coverage (Recommended)", callback_data="mt5switch_follow_channel")],
                 [InlineKeyboardButton("🎯 Pick a Bot", callback_data="mt5switch_choose_bot")],
                 [InlineKeyboardButton("🚀 Account Flip", callback_data="mt5switch_account_flip")],
             ])
@@ -19913,7 +19913,7 @@ def main():
         name="mt5_autotrade_bot_scan"
     )
 
-    # MT5 auto-trade: live execution for "Follow Channel Signals"
+    # MT5 auto-trade: live execution for "Full Signal Coverage"
     # subscribers - copies whatever the channel itself already posts,
     # checked every 2 minutes.
     job_queue.run_repeating(

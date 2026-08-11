@@ -15330,7 +15330,10 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await query.message.edit_text(
             "🤖 <b>How should Exness Auto-Trade decide your trades?</b>\n\n"
             "📡 <b>Full Signal Coverage (Recommended)</b> — auto-copies whatever "
-            "the main channel already posts (XAUUSD, GBPJPY, BTCUSD, etc).\n\n"
+            "the main channel already posts (XAUUSD, USOIL, XAGUSD, BTCUSD, "
+            "etc). And trades every qualifying signal our system generates, "
+            "giving you access to signals that never makes it to the "
+            "channel. More coverage, more opportunities.\n\n"
             "🎯 <b>Pick a Bot</b> — choose one of 4 dedicated strategy "
             "bots and one specific pair for it to trade.\n\n"
             "🚀 <b>Account Flip</b> — its own standalone price-action "
@@ -15678,7 +15681,10 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await query.message.edit_text(
             "🔄 <b>Switch how Exness Auto-Trade decides your trades:</b>\n\n"
             "📡 <b>Full Signal Coverage (Recommended)</b> — auto-copies whatever "
-            "the main channel already posts (XAUUSD, GBPJPY, BTCUSD, etc).\n\n"
+            "the main channel already posts (XAUUSD, USOIL, XAGUSD, BTCUSD, "
+            "etc). And trades every qualifying signal our system generates, "
+            "giving you access to signals that never makes it to the "
+            "channel. More coverage, more opportunities.\n\n"
             "🎯 <b>Pick a Bot</b> — choose one of 4 dedicated strategy "
             "bots and one specific pair for it to trade.\n\n"
             "🚀 <b>Account Flip</b> — its own standalone price-action "

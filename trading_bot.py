@@ -35,6 +35,7 @@ from telegram import (
     MenuButtonCommands,
     MenuButtonDefault,
     BotCommand,
+    InputMediaPhoto,
 )
 
 from telegram.ext import (
@@ -18056,7 +18057,7 @@ async def get_all_known_user_ids():
 
     return user_ids
 
-async def _run_broadcast(bot, message_text, admin_chat_id, button_label=None, destination="exness", photo_file_id=None):
+async def _run_broadcast(bot, message_text, admin_chat_id, button_label=None, destination="exness", photo_file_ids=None):
     user_ids = await get_all_known_user_ids()
     total = len(user_ids)
     print(f"[BROADCAST] Starting send to {total} users")
@@ -18083,16 +18084,33 @@ async def _run_broadcast(bot, message_text, admin_chat_id, button_label=None, de
             InlineKeyboardButton(button_label, url=button_url)
         ]])
 
+    # Per explicit instruction: multiple photos (sent as a Telegram
+    # album) used to silently drop everything after the first - only
+    # whichever message happened to carry the /broadcast caption ever
+    # got processed at all. The caption+button only attach to ONE
+    # photo either way (Telegram's send_media_group has no per-item
+    # reply_markup support at all, confirmed - a button can't attach
+    # to an album), so the first photo still carries caption+button
+    # exactly as before; any additional photos now go out right after
+    # as a plain uncaptioned follow-up album instead of vanishing.
+    first_photo = photo_file_ids[0] if photo_file_ids else None
+    extra_photos = photo_file_ids[1:] if photo_file_ids and len(photo_file_ids) > 1 else []
+
     for uid in user_ids:
         try:
-            if photo_file_id:
+            if first_photo:
                 await bot.send_photo(
                     chat_id=int(uid),
-                    photo=photo_file_id,
+                    photo=first_photo,
                     caption=message_text,
                     parse_mode=ParseMode.HTML,
                     reply_markup=markup
                 )
+                if extra_photos:
+                    await bot.send_media_group(
+                        chat_id=int(uid),
+                        media=[InputMediaPhoto(fid) for fid in extra_photos]
+                    )
             else:
                 await bot.send_message(
                     chat_id=int(uid),
@@ -18483,7 +18501,7 @@ def parse_broadcast_button_syntax(message_text):
     return "\n".join(message_lines).strip(), button_label, destination
 
 
-async def _handle_broadcast_request(update: Update, context: ContextTypes.DEFAULT_TYPE, raw_text: str, photo_file_id=None):
+async def _handle_broadcast_request(update: Update, context: ContextTypes.DEFAULT_TYPE, raw_text: str, photo_file_ids=None):
     """
     Shared core for /broadcast - used by BOTH the plain-text
     CommandHandler below AND the new photo-caption handler
@@ -18493,6 +18511,12 @@ async def _handle_broadcast_request(update: Update, context: ContextTypes.DEFAUL
     sent as "photo + /broadcast... caption" silently did nothing
     before. This shared core is what makes both paths actually work
     the same way, rather than duplicating the parsing/sending logic.
+
+    photo_file_ids is a LIST now, per explicit instruction (confirmed
+    real bug - sending multiple photos as one Telegram album used to
+    silently drop everything after the first) - see broadcast_photo_
+    handler's media-group buffering for how multi-photo albums get
+    collected into this list before this function ever runs.
     """
     user_id = str(update.effective_user.id)
     if not ADMIN_USER_ID or user_id != str(ADMIN_USER_ID):
@@ -18526,7 +18550,7 @@ async def _handle_broadcast_request(update: Update, context: ContextTypes.DEFAUL
     )
 
     asyncio.create_task(
-        _run_broadcast(context.bot, message_text, update.effective_chat.id, button_label, destination, photo_file_id)
+        _run_broadcast(context.bot, message_text, update.effective_chat.id, button_label, destination, photo_file_ids)
     )
 
 
@@ -18534,11 +18558,17 @@ async def broadcast_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await _handle_broadcast_request(update, context, update.message.text)
 
 
-async def _handle_broadcastchannels_request(update: Update, context: ContextTypes.DEFAULT_TYPE, raw_text: str, photo_file_id=None):
+async def _handle_broadcastchannels_request(update: Update, context: ContextTypes.DEFAULT_TYPE, raw_text: str, photo_file_ids=None):
     """
     Shared core for /broadcastchannels - same reasoning as
     _handle_broadcast_request above. Only 3 channels, so this still
     runs inline rather than as a background task.
+
+    photo_file_ids is a LIST now, per explicit instruction (confirmed
+    real bug - sending multiple photos as one Telegram album used to
+    silently drop everything after the first, since the caption/
+    command only ever attaches to ONE message in a Telegram album,
+    and that was the only photo this function ever saw).
     """
     user_id = str(update.effective_user.id)
     if not ADMIN_USER_ID or user_id != str(ADMIN_USER_ID):
@@ -18553,7 +18583,9 @@ async def _handle_broadcastchannels_request(update: Update, context: ContextType
             "LINK: <destination>\n\n"
             "Destinations: exness (default), deriv, signal, news calendar, nexora (just opens the bot directly).\n\n"
             "Attach a photo (with this as its caption) to post it as "
-            "an image with caption instead of plain text.\n\n"
+            "an image with caption instead of plain text - attach "
+            "multiple photos as one album and they'll all post "
+            "together (caption and button only show on the first).\n\n"
             "Posts to all 3 channels at once. Channels have no "
             "persistent keyboard, so a button is the only way to make "
             "the post tappable. HTML formatting tags (<b>, <i>, etc.) "
@@ -18574,14 +18606,28 @@ async def _handle_broadcastchannels_request(update: Update, context: ContextType
             InlineKeyboardButton(button_label, url=button_url)
         ]])
 
+    # Button/caption can only ever attach to ONE photo (Telegram's
+    # send_media_group has no per-item reply_markup support at all,
+    # confirmed) - first photo carries caption+button exactly as a
+    # single-photo post always did; any additional photos post right
+    # after as a plain uncaptioned follow-up album instead of being
+    # silently dropped.
+    first_photo = photo_file_ids[0] if photo_file_ids else None
+    extra_photos = photo_file_ids[1:] if photo_file_ids and len(photo_file_ids) > 1 else []
+
     sent, failed = [], []
     for channel_id in [CHANNEL_1_ID, CHANNEL_2_ID, CHANNEL_3_ID]:
         try:
-            if photo_file_id:
+            if first_photo:
                 await context.bot.send_photo(
-                    chat_id=channel_id, photo=photo_file_id, caption=message_text,
+                    chat_id=channel_id, photo=first_photo, caption=message_text,
                     parse_mode=ParseMode.HTML, reply_markup=markup
                 )
+                if extra_photos:
+                    await context.bot.send_media_group(
+                        chat_id=channel_id,
+                        media=[InputMediaPhoto(fid) for fid in extra_photos]
+                    )
             else:
                 await context.bot.send_message(
                     chat_id=channel_id, text=message_text, parse_mode=ParseMode.HTML,
@@ -18602,6 +18648,49 @@ async def broadcastchannels_command(update: Update, context: ContextTypes.DEFAUL
     await _handle_broadcastchannels_request(update, context, update.message.text)
 
 
+# Buffers photos from a Telegram album (multiple photos sent as one
+# message group) until all of them have arrived, keyed by Telegram's
+# own media_group_id - per explicit instruction, confirmed real bug:
+# an album's caption/command only ever attaches to ONE of its photo
+# messages, so without this, only that single photo was ever seen and
+# every other photo in the album silently vanished. Not meant to
+# persist across restarts - an in-flight album mid-send during a
+# restart is a rare enough edge case that losing it is an acceptable
+# tradeoff for not needing real persistence here.
+MEDIA_GROUP_BUFFER = {}
+MEDIA_GROUP_DEBOUNCE_SECONDS = 1.5
+
+
+async def _process_media_group_after_debounce(media_group_id):
+    """
+    Waits for the album to stop growing before processing it - photos
+    in a Telegram album arrive as separate, near-simultaneous updates,
+    not all at once, so there's no single moment that's reliably "the
+    last one". Each new photo re-triggers this with a fresh timer;
+    only the LAST-scheduled call (the one where no newer photo showed
+    up during its wait) actually processes and clears the buffer.
+    """
+    await asyncio.sleep(MEDIA_GROUP_DEBOUNCE_SECONDS)
+    entry = MEDIA_GROUP_BUFFER.get(media_group_id)
+    if not entry:
+        return  # already processed by another call, or never existed
+    if time.time() - entry["last_update_at"] < MEDIA_GROUP_DEBOUNCE_SECONDS - 0.1:
+        return  # a newer photo arrived since this call started waiting - a fresher call will handle it
+
+    MEDIA_GROUP_BUFFER.pop(media_group_id, None)
+    caption = entry.get("caption")
+    if not caption:
+        return  # no /broadcast or /broadcastchannels caption found anywhere in this album - nothing to do
+
+    file_ids = entry["file_ids"]
+    update = entry["update"]
+    context = entry["context"]
+    if caption.startswith("/broadcastchannels"):
+        await _handle_broadcastchannels_request(update, context, caption, file_ids)
+    elif caption.startswith("/broadcast"):
+        await _handle_broadcast_request(update, context, caption, file_ids)
+
+
 async def broadcast_photo_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """
     Catches /broadcast or /broadcastchannels sent as a PHOTO's
@@ -18613,16 +18702,38 @@ async def broadcast_photo_handler(update: Update, context: ContextTypes.DEFAULT_
     "/broadcastchannels" before the bare "/broadcast" prefix, since
     the latter is a prefix of the former and would otherwise catch
     it by mistake.
+
+    Multiple photos sent as one album (per explicit instruction,
+    confirmed real bug) arrive as SEPARATE messages sharing a
+    media_group_id, with the caption on only ONE of them - buffered
+    via MEDIA_GROUP_BUFFER and processed together once the album stops
+    growing, rather than only ever seeing the single captioned photo.
+    A single photo (no media_group_id) is unaffected and still
+    processes immediately, exactly as before.
     """
-    caption = update.message.caption or ""
     if not update.message.photo:
         return
     photo_file_id = update.message.photo[-1].file_id  # highest resolution Telegram sent
+    caption = update.message.caption or ""
+    media_group_id = update.message.media_group_id
 
-    if caption.startswith("/broadcastchannels"):
-        await _handle_broadcastchannels_request(update, context, caption, photo_file_id)
-    elif caption.startswith("/broadcast"):
-        await _handle_broadcast_request(update, context, caption, photo_file_id)
+    if not media_group_id:
+        if caption.startswith("/broadcastchannels"):
+            await _handle_broadcastchannels_request(update, context, caption, [photo_file_id])
+        elif caption.startswith("/broadcast"):
+            await _handle_broadcast_request(update, context, caption, [photo_file_id])
+        return
+
+    entry = MEDIA_GROUP_BUFFER.setdefault(media_group_id, {
+        "file_ids": [], "caption": None, "update": update, "context": context
+    })
+    entry["file_ids"].append(photo_file_id)
+    if caption:
+        entry["caption"] = caption
+        entry["update"] = update  # the message that actually carries the command/caption
+    entry["context"] = context
+    entry["last_update_at"] = time.time()
+    asyncio.create_task(_process_media_group_after_debounce(media_group_id))
 
 # ============================================
 # STARTUP CATCH-UP (NEW)

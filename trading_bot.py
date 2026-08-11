@@ -11404,8 +11404,21 @@ def generate_signal_chart(display_name, strategy_name, direction, candles, entry
         # current price too, not just the picture. The chart can now
         # never show a last candle that disagrees with the quoted
         # Entry price, regardless of how stale the underlying cache is.
+        #
+        # URGENT FIX: CONFIRMED REAL REGRESSION this same fix caused -
+        # this synthetic point had NO "time" field at all, so
+        # _chart_to_mpl_time's t is None branch fell back to using its
+        # plain array INDEX (an int) instead of a real datetime. Since
+        # every other real candle in the list DOES have a real
+        # datetime, that one stray int got mixed into an otherwise-
+        # all-datetime list, and matplotlib's date-axis formatting
+        # crashed on it ('int' object has no attribute 'astimezone') -
+        # breaking EVERY chart, for every pair, the moment this first
+        # shipped. Fixed by giving it a real "now" timestamp, so it's
+        # indistinguishable in type from every other candle.
         if entry and candles:
             live_point = {
+                "time": datetime.utcnow(),
                 "open": entry, "high": entry, "low": entry, "close": entry,
                 "volume": 0,
             }

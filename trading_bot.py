@@ -12852,7 +12852,6 @@ REASON: [one sentence, max 25 words, explicitly citing the real Actual vs Foreca
 # as lowest priority (component/secondary data).
 EVENT_HEADLINER_PRIORITY = [
     "non-farm employment change", "nonfarm payrolls", "nfp",
-    "cpi", "consumer price index",
     "interest rate decision", "fed funds rate", "official bank rate", "monetary policy statement",
     "gdp",
     "core retail sales", "retail sales",
@@ -12863,11 +12862,75 @@ EVENT_HEADLINER_PRIORITY = [
 
 
 def _headliner_rank(event_title):
+    """
+    CPI handled as its own explicit case, per explicit instruction -
+    CONFIRMED REAL GAP: a single generic "cpi" keyword matched "CPI
+    m/m", "CPI y/y", "Core CPI m/m", and "Core CPI y/y" identically,
+    with zero way to tell them apart - whichever happened to appear
+    first in the feed's own order won, not necessarily the one that
+    actually moves the market. Headline y/y (the number the market
+    actually watches first) now explicitly ranks above headline m/m,
+    both rank above their "core" counterparts (core excludes food/
+    energy - secondary to the market's primary focus on the headline
+    number). Checked before the general keyword list, and returns
+    early, so nothing here can accidentally also match a keyword
+    below it.
+    """
     title_lower = event_title.lower()
+    if "cpi" in title_lower or "consumer price index" in title_lower:
+        is_core = "core" in title_lower
+        is_yy = "y/y" in title_lower or "yoy" in title_lower
+        is_mm = "m/m" in title_lower or "mom" in title_lower
+        if is_yy and not is_core:
+            return 0  # headline CPI y/y - the market's primary read
+        if is_mm and not is_core:
+            return 1  # headline CPI m/m
+        if is_yy and is_core:
+            return 2  # core CPI y/y
+        if is_mm and is_core:
+            return 3  # core CPI m/m
+        return 4  # any other CPI variant (e.g. a plain "CPI" with no m/m or y/y in the title)
+
     for i, keyword in enumerate(EVENT_HEADLINER_PRIORITY):
         if keyword in title_lower:
-            return i
-    return len(EVENT_HEADLINER_PRIORITY)  # lowest priority - no match
+            return 5 + i
+    return 5 + len(EVENT_HEADLINER_PRIORITY)  # lowest priority - no match
+
+
+def group_events_by_time_and_currency(events):
+    """
+    Groups events sharing the exact same currency AND scheduled time -
+    shared by the pre-release alert and the tap handler (previously
+    only the post-release reaction had this kind of grouping). Returns
+    a dict of (currency, event_dt_utc) -> list of events.
+    """
+    groups = {}
+    for event in events:
+        key = (event["currency"], event.get("event_dt_utc", ""))
+        groups.setdefault(key, []).append(event)
+    return groups
+
+
+def get_cluster_and_headliner(event, all_events):
+    """
+    Given one event and the full day's event list, returns
+    (cluster, is_headliner, headliner_event) - per explicit
+    instruction: when several same-currency events release at the
+    EXACT same moment, the market only actually moves one real
+    direction, so only the single most market-moving event in that
+    moment (the "headliner", per EVENT_HEADLINER_PRIORITY/_headliner_
+    rank) should ever get a directional bias shown or tappable - the
+    others would just be different numbers implying different
+    directions for a market that can't actually go two ways at once.
+    A cluster of exactly 1 (nothing else at that same currency+time)
+    means this event IS its own headliner, same as always.
+    """
+    groups = group_events_by_time_and_currency(all_events)
+    key = (event["currency"], event.get("event_dt_utc", ""))
+    cluster = groups.get(key, [event])
+    headliner = min(cluster, key=lambda e: _headliner_rank(e["title"]))
+    is_headliner = event.get("event_key") == headliner.get("event_key")
+    return cluster, is_headliner, headliner
 
 
 async def check_released_high_impact_news(context: ContextTypes.DEFAULT_TYPE):
@@ -13152,6 +13215,34 @@ async def send_news_direction_analysis(bot, chat_id, event, batch_events=None):
     """
     now_utc = datetime.utcnow()
 
+    # Per explicit instruction: when several same-currency events
+    # share the EXACT same release time, the market can only actually
+    # move one direction - so a non-headliner event (see
+    # get_cluster_and_headliner) never gets its own bias or DIRECT
+    # CALL shown at all, tapped before OR after release, only a
+    # pointer to the one that actually drives the market. Checked
+    # first, before anything else in this function, so it can never
+    # fall through to either the pre-release bias path or the post-
+    # release reaction path below.
+    if batch_events:
+        cluster, is_headliner, headliner = get_cluster_and_headliner(event, batch_events)
+        if not is_headliner and len(cluster) > 1:
+            flag_by_currency = {"USD": "🇺🇸", "EUR": "🇪🇺", "GBP": "🇬🇧", "JPY": "🇯🇵"}
+            flag = flag_by_currency.get(event["currency"], "🌍")
+            await bot.send_message(
+                chat_id=chat_id,
+                text=(
+                    f"📰 {flag} <b>{event['title']}</b> ({event['currency']})\n\n"
+                    f"This releases at the exact same time as "
+                    f"<b>{headliner['title']}</b> - since the market can only "
+                    f"move one real direction at once, we only call direction "
+                    f"on the one that actually drives it. Tap "
+                    f"<b>{headliner['title']}</b> from the list above instead."
+                ),
+                parse_mode=ParseMode.HTML
+            )
+            return
+
     # FIX: replaced the old scheduled-TIME-based gate (is_released,
     # from format_event_status) with a real actual-EXISTENCE-based
     # one, per explicit instruction. The old version showed "already
@@ -13414,9 +13505,22 @@ async def check_upcoming_high_impact_news(context: ContextTypes.DEFAULT_TYPE):
     # calling the AI once per recipient instead would be wasteful and
     # slow, and the bias itself doesn't vary by user, only the
     # displayed TIME does.
+    #
+    # Per explicit instruction: when several same-currency events
+    # share the EXACT same release time, the market can only actually
+    # move one direction, so only the cluster's headliner (see
+    # get_cluster_and_headliner) gets a real bias computed and shown -
+    # the rest show their name and time only, with no directional
+    # read at all, so nobody sees 4 different "directions" for one
+    # single market-moving moment.
+    all_today_events = [e for _, e in group]
     event_bias_results = []  # (event, direction_or_None, reason_or_None)
     for _, event in group:
-        direction, reason = await generate_pre_release_bias(event, news_context)
+        _, is_headliner, _ = get_cluster_and_headliner(event, all_today_events)
+        if is_headliner:
+            direction, reason = await generate_pre_release_bias(event, news_context)
+        else:
+            direction, reason = None, None
         event_bias_results.append((event, direction, reason))
 
     def _format_event_bias_line(event, direction, reason, offset_minutes, tz_label):

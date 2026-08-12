@@ -20189,23 +20189,6 @@ def main():
         job_kwargs={"misfire_grace_time": 300}
     )
 
-    # TEMPORARY DIAGNOSTIC, per explicit instruction - answers one
-    # question: does Finnhub's free tier actually return real economic
-    # calendar data (and does "actual" populate faster than our
-    # current feed), or is this endpoint gated behind a paid plan.
-    # Runs once, 15s after startup. Safe to remove once the answer is
-    # known either way - not a permanent integration.
-    async def _temp_test_finnhub_economic_calendar(context: ContextTypes.DEFAULT_TYPE):
-        try:
-            url = "https://finnhub.io/api/v1/calendar/economic?token=d86ke69r01qgiu45qd3gd86ke69r01qgiu45qd40"
-            response = requests.get(url, timeout=15)
-            print(f"[FINNHUB TEST] Status: {response.status_code}")
-            print(f"[FINNHUB TEST] Body (first 1500 chars): {response.text[:1500]}")
-        except Exception as e:
-            print(f"[FINNHUB TEST] Error: {e}")
-
-    job_queue.run_once(_temp_test_finnhub_economic_calendar, when=15, name="temp_finnhub_test")
-
     print("Nexora AI Running...")
     print("Daily schedule (UTC):")
     for utc_time, post_type, data in DAILY_SCHEDULE:

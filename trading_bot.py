@@ -456,6 +456,54 @@ async def deprovision_mt5_account(metaapi_account_id):
         print(f"[MT5 PROVISION] Couldn't remove old account {metaapi_account_id}: {e}")
 
 
+def clean_mt5_provision_error(raw_error):
+    """
+    Translates provision_mt5_account's raw error text into something a
+    non-technical customer can actually act on, per explicit
+    instruction - confirmed via real live testing (wrong password,
+    wrong login, wrong server) that the raw text is a wall of
+    developer-facing jargon (mentions MetaAPI's OWN internal "excessive
+    occurrence charges" and "pricing rules", which could easily be
+    misread by a customer as THEM being charged extra - it's about our
+    MetaAPI billing, not anything relevant to them at all) plus a
+    tracking ID and full request URL, none of which helps a customer
+    fix their own mistake.
+
+    Confirmed live: wrong password and wrong login number are
+    INDISTINGUISHABLE from our side - both return the identical E_AUTH
+    code, MetaAPI genuinely cannot tell them apart. So E_AUTH gets one
+    combined "double check your login AND password" message, not a
+    (false) specific claim about which one was wrong. E_SRV_NOT_FOUND
+    (wrong server) is genuinely distinct and gets its own specific
+    message. Anything unrecognized falls back to a short generic
+    message - the raw text is still fully preserved in Railway's logs
+    (see provision_mt5_account's own print statement) for our own
+    debugging, just never shown to the customer.
+    """
+    if not raw_error:
+        return "Something went wrong on our end. Please try again in a moment."
+    error_lower = raw_error.lower()
+    if "e_auth" in error_lower or "failed to authenticate" in error_lower:
+        return (
+            "We couldn't verify your login and password with your "
+            "broker. Please double-check both are typed exactly right "
+            "(no extra spaces) and try again."
+        )
+    if "e_srv_not_found" in error_lower or "not found, please check the server" in error_lower:
+        return (
+            "We couldn't find a server with that exact name. "
+            "Double-check your server name (e.g. Exness-MT5Real10) - "
+            "you can find the exact spelling in your MT5 app under "
+            "your account settings."
+        )
+    if "timed out after 3 attempts" in error_lower:
+        return (
+            "Your broker's settings are taking longer than usual to "
+            "confirm. Please try again in a few minutes."
+        )
+    return "Please double-check your login, password, and server name are all correct, then try again."
+
+
 async def provision_mt5_account(login, password, server, platform="mt5", account_name=None, progress_callback=None):
     """
     Creates a NEW MetaAPI-managed trading account for a CLIENT'S OWN
@@ -17666,10 +17714,10 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
 
         if error:
+            clean_error = clean_mt5_provision_error(error)
             await wait_connect.edit_text(
-                f"⚠️ <b>Couldn't connect that account.</b>\n\n{error}\n\n"
-                f"Double-check your login, password, and server name, "
-                f"then tap 🤖 Exness Auto-Trade to try again.",
+                f"⚠️ <b>Couldn't connect that account.</b>\n\n{clean_error}\n\n"
+                f"Tap 🤖 Exness Auto-Trade to try again.",
                 parse_mode=ParseMode.HTML
             )
             return
@@ -20232,26 +20280,6 @@ def main():
         days=(1, 2, 3, 4, 5),
         job_kwargs={"misfire_grace_time": 300}
     )
-
-    # TEMPORARY DIAGNOSTIC, per explicit instruction - tests the real
-    # error text provision_mt5_account returns for 3 common mistakes
-    # (wrong password, wrong login number, wrong server), so the
-    # user-facing error message can be checked/cleaned up against real
-    # examples instead of guessed at. Runs once, 15s after startup.
-    # Safe to remove once the answer is known.
-    async def _temp_test_mt5_provision_errors(context: ContextTypes.DEFAULT_TYPE):
-        real_login = "410208602"
-        real_server = "Exness-MT5Real10"
-        test_cases = [
-            ("WRONG PASSWORD (real login+server)", real_login, "definitely_wrong_password_123", real_server),
-            ("WRONG LOGIN (fake login, real server)", "99999999999", "any_password_123", real_server),
-            ("WRONG SERVER (real login, fake server)", real_login, "any_password_123", "Exness-FakeServer999"),
-        ]
-        for label, login, password, server in test_cases:
-            account_id, error = await provision_mt5_account(login, password, server, account_name="DIAGNOSTIC TEST")
-            print(f"[MT5 ERROR TEST] {label} -> account_id={account_id} | error={error!r}")
-
-    job_queue.run_once(_temp_test_mt5_provision_errors, when=15, name="temp_mt5_error_test")
 
     print("Nexora AI Running...")
     print("Daily schedule (UTC):")

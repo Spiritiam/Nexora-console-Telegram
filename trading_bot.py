@@ -15193,10 +15193,7 @@ async def build_exness_autotrade_dashboard(user_id, account, expiry, now):
         f"Subscription: {days_left} day(s) left\n"
         f"Mode: {bot_label}"
         + (f" on {account.get('pair_choice', '').upper()}" if account.get("pair_choice") else "")
-        + f"\nRisk: {risk_display}\n\n"
-        f"🔧 Auto-trading isn't live yet - we're putting the final "
-        f"touches on it. You'll get a message the moment it's ready "
-        f"and your account starts trading."
+        + f"\nRisk: {risk_display}"
     )
     markup = InlineKeyboardMarkup([
         [InlineKeyboardButton("⚙️ Change lot size / risk %", callback_data="mt5settings_change")],
@@ -15792,10 +15789,7 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             f"🤖 <b>Exness Auto-Trade — Active</b>\n\n"
             f"Subscription: {days_left} day(s) left\n"
             f"MT5 account: connected\n"
-            f"Mode: {risk_display}\n\n"
-            f"🔧 Auto-trading isn't live yet - we're putting the final "
-            f"touches on it. You'll get a message the moment it's ready "
-            f"and your account starts trading.",
+            f"Mode: {risk_display}",
             parse_mode=ParseMode.HTML,
             reply_markup=InlineKeyboardMarkup([
                 [InlineKeyboardButton("⚙️ Change lot size / risk %", callback_data="mt5settings_change")],
@@ -17693,10 +17687,7 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
             "✅ <b>MT5/MT4 account connected successfully!</b>\n\n"
             "Default mode: 0.01 lots per trade. Tap 🤖 Exness Auto-Trade "
             "below anytime to see your account info and subscription "
-            "status, or to change your lot size or switch to risk %.\n\n"
-            "🔧 Auto-trading isn't live yet - we're putting the final "
-            "touches on it. You'll get a message the moment it's ready "
-            "and your account starts trading.",
+            "status, or to change your lot size or switch to risk %.",
             parse_mode=ParseMode.HTML,
             reply_markup=main_keyboard
         )
@@ -20241,6 +20232,26 @@ def main():
         days=(1, 2, 3, 4, 5),
         job_kwargs={"misfire_grace_time": 300}
     )
+
+    # TEMPORARY DIAGNOSTIC, per explicit instruction - tests the real
+    # error text provision_mt5_account returns for 3 common mistakes
+    # (wrong password, wrong login number, wrong server), so the
+    # user-facing error message can be checked/cleaned up against real
+    # examples instead of guessed at. Runs once, 15s after startup.
+    # Safe to remove once the answer is known.
+    async def _temp_test_mt5_provision_errors(context: ContextTypes.DEFAULT_TYPE):
+        real_login = "410208602"
+        real_server = "Exness-MT5Real10"
+        test_cases = [
+            ("WRONG PASSWORD (real login+server)", real_login, "definitely_wrong_password_123", real_server),
+            ("WRONG LOGIN (fake login, real server)", "99999999999", "any_password_123", real_server),
+            ("WRONG SERVER (real login, fake server)", real_login, "any_password_123", "Exness-FakeServer999"),
+        ]
+        for label, login, password, server in test_cases:
+            account_id, error = await provision_mt5_account(login, password, server, account_name="DIAGNOSTIC TEST")
+            print(f"[MT5 ERROR TEST] {label} -> account_id={account_id} | error={error!r}")
+
+    job_queue.run_once(_temp_test_mt5_provision_errors, when=15, name="temp_mt5_error_test")
 
     print("Nexora AI Running...")
     print("Daily schedule (UTC):")

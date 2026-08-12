@@ -20198,8 +20198,18 @@ def main():
         try:
             url = f"https://www.alphavantage.co/query?function=CPI&interval=monthly&apikey={ALPHA_VANTAGE_API_KEY}"
             response = requests.get(url, timeout=15)
-            print(f"[ALPHAVANTAGE TEST] Status: {response.status_code}")
-            print(f"[ALPHAVANTAGE TEST] Body (first 1500 chars): {response.text[:1500]}")
+            data = response.json()
+            keys = list(data.keys())
+            print(f"[ALPHAVANTAGE TEST] Status={response.status_code} | top-level keys={keys} | body_length={len(response.text)}")
+            if "data" in data and isinstance(data["data"], list) and data["data"]:
+                latest = data["data"][0]
+                print(f"[ALPHAVANTAGE TEST] Most recent data point: {latest}")
+            if "Error Message" in data:
+                print(f"[ALPHAVANTAGE TEST] Error Message: {data['Error Message']}")
+            if "Information" in data:
+                print(f"[ALPHAVANTAGE TEST] Information: {data['Information']}")
+            if "Note" in data:
+                print(f"[ALPHAVANTAGE TEST] Note: {data['Note']}")
         except Exception as e:
             print(f"[ALPHAVANTAGE TEST] Error: {e}")
 

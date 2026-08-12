@@ -456,7 +456,7 @@ async def deprovision_mt5_account(metaapi_account_id):
         print(f"[MT5 PROVISION] Couldn't remove old account {metaapi_account_id}: {e}")
 
 
-async def provision_mt5_account(login, password, server, platform="mt5", account_name=None):
+async def provision_mt5_account(login, password, server, platform="mt5", account_name=None, progress_callback=None):
     """
     Creates a NEW MetaAPI-managed trading account for a CLIENT'S OWN
     MT5/MT4 login, using the SAME single METAAPI_TOKEN already used
@@ -471,6 +471,18 @@ async def provision_mt5_account(login, password, server, platform="mt5", account
     "Automatic broker settings detection is in progress" response by
     waiting and retrying up to 3 times before giving up, rather than
     treating it as an outright failure on the first try.
+
+    FIX: CONFIRMED REAL LIVE ISSUE, per explicit instruction - each
+    retry here sleeps a full 60s, up to 3 attempts, meaning the REAL
+    worst-case wait is up to 3 minutes, not "up to a minute" as the
+    caller's original message promised - and with nothing updating
+    that message in between, a legitimately-still-working wait looked
+    completely frozen (confirmed live: the account had already been
+    created on MetaAPI's own dashboard while the bot was still
+    silently retrying). progress_callback, if given, is awaited with
+    the attempt number before each retry sleep, so the caller can edit
+    its "connecting..." message with real, live progress instead of
+    leaving it static and silent for up to 3 minutes.
     """
     try:
         api = MetaApi(token=METAAPI_TOKEN)
@@ -515,6 +527,11 @@ async def provision_mt5_account(login, password, server, platform="mt5", account
                     msg = f"{msg} | details: {details}"
                 if "retry" in msg.lower() and attempt < 2:
                     print(f"[MT5 PROVISION] Broker detection in progress, waiting 60s (attempt {attempt + 1}/3)...")
+                    if progress_callback:
+                        try:
+                            await progress_callback(attempt + 1)
+                        except Exception as cb_error:
+                            print(f"[MT5 PROVISION] Progress callback failed: {cb_error}")
                     await asyncio.sleep(60)
                     continue
                 print(f"[MT5 PROVISION] Failed for login {login}/{server}: {msg}")
@@ -17619,14 +17636,37 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
         mt5_signup_state.pop(user_id, None)
 
+        # FIX: CONFIRMED REAL LIVE ISSUE - "up to a minute" was
+        # inaccurate (broker-detection retries can legitimately take
+        # up to 3 minutes total), and with nothing updating this
+        # message during that wait, it looked completely frozen even
+        # while genuinely still working - confirmed live, the account
+        # had already been created on MetaAPI's own dashboard while
+        # this message still sat unchanged. Now gives real, live
+        # progress via provision_mt5_account's progress_callback
+        # instead of going silent.
         wait_connect = await update.message.reply_text(
-            "🔗 <b>Connecting your MT5/MT4 account...</b> this can take up to a minute.",
+            "🔗 <b>Connecting your MT5/MT4 account...</b> this usually "
+            "takes under a minute, but can occasionally take a couple "
+            "of minutes while we confirm your broker's settings.",
             parse_mode=ParseMode.HTML
         )
 
+        async def _show_provision_progress(attempt_number):
+            try:
+                await wait_connect.edit_text(
+                    f"🔗 <b>Still connecting...</b> your broker's settings are "
+                    f"taking a bit longer than usual to confirm (attempt "
+                    f"{attempt_number}/3) - this is normal, hang tight.",
+                    parse_mode=ParseMode.HTML
+                )
+            except Exception:
+                pass  # message content unchanged (e.g. identical retry text) - not worth failing over
+
         account_id, error = await provision_mt5_account(
             account_number, raw_password, server,
-            account_name=account_name
+            account_name=account_name,
+            progress_callback=_show_provision_progress
         )
 
         if error:

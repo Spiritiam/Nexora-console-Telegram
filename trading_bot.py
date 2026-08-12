@@ -20189,32 +20189,6 @@ def main():
         job_kwargs={"misfire_grace_time": 300}
     )
 
-    # TEMPORARY DIAGNOSTIC, per explicit instruction - checks whether
-    # Alpha Vantage's free CPI endpoint actually returns today's real
-    # actual value (not just historical data), and what format it
-    # comes back in, before building the real "actual" checker. Runs
-    # once, 15s after startup. Safe to remove once the answer is known.
-    async def _temp_test_alphavantage_cpi(context: ContextTypes.DEFAULT_TYPE):
-        try:
-            url = f"https://www.alphavantage.co/query?function=CPI&interval=monthly&apikey={ALPHA_VANTAGE_API_KEY}"
-            response = requests.get(url, timeout=15)
-            data = response.json()
-            keys = list(data.keys())
-            print(f"[ALPHAVANTAGE TEST] Status={response.status_code} | top-level keys={keys} | body_length={len(response.text)}")
-            if "data" in data and isinstance(data["data"], list) and data["data"]:
-                latest = data["data"][0]
-                print(f"[ALPHAVANTAGE TEST] Most recent data point: {latest}")
-            if "Error Message" in data:
-                print(f"[ALPHAVANTAGE TEST] Error Message: {data['Error Message']}")
-            if "Information" in data:
-                print(f"[ALPHAVANTAGE TEST] Information: {data['Information']}")
-            if "Note" in data:
-                print(f"[ALPHAVANTAGE TEST] Note: {data['Note']}")
-        except Exception as e:
-            print(f"[ALPHAVANTAGE TEST] Error: {e}")
-
-    job_queue.run_once(_temp_test_alphavantage_cpi, when=15, name="temp_alphavantage_test")
-
     print("Nexora AI Running...")
     print("Daily schedule (UTC):")
     for utc_time, post_type, data in DAILY_SCHEDULE:

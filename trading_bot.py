@@ -15194,8 +15194,9 @@ async def build_exness_autotrade_dashboard(user_id, account, expiry, now):
         f"Mode: {bot_label}"
         + (f" on {account.get('pair_choice', '').upper()}" if account.get("pair_choice") else "")
         + f"\nRisk: {risk_display}\n\n"
-        f"Waiting on the trading strategy to be wired in before "
-        f"real trades begin - infrastructure is ready."
+        f"🔧 Auto-trading isn't live yet - we're putting the final "
+        f"touches on it. You'll get a message the moment it's ready "
+        f"and your account starts trading."
     )
     markup = InlineKeyboardMarkup([
         [InlineKeyboardButton("⚙️ Change lot size / risk %", callback_data="mt5settings_change")],
@@ -15792,8 +15793,9 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             f"Subscription: {days_left} day(s) left\n"
             f"MT5 account: connected\n"
             f"Mode: {risk_display}\n\n"
-            f"Waiting on the trading strategy to be wired in before "
-            f"real trades begin - infrastructure is ready.",
+            f"🔧 Auto-trading isn't live yet - we're putting the final "
+            f"touches on it. You'll get a message the moment it's ready "
+            f"and your account starts trading.",
             parse_mode=ParseMode.HTML,
             reply_markup=InlineKeyboardMarkup([
                 [InlineKeyboardButton("⚙️ Change lot size / risk %", callback_data="mt5settings_change")],
@@ -17688,12 +17690,13 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
         })
 
         await wait_connect.edit_text(
-            "✅ <b>MT5/MT4 account connected!</b>\n\n"
+            "✅ <b>MT5/MT4 account connected successfully!</b>\n\n"
             "Default mode: 0.01 lots per trade. Tap 🤖 Exness Auto-Trade "
-            "anytime to change your lot size or switch to risk %.\n\n"
-            "Auto-trading itself is still waiting on the trading "
-            "strategy to be wired in - you'll be notified the moment "
-            "it goes live.",
+            "below anytime to see your account info and subscription "
+            "status, or to change your lot size or switch to risk %.\n\n"
+            "🔧 Auto-trading isn't live yet - we're putting the final "
+            "touches on it. You'll get a message the moment it's ready "
+            "and your account starts trading.",
             parse_mode=ParseMode.HTML,
             reply_markup=main_keyboard
         )

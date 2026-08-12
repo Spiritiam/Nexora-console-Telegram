@@ -13462,6 +13462,19 @@ async def check_upcoming_high_impact_news(context: ContextTypes.DEFAULT_TYPE):
         f"?width=800&height=450&nologo=true"
     )
 
+    # Per explicit instruction: only the headliner of each same-time-
+    # same-currency cluster gets a tappable button at all now - a
+    # non-headliner's own button used to just redirect straight to
+    # the headliner anyway (see send_news_direction_analysis), so
+    # showing it as tappable in the first place was a dead end by
+    # design. Non-headliners still appear in the alert's TEXT (name +
+    # time, no bias line) - just nothing to tap for them anymore.
+    all_today_events = [e for _, e in group]
+    headliner_group = [
+        (idx, event) for idx, event in group
+        if get_cluster_and_headliner(event, all_today_events)[1]
+    ]
+
     # Channel copy uses url= deep links, NOT callback_data - a
     # callback button on a channel post either fails silently for
     # anyone who hasn't DM'd the bot yet, or replies publicly into
@@ -13474,7 +13487,7 @@ async def check_upcoming_high_impact_news(context: ContextTypes.DEFAULT_TYPE):
             f"🔍 {event['title']} ({event['currency']})",
             url=f"https://t.me/{BOT_USERNAME}?start=newsevent_{list_id}_{idx}"
         )]
-        for idx, event in group
+        for idx, event in headliner_group
     ])
     # Per-user DM copy stays on callback_data - it's already inside
     # a private 1:1 chat, so there's no "channel spam" or "blocked
@@ -13484,7 +13497,7 @@ async def check_upcoming_high_impact_news(context: ContextTypes.DEFAULT_TYPE):
             f"🔍 {event['title']} ({event['currency']})",
             callback_data=f"newsevent_{list_id}_{idx}"
         )]
-        for idx, event in group
+        for idx, event in headliner_group
     ])
 
     # Real news context, fetched ONCE for this whole batch (not per
@@ -13513,7 +13526,6 @@ async def check_upcoming_high_impact_news(context: ContextTypes.DEFAULT_TYPE):
     # the rest show their name and time only, with no directional
     # read at all, so nobody sees 4 different "directions" for one
     # single market-moving moment.
-    all_today_events = [e for _, e in group]
     event_bias_results = []  # (event, direction_or_None, reason_or_None)
     for _, event in group:
         _, is_headliner, _ = get_cluster_and_headliner(event, all_today_events)
@@ -15071,6 +15083,14 @@ async def send_news_calendar(bot, chat_id, user_id):
         status_label, is_released = format_event_status(event, now_utc)
         if is_released:
             released_count += 1
+        # Per explicit instruction, same reasoning as the pre-release
+        # alert: only the headliner of a same-time-same-currency
+        # cluster gets a button at all - a non-headliner's button
+        # would just redirect straight to the headliner anyway (see
+        # send_news_direction_analysis), so it's a dead end by design.
+        _, is_headliner, _ = get_cluster_and_headliner(event, events)
+        if not is_headliner:
+            continue
         local_time = format_local_time(event.get("event_dt_utc", ""), user_offset)
         label = f"{flag} {event['title'][:32]}"
         if local_time:
@@ -16230,6 +16250,15 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 status_label, is_released = format_event_status(event, now_utc)
                 if is_released:
                     released_count += 1
+                # Per explicit instruction, same reasoning as the
+                # pre-release alert: only the headliner of a same-
+                # time-same-currency cluster gets a button - a non-
+                # headliner's button would just redirect straight to
+                # the headliner anyway (see send_news_direction_
+                # analysis), so it's a dead end by design.
+                _, is_headliner, _ = get_cluster_and_headliner(event, events)
+                if not is_headliner:
+                    continue
                 local_time = format_local_time(event.get("event_dt_utc", ""), user_offset)
                 label = f"{flag} {event['title'][:32]}"
                 if local_time:

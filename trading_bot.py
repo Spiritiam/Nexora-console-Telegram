@@ -19483,21 +19483,31 @@ SCHEDULED_DAILY_PAIRS = ("XAUUSD", "XAGUSD", "USOIL", "BTCUSD")
 # alongside the dollar P&L above so pip-focused traders can see both).
 # Unlike dollar P&L, pip distance doesn't need live MT5 data - it's a
 # fixed property of each pair's current SL/TP multiplier config (see
-# the sl_multiplier/tp_multiplier block in build_signal_response),
-# confirmed by calculation, not MT5 lookup: BTCUSD's 495.9/991.8 are
-# NOT round numbers - they're the exact real values of pip_size=165.3
-# * 3/6 / pip_value=1.0, kept precise rather than rounded to "496/992"
-# so this always matches the real, current live SL/TP setting exactly.
-# XAGUSD/USOIL added the same way: pip_size=0.1667 * 4.2/8.4
-# multipliers / pip_value=0.01 = 70.014/140.028 (both pairs share the
-# identical pip_size, pip_value, and multiplier bucket, so their pip
-# distances are identical too - not a copy-paste mistake).
+# the sl_multiplier/tp_multiplier block in build_signal_response) -
+# this dict is REPORTING-ONLY, the real trade SL/TP/multiplier logic
+# that actually places trades is completely separate and untouched by
+# anything here.
+#
+# FIX: CONFIRMED REAL ISSUE, per explicit instruction - BTCUSD used
+# pip_value=1.0 ("1 pip = $1 of raw price movement"), which reported
+# the FULL raw price move as "pips" (e.g. a real $991.80 move showed
+# as "992 pips"). On an actual 0.1 lot trade, real profit is a
+# fraction of that raw move, not the full amount - confirmed live,
+# the reported number didn't match what anyone actually saw in their
+# account. Rescaled to pip_value=10.0, matching how the other pairs
+# already report on a human, account-relatable scale: SL = 165.3*3.0
+# /10.0 = 49.59, TP = 165.3*6.0/10.0 = 99.18 - close to the real per-
+# 0.1-lot dollar profit, not a raw, disconnected price-difference
+# number. XAGUSD/USOIL: pip_size=0.1667 * 4.2/8.4 multipliers /
+# pip_value=0.01 = 70.014/140.028 (both pairs share the identical
+# pip_size, pip_value, and multiplier bucket, so their pip distances
+# are identical too - not a copy-paste mistake).
 SCHEDULED_PAIR_PIPS = {
     "XAUUSD": (150, 300),
     "EURUSD": (30, 60),
     "GBPUSD": (30, 60),
     "GBPJPY": (50, 100),
-    "BTCUSD": (495.9, 991.8),
+    "BTCUSD": (49.59, 99.18),
     "XAGUSD": (70.014, 140.028),
     "USOIL": (70.014, 140.028),
 }

@@ -13348,24 +13348,29 @@ async def send_news_direction_analysis(bot, chat_id, event, batch_events=None):
     # it could (and did) contradict the fundamental call outright
     # ("Technicals read SELL" right under "BIAS CALL: BUY"), which
     # read as confusing and undermined the whole point of a direct
-    # call. Confidence is now the AI's own fundamental strength
-    # percentage (see generate_currency_direction) - one clear number,
-    # not two that can disagree with each other.
-    # Renamed DIRECT CALL -> BIAS CALL, per explicit instruction -
-    # this fires before the event releases (no real actual figure
-    # exists yet, enforced in generate_currency_direction's own
-    # prompt), so "Direct Call" implied a certainty this doesn't
-    # actually have. The POST-release reaction (check_released_
-    # high_impact_news) correctly keeps "DIRECT CALL" - that one IS
-    # grounded in a real, confirmed actual result.
+    # call.
+    #
+    # Rebuilt to "Option C" framing, per explicit instruction - even
+    # with "BIAS CALL" instead of "DIRECT CALL", the surrounding
+    # format (a colored circle, confidence %, "Trade safe") still read
+    # exactly like a real actionable signal, confirmed live. Now leads
+    # with "PRE-RELEASE PREVIEW" as the very first thing anyone reads,
+    # before the direction itself - a caveat at the END of a message
+    # is easy to skim past, one at the START isn't. Confidence % is
+    # dropped entirely (that number specifically was what made it feel
+    # like a real signal); direction is stated as a plain lean
+    # ("Bullish for X"), not an instruction ("BUY X"); closes with an
+    # explicit, unambiguous "not a trade signal" line instead of
+    # "Trade safe" (which itself implied something worth trading).
+    lean_word = "Bullish" if final_direction == "BUY" else "Bearish"
     emoji = "🟢" if final_direction == "BUY" else "🔴"
     response = (
-        f"📰 <b>{event['title']}</b> ({event['currency']})\n\n"
+        f"⏳ <b>PRE-RELEASE PREVIEW</b> — {event['title']} ({event['currency']})\n\n"
         + (f"📊 {data_line}\n\n" if data_line else "")
-        + f"<b>Fundamental read:</b> {ai_reason}\n\n"
-        f"{emoji} <b>BIAS CALL: {final_direction} {pair_display}</b>\n"
-        f"<b>Confidence:</b> {ai_strength}%\n\n"
-        f"<i>Trade safe 💼🔥</i>"
+        + f"{ai_reason}\n\n"
+        f"Early lean: {emoji} {lean_word} for {pair_display}\n\n"
+        f"❗ No actual result yet — this is not a trade signal. Real "
+        f"BUY/SELL call comes the moment results are out."
     )
 
     if event_key:

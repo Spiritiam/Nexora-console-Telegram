@@ -1294,7 +1294,8 @@ async def run_mt5_autotrade_follow_channel_scan(context: ContextTypes.DEFAULT_TY
                     await context.bot.send_message(
                         chat_id=int(user_id),
                         text=(
-                            f"📡 <b>Channel Signal Copied — {direction} {pair_config['display']}</b>\n\n"
+                            f"📡 <b>Full Signal Coverage — Trade Opened</b>\n\n"
+                            f"{direction} {pair_config['display']}\n"
                             f"Entry: {entry_price} | SL: {stop_loss} | TP: {take_profit}\n"
                             f"Volume: {volume} lots"
                         ),

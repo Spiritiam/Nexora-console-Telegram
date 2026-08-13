@@ -735,6 +735,22 @@ async def place_client_mt5_trade(metaapi_account_id, mt5_symbol, direction, volu
         if response.status_code in (200, 201):
             result = response.json()
             order_id = result.get("orderId", "unknown")
+            if order_id == "unknown":
+                # FIX: CONFIRMED REAL LIVE ISSUE, per explicit
+                # instruction - same class of bug already found and
+                # properly fixed in place_mt5_trade (the personal
+                # copier), but this twin function (used for SUBSCRIBER
+                # accounts) still had the original unfixed version.
+                # "unknown" is a TRUTHY string in Python, so a 200/201
+                # response with no real orderId field was being treated
+                # as a genuine success by every caller - confirmed
+                # live, a subscriber got a "Channel Signal Copied"
+                # confirmation message with no real trade appearing on
+                # their MT5 account at all. Now returns None (real
+                # failure) instead, and logs the full raw response for
+                # diagnosis.
+                print(f"[MT5 AUTOTRADE] ⚠️ Trade response for {metaapi_account_id} had no real orderId - full raw response: {result!r}")
+                return None
             print(f"[MT5 AUTOTRADE] ✅ Trade placed for {metaapi_account_id} — Order ID: {order_id}")
             return order_id
         print(f"[MT5 AUTOTRADE] ❌ Trade failed for {metaapi_account_id}: {response.status_code} {response.text}")
@@ -14349,23 +14365,22 @@ async def place_mt5_trade(signal_data, signal_id=None):
             result = response.json()
             order_id = result.get("orderId", "unknown")
             if order_id == "unknown":
-                # FIX: CONFIRMED REAL ISSUE via live logs - a 200/201
-                # response without a real "orderId" field was being
-                # silently logged as a SUCCESS ("Trade placed - Order
-                # ID: unknown"), with the actual response body
-                # discarded entirely. This meant a request that
-                # technically got a 2xx status but didn't actually
-                # place a real trade (e.g. a different field name in
-                # the response, a partial/rejected fill, or some
-                # other MetaApi-side issue) looked identical to a
-                # genuine success in the logs, with zero way to tell
-                # the two apart after the fact. Logging the full raw
-                # response now whenever this happens, so the real
-                # field name/shape/error can be seen directly instead
-                # of guessed at.
+                # FIX: CONFIRMED REAL ISSUE, per explicit instruction -
+                # this used to still RETURN "unknown" here despite
+                # detecting the problem, and "unknown" is a TRUTHY
+                # string in Python - every caller checking `if
+                # order_id:` treated this exact case as a genuine
+                # success, sending real confirmation messages for
+                # trades that were never actually confirmed placed.
+                # Confirmed live: a subscriber got a "Channel Signal
+                # Copied" message with zero real trade appearing on
+                # their MT5. Only the LOGGING was fixed before, not the
+                # actual return value - now genuinely returns None
+                # (real failure) so every caller correctly treats this
+                # as "did not place", not "placed, ID unknown".
                 print(f"[MT5 PERSONAL COPY] ⚠️ Trade response had no real orderId - full raw response: {result!r}")
-            else:
-                print(f"[MT5 PERSONAL COPY] ✅ Trade placed — Order ID: {order_id}")
+                return None
+            print(f"[MT5 PERSONAL COPY] ✅ Trade placed — Order ID: {order_id}")
             return order_id
         else:
             # FIX: used to only log the status code, discarding the

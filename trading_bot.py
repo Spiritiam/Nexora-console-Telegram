@@ -701,6 +701,126 @@ def compute_lot_size(account, entry_price, stop_loss):
     return round(max(0.01, min(lot_size, 10.0)), 2)  # hard-capped 0.01-10.0 as a sanity bound
 
 
+async def resolve_client_symbol_map(metaapi_account_id):
+    """
+    Per explicit instruction - confirmed real live bug: a Raw Spread
+    account's real symbols have NO suffix at all (XAUUSD, not
+    XAUUSDm), while every trade request hardcoded the "m" suffix
+    universally - every trade silently failed on that account type,
+    with the confirmation message still sent because the code never
+    checked whether the symbol itself was valid for THIS specific
+    account. Different brokers/account types use different suffixes
+    (m, z, c, .raw, -ecn, etc.) - this makes the bot suffix-agnostic
+    by fetching this account's REAL symbol list once and matching each
+    of our canonical pair names against what's ACTUALLY there,
+    instead of assuming one fixed convention for every account.
+
+    Returns {pair_name: resolved_real_symbol} for every pair we
+    support, using whichever real symbol was actually found on this
+    account - unresolvable pairs are simply omitted (caller falls back
+    to the old hardcoded default for those specific ones).
+    """
+    try:
+        url = f"https://mt-client-api-v1.london.agiliumtrade.ai/users/current/accounts/{metaapi_account_id}/symbols"
+        headers = {"auth-token": METAAPI_TOKEN, "Accept": "application/json"}
+        response = requests.get(url, headers=headers, timeout=20)
+        if response.status_code != 200:
+            print(f"[SYMBOL MAP] Couldn't fetch symbols for {metaapi_account_id}: {response.status_code}")
+            return {}
+        real_symbols = response.json()
+        real_symbols_set = set(real_symbols)
+        real_symbols_upper = {s.upper(): s for s in real_symbols}
+    except Exception as e:
+        print(f"[SYMBOL MAP] Error fetching symbols for {metaapi_account_id}: {e}")
+        return {}
+
+    # Known common broker suffixes, tried in this order after an exact
+    # match - covers the account types we've actually seen plus the
+    # most common ones reported across brokers generally. Not
+    # exhaustive by design; the prefix-match fallback below catches
+    # anything not on this list.
+    KNOWN_SUFFIXES = ["m", "z", "c", "pro", "raw", "ecn", "micro", ".raw", "-ecn", "_m", ".a", ".r"]
+
+    symbol_map = {}
+    for pair_key, config in PAIR_CONFIG.items():
+        base_name = config["pair_name"]
+        base_upper = base_name.upper()
+
+        # 1. Exact match - covers Raw-style accounts with no suffix.
+        if base_name in real_symbols_set:
+            symbol_map[base_name] = base_name
+            continue
+        if base_upper in real_symbols_upper:
+            symbol_map[base_name] = real_symbols_upper[base_upper]
+            continue
+
+        # 2. Known suffix list, tried in order.
+        matched = None
+        for suffix in KNOWN_SUFFIXES:
+            candidate_upper = base_upper + suffix.upper()
+            if candidate_upper in real_symbols_upper:
+                matched = real_symbols_upper[candidate_upper]
+                break
+        if matched:
+            symbol_map[base_name] = matched
+            continue
+
+        # 3. Fallback: shortest real symbol that starts with our base
+        # name and has a SHORT remainder (<=5 chars) - long numeric
+        # remainders (e.g. "XAUUSD247") are a genuinely different
+        # instrument, not a suffix variant, so those are deliberately
+        # excluded rather than risk trading the wrong thing.
+        candidates = [
+            s for s in real_symbols
+            if s.upper().startswith(base_upper) and len(s) - len(base_upper) <= 5
+        ]
+        if candidates:
+            symbol_map[base_name] = min(candidates, key=len)
+        # else: genuinely unresolvable on this account - omitted,
+        # caller falls back to the old hardcoded default for this one
+        # pair specifically.
+
+    unresolved = [p for p in PAIR_CONFIG.values() if p["pair_name"] not in symbol_map]
+    if unresolved:
+        print(f"[SYMBOL MAP] {metaapi_account_id}: couldn't resolve {[p['pair_name'] for p in unresolved]} - will fall back to default symbol for these")
+    print(f"[SYMBOL MAP] {metaapi_account_id}: resolved {len(symbol_map)}/{len(PAIR_CONFIG)} pairs")
+    return symbol_map
+
+
+async def get_client_symbol_map(account):
+    """
+    Returns this account's real symbol_map, building and persisting it
+    once (lazily, on first use) if it doesn't exist yet - self-heals
+    every EXISTING connected account the first time it actually tries
+    to trade, with no separate migration/backfill step needed. Updates
+    the in-memory `account` dict too, so a caller looping over
+    multiple signals in one scan cycle only pays for this fetch once.
+    """
+    if account.get("symbol_map"):
+        return account["symbol_map"]
+
+    symbol_map = await resolve_client_symbol_map(account["metaapi_account_id"])
+    account["symbol_map"] = symbol_map  # cache on the in-memory dict for the rest of this scan cycle
+    if symbol_map:
+        try:
+            url = f"{SUPABASE_URL}/rest/v1/mt5_auto_trade_accounts?user_id=eq.{account['user_id']}"
+            requests.patch(url, headers=sb_headers(), json={"symbol_map": symbol_map}, timeout=10)
+        except Exception as e:
+            print(f"[SYMBOL MAP] Couldn't save symbol_map for {account.get('user_id')}: {e}")
+    return symbol_map
+
+
+def resolve_trade_symbol(symbol_map, pair_config):
+    """
+    Shared helper for every trade-placement call site - looks up this
+    account's real resolved symbol for a pair, falling back to the old
+    hardcoded default (still correct for whichever account type it was
+    originally tuned for) if this specific pair wasn't resolvable on
+    this account.
+    """
+    return symbol_map.get(pair_config["pair_name"], pair_config["mt5_symbol"])
+
+
 async def place_client_mt5_trade(metaapi_account_id, mt5_symbol, direction, volume, stop_loss, take_profit):
     """
     Generalizes place_mt5_trade for an arbitrary CLIENT account
@@ -1063,7 +1183,10 @@ async def run_mt5_autotrade_bot_scan(context: ContextTypes.DEFAULT_TYPE):
                 if copy_key in MT5_AUTOTRADE_COPIED_SIGNALS:
                     continue
 
-                if await has_client_open_mt5_position(metaapi_account_id, pair_config["mt5_symbol"]):
+                symbol_map = await get_client_symbol_map(account)
+                resolved_symbol = resolve_trade_symbol(symbol_map, pair_config)
+
+                if await has_client_open_mt5_position(metaapi_account_id, resolved_symbol):
                     continue
 
                 if account.get("risk_mode") == "percent":
@@ -1073,7 +1196,7 @@ async def run_mt5_autotrade_bot_scan(context: ContextTypes.DEFAULT_TYPE):
                 volume = compute_lot_size(account, entry_price, stop_loss)
 
                 order_id = await place_client_mt5_trade(
-                    metaapi_account_id, pair_config["mt5_symbol"], direction,
+                    metaapi_account_id, resolved_symbol, direction,
                     volume, stop_loss, take_profit
                 )
                 MT5_AUTOTRADE_COPIED_SIGNALS.add(copy_key)
@@ -1137,7 +1260,10 @@ async def run_mt5_autotrade_follow_channel_scan(context: ContextTypes.DEFAULT_TY
             if copy_key in MT5_AUTOTRADE_COPIED_SIGNALS:
                 continue  # already handled this exact signal for this user this run - not worth logging every cycle
 
-            if await has_client_open_mt5_position(metaapi_account_id, pair_config["mt5_symbol"]):
+            symbol_map = await get_client_symbol_map(account)
+            resolved_symbol = resolve_trade_symbol(symbol_map, pair_config)
+
+            if await has_client_open_mt5_position(metaapi_account_id, resolved_symbol):
                 print(f"[MT5 AUTOTRADE FOLLOW] Signal {signal_id} ({pair_name}) for user {user_id} - already has an open position on this symbol, skipping to avoid stacking")
                 MT5_AUTOTRADE_COPIED_SIGNALS.add(copy_key)
                 continue
@@ -1155,10 +1281,10 @@ async def run_mt5_autotrade_follow_channel_scan(context: ContextTypes.DEFAULT_TY
                 account["_live_balance"] = balance
 
             volume = compute_lot_size(account, entry_price, stop_loss)
-            print(f"[MT5 AUTOTRADE FOLLOW] Attempting to copy signal {signal_id} ({pair_name} {direction}) for user {user_id}, volume={volume}")
+            print(f"[MT5 AUTOTRADE FOLLOW] Attempting to copy signal {signal_id} ({pair_name} {direction}) for user {user_id}, volume={volume}, symbol={resolved_symbol}")
 
             order_id = await place_client_mt5_trade(
-                metaapi_account_id, pair_config["mt5_symbol"], direction,
+                metaapi_account_id, resolved_symbol, direction,
                 volume, stop_loss, take_profit
             )
             MT5_AUTOTRADE_COPIED_SIGNALS.add(copy_key)
@@ -1245,18 +1371,21 @@ async def run_account_flip_entry_scan(context: ContextTypes.DEFAULT_TYPE):
                 if get_open_flip_stack(user_id):
                     continue  # already riding a stack - entry scan sits out until it closes
 
-                if await has_client_open_mt5_position(metaapi_account_id, pair_config["mt5_symbol"]):
+                symbol_map = await get_client_symbol_map(account)
+                resolved_symbol = resolve_trade_symbol(symbol_map, pair_config)
+
+                if await has_client_open_mt5_position(metaapi_account_id, resolved_symbol):
                     continue
 
                 base_lot = float(account.get("flip_base_lot") or 0.01)
                 order_id = await place_client_mt5_trade(
-                    metaapi_account_id, pair_config["mt5_symbol"], direction,
+                    metaapi_account_id, resolved_symbol, direction,
                     base_lot, stop_loss, None
                 )
                 MT5_AUTOTRADE_COPIED_SIGNALS.add(copy_key)
                 if order_id:
                     create_flip_stack(
-                        user_id, metaapi_account_id, pair_key, pair_config["mt5_symbol"],
+                        user_id, metaapi_account_id, pair_key, resolved_symbol,
                         direction, entry_price, stop_loss
                     )
                     try:

@@ -15428,6 +15428,7 @@ async def build_exness_autotrade_dashboard(user_id, account, expiry, now):
     )
     markup = InlineKeyboardMarkup([
         [InlineKeyboardButton("⚙️ Change lot size / risk %", callback_data="mt5settings_change")],
+        [InlineKeyboardButton("🔄 Switch bot / signal mode", callback_data="mt5switch_menu")],
     ])
     return text, markup
 
@@ -16062,6 +16063,7 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             parse_mode=ParseMode.HTML,
             reply_markup=InlineKeyboardMarkup([
                 [InlineKeyboardButton("⚙️ Change lot size / risk %", callback_data="mt5settings_change")],
+                [InlineKeyboardButton("🔄 Switch bot / signal mode", callback_data="mt5switch_menu")],
             ])
         )
         return
@@ -16074,7 +16076,6 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             reply_markup=InlineKeyboardMarkup([
                 [InlineKeyboardButton("📏 Fixed lot size", callback_data="mt5settings_lot")],
                 [InlineKeyboardButton("📊 Risk %", callback_data="mt5settings_risk")],
-                [InlineKeyboardButton("🔄 Switch bot / signal mode", callback_data="mt5switch_menu")],
             ])
         )
         return

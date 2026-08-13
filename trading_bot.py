@@ -15761,6 +15761,24 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     if data == "mt5auto_follow_channel":
         user_id = str(query.from_user.id)
+        await query.message.edit_text(
+            "⚠️ <b>Full Signal Coverage — Before You Enable</b>\n\n"
+            "This mode trades on every qualifying signal our system "
+            "generates, not just what's posted to the channel. That "
+            "means significantly more trades and more notifications "
+            "than our other modes. If you'd prefer fewer, more "
+            "selective trades, Copy Channel Signal or Pick a Bot may "
+            "suit you better.",
+            parse_mode=ParseMode.HTML,
+            reply_markup=InlineKeyboardMarkup([
+                [InlineKeyboardButton("✅ I Understand, Continue", callback_data="mt5auto_follow_channel_accept")],
+                [InlineKeyboardButton("⬅️ Back", callback_data="mt5auto_start")],
+            ])
+        )
+        return
+
+    if data == "mt5auto_follow_channel_accept":
+        user_id = str(query.from_user.id)
         if user_id not in mt5_signup_state:
             mt5_signup_state[user_id] = {"flow": "presetup"}
         mt5_signup_state[user_id]["bot_choice"] = "follow_channel"
@@ -16189,6 +16207,24 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     if data == "mt5switch_follow_channel":
+        user_id = str(query.from_user.id)
+        await query.message.edit_text(
+            "⚠️ <b>Full Signal Coverage — Before You Enable</b>\n\n"
+            "This mode trades on every qualifying signal our system "
+            "generates, not just what's posted to the channel. That "
+            "means significantly more trades and more notifications "
+            "than our other modes. If you'd prefer fewer, more "
+            "selective trades, Copy Channel Signal or Pick a Bot may "
+            "suit you better.",
+            parse_mode=ParseMode.HTML,
+            reply_markup=InlineKeyboardMarkup([
+                [InlineKeyboardButton("✅ I Understand, Continue", callback_data="mt5switch_follow_channel_accept")],
+                [InlineKeyboardButton("⬅️ Back", callback_data="mt5switch_menu")],
+            ])
+        )
+        return
+
+    if data == "mt5switch_follow_channel_accept":
         user_id = str(query.from_user.id)
         upsert_mt5_autotrade_account(user_id, {"bot_choice": "follow_channel", "pair_choice": None})
         await query.message.edit_text(

@@ -715,6 +715,15 @@ async def place_client_mt5_trade(metaapi_account_id, mt5_symbol, direction, volu
     assumption.
     """
     if not METAAPI_TOKEN:
+        # FIX: CONFIRMED REAL GAP - this was the ONLY return in the
+        # entire function with no print attached at all. Live
+        # evidence (2 real failed copy attempts, zero log output from
+        # this function on either) points directly at this exact
+        # line - every other path (success, failed-with-reason,
+        # exception) already logs, so silence here was the only
+        # explanation left. Confirming directly now instead of
+        # deducing it from absence of evidence.
+        print(f"[MT5 AUTOTRADE] ❌ METAAPI_TOKEN is not set - cannot place trade for {metaapi_account_id}")
         return None
     try:
         headers = {"auth-token": METAAPI_TOKEN, "Content-Type": "application/json"}

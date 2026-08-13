@@ -1183,6 +1183,9 @@ async def run_mt5_autotrade_bot_scan(context: ContextTypes.DEFAULT_TYPE):
                 if copy_key in MT5_AUTOTRADE_COPIED_SIGNALS:
                     continue
 
+                if account.get("trading_paused"):
+                    continue  # user turned the bot off - stop opening new trades, don't touch anything already open
+
                 symbol_map = await get_client_symbol_map(account)
                 resolved_symbol = resolve_trade_symbol(symbol_map, pair_config)
 
@@ -1269,6 +1272,9 @@ async def run_mt5_autotrade_follow_channel_scan(context: ContextTypes.DEFAULT_TY
 
             if account.get("bot_choice") == "copy_channel" and not is_genuine_channel_post:
                 continue  # Copy Channel Signal only trades genuine channel posts - not worth logging every cycle, this is the expected, common case for this mode
+
+            if account.get("trading_paused"):
+                continue  # user turned the bot off - stop opening new trades, don't touch anything already open
 
             symbol_map = await get_client_symbol_map(account)
             resolved_symbol = resolve_trade_symbol(symbol_map, pair_config)
@@ -1385,6 +1391,9 @@ async def run_account_flip_entry_scan(context: ContextTypes.DEFAULT_TYPE):
 
                 if get_open_flip_stack(user_id):
                     continue  # already riding a stack - entry scan sits out until it closes
+
+                if account.get("trading_paused"):
+                    continue  # user turned the bot off - stop opening new trades, don't touch anything already open
 
                 symbol_map = await get_client_symbol_map(account)
                 resolved_symbol = resolve_trade_symbol(symbol_map, pair_config)
@@ -1516,7 +1525,15 @@ async def manage_account_flip_stacks(context: ContextTypes.DEFAULT_TYPE):
             # since the LAST layer specifically (not just off the peak) -
             # keeps layer spacing consistent even if price has been
             # choppy rather than moving in a straight line.
-            if favorable_pips >= trigger_pips and layer_count < max_layers:
+            #
+            # trading_paused checked here specifically, per explicit
+            # instruction - adding a layer IS opening a new trade, so a
+            # paused bot must not add one. This does NOT touch the
+            # trailing-stop CLOSE logic elsewhere in this function -
+            # closing is the opposite of opening, so an already-riding
+            # stack keeps being protected/managed normally even while
+            # paused, exactly as agreed.
+            if favorable_pips >= trigger_pips and layer_count < max_layers and not account.get("trading_paused"):
                 new_lot = round(min(float(account.get("flip_base_lot") or 0.01) + step * layer_count, max_lot), 2)
                 order_id = await place_client_mt5_trade(
                     metaapi_account_id, mt5_symbol, direction, new_lot, None, None
@@ -15416,6 +15433,11 @@ async def build_exness_autotrade_dashboard(user_id, account, expiry, now):
     # worth caching - per explicit instruction.
     balance = await get_client_mt5_balance(account["metaapi_account_id"])
     balance_display = f"${balance:,.2f}" if balance is not None else "unavailable right now"
+    trading_paused = bool(account.get("trading_paused"))
+    autotrade_status_line = (
+        "🎯 <b>Auto-Trade:</b> OFF (paused - no new trades will open)" if trading_paused
+        else "🎯 <b>Auto-Trade:</b> ON"
+    )
     text = (
         f"🤖 <b>Exness Auto-Trade — Active</b>\n\n"
         f"Account: {account.get('account_name') or account.get('account_number', 'N/A')}\n"
@@ -15424,11 +15446,18 @@ async def build_exness_autotrade_dashboard(user_id, account, expiry, now):
         f"Subscription: {days_left} day(s) left\n"
         f"Mode: {bot_label}"
         + (f" on {account.get('pair_choice', '').upper()}" if account.get("pair_choice") else "")
-        + f"\nRisk: {risk_display}"
+        + f"\nRisk: {risk_display}\n\n"
+        + autotrade_status_line
+    )
+    toggle_button = (
+        InlineKeyboardButton("🔴 Turn Bot OFF", callback_data="mt5auto_turnoff")
+        if not trading_paused else
+        InlineKeyboardButton("🟢 Turn Bot ON", callback_data="mt5auto_turnon")
     )
     markup = InlineKeyboardMarkup([
         [InlineKeyboardButton("⚙️ Change lot size / risk %", callback_data="mt5settings_change")],
         [InlineKeyboardButton("🔄 Switch bot / signal mode", callback_data="mt5switch_menu")],
+        [toggle_button],
     ])
     return text, markup
 
@@ -16055,15 +16084,27 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             )
         else:
             risk_display = f"{account.get('risk_percent', 1.0)}% risk"
+        trading_paused = bool(account.get("trading_paused"))
+        autotrade_status_line = (
+            "🎯 <b>Auto-Trade:</b> OFF (paused - no new trades will open)" if trading_paused
+            else "🎯 <b>Auto-Trade:</b> ON"
+        )
+        toggle_button = (
+            InlineKeyboardButton("🔴 Turn Bot OFF", callback_data="mt5auto_turnoff")
+            if not trading_paused else
+            InlineKeyboardButton("🟢 Turn Bot ON", callback_data="mt5auto_turnon")
+        )
         await query.message.edit_text(
             f"🤖 <b>Exness Auto-Trade — Active</b>\n\n"
             f"Subscription: {days_left} day(s) left\n"
             f"MT5 account: connected\n"
-            f"Mode: {risk_display}",
+            f"Mode: {risk_display}\n\n"
+            f"{autotrade_status_line}",
             parse_mode=ParseMode.HTML,
             reply_markup=InlineKeyboardMarkup([
                 [InlineKeyboardButton("⚙️ Change lot size / risk %", callback_data="mt5settings_change")],
                 [InlineKeyboardButton("🔄 Switch bot / signal mode", callback_data="mt5switch_menu")],
+                [toggle_button],
             ])
         )
         return
@@ -16077,6 +16118,42 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 [InlineKeyboardButton("📏 Fixed lot size", callback_data="mt5settings_lot")],
                 [InlineKeyboardButton("📊 Risk %", callback_data="mt5settings_risk")],
             ])
+        )
+        return
+
+    if data == "mt5auto_turnoff":
+        # Per explicit instruction, matching Deriv Auto-Trade's exact
+        # behavior: stops OPENING new trades only - never touches
+        # anything already open. Applies the same way regardless of
+        # mode, including Account Flip - a paused account won't start
+        # a new stack or add a new layer to an existing one (see the
+        # trading_paused check in manage_account_flip_stacks), but an
+        # already-open stack's trailing stop keeps managing/protecting
+        # it normally, since closing is the opposite of opening. Kept
+        # as its own dedicated flag, deliberately separate from
+        # is_active (subscription/connection status) - a manual pause
+        # should never be able to interfere with subscription-expiry
+        # logic, or vice versa.
+        user_id = str(query.from_user.id)
+        upsert_mt5_autotrade_account(user_id, {"trading_paused": True})
+        await query.message.edit_text(
+            "🛑 <b>Auto-Trade turned off.</b>\n\n"
+            "Your bot/mode settings are kept, so turning it back on "
+            "later won't need reconfiguring. Anything already open on "
+            "your account keeps being managed normally - this only "
+            "stops new trades from opening. Check status anytime from "
+            "🤖 Exness Auto-Trade.",
+            parse_mode=ParseMode.HTML
+        )
+        return
+
+    if data == "mt5auto_turnon":
+        user_id = str(query.from_user.id)
+        upsert_mt5_autotrade_account(user_id, {"trading_paused": False})
+        await query.message.edit_text(
+            "✅ <b>Auto-Trade turned back on.</b>\n\n"
+            "Check status anytime from 🤖 Exness Auto-Trade.",
+            parse_mode=ParseMode.HTML
         )
         return
 

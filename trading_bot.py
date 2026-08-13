@@ -1116,6 +1116,7 @@ async def run_mt5_autotrade_follow_channel_scan(context: ContextTypes.DEFAULT_TY
         pair_name = signal.get("pair_name", "")
         pair_key = next((k for k, v in PAIR_CONFIG.items() if v.get("pair_name") == pair_name), None)
         if not pair_key:
+            print(f"[MT5 AUTOTRADE FOLLOW] Signal {signal.get('id')} ({pair_name}) - no matching PAIR_CONFIG entry, skipping")
             continue
         pair_config = PAIR_CONFIG[pair_key]
         signal_id = signal.get("id")
@@ -1125,9 +1126,10 @@ async def run_mt5_autotrade_follow_channel_scan(context: ContextTypes.DEFAULT_TY
             metaapi_account_id = account["metaapi_account_id"]
             copy_key = (user_id, f"channel_{signal_id}")
             if copy_key in MT5_AUTOTRADE_COPIED_SIGNALS:
-                continue
+                continue  # already handled this exact signal for this user this run - not worth logging every cycle
 
             if await has_client_open_mt5_position(metaapi_account_id, pair_config["mt5_symbol"]):
+                print(f"[MT5 AUTOTRADE FOLLOW] Signal {signal_id} ({pair_name}) for user {user_id} - already has an open position on this symbol, skipping to avoid stacking")
                 MT5_AUTOTRADE_COPIED_SIGNALS.add(copy_key)
                 continue
 
@@ -1136,6 +1138,7 @@ async def run_mt5_autotrade_follow_channel_scan(context: ContextTypes.DEFAULT_TY
             take_profit = signal.get("take_profit")
             direction = signal.get("direction")
             if not all([entry_price, stop_loss, take_profit, direction]):
+                print(f"[MT5 AUTOTRADE FOLLOW] Signal {signal_id} ({pair_name}) missing required fields - entry={entry_price} sl={stop_loss} tp={take_profit} dir={direction}, skipping")
                 continue
 
             if account.get("risk_mode") == "percent":
@@ -1143,6 +1146,7 @@ async def run_mt5_autotrade_follow_channel_scan(context: ContextTypes.DEFAULT_TY
                 account["_live_balance"] = balance
 
             volume = compute_lot_size(account, entry_price, stop_loss)
+            print(f"[MT5 AUTOTRADE FOLLOW] Attempting to copy signal {signal_id} ({pair_name} {direction}) for user {user_id}, volume={volume}")
 
             order_id = await place_client_mt5_trade(
                 metaapi_account_id, pair_config["mt5_symbol"], direction,
@@ -1163,6 +1167,16 @@ async def run_mt5_autotrade_follow_channel_scan(context: ContextTypes.DEFAULT_TY
                     )
                 except Exception as e:
                     print(f"[MT5 AUTOTRADE FOLLOW] Couldn't notify {user_id}: {e}")
+            else:
+                # FIX: CONFIRMED REAL GAP - this had no logging at all,
+                # meaning a genuine trade-placement failure was
+                # completely indistinguishable from "nothing to do
+                # this cycle" in the logs. place_client_mt5_trade
+                # already logs the specific failure reason itself
+                # (status code/response body, or exception) - this
+                # just makes clear, at the point a failure actually
+                # happened, which signal/user it was for.
+                print(f"[MT5 AUTOTRADE FOLLOW] ❌ Copy failed for signal {signal_id} ({pair_name} {direction}), user {user_id} - see place_client_mt5_trade's own log line above for the real reason. NOT retried - marked as handled either way.")
 
 
 async def run_account_flip_entry_scan(context: ContextTypes.DEFAULT_TYPE):

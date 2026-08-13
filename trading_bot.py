@@ -20319,6 +20319,30 @@ def main():
         job_kwargs={"misfire_grace_time": 300}
     )
 
+    # TEMPORARY DIAGNOSTIC, per explicit instruction - a global
+    # METAAPI_TOKEN issue was ruled out (another subscriber's account
+    # works fine), so this checks what's actually DIFFERENT about this
+    # one specific account: its real region, deployment state, and
+    # broker connection status, straight from MetaAPI's own account-
+    # info endpoint. Runs once, 15s after startup. Safe to remove once
+    # the answer is known.
+    async def _temp_check_account_status(context: ContextTypes.DEFAULT_TYPE):
+        try:
+            account_id = "7477ca32-385c-4fec-b2e7-145e43dfad81"
+            url = f"https://mt-provisioning-api-v1.agiliumtrade.agiliumtrade.ai/users/current/accounts/{account_id}"
+            headers = {"auth-token": METAAPI_TOKEN, "Accept": "application/json"}
+            response = requests.get(url, headers=headers, timeout=15)
+            print(f"[ACCOUNT STATUS TEST] Status={response.status_code}")
+            if response.status_code == 200:
+                data = response.json()
+                print(f"[ACCOUNT STATUS TEST] region={data.get('region')} state={data.get('state')} connectionStatus={data.get('connectionStatus')}")
+            else:
+                print(f"[ACCOUNT STATUS TEST] Body: {response.text[:500]}")
+        except Exception as e:
+            print(f"[ACCOUNT STATUS TEST] Error: {e}")
+
+    job_queue.run_once(_temp_check_account_status, when=15, name="temp_account_status_test")
+
     print("Nexora AI Running...")
     print("Daily schedule (UTC):")
     for utc_time, post_type, data in DAILY_SCHEDULE:

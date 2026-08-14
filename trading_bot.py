@@ -605,9 +605,31 @@ async def provision_mt5_account(login, password, server, platform="mt5", account
 # client's account must never block the scan job for everyone else).
 _CLIENT_MT5_CONNECTIONS = {}
 
+# FIX: CONFIRMED REAL LIVE BUG causing the reported slowness - a
+# connection attempt only ever got cached on SUCCESS, so an account
+# that's currently struggling to connect on MetaAPI's side (confirmed
+# live via repeated TimeoutException in the logs) would repeatedly
+# burn the FULL 15-second timeout on every single call, every time -
+# and this function gets hit constantly (every dashboard view, every
+# balance check, and multiple recurring background scan jobs every
+# 2-5 minutes, across every connected account). With several of these
+# piling up on the same event loop, everything else - including
+# completely unrelated buttons like Signal or News - would end up
+# waiting behind that backlog. This cooldown means a persistently-
+# failing account gets skipped immediately (not reattempted) for 60s
+# after a failure, instead of burning another full 15s timeout on the
+# very next call, which could be mere seconds later.
+_CLIENT_MT5_CONNECTION_FAILURES = {}
+_CLIENT_MT5_FAILURE_COOLDOWN_SECONDS = 60
+
 async def get_client_mt5_connection(metaapi_account_id):
     if metaapi_account_id in _CLIENT_MT5_CONNECTIONS:
         return _CLIENT_MT5_CONNECTIONS[metaapi_account_id]
+
+    last_failure = _CLIENT_MT5_CONNECTION_FAILURES.get(metaapi_account_id)
+    if last_failure and (time.time() - last_failure) < _CLIENT_MT5_FAILURE_COOLDOWN_SECONDS:
+        return None  # failed recently - skip immediately instead of burning another 15s timeout
+
     try:
         async def _connect():
             api = MetaApi(token=METAAPI_TOKEN)
@@ -619,9 +641,11 @@ async def get_client_mt5_connection(metaapi_account_id):
 
         connection = await asyncio.wait_for(_connect(), timeout=15)
         _CLIENT_MT5_CONNECTIONS[metaapi_account_id] = connection
+        _CLIENT_MT5_CONNECTION_FAILURES.pop(metaapi_account_id, None)
         return connection
     except Exception as e:
         print(f"[MT5 AUTOTRADE] Connection failed for client account {metaapi_account_id}: {e}")
+        _CLIENT_MT5_CONNECTION_FAILURES[metaapi_account_id] = time.time()
         return None
 
 
@@ -14622,6 +14646,8 @@ async def place_mt5_trade(signal_data, signal_id=None):
 # placing successfully throughout. This module-level cache holds ONE
 # shared, persistent connection instead, reused across every call.
 _SHARED_MT5_CONNECTION = {"connection": None}
+_SHARED_MT5_CONNECTION_LAST_FAILURE = {"time": None}
+_SHARED_MT5_FAILURE_COOLDOWN_SECONDS = 60
 
 async def get_shared_mt5_connection():
     """
@@ -14654,6 +14680,11 @@ async def get_shared_mt5_connection():
     """
     if _SHARED_MT5_CONNECTION["connection"] is not None:
         return _SHARED_MT5_CONNECTION["connection"]
+
+    last_failure = _SHARED_MT5_CONNECTION_LAST_FAILURE["time"]
+    if last_failure and (time.time() - last_failure) < _SHARED_MT5_FAILURE_COOLDOWN_SECONDS:
+        return None  # failed recently - skip immediately instead of burning another 15s timeout
+
     try:
         async def _connect():
             api = MetaApi(token=METAAPI_TOKEN)
@@ -14667,13 +14698,16 @@ async def get_shared_mt5_connection():
 
         connection = await asyncio.wait_for(_connect(), timeout=15)
         _SHARED_MT5_CONNECTION["connection"] = connection
+        _SHARED_MT5_CONNECTION_LAST_FAILURE["time"] = None
         print("[MT5 SHARED CONNECTION] ✅ New shared connection established and cached.")
         return connection
     except asyncio.TimeoutError:
         print("[MT5 SHARED CONNECTION] ❌ Timed out after 15s - MetaAPI account likely disconnected/disabled. Giving up for now rather than hanging.")
+        _SHARED_MT5_CONNECTION_LAST_FAILURE["time"] = time.time()
         return None
     except Exception as e:
         print(f"[MT5 SHARED CONNECTION] Failed to establish shared connection: {e}")
+        _SHARED_MT5_CONNECTION_LAST_FAILURE["time"] = time.time()
         return None
 
 

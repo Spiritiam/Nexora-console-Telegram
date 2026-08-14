@@ -20698,27 +20698,6 @@ def main():
         job_kwargs={"misfire_grace_time": 300}
     )
 
-    # TEMPORARY DIAGNOSTIC, per explicit instruction - direct check of
-    # whether METAAPI_TOKEN itself is being rejected (expired/invalid
-    # subscription) vs a connectivity/timeout issue on an otherwise
-    # valid token. Runs once, 15s after startup. Safe to remove once
-    # the answer is known.
-    async def _temp_check_metaapi_token_status(context: ContextTypes.DEFAULT_TYPE):
-        try:
-            url = f"https://mt-provisioning-api-v1.agiliumtrade.agiliumtrade.ai/users/current/accounts/{METAAPI_ACCOUNT_ID}"
-            headers = {"auth-token": METAAPI_TOKEN, "Accept": "application/json"}
-            response = requests.get(url, headers=headers, timeout=15)
-            print(f"[METAAPI TOKEN TEST] Status={response.status_code}")
-            if response.status_code == 200:
-                data = response.json()
-                print(f"[METAAPI TOKEN TEST] region={data.get('region')} state={data.get('state')} connectionStatus={data.get('connectionStatus')}")
-            else:
-                print(f"[METAAPI TOKEN TEST] Body: {response.text[:500]}")
-        except Exception as e:
-            print(f"[METAAPI TOKEN TEST] Error: {e}")
-
-    job_queue.run_once(_temp_check_metaapi_token_status, when=15, name="temp_metaapi_token_test")
-
     print("Nexora AI Running...")
     print("Daily schedule (UTC):")
     for utc_time, post_type, data in DAILY_SCHEDULE:

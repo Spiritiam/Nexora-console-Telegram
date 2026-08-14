@@ -14448,7 +14448,7 @@ async def check_for_matching_recent_position(metaapi_account_id, mt5_symbol, com
             f"/users/current/accounts/{metaapi_account_id}/positions"
         )
         headers = {"auth-token": METAAPI_TOKEN, "Accept": "application/json"}
-        response = requests.get(url, headers=headers, timeout=15)
+        response = await asyncio.to_thread(requests.get, url, headers=headers, timeout=15)
         if response.status_code != 200:
             print(f"[MT5] Idempotency check failed to read positions: {response.status_code}")
             return "CHECK_FAILED"

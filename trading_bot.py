@@ -16215,8 +16215,34 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             reply_markup=InlineKeyboardMarkup([
                 [InlineKeyboardButton("📏 Fixed lot size", callback_data="mt5settings_lot")],
                 [InlineKeyboardButton("📊 Risk %", callback_data="mt5settings_risk")],
+                [InlineKeyboardButton("⬅️ Back", callback_data="mt5auto_dashboard")],
             ])
         )
+        return
+
+    if data == "mt5auto_dashboard":
+        # Per explicit instruction - the dashboard itself wasn't
+        # reachable via its own callback before (only ever shown fresh
+        # from the button tap or a signup-success screen), so there
+        # was nothing for "Change lot size / risk %" or "Switch bot /
+        # signal mode" to Back to. Rebuilds it the same way the
+        # button-tap handler does.
+        user_id = str(query.from_user.id)
+        account = get_mt5_autotrade_account(user_id)
+        if not account:
+            await query.message.edit_text("No active Exness Auto-Trade account found.")
+            return
+        now = datetime.utcnow()
+        expiry = None
+        if account.get("subscription_expires_at"):
+            try:
+                expiry = datetime.fromisoformat(
+                    account["subscription_expires_at"].replace("Z", "+00:00")
+                ).replace(tzinfo=None)
+            except Exception:
+                expiry = None
+        dash_text, dash_markup = await build_exness_autotrade_dashboard(user_id, account, expiry, now)
+        await query.message.edit_text(dash_text, parse_mode=ParseMode.HTML, reply_markup=dash_markup)
         return
 
     if data == "mt5auto_turnoff":
@@ -16318,6 +16344,7 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 [InlineKeyboardButton("📻 Copy Channel Signal", callback_data="mt5switch_copy_channel")],
                 [InlineKeyboardButton("🎯 Pick a Bot", callback_data="mt5switch_choose_bot")],
                 [InlineKeyboardButton("🚀 Account Flip", callback_data="mt5switch_account_flip")],
+                [InlineKeyboardButton("⬅️ Back", callback_data="mt5auto_dashboard")],
             ])
         )
         return
@@ -16725,7 +16752,11 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 )
                 await query.message.edit_text(
                     no_news_text,
-                    parse_mode=ParseMode.HTML
+                    parse_mode=ParseMode.HTML,
+                    reply_markup=InlineKeyboardMarkup([
+                        [InlineKeyboardButton("📚 News Breakdown", callback_data="newsmenu_breakdown")],
+                        [InlineKeyboardButton("⬅️ Back", callback_data="newsmenu_root")],
+                    ])
                 )
                 return
 
@@ -16774,7 +16805,25 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 f"Tap any event below for a direct BUY/SELL call, "
                 f"fundamentals-first:",
                 parse_mode=ParseMode.HTML,
-                reply_markup=InlineKeyboardMarkup(buttons)
+                reply_markup=InlineKeyboardMarkup(buttons + [
+                    [InlineKeyboardButton("⬅️ Back", callback_data="newsmenu_root")]
+                ])
+            )
+            return
+
+        elif choice == "root":
+            # Per explicit instruction - lets someone go straight from
+            # News Calendar to News Breakdown (or back to Calendar)
+            # without needing to tap "News" again from the main
+            # keyboard. Same content as the menu shown when News is
+            # first tapped, just also reachable via callback now.
+            await query.message.edit_text(
+                "📰 <b>News</b>\n\nWhat would you like?",
+                parse_mode=ParseMode.HTML,
+                reply_markup=InlineKeyboardMarkup([
+                    [InlineKeyboardButton("📅 News Calendar", callback_data="newsmenu_calendar")],
+                    [InlineKeyboardButton("📚 News Breakdown", callback_data="newsmenu_breakdown")],
+                ])
             )
             return
 

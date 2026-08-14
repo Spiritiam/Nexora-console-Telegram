@@ -15693,7 +15693,21 @@ async def handle_buttons(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     query = update.callback_query
-    await query.answer()
+    try:
+        await query.answer()
+    except Exception as e:
+        # URGENT FIX: CONFIRMED REAL LIVE BUG - a stale/expired
+        # callback query (extremely common - happens whenever someone
+        # taps an old button from an earlier message) raises here, and
+        # since this sat completely unprotected at the very top of
+        # EVERY callback handler, it crashed the entire handler before
+        # even checking what button was pressed - meaning that ONE
+        # tap failed silently with no response at all, matching
+        # exactly what was reported ("any command just stays
+        # dormant"). Logging and continuing - failing to acknowledge
+        # the tap doesn't mean the actual button logic below can't
+        # still run and respond.
+        print(f"[CALLBACK] query.answer() failed (likely a stale/expired query): {e}")
     data = query.data
 
     if data == "show_main_menu":
@@ -17336,7 +17350,10 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             snapshot = await deriv_fetch_account_snapshot(account["api_token"])
             if snapshot and snapshot.get("balance") is not None:
                 if snapshot["balance"] < trade_context["stake"]:
-                    await wait_message.delete()
+                    try:
+                        await wait_message.delete()
+                    except Exception as e:
+                        print(f"[SIGNAL] Couldn't delete wait message: {e}")
                     await send_and_auto_delete(
                         context.bot, int(user_id),
                         f"⚠️ <b>Not enough balance for this stake.</b>\n\n"
@@ -17363,7 +17380,10 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 trade_context["win"],
             )
 
-            await wait_message.delete()
+            try:
+                await wait_message.delete()
+            except Exception as e:
+                print(f"[SIGNAL] Couldn't delete wait message: {e}")
 
             if error:
                 await send_and_auto_delete(
@@ -17401,7 +17421,10 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             # always gets told something instead of silence.
             print(f"[EXECCONFIRM] ❌ Unexpected error for {user_id}: {e}")
             try:
-                await wait_message.delete()
+                try:
+                    await wait_message.delete()
+                except Exception as e:
+                    print(f"[SIGNAL] Couldn't delete wait message: {e}")
             except Exception:
                 pass
             await send_and_auto_delete(
@@ -17618,7 +17641,10 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
         snapshot = await deriv_fetch_account_snapshot(token)
 
-        await wait_message.delete()
+        try:
+            await wait_message.delete()
+        except Exception as e:
+            print(f"[SIGNAL] Couldn't delete wait message: {e}")
 
         if not snapshot:
             sent_bad_token = await update.message.reply_text(
@@ -17770,7 +17796,10 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
             result = await build_synthetic_signal_response(synthetic_key, min_agree=2)
 
-            await wait_message.delete()
+            try:
+                await wait_message.delete()
+            except Exception as e:
+                print(f"[SIGNAL] Couldn't delete wait message: {e}")
 
             if not result:
                 sent_no_signal = await update.message.reply_text(
@@ -17850,7 +17879,23 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if signal_data is not None:
             log_signal(signal_data, source="manual")
 
-        await wait_message.delete()
+        try:
+            try:
+                await wait_message.delete()
+            except Exception as e:
+                print(f"[SIGNAL] Couldn't delete wait message: {e}")
+        except Exception as e:
+            # URGENT FIX: CONFIRMED REAL LIVE BUG - a delete failure
+            # (e.g. "message to delete not found", a common, expected
+            # Telegram-side edge case) was completely unprotected here,
+            # crashing the rest of this function BEFORE the real
+            # signal ever got sent - the user would see the "analyzing"
+            # message and then nothing else at all, matching exactly
+            # what was reported ("stays dormant"). The signal itself
+            # matters far more than cleaning up the old loading
+            # message, so this now just logs and continues instead of
+            # losing the whole response over it.
+            print(f"[SIGNAL] Couldn't delete wait message: {e}")
 
         if image_file_id:
             sent_signal = await update.message.reply_photo(
@@ -19337,7 +19382,13 @@ async def broadcast_photo_handler(update: Update, context: ContextTypes.DEFAULT_
     A single photo (no media_group_id) is unaffected and still
     processes immediately, exactly as before.
     """
-    if not update.message.photo:
+    # URGENT FIX: CONFIRMED REAL LIVE BUG - update.message is None for
+    # edited messages and channel posts (a different field carries the
+    # content in those cases), and accessing .photo directly on None
+    # crashed this handler outright - confirmed live, this fired
+    # repeatedly. Guarding here instead of assuming every update that
+    # reaches this handler is a fresh message.
+    if not update.message or not update.message.photo:
         return
     photo_file_id = update.message.photo[-1].file_id  # highest resolution Telegram sent
     caption = update.message.caption or ""

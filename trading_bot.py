@@ -725,6 +725,10 @@ def compute_lot_size(account, entry_price, stop_loss):
     return round(max(0.01, min(lot_size, 10.0)), 2)  # hard-capped 0.01-10.0 as a sanity bound
 
 
+_SYMBOL_MAP_FAILURES = {}
+_SYMBOL_MAP_FAILURE_COOLDOWN_SECONDS = 60
+
+
 async def resolve_client_symbol_map(metaapi_account_id):
     """
     Per explicit instruction - confirmed real live bug: a Raw Spread
@@ -744,18 +748,41 @@ async def resolve_client_symbol_map(metaapi_account_id):
     account - unresolvable pairs are simply omitted (caller falls back
     to the old hardcoded default for those specific ones).
     """
+    # URGENT FIX: CONFIRMED REAL LIVE BUG - this was a synchronous,
+    # BLOCKING requests.get() call running directly inside an async
+    # function, with a 20s timeout and no failure cooldown at all.
+    # requests is not async-aware - a blocking call like this inside
+    # asyncio code freezes the ENTIRE event loop for its full
+    # duration, not just this one function. That means EVERY other
+    # user's EVERY interaction (Signal, News, any button) had to wait
+    # in line behind it too, confirmed live as exactly the reported
+    # symptom (completely unrelated commands stalling for up to a
+    # minute). asyncio.to_thread runs the blocking call on a separate
+    # thread instead, so the main event loop stays free to keep
+    # processing everyone else's updates while this one call is still
+    # in flight. Failure cooldown added too, matching get_client_mt5_
+    # connection's pattern - a persistently-struggling account (like
+    # one currently undeployed) won't repeatedly attempt this same
+    # slow call on every single scan cycle.
+    last_failure = _SYMBOL_MAP_FAILURES.get(metaapi_account_id)
+    if last_failure and (time.time() - last_failure) < _SYMBOL_MAP_FAILURE_COOLDOWN_SECONDS:
+        return {}
+
     try:
         url = f"https://mt-client-api-v1.london.agiliumtrade.ai/users/current/accounts/{metaapi_account_id}/symbols"
         headers = {"auth-token": METAAPI_TOKEN, "Accept": "application/json"}
-        response = requests.get(url, headers=headers, timeout=20)
+        response = await asyncio.to_thread(requests.get, url, headers=headers, timeout=20)
         if response.status_code != 200:
             print(f"[SYMBOL MAP] Couldn't fetch symbols for {metaapi_account_id}: {response.status_code}")
+            _SYMBOL_MAP_FAILURES[metaapi_account_id] = time.time()
             return {}
         real_symbols = response.json()
         real_symbols_set = set(real_symbols)
         real_symbols_upper = {s.upper(): s for s in real_symbols}
+        _SYMBOL_MAP_FAILURES.pop(metaapi_account_id, None)
     except Exception as e:
         print(f"[SYMBOL MAP] Error fetching symbols for {metaapi_account_id}: {e}")
+        _SYMBOL_MAP_FAILURES[metaapi_account_id] = time.time()
         return {}
 
     # Known common broker suffixes, tried in this order after an exact
@@ -884,7 +911,7 @@ async def place_client_mt5_trade(metaapi_account_id, mt5_symbol, direction, volu
             f"https://mt-client-api-v1.london.agiliumtrade.ai"
             f"/users/current/accounts/{metaapi_account_id}/trade"
         )
-        response = requests.post(url, headers=headers, json=payload, timeout=30)
+        response = await asyncio.to_thread(requests.post, url, headers=headers, json=payload, timeout=30)
         if response.status_code in (200, 201):
             result = response.json()
             order_id = result.get("orderId", "unknown")
@@ -962,7 +989,7 @@ async def close_all_client_mt5_positions(metaapi_account_id, mt5_symbol):
             f"https://mt-client-api-v1.london.agiliumtrade.ai"
             f"/users/current/accounts/{metaapi_account_id}/trade"
         )
-        response = requests.post(url, headers=headers, json=payload, timeout=30)
+        response = await asyncio.to_thread(requests.post, url, headers=headers, json=payload, timeout=30)
         if response.status_code in (200, 201):
             print(f"[ACCOUNT FLIP] ✅ Closed full stack for {metaapi_account_id} on {mt5_symbol}")
             return True
@@ -14524,7 +14551,7 @@ async def place_mt5_trade(signal_data, signal_id=None):
         idempotent_match = None
         attempt_started_at = datetime.utcnow()
         for attempt in range(1, max_attempts + 1):
-            response = requests.post(url, headers=headers, json=payload, timeout=30)
+            response = await asyncio.to_thread(requests.post, url, headers=headers, json=payload, timeout=30)
             last_response = response
             if response.status_code in (200, 201):
                 break

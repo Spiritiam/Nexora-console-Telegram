@@ -1121,9 +1121,21 @@ async def run_mt5_autotrade_bot_scan(context: ContextTypes.DEFAULT_TYPE):
             # needed rewriting to support this. h4/daily are still
             # fetched normally in case a strategy also leans on the
             # genuinely-higher-timeframe context for trend alignment.
-            primary_candles = get_cached_candles(pair_key, pair_config, bot_info["timeframe"], outputsize=210)
-            h4_candles = get_cached_candles(pair_key, pair_config, "4h", outputsize=60)
-            daily_candles = get_cached_candles(pair_key, pair_config, "1day", outputsize=10)
+            #
+            # CAREFUL FIX, per explicit instruction - get_cached_candles
+            # internally makes a real, BLOCKING requests call (first to
+            # MetaAPI, falling back to TwelveData/others if that fails)
+            # - completely unprotected, this would freeze the ENTIRE
+            # bot's event loop for every user while it ran, confirmed
+            # live as a major contributor to reported slowness.
+            # asyncio.to_thread runs the WHOLE existing function
+            # (including its fallback chain) on a separate thread,
+            # without touching a single line of its own careful
+            # internal logic - genuinely zero behavior change, just
+            # keeps it from blocking everyone else while it runs.
+            primary_candles = await asyncio.to_thread(get_cached_candles, pair_key, pair_config, bot_info["timeframe"], outputsize=210)
+            h4_candles = await asyncio.to_thread(get_cached_candles, pair_key, pair_config, "4h", outputsize=60)
+            daily_candles = await asyncio.to_thread(get_cached_candles, pair_key, pair_config, "1day", outputsize=10)
             if not primary_candles:
                 continue
 
@@ -1411,7 +1423,7 @@ async def run_account_flip_entry_scan(context: ContextTypes.DEFAULT_TYPE):
         if not pair_config:
             continue
         try:
-            candles = get_cached_candles(pair_key, pair_config, "15min", outputsize=210)
+            candles = await asyncio.to_thread(get_cached_candles, pair_key, pair_config, "15min", outputsize=210)
             if not candles or len(candles) < 5:
                 continue
 
@@ -5308,7 +5320,7 @@ async def build_synthetic_signal_response(index_key, min_agree=2):
             # retry with freshly re-fetched candles is cheap insurance
             # against a transient data hiccup on the first attempt.
             print(f"[CHART] {config['display']}/{chart_strategy_name}: first attempt failed, retrying once with a fresh candle fetch...")
-            time.sleep(2)
+            await asyncio.sleep(2)
             if chart_strategy_name in M1_BASED_STRATEGIES:
                 retry_candles = await get_cached_synthetic_candles(index_key, symbol, "1m", 60, 60)
             else:
@@ -12121,7 +12133,18 @@ async def build_signal_response(question, user_id=None):
     display = config["display"]
     decimals = config.get("decimals", 2)
 
-    current_price, price_1h_ago = get_cached_price_data(matched_key, symbol, config)
+    # CAREFUL FIX, per explicit instruction - both of these make real,
+    # BLOCKING requests calls internally (get_cached_price_data ->
+    # get_live_price -> MetaAPI/TwelveData/other fallbacks;
+    # get_cached_candles -> MetaAPI/TwelveData fallback). This is the
+    # single most-called function in the whole file (every scheduled
+    # AND manual signal goes through it), so this was very likely the
+    # single biggest contributor to the reported slowness.
+    # asyncio.to_thread runs each existing call on a separate thread,
+    # without touching a single line of their own internal fallback
+    # logic - zero behavior change, just stops them from blocking
+    # every other user while they run.
+    current_price, price_1h_ago = await asyncio.to_thread(get_cached_price_data, matched_key, symbol, config)
     if current_price is None:
         print(f"[SIGNAL] ❌ Could not get live price for {pair_name}")
         return None, None, None, None
@@ -12135,9 +12158,9 @@ async def build_signal_response(question, user_id=None):
     used_smc = False
     used_ai_layer = False
 
-    h1_candles = get_cached_candles(matched_key, config, "1h", outputsize=210)
-    h4_candles = get_cached_candles(matched_key, config, "4h", outputsize=60)
-    daily_candles = get_cached_candles(matched_key, config, "1day", outputsize=10)
+    h1_candles = await asyncio.to_thread(get_cached_candles, matched_key, config, "1h", outputsize=210)
+    h4_candles = await asyncio.to_thread(get_cached_candles, matched_key, config, "4h", outputsize=60)
+    daily_candles = await asyncio.to_thread(get_cached_candles, matched_key, config, "1day", outputsize=10)
 
     # min_agree=2 is the PREFERRED bar everywhere, scheduled and DM
     # alike - per explicit instruction, run_strategy_bank itself now
@@ -12358,8 +12381,8 @@ async def build_signal_response(question, user_id=None):
             # getting a fuller set the second time, not just
             # deterministically repeating the same failure.
             print(f"[CHART] {display}/{chart_strategy_name}: first attempt failed, retrying once with a fresh candle fetch...")
-            time.sleep(2)
-            retry_candles = get_cached_candles(matched_key, config, "1h", outputsize=210)
+            await asyncio.sleep(2)
+            retry_candles = await asyncio.to_thread(get_cached_candles, matched_key, config, "1h", outputsize=210)
             if retry_candles:
                 chart_ok = generate_signal_chart(
                     display, chart_strategy_name, direction, retry_candles,
@@ -15038,7 +15061,7 @@ async def generate_breakdown(question):
         symbol = config["symbol"]
         pair_name = config["display"]
 
-    live_price = get_live_price(symbol, config=config)
+    live_price = await asyncio.to_thread(get_live_price, symbol, config=config)
     live_price_text = (
         str(round(live_price, 4)) if live_price
         else "Live price unavailable"
@@ -19638,8 +19661,8 @@ async def check_open_signals(context: ContextTypes.DEFAULT_TYPE):
             continue
 
         config = PAIR_CONFIG[pair_key]
-        current_price, _ = get_cached_price_data(
-            pair_key, config["symbol"], config
+        current_price, _ = await asyncio.to_thread(
+            get_cached_price_data, pair_key, config["symbol"], config
         )
         if current_price is None:
             continue

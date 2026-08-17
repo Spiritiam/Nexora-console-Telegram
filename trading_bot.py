@@ -2079,7 +2079,7 @@ async def process_pending_deriv_oauth_connections(context: ContextTypes.DEFAULT_
 CHANNEL_1_ID = os.getenv("CHANNEL_1_ID", "-1001722756645")
 CHANNEL_2_ID = os.getenv("CHANNEL_2_ID", "-1002468228698")
 CHANNEL_3_ID = os.getenv("CHANNEL_3_ID", "-1003928419513")  # Official Nexora AI channel - builds its own audience, gets the same content (signals/news) plus the same "Get Your Own Signal" CTA button as Channel 1
-FOLLOW_GATE_CHANNEL = "@nexoraaitrading"  # https://t.me/nexoraaitrading - bot MUST be added as admin here for get_chat_member to work reliably
+FOLLOW_GATE_CHANNEL = "@nexoraaiapp"  # https://t.me/nexoraaiapp - bot MUST be added as admin here for get_chat_member to work reliably
 
 # ============================================
 # VERIFICATION GROUP ID

@@ -13066,64 +13066,69 @@ def get_todays_calendar_events_fresh():
     return events
 
 
-async def get_real_time_technical_context(currency):
+async def fetch_targeted_fundamental_research(event):
     """
-    Real, factual price-action read for the pair mapped to this
-    currency (see CURRENCY_PAIR_MAP), per explicit instruction - the
-    pre-release bias used to reason from forecast/previous numbers
-    alone, with zero grounding in what the market is actually doing
-    right now. Computed deterministically from real H1 candles (not
-    an AI opinion) - a genuine % change over the last 4h and 24h,
-    stated in the PAIR's own terms. Returns None if candles aren't
-    available, so the caller can fall back to a fundamentals-only
-    read rather than block the whole alert on this.
+    Real, TARGETED fundamental/geopolitical research for this specific
+    event and currency, per explicit instruction - replaces both the
+    earlier real-time technical layer (walked back per explicit
+    instruction: a pre-release prediction is about what will actually
+    drive the number, not how price has been trading, which is a
+    downstream reaction rather than a cause) AND the old shared
+    approach (one random general-business article reused across every
+    event in the alert, regardless of whether it was actually relevant
+    to each one).
+
+    Uses GNews's real SEARCH endpoint (confirmed: GET /api/v4/search?
+    q=..., a genuine keyword search, not the generic /top-headlines
+    category browse fetch_market_news uses elsewhere) with a query
+    built from the currency and event title - e.g. "USD CPI y/y" -
+    genuinely aimed at surfacing whatever real reporting exists on
+    THIS specific number/currency right now (central bank stance,
+    recent related data trends, geopolitical drivers), not whatever
+    happened to be trending in general business news that day.
+
+    Returns a combined string of up to 3 real article title+
+    descriptions, or None if nothing relevant was found - the caller
+    falls back to reasoning from forecast/previous alone rather than
+    inventing context to fill the gap.
     """
-    mapping = CURRENCY_PAIR_MAP.get(currency)
-    if not mapping:
-        return None
-    pair_key = mapping["pair_key"]
-    config = PAIR_CONFIG.get(pair_key)
-    if not config:
+    if not GNEWS_API_KEY:
         return None
     try:
-        candles = await asyncio.to_thread(get_cached_candles, pair_key, config, "1h", outputsize=30)
-        if not candles or len(candles) < 25:
-            return None
-        current = candles[-1]["close"]
-        price_4h_ago = candles[-5]["close"]
-        price_24h_ago = candles[-25]["close"]
-        change_4h_pct = ((current - price_4h_ago) / price_4h_ago) * 100
-        change_24h_pct = ((current - price_24h_ago) / price_24h_ago) * 100
-        direction_4h = "up" if change_4h_pct >= 0 else "down"
-        direction_24h = "up" if change_24h_pct >= 0 else "down"
-        return (
-            f"{config['display']} is {direction_4h} {abs(change_4h_pct):.2f}% over the last 4 hours "
-            f"and {direction_24h} {abs(change_24h_pct):.2f}% over the last 24 hours "
-            f"({'{}'.format(currency)} is the {'quote' if mapping['inverted'] else 'base'} "
-            f"currency in this pair, so weigh the direction accordingly)."
+        query = f"{event['currency']} {event['title']}"
+        url = (
+            f"https://gnews.io/api/v4/search"
+            f"?q={requests.utils.quote(query)}&lang=en&max=3&apikey={GNEWS_API_KEY}"
         )
+        response = await asyncio.to_thread(requests.get, url, timeout=10)
+        data = response.json()
+        articles = data.get("articles", [])
+        if not articles:
+            return None
+        combined = "\n".join(
+            f"- {a.get('title', '')}. {a.get('description', '')}".strip()
+            for a in articles if a.get("title")
+        )
+        return combined if combined else None
     except Exception as e:
-        print(f"[PRE-RELEASE TECHNICAL] Couldn't compute technical context for {currency}: {e}")
+        print(f"[PRE-RELEASE RESEARCH] Couldn't fetch targeted research for {event['currency']} {event['title']}: {e}")
         return None
 
 
-async def generate_pre_release_bias(event, news_context):
+async def generate_pre_release_bias(event):
     """
-    Pre-release channel bias, per explicit instruction: grounded in
-    real Forecast/Previous numbers, real fetched news context (a
-    genuine recent article, same source the regular briefings use -
-    NOT the AI's own free-associated "geopolitical awareness", which
-    would just be a second version of the exact fabrication problem
-    already found and fixed once), AND now also real-time technical
-    price context (see get_real_time_technical_context) - per
-    explicit instruction, since a source for genuine actual results
-    isn't reliably available, this bias needed to be scrutinized by
-    real market data, not fundamentals alone. All fed into ONE single
-    AI judgment, not stated as a separate technical opinion alongside
-    it - a second, separately-displayed reading is what caused the
-    old technical cross-check to visibly contradict the fundamental
-    call and get removed entirely; this avoids that by making it one
-    combined judgment with more real inputs, never two.
+    Pre-release channel bias, per explicit instruction: leans on real,
+    TARGETED fundamental/geopolitical research (see
+    fetch_targeted_fundamental_research above) alongside real
+    Forecast/Previous numbers - NOT the AI's own free-associated
+    "geopolitical awareness" (which would just be a second version of
+    the exact fabrication problem already found and fixed once), and
+    deliberately NOT technical/price-action analysis - per explicit
+    instruction, a pre-release prediction should be driven by the real
+    forces that produce the number (central bank stance, related data
+    trends, geopolitical events), not by how price has been reacting,
+    which is downstream of expectations rather than a cause of the
+    actual result.
 
     Same hard rule as generate_currency_direction: this always runs
     BEFORE release, so it must never state or imply a specific actual
@@ -13133,18 +13138,12 @@ async def generate_pre_release_bias(event, news_context):
     previous_line = f"Previous: {event['previous']}" if event.get("previous") else ""
     data_lines = "\n".join(l for l in [forecast_line, previous_line] if l)
 
+    research = await fetch_targeted_fundamental_research(event)
     news_block = (
-        f"\nRELEVANT REAL NEWS CONTEXT (from a real, recently fetched article - "
-        f"use only if genuinely relevant to this event/currency, ignore otherwise):\n"
-        f"\"{news_context}\"\n"
-        if news_context else ""
-    )
-
-    technical_context = await get_real_time_technical_context(event["currency"])
-    technical_block = (
-        f"\nREAL-TIME PRICE CONTEXT (genuine current market data - weigh this "
-        f"alongside the fundamental setup, not instead of it):\n{technical_context}\n"
-        if technical_context else ""
+        f"\nREAL, TARGETED FUNDAMENTAL RESEARCH (genuine recent articles "
+        f"searched specifically for this event/currency - use only what's "
+        f"genuinely relevant, ignore the rest):\n{research}\n"
+        if research else ""
     )
 
     prompt = f"""
@@ -13155,16 +13154,14 @@ EVENT: {event['title']}
 CURRENCY: {event['currency']}
 {data_lines}
 {news_block}
-{technical_block}
 This event has NOT released yet - there is no actual result. Do not
 state, imply, or invent one. Judge whether the SETUP (forecast vs
-previous, the real news context if relevant, AND the real-time price
-context if given) leans BULLISH or BEARISH for {event['currency']},
-framed as anticipation only (e.g. "a forecast above the previous
-reading would signal..."). Weigh all the real inputs given together
-as one combined judgment - don't just restate the forecast/previous
-comparison if the real-time price context meaningfully agrees or
-disagrees with it.
+previous, and the real fundamental research above if relevant) leans
+BULLISH or BEARISH for {event['currency']}, framed as anticipation
+only (e.g. "a forecast above the previous reading would signal...").
+Base this on real fundamental/geopolitical drivers - what's actually
+happening that would push this number higher or lower - not on price
+action or technical analysis.
 
 Respond in EXACTLY this format, nothing else, no markdown:
 DIRECTION: BULLISH or BEARISH
@@ -13903,24 +13900,17 @@ async def check_upcoming_high_impact_news(context: ContextTypes.DEFAULT_TYPE):
         for idx, event in headliner_group
     ])
 
-    # Real news context, fetched ONCE for this whole batch (not per
-    # event) - same source the regular briefings already use, per
-    # explicit instruction ("use real life news not just AI"). A
-    # single shared article is enough context for the AI to draw on
-    # if genuinely relevant; the prompt itself tells it to ignore this
-    # context entirely if it doesn't actually relate to a given event.
-    grounding_article = fetch_market_news()
-    news_context = ""
-    if grounding_article:
-        news_context = f"{grounding_article.get('title', '')}. {grounding_article.get('description', '')}".strip()
-
-    # Per-event real bias - forecast/previous + real news context,
+    # Per-event real bias - forecast/previous + real TARGETED
+    # fundamental research (see fetch_targeted_fundamental_research),
     # never a fabricated actual figure (generate_pre_release_bias
     # enforces this in its own prompt). Computed ONCE per event here,
     # then reused for both the channel post AND every user's DM below -
     # calling the AI once per recipient instead would be wasteful and
     # slow, and the bias itself doesn't vary by user, only the
-    # displayed TIME does.
+    # displayed TIME does. Per explicit instruction, the old single
+    # shared random article (fetched once, reused across every event
+    # regardless of actual relevance) is gone - each headliner now
+    # searches specifically for its own event/currency instead.
     #
     # Per explicit instruction: when several same-currency events
     # share the EXACT same release time, the market can only actually
@@ -13933,7 +13923,7 @@ async def check_upcoming_high_impact_news(context: ContextTypes.DEFAULT_TYPE):
     for _, event in group:
         _, is_headliner, _ = get_cluster_and_headliner(event, all_today_events)
         if is_headliner:
-            direction, reason = await generate_pre_release_bias(event, news_context)
+            direction, reason = await generate_pre_release_bias(event)
         else:
             direction, reason = None, None
         event_bias_results.append((event, direction, reason))

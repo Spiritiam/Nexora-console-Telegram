@@ -13066,17 +13066,64 @@ def get_todays_calendar_events_fresh():
     return events
 
 
+async def get_real_time_technical_context(currency):
+    """
+    Real, factual price-action read for the pair mapped to this
+    currency (see CURRENCY_PAIR_MAP), per explicit instruction - the
+    pre-release bias used to reason from forecast/previous numbers
+    alone, with zero grounding in what the market is actually doing
+    right now. Computed deterministically from real H1 candles (not
+    an AI opinion) - a genuine % change over the last 4h and 24h,
+    stated in the PAIR's own terms. Returns None if candles aren't
+    available, so the caller can fall back to a fundamentals-only
+    read rather than block the whole alert on this.
+    """
+    mapping = CURRENCY_PAIR_MAP.get(currency)
+    if not mapping:
+        return None
+    pair_key = mapping["pair_key"]
+    config = PAIR_CONFIG.get(pair_key)
+    if not config:
+        return None
+    try:
+        candles = await asyncio.to_thread(get_cached_candles, pair_key, config, "1h", outputsize=30)
+        if not candles or len(candles) < 25:
+            return None
+        current = candles[-1]["close"]
+        price_4h_ago = candles[-5]["close"]
+        price_24h_ago = candles[-25]["close"]
+        change_4h_pct = ((current - price_4h_ago) / price_4h_ago) * 100
+        change_24h_pct = ((current - price_24h_ago) / price_24h_ago) * 100
+        direction_4h = "up" if change_4h_pct >= 0 else "down"
+        direction_24h = "up" if change_24h_pct >= 0 else "down"
+        return (
+            f"{config['display']} is {direction_4h} {abs(change_4h_pct):.2f}% over the last 4 hours "
+            f"and {direction_24h} {abs(change_24h_pct):.2f}% over the last 24 hours "
+            f"({'{}'.format(currency)} is the {'quote' if mapping['inverted'] else 'base'} "
+            f"currency in this pair, so weigh the direction accordingly)."
+        )
+    except Exception as e:
+        print(f"[PRE-RELEASE TECHNICAL] Couldn't compute technical context for {currency}: {e}")
+        return None
+
+
 async def generate_pre_release_bias(event, news_context):
     """
     Pre-release channel bias, per explicit instruction: grounded in
-    real Forecast/Previous numbers AND real fetched news context (a
+    real Forecast/Previous numbers, real fetched news context (a
     genuine recent article, same source the regular briefings use -
     NOT the AI's own free-associated "geopolitical awareness", which
     would just be a second version of the exact fabrication problem
-    already found and fixed once). If no real article is available
-    this round, news_context is empty and the AI is told to reason
-    from the calendar numbers alone rather than invent context to
-    fill the gap.
+    already found and fixed once), AND now also real-time technical
+    price context (see get_real_time_technical_context) - per
+    explicit instruction, since a source for genuine actual results
+    isn't reliably available, this bias needed to be scrutinized by
+    real market data, not fundamentals alone. All fed into ONE single
+    AI judgment, not stated as a separate technical opinion alongside
+    it - a second, separately-displayed reading is what caused the
+    old technical cross-check to visibly contradict the fundamental
+    call and get removed entirely; this avoids that by making it one
+    combined judgment with more real inputs, never two.
 
     Same hard rule as generate_currency_direction: this always runs
     BEFORE release, so it must never state or imply a specific actual
@@ -13093,6 +13140,13 @@ async def generate_pre_release_bias(event, news_context):
         if news_context else ""
     )
 
+    technical_context = await get_real_time_technical_context(event["currency"])
+    technical_block = (
+        f"\nREAL-TIME PRICE CONTEXT (genuine current market data - weigh this "
+        f"alongside the fundamental setup, not instead of it):\n{technical_context}\n"
+        if technical_context else ""
+    )
+
     prompt = f"""
 You are a forex fundamental analyst previewing a high-impact event
 BEFORE it releases, for a Telegram trading channel.
@@ -13101,11 +13155,16 @@ EVENT: {event['title']}
 CURRENCY: {event['currency']}
 {data_lines}
 {news_block}
+{technical_block}
 This event has NOT released yet - there is no actual result. Do not
-state, imply, or invent one. Judge only whether the SETUP (forecast
-vs previous, plus the real news context if relevant) leans BULLISH or
-BEARISH for {event['currency']}, framed as anticipation only (e.g.
-"a forecast above the previous reading would signal...").
+state, imply, or invent one. Judge whether the SETUP (forecast vs
+previous, the real news context if relevant, AND the real-time price
+context if given) leans BULLISH or BEARISH for {event['currency']},
+framed as anticipation only (e.g. "a forecast above the previous
+reading would signal..."). Weigh all the real inputs given together
+as one combined judgment - don't just restate the forecast/previous
+comparison if the real-time price context meaningfully agrees or
+disagrees with it.
 
 Respond in EXACTLY this format, nothing else, no markdown:
 DIRECTION: BULLISH or BEARISH
@@ -13708,8 +13767,8 @@ async def send_news_direction_analysis(bot, chat_id, event, batch_events=None):
         + (f"📊 {data_line}\n\n" if data_line else "")
         + f"{ai_reason}\n\n"
         f"Early lean: {emoji} {lean_word} for {pair_display}\n\n"
-        f"❗ No actual result yet — this is not a trade signal. Real "
-        f"BUY/SELL call comes the moment results are out."
+        f"❗ This is a pre-release bias based on the setup and current "
+        f"market context, not a trade signal."
     )
 
     if event_key:
@@ -13897,7 +13956,6 @@ async def check_upcoming_high_impact_news(context: ContextTypes.DEFAULT_TYPE):
             _format_event_bias_line(event, direction, reason, DEFAULT_UTC_OFFSET_MINUTES, "GMT+1")
             for event, direction, reason in event_bias_results
         )
-        + f"\n\nWe'll post the real BUY/SELL call the moment actual results are out."
     )
 
     print(f"[NEWS ALERT] Notifying for {len(group)} event(s) today, first at {earliest_time}: {[e['title'] for _, e in group]}")
@@ -13931,7 +13989,6 @@ async def check_upcoming_high_impact_news(context: ContextTypes.DEFAULT_TYPE):
                     _format_event_bias_line(event, direction, reason, offset_minutes, tz_label)
                     for event, direction, reason in event_bias_results
                 )
-                + f"\n\nWe'll post the real BUY/SELL call the moment actual results are out."
             )
             await bot.send_photo(
                 chat_id=int(uid), photo=image_url, caption=personal_alert_text,

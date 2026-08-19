@@ -15195,10 +15195,25 @@ def clean_text(text):
 # VERIFICATION GATE MESSAGE
 # ============================================
 
-async def send_verification_gate(update):
-    await update.effective_message.reply_text(
+async def send_verification_gate(update, reason_header=None):
+    # FIX: CONFIRMED REAL BUG, per explicit instruction - this message
+    # was hardcoded to always claim "you've used your 3 FREE trial
+    # signals", even when shown for a completely unrelated reason (a
+    # feature that requires verification regardless of trial status,
+    # like Exness Auto-Trade). Confirmed live: a brand-new account
+    # that had never touched Signal or News still saw this exact
+    # trial-exhaustion message the moment they tried Exness Auto-Trade
+    # - genuinely misleading, since nothing about their trial was
+    # actually the reason. reason_header defaults to the original
+    # wording, so all 12 genuinely trial-triggered call sites are
+    # completely unaffected - only the one non-trial trigger (Exness
+    # Auto-Trade) now passes its own accurate header.
+    intro = reason_header or (
         "🔐 <b>You've used your 3 FREE trial signals!</b>\n\n"
-        "Hope you loved what you saw! 🔥\n\n"
+        "Hope you loved what you saw! 🔥"
+    )
+    await update.effective_message.reply_text(
+        f"{intro}\n\n"
         "To continue enjoying <b>UNLIMITED FREE signals</b>, "
         "live market analysis and AI breakdowns — "
         "you just need <b>ONE simple step:</b>\n\n"
@@ -15451,7 +15466,9 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
             f"📰 <b>News</b> — Get a direct call on high-impact news\n\n"
             f"🔗 <b>Connect Deriv</b> — Link your Deriv account to trade "
             f"signals directly, manually or fully automatic\n\n"
-            f"<i>All three buttons are at the bottom of your screen 👇</i>",
+            f"🤖 <b>Exness Auto-Trade</b> — Subscribe to auto-trade "
+            f"directly on your own Exness MT5/MT4 account\n\n"
+            f"<i>All four buttons are at the bottom of your screen 👇</i>",
             parse_mode=ParseMode.HTML,
             reply_markup=main_keyboard
         )
@@ -16155,14 +16172,14 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         user_id = str(query.from_user.id)
 
         if not is_verified(user_id):
-            await query.message.edit_text(
-                "🔒 <b>Exness Auto-Trade requires a verified Exness "
-                "account first.</b>\n\n"
-                "One quick step below 👇",
-                parse_mode=ParseMode.HTML
-            )
             user_modes[user_id] = "awaiting_email"
-            await send_verification_gate(update)
+            await send_verification_gate(
+                update,
+                reason_header=(
+                    "🔒 <b>Exness Auto-Trade requires a verified Exness "
+                    "account first.</b>"
+                )
+            )
             return
 
         account = get_mt5_autotrade_account(user_id)
@@ -17311,7 +17328,9 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     f"📰 <b>News</b> — Get a direct call on high-impact news\n\n"
                     f"🔗 <b>Connect Deriv</b> — Link your Deriv account to trade "
                     f"signals directly, manually or fully automatic\n\n"
-                    f"<i>All three buttons are at the bottom of your screen 👇</i>"
+                    f"🤖 <b>Exness Auto-Trade</b> — Subscribe to auto-trade "
+                    f"directly on your own Exness MT5/MT4 account\n\n"
+                    f"<i>All four buttons are at the bottom of your screen 👇</i>"
                 ),
                 parse_mode=ParseMode.HTML,
                 reply_markup=main_keyboard
@@ -17406,7 +17425,9 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 f"📰 <b>News</b> — Get a direct call on high-impact news\n\n"
                 f"🔗 <b>Connect Deriv</b> — Link your Deriv account to trade "
                 f"signals directly, manually or fully automatic\n\n"
-                f"<i>All three buttons are at the bottom of your screen 👇</i>"
+                f"🤖 <b>Exness Auto-Trade</b> — Subscribe to auto-trade "
+                f"directly on your own Exness MT5/MT4 account\n\n"
+                f"<i>All four buttons are at the bottom of your screen 👇</i>"
             ),
             parse_mode=ParseMode.HTML,
             reply_markup=main_keyboard

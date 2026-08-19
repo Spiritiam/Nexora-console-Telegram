@@ -17077,7 +17077,11 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     "━━━━━━━━━━━━━━━━━━━━━\n\n"
                     "👇 <b>TAP AN OPTION BELOW TO GET STARTED:</b>\n\n"
                     "📊 <b>Signal</b> — Get a live trading signal\n\n"
-                    "📰 <b>News</b> — Get a direct call on high-impact news"
+                    "📰 <b>News</b> — Get a direct call on high-impact news\n\n"
+                    "🔗 <b>Connect Deriv</b> — Link your Deriv account to trade "
+                    "signals directly, manually or fully automatic\n\n"
+                    "🤖 <b>Exness Auto-Trade</b> — Subscribe to auto-trade "
+                    "directly on your own Exness MT5/MT4 account"
                 ),
                 parse_mode=ParseMode.HTML,
                 reply_markup=main_keyboard

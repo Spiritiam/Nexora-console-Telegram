@@ -2103,7 +2103,7 @@ BOT_USERNAME = "NexoraConsoleBot"
 # FREE TRIAL LIMIT
 # ============================================
 
-FREE_TRIAL_LIMIT = 3
+FREE_TRIAL_LIMIT = 5
 
 # ============================================
 # IMAGE FILE IDs
@@ -15209,7 +15209,7 @@ async def send_verification_gate(update, reason_intro=None):
     # second time. Defaults to the original wording, so all 12
     # genuinely trial-triggered call sites are completely unaffected.
     intro = reason_intro or (
-        "🔐 <b>You've used your 3 FREE trial signals!</b>\n\n"
+        "🔐 <b>You've used your 5 FREE trial signals!</b>\n\n"
         "Hope you loved what you saw! 🔥\n\n"
         "To continue enjoying <b>UNLIMITED FREE signals</b>, "
         "live market analysis and AI breakdowns — "
@@ -17342,7 +17342,7 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await context.bot.send_message(
             chat_id=int(user_id),
             text=(
-                "🔐 <b>You've used your 3 FREE trial signals!</b>\n\n"
+                "🔐 <b>You've used your 5 FREE trial signals!</b>\n\n"
                 "Hope you loved what you saw! 🔥\n\n"
                 "To continue enjoying <b>UNLIMITED FREE signals</b>, "
                 "live market analysis and AI breakdowns — "
@@ -18091,6 +18091,35 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if mode == "signal":
 
         requested_key = match_pair_key(message)
+
+        # FIX: CONFIRMED REAL BUG, per explicit instruction - there was
+        # no check here at all for "did we actually recognize a pair
+        # in what they typed". An unrecognized word (e.g. a typo like
+        # "caused" instead of "xauusd") fell straight through to
+        # attempting a real signal generation anyway, which then
+        # failed with the generic "Unable to fetch live market data"
+        # message - genuinely misleading, since the real problem was
+        # "didn't understand what you typed", not a data/technical
+        # failure. It ALSO silently counted as one of their 3 free
+        # trial uses (see increment_trial below) even though no real
+        # signal was ever delivered - confirmed as the likely cause of
+        # a report where someone felt their trial ran out after only 2
+        # real attempts. Now checked and handled BEFORE any trial
+        # counting happens at all, so a typo costs nothing.
+        if not requested_key:
+            sent_unrecognized = await update.message.reply_text(
+                "🤔 <b>I didn't recognize that pair.</b>\n\n"
+                "Try one of these: <b>XAUUSD</b> (Gold), <b>XAGUSD</b> "
+                "(Silver), <b>USOIL</b>, <b>BTCUSD</b>, <b>EURUSD</b>, "
+                "<b>GBPUSD</b>, <b>GBPJPY</b>, <b>USDJPY</b>, "
+                "<b>AUDUSD</b>, <b>USDCAD</b>, <b>EURJPY</b>, "
+                "<b>USDCHF</b>, or <b>NZDUSD</b>.",
+                parse_mode=ParseMode.HTML,
+                reply_markup=main_keyboard
+            )
+            schedule_auto_delete(sent_unrecognized.chat_id, sent_unrecognized.message_id)
+            return
+
         if (
             requested_key
             and requested_key != "btcusd"

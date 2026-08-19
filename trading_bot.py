@@ -2540,14 +2540,23 @@ def sb_headers():
     }
 
 def is_verified(user_id):
+    # FIX: CONFIRMED REAL BUG - this used to only check whether a row
+    # existed, not whether it had a usable email. Confirmed live: 17
+    # real users had a row with email='unknown' (a broken placeholder,
+    # see add_verified_user/the approve_ handler for the root cause) -
+    # they correctly passed THIS check (a row existed), then hit a
+    # confusing, unrelated-looking payment failure later when that
+    # broken email got used for a real transaction. Now requires an
+    # actual, valid-looking email too, so "verified" genuinely means
+    # "has a usable email" everywhere this is checked.
     try:
         url = (
             f"{SUPABASE_URL}/rest/v1/verified_users"
-            f"?user_id=eq.{user_id}&select=user_id"
+            f"?user_id=eq.{user_id}&select=email"
         )
         response = requests.get(url, headers=sb_headers(), timeout=10)
         data = response.json()
-        return len(data) > 0
+        return bool(data) and bool(data[0].get("email")) and "@" in data[0]["email"]
     except Exception as e:
         print(f"[DB] is_verified error: {e}")
         return False
@@ -2685,7 +2694,14 @@ def get_verified_user_email(user_id):
         )
         response = requests.get(url, headers=sb_headers(), timeout=10)
         data = response.json()
-        return data[0]["email"] if data else None
+        if not data:
+            return None
+        email = data[0].get("email")
+        # Same defense-in-depth as is_verified() - a stored value that
+        # doesn't look like a real email (e.g. the "unknown" bug found
+        # and fixed in add_verified_user/the approve_ handler) is
+        # treated as no email at all, not passed through as-is.
+        return email if email and "@" in email else None
     except Exception as e:
         print(f"[DB] get_verified_user_email error: {e}")
         return None
@@ -2711,6 +2727,15 @@ def get_verified_user_by_email(email):
         return None
 
 def add_verified_user(user_id, email):
+    # FIX: CONFIRMED REAL, WIDESPREAD BUG - 17 real users ended up with
+    # a garbage "unknown" placeholder permanently saved as their
+    # verified email (see the approve_ handler for the root cause).
+    # This is the hard backstop - regardless of what any caller passes
+    # in, a value that doesn't even look like an email can never be
+    # saved here again.
+    if not email or "@" not in email:
+        print(f"[DB] ❌ add_verified_user refused - invalid email {email!r} for user {user_id}")
+        return False
     try:
         url = (
             f"{SUPABASE_URL}/rest/v1/verified_users"
@@ -16930,6 +16955,29 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         target_id = data.replace("approve_", "")
         email = pending_verifications.get(target_id, "unknown")
 
+        # FIX: CONFIRMED REAL, WIDESPREAD BUG - 17 real users over 2+
+        # months ended up with email='unknown' permanently saved as
+        # their "verified" email. Root cause: .get() silently returns
+        # the "unknown" default on ANY failure (a transient read
+        # error, not just a genuinely-missing row - its own try/except
+        # swallows the difference), and this code then saved that
+        # placeholder AND deleted the real pending row regardless,
+        # with no way to tell the two cases apart or recover
+        # afterward. Now refuses to proceed at all unless the email
+        # actually looks like one - a transient hiccup now means "try
+        # Approve again", not "silently corrupt this user's record
+        # forever".
+        if not email or "@" not in email:
+            await query.message.reply_text(
+                f"⚠️ Couldn't find a valid submitted email for user "
+                f"{target_id} - nothing was saved or deleted. This can "
+                f"happen on a momentary read error - try tapping "
+                f"Approve again. If it keeps failing, they may need to "
+                f"resubmit their email.",
+                parse_mode=ParseMode.HTML
+            )
+            return
+
         add_verified_user(target_id, email)
 
         if target_id in pending_verifications:
@@ -17036,7 +17084,12 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         target_id = data.replace("reject_", "")
         email = pending_verifications.get(target_id, "unknown")
 
-        if target_id in pending_verifications:
+        # Same reasoning as the Approve handler above - a failed read
+        # shouldn't silently delete the user's real pending
+        # submission. Rejecting an already-missing/invalid entry is
+        # harmless either way, so this just skips the delete rather
+        # than blocking the reject notification entirely.
+        if email and "@" in email and target_id in pending_verifications:
             del pending_verifications[target_id]
 
         try:

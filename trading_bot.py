@@ -15195,28 +15195,28 @@ def clean_text(text):
 # VERIFICATION GATE MESSAGE
 # ============================================
 
-async def send_verification_gate(update, reason_header=None):
+async def send_verification_gate(update, reason_intro=None):
     # FIX: CONFIRMED REAL BUG, per explicit instruction - this message
     # was hardcoded to always claim "you've used your 3 FREE trial
-    # signals", even when shown for a completely unrelated reason (a
+    # signals" AND to always talk about "unlimited signals/analysis/
+    # breakdowns", even when shown for a completely unrelated reason (a
     # feature that requires verification regardless of trial status,
-    # like Exness Auto-Trade). Confirmed live: a brand-new account
-    # that had never touched Signal or News still saw this exact
-    # trial-exhaustion message the moment they tried Exness Auto-Trade
-    # - genuinely misleading, since nothing about their trial was
-    # actually the reason. reason_header defaults to the original
-    # wording, so all 12 genuinely trial-triggered call sites are
-    # completely unaffected - only the one non-trial trigger (Exness
-    # Auto-Trade) now passes its own accurate header.
-    intro = reason_header or (
+    # like Exness Auto-Trade). reason_intro now owns the WHOLE opening
+    # (through "...one simple step:"), not just the first line - so a
+    # custom reason gets one clean, complete, non-redundant intro
+    # instead of its own header awkwardly followed by a mismatched
+    # "continue enjoying signals" line repeating "one simple step" a
+    # second time. Defaults to the original wording, so all 12
+    # genuinely trial-triggered call sites are completely unaffected.
+    intro = reason_intro or (
         "🔐 <b>You've used your 3 FREE trial signals!</b>\n\n"
-        "Hope you loved what you saw! 🔥"
+        "Hope you loved what you saw! 🔥\n\n"
+        "To continue enjoying <b>UNLIMITED FREE signals</b>, "
+        "live market analysis and AI breakdowns — "
+        "you just need <b>ONE simple step:</b>"
     )
     await update.effective_message.reply_text(
         f"{intro}\n\n"
-        "To continue enjoying <b>UNLIMITED FREE signals</b>, "
-        "live market analysis and AI breakdowns — "
-        "you just need <b>ONE simple step:</b>\n\n"
         "━━━━━━━━━━━━━━━━━━━━━\n"
         "🔓 <b>HOW TO UNLOCK FULL ACCESS</b>\n"
         "━━━━━━━━━━━━━━━━━━━━━\n\n"
@@ -16175,9 +16175,10 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             user_modes[user_id] = "awaiting_email"
             await send_verification_gate(
                 update,
-                reason_header=(
-                    "🔒 <b>Exness Auto-Trade requires a verified Exness "
-                    "account first.</b>"
+                reason_intro=(
+                    "🔒 <b>Exness auto trade requires a verified Exness "
+                    "account first to continue the connection process</b> "
+                    "— you just need <b>one simple step:</b>"
                 )
             )
             return

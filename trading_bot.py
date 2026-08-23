@@ -15883,6 +15883,17 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         print(f"[CALLBACK] query.answer() failed (likely a stale/expired query): {e}")
     data = query.data
 
+    if data == "trial_verify_now":
+        # Per explicit instruction - the fix for someone tapping
+        # "Verify My Exness Account" on the trial-remaining notice.
+        # Correctly sets awaiting_email BEFORE they type anything, so
+        # their email lands in the right handler instead of getting
+        # misread as a trading pair.
+        user_id = str(query.from_user.id)
+        user_modes[user_id] = "awaiting_email"
+        await send_verification_gate(update)
+        return
+
     if data == "show_main_menu":
         user_id = str(query.from_user.id)
         if is_verified(user_id):
@@ -17761,6 +17772,23 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
     username = update.message.from_user.username or "Trader"
     message = update.message.text.strip()
 
+    # FIX, per explicit instruction: an unverified user who types their
+    # email directly - a completely reasonable reaction to the trial-
+    # remaining notice inviting verification, especially for anyone who
+    # doesn't use the new Verify button - used to have it silently
+    # misrouted into whatever mode happened to be active (e.g. signal-
+    # mode pair matching), since the "awaiting_email" handler below only
+    # fires when that mode was already explicitly set. This catches an
+    # email-shaped message in ANY mode and redirects it correctly,
+    # regardless of how they got here. Only for unverified users, and
+    # only when not already in a mode that owns this exact turn's input.
+    if (
+        not is_verified(user_id)
+        and user_modes.get(user_id) not in ("awaiting_email", "awaiting_timezone_location")
+        and re.match(r"^[^\s@]+@[^\s@]+\.[^\s@]+$", message)
+    ):
+        user_modes[user_id] = "awaiting_email"
+
     if user_modes.get(user_id) == "awaiting_timezone_location":
         # Any text here (in practice, the "Skip" button) means: use
         # the default WAT offset and stop asking - saved explicitly so
@@ -18196,6 +18224,17 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
             if not is_verified(user_id):
                 remaining = trial_remaining(user_id)
                 if remaining > 0:
+                    # FIX, per explicit instruction: this message invited
+                    # verification ("Verify your Exness account...") but
+                    # gave no actual way to start it - someone who just
+                    # typed their email right then (a completely
+                    # reasonable reaction to this exact message) had it
+                    # misrouted into signal-mode pair matching instead,
+                    # since user_modes was never set to "awaiting_email"
+                    # here. This explicit button sets that mode correctly
+                    # before they type anything, so verifying early -
+                    # before finishing all free trials - now actually
+                    # works via the tap.
                     sent_trial_notice = await update.message.reply_text(
                         f"⚡ <b>You have {remaining} free trial "
                         f"signal(s) remaining.</b>\n\n"
@@ -18204,7 +18243,9 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
                         f"📊 <b>Signal</b> — Get another signal\n"
                         f"📰 <b>News</b> — Get a direct call on high-impact news",
                         parse_mode=ParseMode.HTML,
-                        reply_markup=main_keyboard
+                        reply_markup=InlineKeyboardMarkup([
+                            [InlineKeyboardButton("✅ Verify My Exness Account", callback_data="trial_verify_now")]
+                        ])
                     )
                     schedule_auto_delete(sent_trial_notice.chat_id, sent_trial_notice.message_id)
                 else:
@@ -18631,6 +18672,10 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if not is_verified(user_id):
             remaining = trial_remaining(user_id)
             if remaining > 0:
+                # Same fix as the Signal-side trial notice, per explicit
+                # instruction - a real, tappable way to start
+                # verification early, instead of inviting it with no
+                # actual path to act on it.
                 sent_trial_notice = await update.message.reply_text(
                     f"⚡ <b>You have {remaining} free trial "
                     f"signal(s) remaining.</b>\n\n"
@@ -18639,7 +18684,9 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     f"📊 <b>Signal</b> — Get a live trading signal\n"
                     f"📰 <b>News</b> — Get a direct call on high-impact news",
                     parse_mode=ParseMode.HTML,
-                    reply_markup=main_keyboard
+                    reply_markup=InlineKeyboardMarkup([
+                        [InlineKeyboardButton("✅ Verify My Exness Account", callback_data="trial_verify_now")]
+                    ])
                 )
                 schedule_auto_delete(sent_trial_notice.chat_id, sent_trial_notice.message_id)
             else:

@@ -108,6 +108,23 @@ KORAPAY_BASE_URL = "https://api.korapay.com/merchant/api/v1"
 # to. This bot has never needed a public HTTP endpoint before now.
 KORAPAY_WEBHOOK_URL = os.getenv("KORAPAY_WEBHOOK_URL")
 
+# NOWPayments - added as a SECOND, alternative payment option
+# alongside KoraPay, per explicit instruction, NOT a replacement.
+# KoraPay doesn't support payment from customers outside supported
+# countries; crypto sidesteps that restriction structurally, since
+# there's no "which countries can pay" list the way card processors
+# have. Person picks whichever one actually works for them. Same
+# pattern as KORAPAY_SECRET_KEY above - never hardcode, always a
+# Railway environment variable.
+NOWPAYMENTS_API_KEY = os.getenv("NOWPAYMENTS_API_KEY")
+NOWPAYMENTS_IPN_SECRET = os.getenv("NOWPAYMENTS_IPN_SECRET")
+NOWPAYMENTS_BASE_URL = "https://api.nowpayments.io/v1"
+
+# Same reasoning as KORAPAY_WEBHOOK_URL above - set this AFTER
+# exposing this Railway service publicly, e.g.
+# "https://your-service.up.railway.app/nowpayments-webhook".
+NOWPAYMENTS_WEBHOOK_URL = os.getenv("NOWPAYMENTS_WEBHOOK_URL")
+
 # $50/month, confirmed by SpiritFX. NOTE: KoraPay's documented amount
 # format for NGN/GHS/KES is the currency's own base unit (e.g. 50000
 # means ₦50,000, not kobo) - USD wasn't explicitly confirmed either
@@ -376,6 +393,116 @@ def mark_korapay_transaction_processed(reference):
         requests.patch(url, headers=sb_headers(), json={"processed": True}, timeout=10)
     except Exception as e:
         print(f"[KORAPAY DB] mark_korapay_transaction_processed error: {e}")
+
+
+async def nowpayments_initialize_payment(user_id, order_id):
+    """
+    Starts a NOWPayments crypto payment for the MT5 auto-trade
+    subscription - the crypto ALTERNATIVE to korapay_initialize_charge
+    above, per explicit instruction (added alongside KoraPay, not
+    replacing it). Returns the invoice_url to send the user, or None
+    on failure. Uses POST /v1/invoice (a hosted checkout page showing
+    a QR code + address, letting the customer pick from 350+
+    cryptocurrencies) rather than POST /v1/payment (which would
+    require this bot to pick ONE specific coin upfront) - matches the
+    same "hand the user one URL to open" shape KoraPay's checkout_url
+    already provides, so the rest of the flow (button + webhook +
+    processing job) can follow an identical pattern.
+    """
+    if not NOWPAYMENTS_API_KEY:
+        print("[NOWPAYMENTS] NOWPAYMENTS_API_KEY not configured.")
+        return None
+    if not MT5_AUTOTRADE_MONTHLY_FEE:
+        print("[NOWPAYMENTS] MT5_AUTOTRADE_MONTHLY_FEE not set yet - waiting on the real price from SpiritFX.")
+        return None
+    try:
+        response = await asyncio.to_thread(
+            requests.post,
+            f"{NOWPAYMENTS_BASE_URL}/invoice",
+            headers={"x-api-key": NOWPAYMENTS_API_KEY, "Content-Type": "application/json"},
+            json={
+                "price_amount": MT5_AUTOTRADE_MONTHLY_FEE,
+                # NOWPayments prices in USD/major fiat, not NGN - per
+                # explicit instruction this is a genuinely separate
+                # payment rail from KoraPay, not a currency-converted
+                # mirror of it. MT5_AUTOTRADE_MONTHLY_FEE is already
+                # the real USD-equivalent price confirmed elsewhere in
+                # this file; NOWPayments converts to whichever crypto
+                # the customer picks at checkout.
+                "price_currency": "usd",
+                "order_id": order_id,
+                "order_description": "Nexora AI - Exness Auto-Trade Subscription",
+                "ipn_callback_url": NOWPAYMENTS_WEBHOOK_URL,
+            },
+            timeout=15,
+        )
+        data = response.json()
+        if data.get("invoice_url"):
+            return data["invoice_url"]
+        print(f"[NOWPAYMENTS] Invoice creation failed: {data}")
+        return None
+    except Exception as e:
+        print(f"[NOWPAYMENTS] Invoice creation error: {e}")
+        return None
+
+
+def verify_nowpayments_signature(data_dict, signature_header):
+    """
+    Confirms an IPN callback genuinely came from NOWPayments, per
+    their documented scheme - an HMAC-SHA512 of the JSON-encoded
+    payload, signed with the IPN Secret Key, compared against the
+    x-nowpayments-sig header. Same non-negotiable rule as
+    verify_korapay_signature above: never trust a webhook without
+    this check.
+
+    IMPORTANT DIFFERENCE from verify_korapay_signature: NOWPayments'
+    documented scheme requires the JSON keys to be SORTED
+    alphabetically before signing (confirmed in their own IPN docs) -
+    unlike KoraPay, which just re-serializes in parsed order. Getting
+    this wrong is the single most common integration mistake reported
+    for this API, so sort_keys=True here is deliberate, not
+    incidental.
+    """
+    if not NOWPAYMENTS_IPN_SECRET or not signature_header:
+        return False
+    computed = hmac.new(
+        NOWPAYMENTS_IPN_SECRET.encode(),
+        json.dumps(data_dict, sort_keys=True, separators=(",", ":")).encode(),
+        hashlib.sha512,
+    ).hexdigest()
+    return hmac.compare_digest(computed, signature_header)
+
+
+def log_nowpayments_transaction(order_id, user_id, amount, currency):
+    try:
+        url = f"{SUPABASE_URL}/rest/v1/nowpayments_transactions"
+        requests.post(url, headers=sb_headers(), json={
+            "order_id": order_id, "user_id": user_id,
+            "amount": amount, "currency": currency, "status": "pending"
+        }, timeout=10)
+    except Exception as e:
+        print(f"[NOWPAYMENTS DB] log_nowpayments_transaction error: {e}")
+
+
+def get_unprocessed_confirmed_nowpayments_transactions():
+    try:
+        url = (
+            f"{SUPABASE_URL}/rest/v1/nowpayments_transactions"
+            f"?status=eq.finished&processed=eq.false&select=*"
+        )
+        response = requests.get(url, headers=sb_headers(), timeout=10)
+        return response.json()
+    except Exception as e:
+        print(f"[NOWPAYMENTS DB] get_unprocessed_confirmed_nowpayments_transactions error: {e}")
+        return []
+
+
+def mark_nowpayments_transaction_processed(order_id):
+    try:
+        url = f"{SUPABASE_URL}/rest/v1/nowpayments_transactions?order_id=eq.{order_id}"
+        requests.patch(url, headers=sb_headers(), json={"processed": True}, timeout=10)
+    except Exception as e:
+        print(f"[NOWPAYMENTS DB] mark_nowpayments_transaction_processed error: {e}")
 
 
 def get_mt5_autotrade_account(user_id):
@@ -1786,6 +1913,49 @@ async def korapay_webhook_handler(request):
     return web.Response(status=200, text="ok")
 
 
+async def nowpayments_webhook_handler(request):
+    """
+    Receives NOWPayments' IPN callback - the crypto counterpart to
+    korapay_webhook_handler above, per explicit instruction. Same
+    minimal-handler rule: verify the signature, update the database,
+    nothing else. The actual user notification and subscription
+    activation happens separately, in
+    process_confirmed_nowpayments_payments, on the bot's own event
+    loop via job_queue - exactly mirroring the KoraPay flow.
+
+    NOWPayments sends the signature as x-nowpayments-sig (not
+    x-korapay-signature), and signs the WHOLE payload (not a nested
+    "data" object the way KoraPay does) - the body IS the data here.
+    payment_status moves through several states (waiting, confirming,
+    confirmed, sending, finished, failed, refunded, expired) - only
+    "finished" means the money has genuinely settled; earlier states
+    are real but not yet complete, so nothing is confirmed on those.
+    """
+    try:
+        payload = await request.json()
+    except Exception:
+        return web.Response(status=400, text="bad request")
+
+    signature = request.headers.get("x-nowpayments-sig", "")
+    if not verify_nowpayments_signature(payload, signature):
+        print("[NOWPAYMENTS WEBHOOK] ❌ Signature verification failed - ignoring, possible spoofed request.")
+        return web.Response(status=401, text="invalid signature")
+
+    if payload.get("payment_status") == "finished":
+        order_id = payload.get("order_id")
+        print(f"[NOWPAYMENTS WEBHOOK] ✅ Payment confirmed for order {order_id}")
+        try:
+            url = f"{SUPABASE_URL}/rest/v1/nowpayments_transactions?order_id=eq.{order_id}"
+            requests.patch(url, headers=sb_headers(), json={
+                "status": "finished",
+                "confirmed_at": datetime.utcnow().isoformat(),
+            }, timeout=10)
+        except Exception as e:
+            print(f"[NOWPAYMENTS WEBHOOK] DB update failed: {e}")
+
+    return web.Response(status=200, text="ok")
+
+
 def render_deriv_oauth_page(heading, message, kind="info", emoji=None):
     """
     Shared styled page for every deriv_oauth_callback_handler response
@@ -1983,6 +2153,7 @@ def run_korapay_webhook_server():
     """
     webhook_app = web.Application()
     webhook_app.router.add_post("/korapay-webhook", korapay_webhook_handler)
+    webhook_app.router.add_post("/nowpayments-webhook", nowpayments_webhook_handler)
     webhook_app.router.add_get("/deriv-oauth-callback", deriv_oauth_callback_handler)
     port = int(os.getenv("PORT", 8080))
     print(f"[KORAPAY WEBHOOK] Starting webhook server on port {port}...")
@@ -2094,6 +2265,63 @@ async def process_confirmed_korapay_payments(context: ContextTypes.DEFAULT_TYPE)
                 )
         except Exception as e:
             print(f"[MT5 AUTOTRADE] ❌ Failed to process payment for {user_id}: {e}")
+
+
+async def process_confirmed_nowpayments_payments(context: ContextTypes.DEFAULT_TYPE):
+    """
+    Runs every ~20 seconds on the bot's own event loop - the crypto
+    counterpart to process_confirmed_korapay_payments above, per
+    explicit instruction. Identical activation logic and identical
+    user-facing messages, since a subscriber shouldn't be able to
+    tell which payment rail they used once it's confirmed - only the
+    tracking key differs (order_id here vs reference for KoraPay).
+    """
+    transactions = get_unprocessed_confirmed_nowpayments_transactions()
+    if not transactions:
+        return
+
+    bot = context.bot
+    for txn in transactions:
+        user_id = txn.get("user_id")
+        order_id = txn.get("order_id")
+        if not user_id or not order_id:
+            continue
+        try:
+            expires_at = (datetime.utcnow() + timedelta(days=MT5_SUBSCRIPTION_DAYS)).isoformat()
+            account = get_mt5_autotrade_account(user_id)
+            upsert_mt5_autotrade_account(user_id, {"subscription_expires_at": expires_at})
+            mark_nowpayments_transaction_processed(order_id)
+            print(f"[MT5 AUTOTRADE] ✅ Subscription activated for {user_id} until {expires_at} (paid via crypto)")
+
+            if account and account.get("metaapi_account_id"):
+                await bot.send_message(
+                    chat_id=int(user_id),
+                    text=(
+                        "✅ <b>Payment confirmed!</b>\n\n"
+                        f"Your MT5 auto-trade subscription is active "
+                        f"for {MT5_SUBSCRIPTION_DAYS} more days.\n\n"
+                        "Keep using your current trading account, or "
+                        "connect a different one?"
+                    ),
+                    parse_mode=ParseMode.HTML,
+                    reply_markup=InlineKeyboardMarkup([
+                        [InlineKeyboardButton("✅ Keep current account", callback_data="mt5renew_keep")],
+                        [InlineKeyboardButton("🔄 Connect a new account", callback_data="mt5renew_new")],
+                    ])
+                )
+            else:
+                user_modes[user_id] = "mt5_awaiting_account_number"
+                await bot.send_message(
+                    chat_id=int(user_id),
+                    text=(
+                        "✅ <b>Payment confirmed!</b>\n\n"
+                        "Now let's connect your Exness MT5/MT4 account.\n\n"
+                        "Send your <b>account number</b>:"
+                    ),
+                    parse_mode=ParseMode.HTML
+                )
+        except Exception as e:
+            print(f"[MT5 AUTOTRADE] ❌ Failed to process crypto payment for {user_id}: {e}")
 
 
 async def process_pending_deriv_oauth_connections(context: ContextTypes.DEFAULT_TYPE):
@@ -16440,24 +16668,14 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         subscribed = expiry is not None and now < expiry
 
         if not subscribed:
-            email = get_verified_user_email(user_id)
-            reference = f"MT5AUTO-{user_id}-{int(time.time())}"
-            checkout_url = await korapay_initialize_charge(user_id, email or f"{user_id}@nexoraai.temp", reference)
-            if not checkout_url:
-                await query.message.edit_text(
-                    "⚠️ <b>Couldn't start the payment right now.</b> "
-                    "Please try again shortly.",
-                    parse_mode=ParseMode.HTML
-                )
-                return
-            log_korapay_transaction(reference, user_id, MT5_AUTOTRADE_MONTHLY_FEE, MT5_AUTOTRADE_CURRENCY)
-
             # Persist the bot/pair/lot-risk choices NOW, before payment
             # confirms - per explicit instruction, these are collected
-            # BEFORE payment, so they must survive until the KoraPay
-            # webhook + process_confirmed_korapay_payments job actually
-            # activates the subscription (which happens independently,
-            # possibly minutes later).
+            # BEFORE payment, so they must survive until whichever
+            # payment rail's confirmation job actually activates the
+            # subscription (which happens independently, possibly
+            # minutes later). Moved here (out of the KoraPay-specific
+            # block below) since this must happen regardless of which
+            # payment method gets chosen next.
             signup = mt5_signup_state.get(user_id, {})
             account_fields = {
                 "bot_choice": signup.get("bot_choice", "follow_channel"),
@@ -16478,12 +16696,19 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 })
             upsert_mt5_autotrade_account(user_id, account_fields)
 
+            # Per explicit instruction: crypto added as a SECOND,
+            # alternative payment option alongside KoraPay, not a
+            # replacement - if KoraPay doesn't work for someone (e.g.
+            # their country isn't supported), they can try crypto
+            # instead, without needing to start the whole flow over.
             await query.message.edit_text(
                 f"🤖 <b>Exness Auto-Trade — {MT5_SUBSCRIPTION_DAYS}-day subscription</b>\n\n"
-                f"Tap below to pay. Your MT5 connection will unlock "
-                f"automatically once payment is confirmed.",
+                f"Choose how you'd like to pay:",
                 parse_mode=ParseMode.HTML,
-                reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("💳 Pay Now", url=checkout_url)]])
+                reply_markup=InlineKeyboardMarkup([
+                    [InlineKeyboardButton("💳 Pay with Card", callback_data="mt5auto_pay_card")],
+                    [InlineKeyboardButton("₿ Pay with Crypto", callback_data="mt5auto_pay_crypto")],
+                ])
             )
             return
 
@@ -16537,6 +16762,58 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 [InlineKeyboardButton("🔄 Switch bot / signal mode", callback_data="mt5switch_menu")],
                 [toggle_button],
             ])
+        )
+        return
+
+    if data == "mt5auto_pay_card":
+        # Per explicit instruction - the KoraPay half of the two
+        # payment options. Same logic mt5auto_continue used to do
+        # directly, just split into its own handler now that there's
+        # a real choice to make first.
+        user_id = str(query.from_user.id)
+        email = get_verified_user_email(user_id)
+        reference = f"MT5AUTO-{user_id}-{int(time.time())}"
+        checkout_url = await korapay_initialize_charge(user_id, email or f"{user_id}@nexoraai.temp", reference)
+        if not checkout_url:
+            await query.message.edit_text(
+                "⚠️ <b>Couldn't start the payment right now.</b> "
+                "Please try again shortly.",
+                parse_mode=ParseMode.HTML
+            )
+            return
+        log_korapay_transaction(reference, user_id, MT5_AUTOTRADE_MONTHLY_FEE, MT5_AUTOTRADE_CURRENCY)
+
+        await query.message.edit_text(
+            f"🤖 <b>Exness Auto-Trade — {MT5_SUBSCRIPTION_DAYS}-day subscription</b>\n\n"
+            f"Tap below to pay. Your MT5 connection will unlock "
+            f"automatically once payment is confirmed.",
+            parse_mode=ParseMode.HTML,
+            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("💳 Pay Now", url=checkout_url)]])
+        )
+        return
+
+    if data == "mt5auto_pay_crypto":
+        # Per explicit instruction - the NOWPayments half of the two
+        # payment options, for anyone KoraPay doesn't work for.
+        user_id = str(query.from_user.id)
+        order_id = f"MT5AUTO-{user_id}-{int(time.time())}"
+        invoice_url = await nowpayments_initialize_payment(user_id, order_id)
+        if not invoice_url:
+            await query.message.edit_text(
+                "⚠️ <b>Couldn't start the crypto payment right now.</b> "
+                "Please try again shortly, or try paying with card instead.",
+                parse_mode=ParseMode.HTML
+            )
+            return
+        log_nowpayments_transaction(order_id, user_id, MT5_AUTOTRADE_MONTHLY_FEE, "usd")
+
+        await query.message.edit_text(
+            f"🤖 <b>Exness Auto-Trade — {MT5_SUBSCRIPTION_DAYS}-day subscription</b>\n\n"
+            f"Tap below to pay with crypto (350+ coins accepted). "
+            f"Your MT5 connection will unlock automatically once "
+            f"payment is confirmed on the blockchain.",
+            parse_mode=ParseMode.HTML,
+            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("₿ Pay with Crypto", url=invoice_url)]])
         )
         return
 
@@ -21156,6 +21433,16 @@ def main():
         interval=20,
         first=15,
         name="mt5_autotrade_payment_processing"
+    )
+
+    # Crypto counterpart to the KoraPay job above, per explicit
+    # instruction - added as a second payment option, not a
+    # replacement, so both need their own confirmation processing.
+    job_queue.run_repeating(
+        process_confirmed_nowpayments_payments,
+        interval=20,
+        first=15,
+        name="mt5_autotrade_crypto_payment_processing"
     )
 
     # Deriv OAuth: picks up what deriv_oauth_callback_handler already

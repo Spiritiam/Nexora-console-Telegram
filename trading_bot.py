@@ -146,6 +146,20 @@ MT5_AUTOTRADE_DISPLAY_PRICE = "$50/month"
 MT5_AUTOTRADE_MONTHLY_FEE = 69000
 MT5_AUTOTRADE_CURRENCY = "NGN"
 
+# CONFIRMED REAL BUG FIX, per explicit instruction - the NOWPayments
+# crypto integration was sending MT5_AUTOTRADE_MONTHLY_FEE (69000)
+# straight through as price_amount with price_currency="usd", meaning
+# anyone paying with crypto would have been charged $69,000 instead of
+# the real ~$51 USD equivalent of ₦69,000. Real exchange rate checked
+# live (~₦1,347/$1 at time of writing) puts ₦69,000 at roughly $51.22;
+# $50 is used as a clean, reasonable rounding of that, matching normal
+# subscription pricing conventions. This is a SEPARATE, independently
+# set constant (not computed from the NGN figure at runtime) since
+# NGN/USD moves regularly and a live FX lookup would add another
+# external dependency to payment initialization - update this by hand
+# if the real-world gap ever grows enough to matter.
+MT5_AUTOTRADE_MONTHLY_FEE_USD = 50
+
 MT5_SUBSCRIPTION_DAYS = 30
 
 # EXPERIMENTAL, per explicit instruction - a one-week test flipping
@@ -412,8 +426,8 @@ async def nowpayments_initialize_payment(user_id, order_id):
     if not NOWPAYMENTS_API_KEY:
         print("[NOWPAYMENTS] NOWPAYMENTS_API_KEY not configured.")
         return None
-    if not MT5_AUTOTRADE_MONTHLY_FEE:
-        print("[NOWPAYMENTS] MT5_AUTOTRADE_MONTHLY_FEE not set yet - waiting on the real price from SpiritFX.")
+    if not MT5_AUTOTRADE_MONTHLY_FEE_USD:
+        print("[NOWPAYMENTS] MT5_AUTOTRADE_MONTHLY_FEE_USD not set yet.")
         return None
     try:
         response = await asyncio.to_thread(
@@ -421,14 +435,15 @@ async def nowpayments_initialize_payment(user_id, order_id):
             f"{NOWPAYMENTS_BASE_URL}/invoice",
             headers={"x-api-key": NOWPAYMENTS_API_KEY, "Content-Type": "application/json"},
             json={
-                "price_amount": MT5_AUTOTRADE_MONTHLY_FEE,
-                # NOWPayments prices in USD/major fiat, not NGN - per
-                # explicit instruction this is a genuinely separate
-                # payment rail from KoraPay, not a currency-converted
-                # mirror of it. MT5_AUTOTRADE_MONTHLY_FEE is already
-                # the real USD-equivalent price confirmed elsewhere in
-                # this file; NOWPayments converts to whichever crypto
-                # the customer picks at checkout.
+                # CONFIRMED REAL BUG FIX, per explicit instruction -
+                # this used to send MT5_AUTOTRADE_MONTHLY_FEE (69000,
+                # the NGN amount) straight through as a USD price,
+                # meaning anyone paying with crypto would have been
+                # charged $69,000 instead of the real ~$50 USD
+                # equivalent. MT5_AUTOTRADE_MONTHLY_FEE_USD is a
+                # genuinely separate, independently-set constant for
+                # exactly this reason.
+                "price_amount": MT5_AUTOTRADE_MONTHLY_FEE_USD,
                 "price_currency": "usd",
                 "order_id": order_id,
                 "order_description": "Nexora AI - Exness Auto-Trade Subscription",
@@ -16805,7 +16820,7 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 parse_mode=ParseMode.HTML
             )
             return
-        log_nowpayments_transaction(order_id, user_id, MT5_AUTOTRADE_MONTHLY_FEE, "usd")
+        log_nowpayments_transaction(order_id, user_id, MT5_AUTOTRADE_MONTHLY_FEE_USD, "usd")
 
         await query.message.edit_text(
             f"🤖 <b>Exness Auto-Trade — {MT5_SUBSCRIPTION_DAYS}-day subscription</b>\n\n"

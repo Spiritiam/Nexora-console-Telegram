@@ -8190,10 +8190,13 @@ def get_price_history_1h(symbol, config=None):
 # of how many people request that pair.
 # ============================================
 
-def get_cached_price_data(pair_key, symbol, config, source_tracker=None):
+def get_cached_price_data(pair_key, symbol, config, source_tracker=None, force_fresh=False):
+    # force_fresh: same reasoning as get_cached_candles - used only by
+    # the scheduled signal path's mismatch-retry loop, so a retry
+    # doesn't just read back the same cached price for up to an hour.
     now = time.time()
     cached = price_cache.get(pair_key)
-    if cached and (now - cached["timestamp"] < PRICE_CACHE_SECONDS):
+    if not force_fresh and cached and (now - cached["timestamp"] < PRICE_CACHE_SECONDS):
         # A cache hit skips calling get_live_price entirely, so the
         # tracker has to be filled from the CACHED source instead -
         # otherwise a cache hit would silently look like "unknown
@@ -8447,7 +8450,7 @@ METAAPI_FIRST_PAIRS = {
 }
 
 
-def get_cached_candles(pair_key, config, interval, outputsize=60):
+def get_cached_candles(pair_key, config, interval, outputsize=60, force_fresh=False):
     """
     CONFIRMED REAL BUG FIX: cache_key previously omitted outputsize
     entirely (f"{pair_key}_{interval}"), so whichever call happened
@@ -8467,12 +8470,20 @@ def get_cached_candles(pair_key, config, interval, outputsize=60):
     key means a 60-candle cache entry and a 210-candle cache entry
     are now tracked as genuinely separate things, each fetched fresh
     when first needed at that specific size.
+
+    force_fresh: per explicit instruction, used ONLY by the scheduled
+    signal path's mismatch-retry loop - candles are normally cached
+    for up to an hour, so a retry within that same window would
+    otherwise silently read back the exact same (possibly still-
+    mismatched) candles instead of giving MetaAPI a genuine chance to
+    have recovered. Skips the cache read AND overwrites the cache
+    entry with the fresh result, so later callers benefit too.
     """
     cache_key = f"{pair_key}_{interval}_{outputsize}"
     now = time.time()
     ttl = CANDLE_CACHE_SECONDS.get(interval, 3600)
     cached = candle_cache.get(cache_key)
-    if cached and (now - cached["timestamp"] < ttl):
+    if not force_fresh and cached and (now - cached["timestamp"] < ttl):
         return cached["candles"]
 
     if pair_key in METAAPI_FIRST_PAIRS and config.get("mt5_symbol"):
@@ -12170,7 +12181,7 @@ def generate_signal_narrative(display_name, direction, winning_votes):
 # rare case where no usable candle data exists.
 # ============================================
 
-async def build_signal_response(question, user_id=None):
+async def build_signal_response(question, user_id=None, retry_mismatch=False):
     matched_key = match_pair_key(question)
 
     if matched_key is None:
@@ -12220,6 +12231,24 @@ async def build_signal_response(question, user_id=None):
     # a signal ever gets built, and refuses to trade on it - same
     # principle as every other honest-failure path in this function,
     # never show a chart we can't stand behind.
+    #
+    # retry_mismatch, per explicit instruction: manual DM requests
+    # (retry_mismatch=False, the default) get an INSTANT answer either
+    # way - refuse immediately on a mismatch, exactly as before, since
+    # making someone wait up to 2 minutes for a signal they asked for
+    # right now would recreate the exact "bot feels frozen" problem
+    # already fixed once. Scheduled auto-posts (retry_mismatch=True)
+    # can afford to wait - nobody's watching a loading spinner for a
+    # background job - so instead of refusing on the first mismatch,
+    # this re-fetches BOTH price and candles fresh (force_fresh=True,
+    # bypassing the cache entirely - a retry that just reads back the
+    # same cached values would never give MetaAPI a real chance to
+    # have recovered) every 20 seconds for up to 2 minutes total. If
+    # it clears within that window, the signal goes out clean. If
+    # it's STILL mismatched after the full 2 minutes, it sends anyway
+    # rather than skip the scheduled post entirely - the existing
+    # chart-anchoring safety net (the synthetic live point) still
+    # keeps the chart's last point honest even then.
     price_source_tracker = {}
     current_price, price_1h_ago = await asyncio.to_thread(
         get_cached_price_data, matched_key, symbol, config, price_source_tracker
@@ -12241,21 +12270,64 @@ async def build_signal_response(question, user_id=None):
     h4_candles = await asyncio.to_thread(get_cached_candles, matched_key, config, "4h", outputsize=60)
     daily_candles = await asyncio.to_thread(get_cached_candles, matched_key, config, "1day", outputsize=10)
 
-    if (
-        price_source_tracker.get("source") in ("oil_api", "metals_api")
-        and h1_candles
-    ):
-        last_real_close = h1_candles[-1]["close"]
-        if last_real_close:
-            gap_pct = abs(live_price - last_real_close) / last_real_close * 100
-            if gap_pct > 1.5:
-                print(
-                    f"[SIGNAL] ❌ {pair_name}: live price ({live_price}) from "
-                    f"{price_source_tracker['source']} disagrees with the last "
-                    f"candle close ({last_real_close}) by {gap_pct:.2f}% - "
-                    f"refusing to build a signal on a chart/price mismatch."
-                )
-                return None, None, "PRICE_SOURCE_MISMATCH", None
+    def _mismatch_gap_pct():
+        if price_source_tracker.get("source") in ("oil_api", "metals_api") and h1_candles:
+            last_real_close = h1_candles[-1]["close"]
+            if last_real_close:
+                return abs(live_price - last_real_close) / last_real_close * 100
+        return 0
+
+    gap_pct = _mismatch_gap_pct()
+
+    if gap_pct > 1.5 and not retry_mismatch:
+        print(
+            f"[SIGNAL] ❌ {pair_name}: live price ({live_price}) from "
+            f"{price_source_tracker['source']} disagrees with the last "
+            f"candle close by {gap_pct:.2f}% - refusing to build a "
+            f"signal on a chart/price mismatch (manual request, "
+            f"instant refuse per explicit instruction)."
+        )
+        return None, None, "PRICE_SOURCE_MISMATCH", None
+
+    elif gap_pct > 1.5 and retry_mismatch:
+        retry_budget_seconds = 120
+        retry_interval_seconds = 20
+        elapsed = 0
+        while gap_pct > 1.5 and elapsed < retry_budget_seconds:
+            print(
+                f"[SIGNAL] ⏳ {pair_name}: price/chart mismatch "
+                f"({gap_pct:.2f}%) - retrying in {retry_interval_seconds}s "
+                f"({elapsed}s/{retry_budget_seconds}s elapsed, scheduled "
+                f"post can wait for MetaAPI to recover)."
+            )
+            await asyncio.sleep(retry_interval_seconds)
+            elapsed += retry_interval_seconds
+
+            price_source_tracker = {}
+            current_price, price_1h_ago = await asyncio.to_thread(
+                get_cached_price_data, matched_key, symbol, config, price_source_tracker, True
+            )
+            if current_price is None:
+                print(f"[SIGNAL] ❌ Could not get live price for {pair_name} during retry")
+                return None, None, None, None
+            live_price = current_price
+
+            h1_candles = await asyncio.to_thread(get_cached_candles, matched_key, config, "1h", outputsize=210, force_fresh=True)
+            h4_candles = await asyncio.to_thread(get_cached_candles, matched_key, config, "4h", outputsize=60, force_fresh=True)
+            daily_candles = await asyncio.to_thread(get_cached_candles, matched_key, config, "1day", outputsize=10, force_fresh=True)
+
+            gap_pct = _mismatch_gap_pct()
+
+        if gap_pct > 1.5:
+            print(
+                f"[SIGNAL] ⚠️ {pair_name}: still mismatched ({gap_pct:.2f}%) "
+                f"after the full {retry_budget_seconds}s retry window - "
+                f"sending anyway per explicit instruction, relying on the "
+                f"chart-anchoring safety net to keep the chart's last "
+                f"point honest."
+            )
+        else:
+            print(f"[SIGNAL] ✅ {pair_name}: price/chart mismatch cleared after {elapsed}s.")
 
     # min_agree=2 is the PREFERRED bar everywhere, scheduled and DM
     # alike - per explicit instruction, run_strategy_bank itself now
@@ -18896,7 +18968,7 @@ async def _post_signal_for_pair(bot, pair_keyword):
             return
 
         image_file_id, direction, signal, signal_data = (
-            await build_signal_response(pair_keyword, user_id=None)
+            await build_signal_response(pair_keyword, user_id=None, retry_mismatch=True)
         )
 
         if signal_data is None:

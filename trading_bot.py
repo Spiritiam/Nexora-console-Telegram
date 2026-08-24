@@ -20480,6 +20480,60 @@ def get_week_start():
     monday = now - timedelta(days=now.weekday())
     return monday.replace(hour=0, minute=0, second=0, microsecond=0)
 
+async def send_self_serve_reminder(context: ContextTypes.DEFAULT_TYPE):
+    """
+    Per explicit instruction: a short reminder, 3x weekly (Mon/Wed/Fri
+    2PM WAT / 13:00 UTC), telling people they don't have to wait for
+    the channel's scheduled signals - they can request their own
+    signals, news calls, and set up Exness/Deriv Auto-Trade anytime.
+    Posted to all 3 channels AND every known individual user, same
+    proven patterns already used elsewhere in this file (channel loop
+    + per-user DM loop with safe ~20/sec pacing). Uses a url= deep
+    link button, not callback_data, for the same reason
+    get_channel_button() does - a callback_data button from a channel
+    post can't open a DM with someone who hasn't started one already,
+    while a url= link opens the DM itself.
+    """
+    text = (
+        "📊 <b>You don't have to wait for the channel!</b>\n\n"
+        "Our 3 daily signals here are just the start — you can get "
+        "your own trading signals, news calls, and even set up "
+        "automatic trading anytime you want.\n\n"
+        "Tap below to:\n"
+        "📊 Get an instant signal\n"
+        "📰 Get a call on breaking news\n"
+        "🤖 Set up Exness or Deriv Auto-Trade\n\n"
+        "Available 24/7, right in your DMs. 👇"
+    )
+    markup = InlineKeyboardMarkup([
+        [InlineKeyboardButton(
+            "🚀 Open Nexora AI",
+            url=f"https://t.me/{BOT_USERNAME}?start=selfserve"
+        )]
+    ])
+
+    for channel_id in [CHANNEL_1_ID, CHANNEL_2_ID, CHANNEL_3_ID]:
+        try:
+            await context.bot.send_message(
+                chat_id=channel_id, text=text, parse_mode=ParseMode.HTML, reply_markup=markup
+            )
+        except Exception as e:
+            print(f"[SELF-SERVE REMINDER] Channel post failed for {channel_id}: {e}")
+
+    user_ids = await get_all_known_user_ids()
+    sent = failed = 0
+    for uid in user_ids:
+        try:
+            await context.bot.send_message(
+                chat_id=int(uid), text=text, parse_mode=ParseMode.HTML, reply_markup=markup
+            )
+            sent += 1
+        except Exception:
+            failed += 1
+        await asyncio.sleep(0.05)
+
+    print(f"[SELF-SERVE REMINDER] Done — sent {sent}, failed {failed}")
+
 async def post_weekly_report(context: ContextTypes.DEFAULT_TYPE):
     week_start = get_week_start()
     now = datetime.utcnow()
@@ -21159,6 +21213,19 @@ def main():
         time=parse_time("20:00"),
         name="daily_report",
         days=(1, 2, 3, 4, 5),
+        job_kwargs={"misfire_grace_time": 300}
+    )
+
+    # Self-serve reminder - 3x weekly, per explicit instruction:
+    # Monday, Wednesday, Friday at 2PM WAT (13:00 UTC, WAT is
+    # DEFAULT_UTC_OFFSET_MINUTES = UTC+1). Same cron-style day
+    # indexing as every other run_daily call in this file (0=Sunday)
+    # - days=(1, 3, 5) is Monday, Wednesday, Friday.
+    job_queue.run_daily(
+        send_self_serve_reminder,
+        time=parse_time("13:00"),
+        name="self_serve_reminder",
+        days=(1, 3, 5),
         job_kwargs={"misfire_grace_time": 300}
     )
 

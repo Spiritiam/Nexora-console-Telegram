@@ -1958,7 +1958,32 @@ async def nowpayments_webhook_handler(request):
 
     if payload.get("payment_status") == "finished":
         order_id = payload.get("order_id")
-        print(f"[NOWPAYMENTS WEBHOOK] ✅ Payment confirmed for order {order_id}")
+
+        # CONFIRMED REAL GAP CLOSED, per explicit instruction to
+        # thoroughly cross-check this flow - NOWPayments' own official
+        # integration guide explicitly recommends checking the actual
+        # amount paid, not just the status, before granting access.
+        # The signature proves this notification is genuinely from
+        # NOWPayments, but doesn't by itself guarantee the AMOUNT tied
+        # to this order_id matches what we actually invoiced - a
+        # correctly-signed notification for a real but much smaller
+        # NOWPayments transaction (order_id is a string we generate,
+        # not a secret) could otherwise slip through. price_amount is
+        # NOWPayments' own record of what THIS invoice was created
+        # for, so comparing it against our real subscription price
+        # closes that gap. Small tolerance for float rounding only,
+        # not for genuine underpayment.
+        price_amount = payload.get("price_amount")
+        if price_amount is None or price_amount < (MT5_AUTOTRADE_MONTHLY_FEE_USD - 0.01):
+            print(
+                f"[NOWPAYMENTS WEBHOOK] ⚠️ Order {order_id} marked finished but "
+                f"price_amount ({price_amount}) doesn't match the real "
+                f"subscription price (${MT5_AUTOTRADE_MONTHLY_FEE_USD}) - "
+                f"NOT activating, this needs a human look."
+            )
+            return web.Response(status=200, text="ok")
+
+        print(f"[NOWPAYMENTS WEBHOOK] ✅ Payment confirmed for order {order_id} (${price_amount})")
         try:
             url = f"{SUPABASE_URL}/rest/v1/nowpayments_transactions?order_id=eq.{order_id}"
             requests.patch(url, headers=sb_headers(), json={

@@ -872,7 +872,7 @@ def resolve_trade_symbol(symbol_map, pair_config):
     return symbol_map.get(pair_config["pair_name"], pair_config["mt5_symbol"])
 
 
-async def place_client_mt5_trade(metaapi_account_id, mt5_symbol, direction, volume, stop_loss, take_profit):
+async def place_client_mt5_trade(metaapi_account_id, mt5_symbol, direction, volume, stop_loss, take_profit, trade_comment=None):
     """
     Generalizes place_mt5_trade for an arbitrary CLIENT account
     rather than the bot's single own account - same proven REST
@@ -884,6 +884,30 @@ async def place_client_mt5_trade(metaapi_account_id, mt5_symbol, direction, volu
     trade failure here. Worth watching for in the logs; if it comes
     up, this needs a per-account region lookup rather than an
     assumption.
+
+    FIX: CONFIRMED REAL GAP, per explicit instruction - this function
+    had ZERO retry logic and NO idempotency protection at all, unlike
+    its twin place_mt5_trade (the bot's own account), which already
+    has both from an earlier real incident (a genuine duplicate order
+    from blindly retrying a 504). Confirmed live: a USOIL signal that
+    posted successfully never actually placed on a real subscriber
+    account, with the strong working theory being the same ongoing
+    MetaAPI connectivity issue hit this call too, and a single failed
+    attempt with no retry meant it was gone for good. Now mirrors
+    place_mt5_trade's exact proven pattern: retries transient failures
+    (429 rate-limit, 502/503/504 - momentary upstream issues, not real
+    rejections) up to 2 extra times with a short backoff, and before
+    EVERY retry, confirms via a real position check whether the PRIOR
+    attempt actually already placed the trade before ever resubmitting
+    - a duplicate real order on someone's live account is worse than a
+    missed one, so retrying is only made safe by checking first, never
+    assumed safe on its own.
+
+    trade_comment: optional, per-call unique identifier (e.g. a real
+    signal_id) so the idempotency check can never cross-match a
+    DIFFERENT trade's position as this one's. Falls back to the
+    original shared comment if not provided, so any caller that
+    doesn't pass one keeps working exactly as before.
     """
     if not METAAPI_TOKEN:
         # FIX: CONFIRMED REAL GAP - this was the ONLY return in the
@@ -899,19 +923,60 @@ async def place_client_mt5_trade(metaapi_account_id, mt5_symbol, direction, volu
     try:
         headers = {"auth-token": METAAPI_TOKEN, "Content-Type": "application/json"}
         order_type = "ORDER_TYPE_BUY" if direction == "BUY" else "ORDER_TYPE_SELL"
+        comment = trade_comment or "NexoraAI AutoTrade"
         payload = {
             "symbol": mt5_symbol,
             "volume": volume,
             "actionType": order_type,
             "stopLoss": stop_loss,
             "takeProfit": take_profit,
-            "comment": "NexoraAI AutoTrade",
+            "comment": comment,
         }
         url = (
             f"https://mt-client-api-v1.london.agiliumtrade.ai"
             f"/users/current/accounts/{metaapi_account_id}/trade"
         )
-        response = await asyncio.to_thread(requests.post, url, headers=headers, json=payload, timeout=30)
+
+        transient_statuses = (429, 502, 503, 504)
+        max_attempts = 3
+        last_response = None
+        idempotent_match = None
+        attempt_started_at = datetime.utcnow()
+        for attempt in range(1, max_attempts + 1):
+            response = await asyncio.to_thread(requests.post, url, headers=headers, json=payload, timeout=30)
+            last_response = response
+            if response.status_code in (200, 201):
+                break
+            if response.status_code not in transient_statuses or attempt == max_attempts:
+                break
+
+            check_result = await check_for_matching_recent_position(
+                metaapi_account_id, mt5_symbol, comment, attempt_started_at
+            )
+            if check_result == "CHECK_FAILED":
+                print(f"[MT5 AUTOTRADE] ⚠️ Idempotency check itself failed for {metaapi_account_id} - stopping rather than risk a duplicate order.")
+                break
+            if check_result:
+                idempotent_match = check_result
+                print(
+                    f"[MT5 AUTOTRADE] ✅ Prior attempt {attempt} for {metaapi_account_id} actually "
+                    f"succeeded (found matching open position {idempotent_match.get('id')}) - "
+                    f"using it, NOT resubmitting."
+                )
+                break
+
+            wait_seconds = 2 * attempt
+            print(
+                f"[MT5 AUTOTRADE] ⚠️ Trade request for {metaapi_account_id} got "
+                f"{response.status_code} (attempt {attempt}/{max_attempts}) - "
+                f"retrying in {wait_seconds}s..."
+            )
+            await asyncio.sleep(wait_seconds)
+
+        if idempotent_match:
+            return idempotent_match.get("id", "unknown")
+
+        response = last_response
         if response.status_code in (200, 201):
             result = response.json()
             order_id = result.get("orderId", "unknown")
@@ -933,7 +998,7 @@ async def place_client_mt5_trade(metaapi_account_id, mt5_symbol, direction, volu
                 return None
             print(f"[MT5 AUTOTRADE] ✅ Trade placed for {metaapi_account_id} — Order ID: {order_id}")
             return order_id
-        print(f"[MT5 AUTOTRADE] ❌ Trade failed for {metaapi_account_id}: {response.status_code} {response.text}")
+        print(f"[MT5 AUTOTRADE] ❌ Trade failed for {metaapi_account_id} after {max_attempts} attempt(s): {response.status_code} {response.text}")
         return None
     except Exception as e:
         print(f"[MT5 AUTOTRADE] ❌ Exception placing trade for {metaapi_account_id}: {e}")
@@ -1263,7 +1328,17 @@ async def run_mt5_autotrade_bot_scan(context: ContextTypes.DEFAULT_TYPE):
 
                 order_id = await place_client_mt5_trade(
                     metaapi_account_id, resolved_symbol, direction,
-                    volume, stop_loss, take_profit
+                    volume, stop_loss, take_profit,
+                    # Short, per explicit instruction - MT5's native
+                    # comment field has a real, strict length limit
+                    # (commonly ~31 chars). signal_marker alone can run
+                    # well past that, and a comment silently truncated
+                    # by the broker would never exactly match what the
+                    # idempotency check compares against, breaking the
+                    # whole retry-safety mechanism. A compact timestamp
+                    # is unique enough for the short retry window this
+                    # is actually used for.
+                    trade_comment=f"NexoraAI-{int(time.time())}"
                 )
                 MT5_AUTOTRADE_COPIED_SIGNALS.add(copy_key)
                 if order_id:
@@ -1364,7 +1439,12 @@ async def run_mt5_autotrade_follow_channel_scan(context: ContextTypes.DEFAULT_TY
 
             order_id = await place_client_mt5_trade(
                 metaapi_account_id, resolved_symbol, direction,
-                volume, stop_loss, take_profit
+                volume, stop_loss, take_profit,
+                # signal_id is a real Supabase auto-incrementing ID
+                # (short, numeric) - safe within MT5's comment length
+                # limit, and a genuinely meaningful identifier here
+                # since this call copies an actual logged signal.
+                trade_comment=f"NexoraAI-{signal_id}"
             )
             MT5_AUTOTRADE_COPIED_SIGNALS.add(copy_key)
             if order_id:
@@ -1467,7 +1547,12 @@ async def run_account_flip_entry_scan(context: ContextTypes.DEFAULT_TYPE):
                 base_lot = float(account.get("flip_base_lot") or 0.01)
                 order_id = await place_client_mt5_trade(
                     metaapi_account_id, resolved_symbol, direction,
-                    base_lot, stop_loss, None
+                    base_lot, stop_loss, None,
+                    # No natural signal_id here (Account Flip's entry
+                    # isn't tied to a logged signal) - a compact
+                    # timestamp is unique enough for the short retry
+                    # window, same reasoning as the Pick-a-Bot scan.
+                    trade_comment=f"NexoraAI-Flip-{int(time.time())}"
                 )
                 MT5_AUTOTRADE_COPIED_SIGNALS.add(copy_key)
                 if order_id:
@@ -1599,7 +1684,12 @@ async def manage_account_flip_stacks(context: ContextTypes.DEFAULT_TYPE):
             if favorable_pips >= trigger_pips and layer_count < max_layers and not account.get("trading_paused"):
                 new_lot = round(min(float(account.get("flip_base_lot") or 0.01) + step * layer_count, max_lot), 2)
                 order_id = await place_client_mt5_trade(
-                    metaapi_account_id, mt5_symbol, direction, new_lot, None, None
+                    metaapi_account_id, mt5_symbol, direction, new_lot, None, None,
+                    # layer_count makes each layer's comment genuinely
+                    # distinct from the others in the same stack, not
+                    # just unique in time - useful for reading real
+                    # positions later, not just idempotency safety.
+                    trade_comment=f"NexoraAI-Layer{layer_count + 1}-{int(time.time())}"
                 )
                 if order_id:
                     layer_count += 1

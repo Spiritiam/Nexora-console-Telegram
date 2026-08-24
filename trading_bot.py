@@ -646,6 +646,175 @@ def clean_mt5_provision_error(raw_error):
     return "Please double-check your login, password, and server name are all correct, then try again."
 
 
+def log_pending_mt5_provisioning(user_id, account_number, encrypted_password, server, account_name):
+    """
+    CONFIRMED REAL GAP FIX, per explicit instruction - marks a
+    provisioning attempt as "in progress" in the database BEFORE
+    starting the (potentially up-to-3-minute) wait, so it survives a
+    bot restart. Confirmed live: a client's account genuinely
+    connected successfully on MetaAPI's side, but the bot never sent
+    the confirmation - the strong working theory is a deploy
+    restarted the process mid-wait, killing the in-memory task
+    (including its reference to the "connecting..." message) with no
+    way to recover, even though the underlying MetaAPI call kept
+    going and succeeded independently. Returns the new row's id, or
+    None on failure (the flow still proceeds either way - this is a
+    safety net, not a hard requirement for provisioning itself to
+    work).
+    """
+    try:
+        url = f"{SUPABASE_URL}/rest/v1/pending_mt5_provisioning"
+        response = requests.post(url, headers={**sb_headers(), "Prefer": "return=representation"}, json={
+            "user_id": user_id, "account_number": account_number,
+            "encrypted_password": encrypted_password, "server": server,
+            "account_name": account_name,
+        }, timeout=10)
+        data = response.json()
+        return data[0]["id"] if data else None
+    except Exception as e:
+        print(f"[MT5 PROVISION TRACKING] log_pending_mt5_provisioning error: {e}")
+        return None
+
+
+def resolve_pending_mt5_provisioning(row_id, status):
+    if not row_id:
+        return
+    try:
+        url = f"{SUPABASE_URL}/rest/v1/pending_mt5_provisioning?id=eq.{row_id}"
+        requests.patch(url, headers=sb_headers(), json={
+            "status": status, "resolved_at": datetime.utcnow().isoformat(),
+        }, timeout=10)
+    except Exception as e:
+        print(f"[MT5 PROVISION TRACKING] resolve_pending_mt5_provisioning error: {e}")
+
+
+def get_stuck_mt5_provisioning_rows(older_than_minutes):
+    try:
+        cutoff = (datetime.utcnow() - timedelta(minutes=older_than_minutes)).isoformat()
+        url = (
+            f"{SUPABASE_URL}/rest/v1/pending_mt5_provisioning"
+            f"?status=eq.in_progress&started_at=lt.{cutoff}&select=*"
+        )
+        response = requests.get(url, headers=sb_headers(), timeout=10)
+        return response.json()
+    except Exception as e:
+        print(f"[MT5 PROVISION TRACKING] get_stuck_mt5_provisioning_rows error: {e}")
+        return []
+
+
+async def find_metaapi_account_by_login_server(login, server):
+    """
+    Searches the bot's real, live MetaAPI account list for one
+    matching this login+server - used ONLY by the stuck-provisioning
+    recovery job, to genuinely confirm (not assume) whether an
+    interrupted provisioning attempt actually succeeded on MetaAPI's
+    side before telling anyone it did. Returns the real account_id if
+    found, else None.
+    """
+    if not METAAPI_TOKEN:
+        return None
+    try:
+        response = await asyncio.to_thread(
+            requests.get,
+            "https://mt-provisioning-api-v1.agiliumtrade.agiliumtrade.ai/users/current/accounts",
+            headers={"auth-token": METAAPI_TOKEN, "Accept": "application/json"},
+            timeout=15,
+        )
+        data = response.json()
+        items = data.get("items", []) if isinstance(data, dict) else data
+        for item in items or []:
+            if str(item.get("login")) == str(login) and item.get("server") == server:
+                return item.get("_id")
+        return None
+    except Exception as e:
+        print(f"[MT5 PROVISION RECOVERY] find_metaapi_account_by_login_server error: {e}")
+        return None
+
+
+async def recover_stuck_mt5_provisioning(context: ContextTypes.DEFAULT_TYPE):
+    """
+    Runs periodically on the bot's own event loop, per explicit
+    instruction - catches exactly the incident described: a
+    provisioning wait that got interrupted (most likely a deploy
+    restarting the process mid-wait) after the underlying MetaAPI
+    account creation had already genuinely succeeded, but before the
+    bot could tell the user. Only acts on rows old enough that the
+    normal up-to-3-minute retry window has definitely already passed
+    (4 minutes) - never touches a provisioning attempt that's still
+    genuinely in progress. Checks MetaAPI's REAL account list before
+    concluding anything - never assumes success or failure.
+    """
+    rows = get_stuck_mt5_provisioning_rows(older_than_minutes=4)
+    if not rows:
+        return
+
+    for row in rows:
+        user_id = row.get("user_id")
+        account_number = row.get("account_number")
+        server = row.get("server")
+        row_id = row.get("id")
+        started_at = row.get("started_at")
+
+        account_id = await find_metaapi_account_by_login_server(account_number, server)
+
+        if account_id:
+            upsert_mt5_autotrade_account(user_id, {
+                "account_number": account_number,
+                "encrypted_password": row.get("encrypted_password"),
+                "server": server,
+                "account_name": row.get("account_name"),
+                "metaapi_account_id": account_id,
+                "is_active": True,
+            })
+            resolve_pending_mt5_provisioning(row_id, "recovered_success")
+            # Same warm-up reasoning as the normal success path -
+            # cheap insurance, even though this account has likely
+            # already finished deploying by now given the 4+ minute
+            # delay before this recovery job even looks at it.
+            asyncio.create_task(get_client_mt5_connection(account_id))
+            print(f"[MT5 PROVISION RECOVERY] ✅ Recovered a genuinely-succeeded connection for {user_id} that never got confirmed.")
+            try:
+                await context.bot.send_message(
+                    chat_id=int(user_id),
+                    text=(
+                        "✅ <b>MT5/MT4 account connected successfully!</b>\n\n"
+                        "Sorry for the delay confirming this - everything's "
+                        "connected and ready. Default mode: 0.01 lots per "
+                        "trade. Tap 🤖 Exness Auto-Trade below anytime to "
+                        "see your account info and subscription status, or "
+                        "to change your lot size or switch to risk %.",
+                    ),
+                    parse_mode=ParseMode.HTML,
+                    reply_markup=main_keyboard
+                )
+            except Exception as e:
+                print(f"[MT5 PROVISION RECOVERY] Couldn't notify {user_id}: {e}")
+            continue
+
+        # Not found yet - only give up after a much longer window (15
+        # min total), since a genuinely slow broker-detection retry
+        # combined with restart timing could still resolve itself.
+        try:
+            started_dt = datetime.fromisoformat(started_at.replace("Z", "+00:00")).replace(tzinfo=None)
+        except Exception:
+            started_dt = datetime.utcnow()
+        if (datetime.utcnow() - started_dt) > timedelta(minutes=15):
+            resolve_pending_mt5_provisioning(row_id, "recovered_failed")
+            print(f"[MT5 PROVISION RECOVERY] ❌ Giving up on stuck provisioning for {user_id} after 15 min - no matching MetaAPI account found.")
+            try:
+                await context.bot.send_message(
+                    chat_id=int(user_id),
+                    text=(
+                        "⚠️ <b>Couldn't confirm your MT5/MT4 connection.</b>\n\n"
+                        "Tap 🤖 Exness Auto-Trade to try connecting again."
+                    ),
+                    parse_mode=ParseMode.HTML,
+                    reply_markup=main_keyboard
+                )
+            except Exception as e:
+                print(f"[MT5 PROVISION RECOVERY] Couldn't notify {user_id} of failure: {e}")
+
+
 async def provision_mt5_account(login, password, server, platform="mt5", account_name=None, progress_callback=None):
     """
     Creates a NEW MetaAPI-managed trading account for a CLIENT'S OWN
@@ -18968,6 +19137,15 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
             parse_mode=ParseMode.HTML
         )
 
+        # FIX: CONFIRMED REAL GAP, per explicit instruction - see
+        # log_pending_mt5_provisioning's docstring. This row is the
+        # safety net: recover_stuck_mt5_provisioning picks up and
+        # finishes anything that never gets resolved below (e.g. a
+        # deploy restarting the process mid-wait).
+        pending_row_id = log_pending_mt5_provisioning(
+            user_id, account_number, encrypt_credential(raw_password), server, account_name
+        )
+
         async def _show_provision_progress(attempt_number):
             try:
                 await wait_connect.edit_text(
@@ -18986,6 +19164,7 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
 
         if error:
+            resolve_pending_mt5_provisioning(pending_row_id, "failed")
             clean_error = clean_mt5_provision_error(error)
             await wait_connect.edit_text(
                 f"⚠️ <b>Couldn't connect that account.</b>\n\n{clean_error}\n\n"
@@ -19002,6 +19181,31 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
             "metaapi_account_id": account_id,
             "is_active": True,
         })
+        resolve_pending_mt5_provisioning(pending_row_id, "success")
+
+        # FIX: CONFIRMED REAL GAP, per explicit instruction - a
+        # freshly-provisioned account often genuinely isn't ready for
+        # real-time queries (balance, etc.) the moment it's created;
+        # MetaAPI needs real time to finish deploying it. If the
+        # dashboard's first balance check happens to land in that
+        # window, it fails - and the 60s failure cooldown (built to
+        # stop a DIFFERENT problem, repeated slow retries hammering
+        # the event loop) then keeps showing "unavailable" for a full
+        # minute afterward even once the account becomes genuinely
+        # ready. Fire-and-forget warm-up: tries the connection a few
+        # times in the background, spaced past the cooldown window, so
+        # by the time the person actually taps the dashboard, it's
+        # very likely already cached and ready - never blocks the
+        # success message above on this.
+        async def _warm_up_new_connection():
+            for _ in range(3):
+                connection = await get_client_mt5_connection(account_id)
+                if connection is not None:
+                    print(f"[MT5 PROVISION] Warmed up connection for freshly-connected account {account_id}.")
+                    return
+                await asyncio.sleep(_CLIENT_MT5_FAILURE_COOLDOWN_SECONDS + 5)
+
+        asyncio.create_task(_warm_up_new_connection())
 
         await wait_connect.edit_text(
             "✅ <b>MT5/MT4 account connected successfully!</b>\n\n"
@@ -21483,6 +21687,18 @@ def main():
         interval=20,
         first=15,
         name="mt5_autotrade_crypto_payment_processing"
+    )
+
+    # Recovers a genuinely-succeeded MT5/MT4 connection that never
+    # got confirmed to the user (e.g. a deploy restarted the process
+    # mid-wait), per explicit instruction - runs every 60s, only ever
+    # acts on rows old enough that the normal provisioning window has
+    # definitely already passed.
+    job_queue.run_repeating(
+        recover_stuck_mt5_provisioning,
+        interval=60,
+        first=30,
+        name="mt5_provisioning_recovery"
     )
 
     # Deriv OAuth: picks up what deriv_oauth_callback_handler already

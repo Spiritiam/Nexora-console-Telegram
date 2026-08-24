@@ -21606,15 +21606,6 @@ def main():
         job_kwargs={"misfire_grace_time": 300}
     )
 
-    # TEMPORARY DIAGNOSTIC, per explicit instruction - re-verifying
-    # after the webhook URL fix. Safe to remove once confirmed.
-    async def _temp_recheck_nowpayments(context: ContextTypes.DEFAULT_TYPE):
-        print(f"[NOWPAYMENTS RECHECK] Webhook URL now: {NOWPAYMENTS_WEBHOOK_URL!r}")
-        test_invoice_url = await nowpayments_initialize_payment("diagnostic_test", f"DIAGTEST-{int(time.time())}")
-        print(f"[NOWPAYMENTS RECHECK] Real test invoice creation: {'SUCCESS - ' + test_invoice_url if test_invoice_url else 'FAILED - see [NOWPAYMENTS] logs above for the reason'}")
-
-    job_queue.run_once(_temp_recheck_nowpayments, when=15, name="temp_nowpayments_recheck")
-
     print("Nexora AI Running...")
     print("Daily schedule (UTC):")
     for utc_time, post_type, data in DAILY_SCHEDULE:

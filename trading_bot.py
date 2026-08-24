@@ -12197,8 +12197,18 @@ def _chart_to_mpl_time(candles):
 
 
 def _chart_draw_candles(ax, candles, times):
-    is_datetime = isinstance(times[0], datetime)
-    x = mdates.date2num(times) if is_datetime else list(range(len(times)))
+    # FIX: per explicit instruction - candles used to be positioned by
+    # REAL elapsed time (mdates.date2num), which is technically
+    # accurate but visually shows every weekend (and any other real
+    # gap in the data) as a stretch of empty space - candles dense,
+    # then a visible "cut", then dense again. Every mainstream trading
+    # platform instead spaces candles evenly regardless of the real
+    # time between them, which is what actually reads as a clean,
+    # continuous chart. Always index-based now, regardless of whether
+    # times are real datetimes - the real timestamps are still used
+    # separately for the axis tick LABELS (see _chart_finish), just
+    # not for positioning anymore.
+    x = list(range(len(times)))
     if len(x) > 1:
         width = (x[-1] - x[0]) / len(x) * 0.6
     else:
@@ -12222,8 +12232,18 @@ def _chart_fmt_price(value, all_values):
 
 
 def _chart_finish(fig, ax, x, times, candles, entry, sl, tp, title, save_path, sub_ax=None):
-    label_box = dict(boxstyle="round,pad=0.3", facecolor="#0f1115", edgecolor="none")
-    is_datetime = isinstance(times[0], datetime)
+    # Per explicit instruction - filled, colored label backgrounds
+    # instead of a uniform dark box for all three, so each level
+    # actually stands out and is instantly distinguishable at a
+    # glance, not just readable by its text color. Entry gets its own
+    # distinct accent color (amber) rather than plain gray, which
+    # tended to blend into the candle wicks and grid.
+    entry_color = "#f59e0b"
+    sl_color = "#ef4444"
+    tp_color = "#22c55e"
+    entry_box = dict(boxstyle="round,pad=0.35", facecolor=entry_color, edgecolor="none")
+    sl_box = dict(boxstyle="round,pad=0.35", facecolor=sl_color, edgecolor="none")
+    tp_box = dict(boxstyle="round,pad=0.35", facecolor=tp_color, edgecolor="none")
     x_right = x[-1] + (x[-1] - x[0]) * 0.01 if len(x) > 1 else x[-1] + 1
 
     all_lows = [c["low"] for c in candles]
@@ -12241,15 +12261,17 @@ def _chart_finish(fig, ax, x, times, candles, entry, sl, tp, title, save_path, s
         if adjusted[curr_name] - adjusted[prev_name] < min_gap:
             adjusted[curr_name] = adjusted[prev_name] + min_gap
 
+    # Slightly thicker lines than before (1 -> 1.4) so they read as
+    # clearly intentional markers, not just another grid line.
     if entry is not None:
-        ax.axhline(entry, color="#e5e7eb", linewidth=1, linestyle="--", zorder=1)
-        ax.text(x_right, adjusted["entry"], f"Entry {_chart_fmt_price(entry, all_price_values)}", color="#e5e7eb", fontsize=9, va="center", bbox=label_box, zorder=5)
+        ax.axhline(entry, color=entry_color, linewidth=1.4, linestyle="--", zorder=1)
+        ax.text(x_right, adjusted["entry"], f" Entry {_chart_fmt_price(entry, all_price_values)} ", color="#0f1115", fontsize=9, fontweight="bold", va="center", bbox=entry_box, zorder=5)
     if sl is not None:
-        ax.axhline(sl, color="#ef4444", linewidth=1, linestyle="--", zorder=1)
-        ax.text(x_right, adjusted["sl"], f"SL {_chart_fmt_price(sl, all_price_values)}", color="#ef4444", fontsize=9, va="center", bbox=label_box, zorder=5)
+        ax.axhline(sl, color=sl_color, linewidth=1.4, linestyle="--", zorder=1)
+        ax.text(x_right, adjusted["sl"], f" SL {_chart_fmt_price(sl, all_price_values)} ", color="#0f1115", fontsize=9, fontweight="bold", va="center", bbox=sl_box, zorder=5)
     if tp is not None:
-        ax.axhline(tp, color="#22c55e", linewidth=1, linestyle="--", zorder=1)
-        ax.text(x_right, adjusted["tp"], f"TP {_chart_fmt_price(tp, all_price_values)}", color="#22c55e", fontsize=9, va="center", bbox=label_box, zorder=5)
+        ax.axhline(tp, color=tp_color, linewidth=1.4, linestyle="--", zorder=1)
+        ax.text(x_right, adjusted["tp"], f" TP {_chart_fmt_price(tp, all_price_values)} ", color="#0f1115", fontsize=9, fontweight="bold", va="center", bbox=tp_box, zorder=5)
 
     xlim_left = x[0] - (x[-1] - x[0]) * 0.02 if len(x) > 1 else x[0] - 1
     xlim_right = x_right + (x[-1] - x[0]) * 0.12 if len(x) > 1 else x_right + 2
@@ -12257,9 +12279,23 @@ def _chart_finish(fig, ax, x, times, candles, entry, sl, tp, title, save_path, s
     y_pad = full_range * 0.08
     ax.set_ylim(min(all_price_values) - y_pad, max(all_price_values) + y_pad)
 
+    # FIX: per explicit instruction - x is now always plain candle
+    # INDEX (see _chart_draw_candles), not a real matplotlib date
+    # value, so the old xaxis_date()/DateFormatter approach (which
+    # requires real date values to work) no longer applies. Real
+    # datetimes are still used here, just to build the LABEL TEXT at
+    # a manually-chosen, evenly-spaced subset of tick positions -
+    # showing a label on every single candle would be unreadably
+    # dense, so this picks roughly 7-8 ticks across the visible range.
+    is_datetime = isinstance(times[0], datetime)
     if is_datetime and sub_ax is None:
-        ax.xaxis_date()
-        ax.xaxis.set_major_formatter(mdates.DateFormatter("%d %b %Hh"))
+        n = len(times)
+        step = max(1, n // 7)
+        tick_positions = list(range(0, n, step))
+        if tick_positions[-1] != n - 1:
+            tick_positions.append(n - 1)
+        ax.set_xticks(tick_positions)
+        ax.set_xticklabels([times[i].strftime("%d %b %Hh") for i in tick_positions])
         plt.setp(ax.get_xticklabels(), rotation=20)
     elif sub_ax is not None:
         ax.tick_params(labelbottom=False)
@@ -12277,8 +12313,13 @@ def _chart_finish(fig, ax, x, times, candles, entry, sl, tp, title, save_path, s
     if sub_ax is not None:
         sub_ax.set_xlim(xlim_left, xlim_right)
         if is_datetime:
-            sub_ax.xaxis_date()
-            sub_ax.xaxis.set_major_formatter(mdates.DateFormatter("%d %b %Hh"))
+            n = len(times)
+            step = max(1, n // 7)
+            tick_positions = list(range(0, n, step))
+            if tick_positions[-1] != n - 1:
+                tick_positions.append(n - 1)
+            sub_ax.set_xticks(tick_positions)
+            sub_ax.set_xticklabels([times[i].strftime("%d %b %Hh") for i in tick_positions])
             plt.setp(sub_ax.get_xticklabels(), rotation=20)
         sub_ax.tick_params(colors="#9ca3af", labelsize=8)
         for spine in sub_ax.spines.values():
@@ -21237,15 +21278,15 @@ async def send_self_serve_reminder(context: ContextTypes.DEFAULT_TYPE):
     while a url= link opens the DM itself.
     """
     text = (
-        "📊 <b>You don't have to wait for the channel!</b>\n\n"
-        "Our 3 daily signals here are just the start — you can get "
-        "your own trading signals, news calls, and even set up "
-        "automatic trading anytime you want.\n\n"
-        "Tap below to:\n"
-        "📊 Get an instant signal\n"
-        "📰 Get a call on breaking news\n"
-        "🤖 Set up Exness or Deriv Auto-Trade\n\n"
-        "Available 24/7, right in your DMs. 👇"
+        "👋 <b>Quick reminder — you're not limited to the 3 daily "
+        "signals sent to this channel!</b>\n\n"
+        "Anytime you want a signal, a news call, or want your account "
+        "trading automatically, you can just ask.\n\n"
+        "Tap the button below to:\n\n"
+        "📊 <b>Signal</b> — get one instantly\n\n"
+        "📰 <b>News</b> — get a call on breaking news\n\n"
+        "🤖 <b>Auto-Trade</b> — set up Exness or Deriv to trade for you\n\n"
+        "It's available 24/7, right here in your DMs. 👇"
     )
     markup = InlineKeyboardMarkup([
         [InlineKeyboardButton(

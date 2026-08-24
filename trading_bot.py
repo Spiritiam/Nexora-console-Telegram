@@ -931,6 +931,13 @@ _CLIENT_MT5_CONNECTIONS = {}
 # after a failure, instead of burning another full 15s timeout on the
 # very next call, which could be mere seconds later.
 _CLIENT_MT5_CONNECTION_FAILURES = {}
+# Per explicit instruction - tracks the LAST failure's real reason per
+# account, separately from the cooldown timestamp above, so the
+# dashboard can show something more honest than "unavailable" for a
+# genuinely actionable cause (e.g. MetaAPI billing) without needing to
+# change get_client_mt5_connection's return type/signature at all -
+# every existing caller is completely unaffected.
+_CLIENT_MT5_CONNECTION_FAILURE_REASONS = {}
 _CLIENT_MT5_FAILURE_COOLDOWN_SECONDS = 60
 
 async def get_client_mt5_connection(metaapi_account_id):
@@ -953,6 +960,7 @@ async def get_client_mt5_connection(metaapi_account_id):
         connection = await asyncio.wait_for(_connect(), timeout=15)
         _CLIENT_MT5_CONNECTIONS[metaapi_account_id] = connection
         _CLIENT_MT5_CONNECTION_FAILURES.pop(metaapi_account_id, None)
+        _CLIENT_MT5_CONNECTION_FAILURE_REASONS.pop(metaapi_account_id, None)
         return connection
     except Exception as e:
         # FIX: CONFIRMED REAL LIVE ISSUE, per explicit instruction -
@@ -991,6 +999,7 @@ async def get_client_mt5_connection(metaapi_account_id):
                     connection = await asyncio.wait_for(_retry_connect(), timeout=20)
                     _CLIENT_MT5_CONNECTIONS[metaapi_account_id] = connection
                     _CLIENT_MT5_CONNECTION_FAILURES.pop(metaapi_account_id, None)
+                    _CLIENT_MT5_CONNECTION_FAILURE_REASONS.pop(metaapi_account_id, None)
                     print(f"[MT5 AUTOTRADE] ✅ {metaapi_account_id} redeployed and connected successfully.")
                     return connection
             except Exception as redeploy_error:
@@ -998,6 +1007,7 @@ async def get_client_mt5_connection(metaapi_account_id):
 
         print(f"[MT5 AUTOTRADE] Connection failed for client account {metaapi_account_id}: {e}")
         _CLIENT_MT5_CONNECTION_FAILURES[metaapi_account_id] = time.time()
+        _CLIENT_MT5_CONNECTION_FAILURE_REASONS[metaapi_account_id] = str(e)
         return None
 
 
@@ -16315,7 +16325,21 @@ async def build_exness_autotrade_dashboard(user_id, account, expiry, now):
     # a live fetch since it changes constantly and was never something
     # worth caching - per explicit instruction.
     balance = await get_client_mt5_balance(account["metaapi_account_id"])
-    balance_display = f"${balance:,.2f}" if balance is not None else "unavailable right now"
+    if balance is not None:
+        balance_display = f"${balance:,.2f}"
+    else:
+        # FIX: CONFIRMED REAL ISSUE, per explicit instruction - a
+        # generic "unavailable right now" was hiding a genuinely
+        # actionable cause when the real reason was known (confirmed
+        # live: MetaAPI billing requiring a top-up). Only ever shows
+        # something more specific for causes that are actually
+        # actionable by the account owner - anything else still shows
+        # the same honest, generic message as before.
+        failure_reason = _CLIENT_MT5_CONNECTION_FAILURE_REASONS.get(account["metaapi_account_id"], "")
+        if "top up" in failure_reason.lower():
+            balance_display = "unavailable — MetaAPI account needs a top-up"
+        else:
+            balance_display = "unavailable right now"
     trading_paused = bool(account.get("trading_paused"))
     autotrade_status_line = (
         "🎯 <b>Auto-Trade:</b> OFF (paused - no new trades will open)" if trading_paused
@@ -21902,25 +21926,6 @@ def main():
         days=(1, 3, 5),
         job_kwargs={"misfire_grace_time": 300}
     )
-
-    # TEMPORARY ONE-OFF FIX, per explicit instruction - the client's
-    # SPIRITFX RAW ACCOUNT (7477ca32-385c-4fec-b2e7-145e43dfad81) is
-    # currently undeployed on MetaAPI's side ("you have no accounts
-    # deployed yet"). Deploys it directly via MetaAPI's real deploy
-    # endpoint. Runs once, safe to remove after confirming it worked.
-    async def _temp_deploy_stuck_account(context: ContextTypes.DEFAULT_TYPE):
-        try:
-            response = await asyncio.to_thread(
-                requests.post,
-                "https://mt-provisioning-api-v1.agiliumtrade.agiliumtrade.ai/users/current/accounts/7477ca32-385c-4fec-b2e7-145e43dfad81/deploy",
-                headers={"auth-token": METAAPI_TOKEN, "Accept": "application/json"},
-                timeout=20,
-            )
-            print(f"[DEPLOY FIX] Status: {response.status_code} Body: {response.text[:300]}")
-        except Exception as e:
-            print(f"[DEPLOY FIX] Error: {e}")
-
-    job_queue.run_once(_temp_deploy_stuck_account, when=10, name="temp_deploy_fix")
 
     print("Nexora AI Running...")
     print("Daily schedule (UTC):")

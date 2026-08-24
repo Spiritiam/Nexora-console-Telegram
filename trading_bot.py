@@ -8088,7 +8088,7 @@ def get_price_metaapi(mt5_symbol):
         return None
 
 
-def get_live_price(symbol="XAU/USD", config=None):
+def get_live_price(symbol="XAU/USD", config=None, source_tracker=None):
     # FIX: per explicit instruction, MetaAPI is now the PRIMARY live-
     # price source for every pair that has an mt5_symbol - not just
     # candles. Confirmed live: XAUUSD's signal generation went down
@@ -8099,15 +8099,32 @@ def get_live_price(symbol="XAU/USD", config=None):
     # a real single point of failure. Every existing fallback below is
     # completely unchanged, still runs exactly as before if MetaAPI
     # has any issue.
+    #
+    # source_tracker: CONFIRMED REAL BUG FIX, per explicit instruction
+    # - optional mutable dict, only used by build_signal_response for
+    # pairs whose CANDLES come from MetaAPI (see METAAPI_FIRST_PAIRS).
+    # Confirmed live via real logs: when MetaAPI's price endpoint
+    # times out but candles still succeed (both hit the same account,
+    # but not always at the exact same moment), a pair like USOIL -
+    # which has its OWN separate, oil-only price fallback that no
+    # other pair uses - could end up with candles from MetaAPI's
+    # (possibly stale, same root connectivity issue) feed and a live
+    # price from a completely different provider, drawn on the same
+    # chart as if they agreed. Every existing caller that doesn't pass
+    # this stays 100% unaffected - it's a no-op unless explicitly used.
     if config and config.get("mt5_symbol"):
         price = get_price_metaapi(config["mt5_symbol"])
         if price is not None:
+            if source_tracker is not None:
+                source_tracker["source"] = "metaapi"
             return price
         print(f"[PRICE] MetaAPI failed for {symbol} - falling back to existing sources")
 
     if config and config.get("use_metals_api"):
         price = get_silver_price()
         if price:
+            if source_tracker is not None:
+                source_tracker["source"] = "metals_api"
             return price
         print("[PRICE] metals.dev failed for silver")
         return None
@@ -8115,12 +8132,16 @@ def get_live_price(symbol="XAU/USD", config=None):
     if config and config.get("use_oil_api"):
         price = get_oil_price()
         if price:
+            if source_tracker is not None:
+                source_tracker["source"] = "oil_api"
             return price
         print("[PRICE] All oil APIs failed")
         return None
 
     price = get_price_twelvedata(symbol)
     if price is not None:
+        if source_tracker is not None:
+            source_tracker["source"] = "twelvedata"
         return price
     if config:
         print(
@@ -8130,6 +8151,8 @@ def get_live_price(symbol="XAU/USD", config=None):
         price = get_price_alphavantage(config)
         if price is not None:
             print(f"[PRICE] Alpha Vantage: {price} for {symbol}")
+            if source_tracker is not None:
+                source_tracker["source"] = "alphavantage"
             return price
     print(f"[PRICE] Both APIs failed for {symbol}")
     return None
@@ -8167,13 +8190,20 @@ def get_price_history_1h(symbol, config=None):
 # of how many people request that pair.
 # ============================================
 
-def get_cached_price_data(pair_key, symbol, config):
+def get_cached_price_data(pair_key, symbol, config, source_tracker=None):
     now = time.time()
     cached = price_cache.get(pair_key)
     if cached and (now - cached["timestamp"] < PRICE_CACHE_SECONDS):
+        # A cache hit skips calling get_live_price entirely, so the
+        # tracker has to be filled from the CACHED source instead -
+        # otherwise a cache hit would silently look like "unknown
+        # source" to the caller, defeating the whole point of tracking
+        # it.
+        if source_tracker is not None:
+            source_tracker["source"] = cached.get("source")
         return cached["current_price"], cached["price_1h_ago"]
 
-    current_price = get_live_price(symbol, config=config)
+    current_price = get_live_price(symbol, config=config, source_tracker=source_tracker)
     if current_price is None:
         return None, None
 
@@ -8183,6 +8213,7 @@ def get_cached_price_data(pair_key, symbol, config):
         "current_price": current_price,
         "price_1h_ago": price_1h_ago,
         "timestamp": now,
+        "source": source_tracker.get("source") if source_tracker is not None else None,
     }
     return current_price, price_1h_ago
 
@@ -12169,7 +12200,30 @@ async def build_signal_response(question, user_id=None):
     # without touching a single line of their own internal fallback
     # logic - zero behavior change, just stops them from blocking
     # every other user while they run.
-    current_price, price_1h_ago = await asyncio.to_thread(get_cached_price_data, matched_key, symbol, config)
+    # CONFIRMED REAL BUG FIX, per explicit instruction - see
+    # get_live_price's source_tracker docstring for the full mechanism.
+    # In short: USOIL and XAGUSD each have their own dedicated,
+    # completely separate live-price fallback (get_oil_price /
+    # get_silver_price) that no other pair uses, while their CANDLES
+    # come from MetaAPI specifically (TwelveData doesn't support
+    # either on the current plan). Confirmed live via real logs: when
+    # MetaAPI's price endpoint times out (the same ongoing account
+    # connectivity issue) but its candle endpoint still succeeds, the
+    # chart and the Entry/SL/TP price can end up built from two
+    # genuinely different providers' view of "current price" - not
+    # just stale-vs-fresh, but two different feeds that can disagree
+    # by more than normal market noise. The existing chart-anchoring
+    # fix (the synthetic live point in generate_signal_chart) still
+    # keeps the LAST point matching Entry exactly, but doesn't stop a
+    # jarring, unrealistic jump getting drawn to reach it if the two
+    # sources have drifted apart. This check catches that gap BEFORE
+    # a signal ever gets built, and refuses to trade on it - same
+    # principle as every other honest-failure path in this function,
+    # never show a chart we can't stand behind.
+    price_source_tracker = {}
+    current_price, price_1h_ago = await asyncio.to_thread(
+        get_cached_price_data, matched_key, symbol, config, price_source_tracker
+    )
     if current_price is None:
         print(f"[SIGNAL] ❌ Could not get live price for {pair_name}")
         return None, None, None, None
@@ -12186,6 +12240,22 @@ async def build_signal_response(question, user_id=None):
     h1_candles = await asyncio.to_thread(get_cached_candles, matched_key, config, "1h", outputsize=210)
     h4_candles = await asyncio.to_thread(get_cached_candles, matched_key, config, "4h", outputsize=60)
     daily_candles = await asyncio.to_thread(get_cached_candles, matched_key, config, "1day", outputsize=10)
+
+    if (
+        price_source_tracker.get("source") in ("oil_api", "metals_api")
+        and h1_candles
+    ):
+        last_real_close = h1_candles[-1]["close"]
+        if last_real_close:
+            gap_pct = abs(live_price - last_real_close) / last_real_close * 100
+            if gap_pct > 1.5:
+                print(
+                    f"[SIGNAL] ❌ {pair_name}: live price ({live_price}) from "
+                    f"{price_source_tracker['source']} disagrees with the last "
+                    f"candle close ({last_real_close}) by {gap_pct:.2f}% - "
+                    f"refusing to build a signal on a chart/price mismatch."
+                )
+                return None, None, "PRICE_SOURCE_MISMATCH", None
 
     # min_agree=2 is the PREFERRED bar everywhere, scheduled and DM
     # alike - per explicit instruction, run_strategy_bank itself now
@@ -18274,6 +18344,25 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 reply_markup=main_keyboard
             )
             schedule_auto_delete(sent_no_data.chat_id, sent_no_data.message_id)
+        elif signal == "PRICE_SOURCE_MISMATCH":
+            # Per explicit instruction - this is the honest-failure
+            # path for the confirmed USOIL/XAGUSD chart-price mismatch:
+            # the live price and the chart's candle data momentarily
+            # disagreed by more than normal market noise (two
+            # different providers, same root MetaAPI connectivity
+            # issue). Rather than show a chart that visually
+            # contradicts its own Entry/SL/TP, this refuses and says
+            # so honestly.
+            sent_mismatch = await update.message.reply_text(
+                "⚠️ <b>Price data is momentarily inconsistent for this pair.</b>\n\n"
+                "Our live price and chart data briefly disagreed, so "
+                "we're not showing a signal we can't fully stand "
+                "behind.\n\n"
+                "Try again in a moment, or try another pair.",
+                parse_mode=ParseMode.HTML,
+                reply_markup=main_keyboard
+            )
+            schedule_auto_delete(sent_mismatch.chat_id, sent_mismatch.message_id)
         else:
             sent_fetch_failed = await update.message.reply_text(
                 "⚠️ <b>Unable to fetch live market data.</b>\n"
@@ -18815,6 +18904,8 @@ async def _post_signal_for_pair(bot, pair_keyword):
                 print(f"[AUTO SIGNAL] ⏸️ {pair_keyword.upper()} skipped — forex market closed.")
             elif signal == "NO_DATA_AVAILABLE":
                 print(f"[AUTO SIGNAL] ⏸️ {pair_keyword.upper()} skipped — no real data source available (should not be scheduled).")
+            elif signal == "PRICE_SOURCE_MISMATCH":
+                print(f"[AUTO SIGNAL] ⏸️ {pair_keyword.upper()} skipped — live price and chart data momentarily disagreed, refusing to post an inconsistent chart.")
             else:
                 print(f"[AUTO SIGNAL] ❌ Could not fetch price for {pair_keyword}.")
             return

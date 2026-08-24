@@ -21927,6 +21927,40 @@ def main():
         job_kwargs={"misfire_grace_time": 300}
     )
 
+    # TEMPORARY DIAGNOSTIC, per explicit instruction - user confirmed
+    # real funds exist on MetaAPI, contradicting my prior "top up"
+    # conclusion. Checking the REAL account status and any account-
+    # count/resource-slot limits directly, rather than trusting my
+    # own earlier assumption.
+    async def _temp_check_metaapi_account_limits(context: ContextTypes.DEFAULT_TYPE):
+        try:
+            response = await asyncio.to_thread(
+                requests.get,
+                "https://mt-provisioning-api-v1.agiliumtrade.agiliumtrade.ai/users/current/accounts/7477ca32-385c-4fec-b2e7-145e43dfad81",
+                headers={"auth-token": METAAPI_TOKEN, "Accept": "application/json"},
+                timeout=15,
+            )
+            print(f"[METAAPI ACCOUNT CHECK] Status={response.status_code}")
+            print(f"[METAAPI ACCOUNT CHECK] Body: {response.text[:1500]}")
+
+            all_accounts_response = await asyncio.to_thread(
+                requests.get,
+                "https://mt-provisioning-api-v1.agiliumtrade.agiliumtrade.ai/users/current/accounts",
+                headers={"auth-token": METAAPI_TOKEN, "Accept": "application/json"},
+                timeout=15,
+            )
+            all_data = all_accounts_response.json()
+            items = all_data.get("items", []) if isinstance(all_data, dict) else all_data
+            deployed_count = sum(1 for i in (items or []) if i.get("state") == "DEPLOYED")
+            total_count = len(items) if items else 0
+            print(f"[METAAPI ACCOUNT CHECK] Total accounts: {total_count}, currently DEPLOYED: {deployed_count}")
+            for i in (items or [])[:20]:
+                print(f"[METAAPI ACCOUNT CHECK]   {i.get('_id')} login={i.get('login')} state={i.get('state')} region={i.get('region')} reliability={i.get('reliability')}")
+        except Exception as e:
+            print(f"[METAAPI ACCOUNT CHECK] Error: {e}")
+
+    job_queue.run_once(_temp_check_metaapi_account_limits, when=10, name="temp_metaapi_account_check")
+
     print("Nexora AI Running...")
     print("Daily schedule (UTC):")
     for utc_time, post_type, data in DAILY_SCHEDULE:

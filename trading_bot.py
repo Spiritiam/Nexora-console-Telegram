@@ -940,7 +940,66 @@ _CLIENT_MT5_CONNECTION_FAILURES = {}
 _CLIENT_MT5_CONNECTION_FAILURE_REASONS = {}
 _CLIENT_MT5_FAILURE_COOLDOWN_SECONDS = 60
 
+# Per explicit instruction - dedup window for admin notifications
+# about a failed MetaAPI redeploy. Confirmed live: when the
+# underlying cause is account-wide (e.g. a MetaAPI billing lapse),
+# many different client accounts can all fail within moments of each
+# other - without this, the admin would get one notification PER
+# affected account, all saying the same underlying thing. One
+# notification per this window is enough to prompt action.
+_LAST_METAAPI_DEPLOY_FAILURE_ADMIN_ALERT = {"time": None}
+_METAAPI_DEPLOY_FAILURE_ALERT_COOLDOWN_SECONDS = 1800
+
+
+async def notify_admin_of_metaapi_deploy_failure(metaapi_account_id, reason):
+    """
+    Per explicit instruction - a real, immediate Telegram alert to the
+    admin when a client's MetaAPI account fails to redeploy, so the
+    admin can act (most likely cause found live: a MetaAPI account
+    balance/plan needing a top-up) without a client having to notice
+    and report "balance unavailable" first.
+    """
+    if not ADMIN_USER_ID or not _app_instance:
+        return
+    last_alert = _LAST_METAAPI_DEPLOY_FAILURE_ADMIN_ALERT["time"]
+    if last_alert and (time.time() - last_alert) < _METAAPI_DEPLOY_FAILURE_ALERT_COOLDOWN_SECONDS:
+        return
+    _LAST_METAAPI_DEPLOY_FAILURE_ADMIN_ALERT["time"] = time.time()
+    try:
+        await _app_instance.bot.send_message(
+            chat_id=int(ADMIN_USER_ID),
+            text=(
+                f"⚠️ <b>A client's MetaAPI account failed to redeploy.</b>\n\n"
+                f"Account: <code>{metaapi_account_id}</code>\n"
+                f"Reason: {reason[:400]}\n\n"
+                f"Most likely cause: your MetaAPI account balance/plan "
+                f"needs a top-up. Check metaapi.cloud directly.\n\n"
+                f"<i>(Further alerts are muted for 30 minutes to avoid "
+                f"spam if multiple accounts are affected at once.)</i>"
+            ),
+            parse_mode=ParseMode.HTML
+        )
+    except Exception as e:
+        print(f"[MT5 AUTOTRADE] Couldn't notify admin of deploy failure: {e}")
+
+
 async def get_client_mt5_connection(metaapi_account_id):
+    """
+    FIX: CONFIRMED REAL BUG in the previous version of this function,
+    per explicit instruction to fix it properly. That version tried
+    to DETECT an undeployed account by pattern-matching the text of
+    whatever exception the websocket connection attempt eventually
+    raised - but confirmed live, the underlying MetaAPI SDK retries
+    the subscription internally for LONGER than this function's own
+    15s outer timeout, so what actually got caught was a generic,
+    EMPTY asyncio.TimeoutError, never the real "no accounts deployed"
+    message at all. The detection could never fire.
+
+    Redesigned to check the REAL deployment state directly via a
+    fast REST call FIRST, before ever attempting the slow websocket
+    connection - this doesn't guess at anything from error text, it
+    KNOWS the actual state with certainty, and acts on it directly.
+    """
     if metaapi_account_id in _CLIENT_MT5_CONNECTIONS:
         return _CLIENT_MT5_CONNECTIONS[metaapi_account_id]
 
@@ -948,14 +1007,44 @@ async def get_client_mt5_connection(metaapi_account_id):
     if last_failure and (time.time() - last_failure) < _CLIENT_MT5_FAILURE_COOLDOWN_SECONDS:
         return None  # failed recently - skip immediately instead of burning another 15s timeout
 
+    async def _connect():
+        api = MetaApi(token=METAAPI_TOKEN)
+        account = await api.metatrader_account_api.get_account(account_id=metaapi_account_id)
+        connection = account.get_rpc_connection()
+        await connection.connect()
+        await connection.wait_synchronized()
+        return connection
+
     try:
-        async def _connect():
-            api = MetaApi(token=METAAPI_TOKEN)
-            account = await api.metatrader_account_api.get_account(account_id=metaapi_account_id)
-            connection = account.get_rpc_connection()
-            await connection.connect()
-            await connection.wait_synchronized()
-            return connection
+        state_response = await asyncio.to_thread(
+            requests.get,
+            f"https://mt-provisioning-api-v1.agiliumtrade.agiliumtrade.ai/users/current/accounts/{metaapi_account_id}",
+            headers={"auth-token": METAAPI_TOKEN, "Accept": "application/json"},
+            timeout=15,
+        )
+        state_data = state_response.json() if state_response.status_code == 200 else {}
+        current_state = state_data.get("state")
+
+        if current_state and current_state != "DEPLOYED":
+            print(f"[MT5 AUTOTRADE] {metaapi_account_id} is {current_state} on MetaAPI's side - redeploying automatically...")
+            deploy_response = await asyncio.to_thread(
+                requests.post,
+                f"https://mt-provisioning-api-v1.agiliumtrade.agiliumtrade.ai/users/current/accounts/{metaapi_account_id}/deploy",
+                headers={"auth-token": METAAPI_TOKEN, "Accept": "application/json"},
+                timeout=20,
+            )
+            if deploy_response.status_code not in (200, 204):
+                # Definitive, confirmed failure - no guessing about
+                # whether this is transient, real error text captured
+                # directly from MetaAPI's own response.
+                reason = f"Deploy failed ({deploy_response.status_code}): {deploy_response.text[:300]}"
+                print(f"[MT5 AUTOTRADE] ❌ Redeploy for {metaapi_account_id} failed: {reason}")
+                _CLIENT_MT5_CONNECTION_FAILURES[metaapi_account_id] = time.time()
+                _CLIENT_MT5_CONNECTION_FAILURE_REASONS[metaapi_account_id] = reason
+                await notify_admin_of_metaapi_deploy_failure(metaapi_account_id, reason)
+                return None
+            print(f"[MT5 AUTOTRADE] Redeploy request for {metaapi_account_id} accepted - giving it a moment to come up...")
+            await asyncio.sleep(15)  # give it a real moment to actually come up
 
         connection = await asyncio.wait_for(_connect(), timeout=15)
         _CLIENT_MT5_CONNECTIONS[metaapi_account_id] = connection
@@ -963,48 +1052,6 @@ async def get_client_mt5_connection(metaapi_account_id):
         _CLIENT_MT5_CONNECTION_FAILURE_REASONS.pop(metaapi_account_id, None)
         return connection
     except Exception as e:
-        # FIX: CONFIRMED REAL LIVE ISSUE, per explicit instruction -
-        # confirmed live via real logs: an already-connected, already-
-        # subscribed client's account can end up UNDEPLOYED on
-        # MetaAPI's side ("you have no accounts deployed yet"), which
-        # this used to just report as a generic failure, leaving the
-        # dashboard stuck on "unavailable" until someone manually
-        # redeployed it via MetaAPI's own dashboard. This is now
-        # self-healing: detects this specific, real error message and
-        # calls MetaAPI's own real Deploy Account endpoint directly,
-        # then gives it a real moment to actually come up before
-        # trying the connection ONE more time. Every other kind of
-        # failure still falls through to the exact same cooldown
-        # behavior as before - this only changes behavior for this
-        # one specific, identifiable cause.
-        if "no accounts deployed" in str(e).lower():
-            print(f"[MT5 AUTOTRADE] {metaapi_account_id} is undeployed on MetaAPI's side - redeploying automatically...")
-            try:
-                deploy_response = await asyncio.to_thread(
-                    requests.post,
-                    f"https://mt-provisioning-api-v1.agiliumtrade.agiliumtrade.ai/users/current/accounts/{metaapi_account_id}/deploy",
-                    headers={"auth-token": METAAPI_TOKEN, "Accept": "application/json"},
-                    timeout=20,
-                )
-                print(f"[MT5 AUTOTRADE] Redeploy request for {metaapi_account_id}: {deploy_response.status_code}")
-                if deploy_response.status_code in (200, 204):
-                    await asyncio.sleep(15)  # give it a real moment to actually come up
-                    async def _retry_connect():
-                        api = MetaApi(token=METAAPI_TOKEN)
-                        account = await api.metatrader_account_api.get_account(account_id=metaapi_account_id)
-                        connection = account.get_rpc_connection()
-                        await connection.connect()
-                        await connection.wait_synchronized()
-                        return connection
-                    connection = await asyncio.wait_for(_retry_connect(), timeout=20)
-                    _CLIENT_MT5_CONNECTIONS[metaapi_account_id] = connection
-                    _CLIENT_MT5_CONNECTION_FAILURES.pop(metaapi_account_id, None)
-                    _CLIENT_MT5_CONNECTION_FAILURE_REASONS.pop(metaapi_account_id, None)
-                    print(f"[MT5 AUTOTRADE] ✅ {metaapi_account_id} redeployed and connected successfully.")
-                    return connection
-            except Exception as redeploy_error:
-                print(f"[MT5 AUTOTRADE] Redeploy attempt for {metaapi_account_id} failed: {redeploy_error}")
-
         print(f"[MT5 AUTOTRADE] Connection failed for client account {metaapi_account_id}: {e}")
         _CLIENT_MT5_CONNECTION_FAILURES[metaapi_account_id] = time.time()
         _CLIENT_MT5_CONNECTION_FAILURE_REASONS[metaapi_account_id] = str(e)
@@ -16587,8 +16634,17 @@ async def handle_buttons(update: Update, context: ContextTypes.DEFAULT_TYPE):
             and account.get("metaapi_account_id")
         )
         if already_active:
+            # Per explicit instruction - real, immediate feedback the
+            # moment this is tapped, since checking the real balance
+            # can take a genuine few seconds (or longer if MetaAPI
+            # needs a redeploy) - matches the "connecting..." progress
+            # pattern already used for onboarding.
+            checking_msg = await update.message.reply_text(
+                "🔄 <b>Checking your linked Exness account...</b>",
+                parse_mode=ParseMode.HTML
+            )
             dash_text, dash_markup = await build_exness_autotrade_dashboard(user_id, account, expiry, now)
-            await update.message.reply_text(dash_text, parse_mode=ParseMode.HTML, reply_markup=dash_markup)
+            await checking_msg.edit_text(dash_text, parse_mode=ParseMode.HTML, reply_markup=dash_markup)
             return
         await send_exness_autotrade_intro(context.bot, update.message.chat_id)
         return
@@ -16664,6 +16720,12 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if already_active:
             # Already fully set up - no need to walk through bot/pair/
             # lot-risk selection again, just show current status.
+            # Same "checking..." feedback as the other dashboard entry
+            # point, per explicit instruction.
+            await query.message.edit_text(
+                "🔄 <b>Checking your linked Exness account...</b>",
+                parse_mode=ParseMode.HTML
+            )
             dash_text, dash_markup = await build_exness_autotrade_dashboard(user_id, account, expiry, now)
             await query.message.edit_text(dash_text, parse_mode=ParseMode.HTML, reply_markup=dash_markup)
             return
@@ -17125,6 +17187,10 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 ).replace(tzinfo=None)
             except Exception:
                 expiry = None
+        await query.message.edit_text(
+            "🔄 <b>Checking your linked Exness account...</b>",
+            parse_mode=ParseMode.HTML
+        )
         dash_text, dash_markup = await build_exness_autotrade_dashboard(user_id, account, expiry, now)
         await query.message.edit_text(dash_text, parse_mode=ParseMode.HTML, reply_markup=dash_markup)
         return

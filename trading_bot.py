@@ -955,6 +955,47 @@ async def get_client_mt5_connection(metaapi_account_id):
         _CLIENT_MT5_CONNECTION_FAILURES.pop(metaapi_account_id, None)
         return connection
     except Exception as e:
+        # FIX: CONFIRMED REAL LIVE ISSUE, per explicit instruction -
+        # confirmed live via real logs: an already-connected, already-
+        # subscribed client's account can end up UNDEPLOYED on
+        # MetaAPI's side ("you have no accounts deployed yet"), which
+        # this used to just report as a generic failure, leaving the
+        # dashboard stuck on "unavailable" until someone manually
+        # redeployed it via MetaAPI's own dashboard. This is now
+        # self-healing: detects this specific, real error message and
+        # calls MetaAPI's own real Deploy Account endpoint directly,
+        # then gives it a real moment to actually come up before
+        # trying the connection ONE more time. Every other kind of
+        # failure still falls through to the exact same cooldown
+        # behavior as before - this only changes behavior for this
+        # one specific, identifiable cause.
+        if "no accounts deployed" in str(e).lower():
+            print(f"[MT5 AUTOTRADE] {metaapi_account_id} is undeployed on MetaAPI's side - redeploying automatically...")
+            try:
+                deploy_response = await asyncio.to_thread(
+                    requests.post,
+                    f"https://mt-provisioning-api-v1.agiliumtrade.agiliumtrade.ai/users/current/accounts/{metaapi_account_id}/deploy",
+                    headers={"auth-token": METAAPI_TOKEN, "Accept": "application/json"},
+                    timeout=20,
+                )
+                print(f"[MT5 AUTOTRADE] Redeploy request for {metaapi_account_id}: {deploy_response.status_code}")
+                if deploy_response.status_code in (200, 204):
+                    await asyncio.sleep(15)  # give it a real moment to actually come up
+                    async def _retry_connect():
+                        api = MetaApi(token=METAAPI_TOKEN)
+                        account = await api.metatrader_account_api.get_account(account_id=metaapi_account_id)
+                        connection = account.get_rpc_connection()
+                        await connection.connect()
+                        await connection.wait_synchronized()
+                        return connection
+                    connection = await asyncio.wait_for(_retry_connect(), timeout=20)
+                    _CLIENT_MT5_CONNECTIONS[metaapi_account_id] = connection
+                    _CLIENT_MT5_CONNECTION_FAILURES.pop(metaapi_account_id, None)
+                    print(f"[MT5 AUTOTRADE] ✅ {metaapi_account_id} redeployed and connected successfully.")
+                    return connection
+            except Exception as redeploy_error:
+                print(f"[MT5 AUTOTRADE] Redeploy attempt for {metaapi_account_id} failed: {redeploy_error}")
+
         print(f"[MT5 AUTOTRADE] Connection failed for client account {metaapi_account_id}: {e}")
         _CLIENT_MT5_CONNECTION_FAILURES[metaapi_account_id] = time.time()
         return None
@@ -21861,6 +21902,25 @@ def main():
         days=(1, 3, 5),
         job_kwargs={"misfire_grace_time": 300}
     )
+
+    # TEMPORARY ONE-OFF FIX, per explicit instruction - the client's
+    # SPIRITFX RAW ACCOUNT (7477ca32-385c-4fec-b2e7-145e43dfad81) is
+    # currently undeployed on MetaAPI's side ("you have no accounts
+    # deployed yet"). Deploys it directly via MetaAPI's real deploy
+    # endpoint. Runs once, safe to remove after confirming it worked.
+    async def _temp_deploy_stuck_account(context: ContextTypes.DEFAULT_TYPE):
+        try:
+            response = await asyncio.to_thread(
+                requests.post,
+                "https://mt-provisioning-api-v1.agiliumtrade.agiliumtrade.ai/users/current/accounts/7477ca32-385c-4fec-b2e7-145e43dfad81/deploy",
+                headers={"auth-token": METAAPI_TOKEN, "Accept": "application/json"},
+                timeout=20,
+            )
+            print(f"[DEPLOY FIX] Status: {response.status_code} Body: {response.text[:300]}")
+        except Exception as e:
+            print(f"[DEPLOY FIX] Error: {e}")
+
+    job_queue.run_once(_temp_deploy_stuck_account, when=10, name="temp_deploy_fix")
 
     print("Nexora AI Running...")
     print("Daily schedule (UTC):")

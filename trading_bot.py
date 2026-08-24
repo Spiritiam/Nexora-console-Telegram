@@ -21606,6 +21606,39 @@ def main():
         job_kwargs={"misfire_grace_time": 300}
     )
 
+    # TEMPORARY DIAGNOSTIC, per explicit instruction - confirms the
+    # 3 real NOWPayments credentials are actually working end to end
+    # (not just present as env vars), by making a real API call and a
+    # real test invoice creation. Runs once, 15s after startup. Safe
+    # to remove once the answer is known.
+    async def _temp_check_nowpayments_credentials(context: ContextTypes.DEFAULT_TYPE):
+        print(f"[NOWPAYMENTS TEST] API key set: {bool(NOWPAYMENTS_API_KEY)}")
+        print(f"[NOWPAYMENTS TEST] IPN secret set: {bool(NOWPAYMENTS_IPN_SECRET)}")
+        print(f"[NOWPAYMENTS TEST] Webhook URL set: {NOWPAYMENTS_WEBHOOK_URL!r}")
+        if not NOWPAYMENTS_API_KEY:
+            print("[NOWPAYMENTS TEST] Cannot proceed - API key missing.")
+            return
+        try:
+            status_response = await asyncio.to_thread(
+                requests.get, f"{NOWPAYMENTS_BASE_URL}/status", timeout=15
+            )
+            print(f"[NOWPAYMENTS TEST] API status check: {status_response.status_code} {status_response.text[:200]}")
+
+            auth_response = await asyncio.to_thread(
+                requests.get,
+                f"{NOWPAYMENTS_BASE_URL}/key",
+                headers={"x-api-key": NOWPAYMENTS_API_KEY},
+                timeout=15,
+            )
+            print(f"[NOWPAYMENTS TEST] Auth check (GET /key): {auth_response.status_code} {auth_response.text[:300]}")
+
+            test_invoice_url = await nowpayments_initialize_payment("diagnostic_test", f"DIAGTEST-{int(time.time())}")
+            print(f"[NOWPAYMENTS TEST] Real test invoice creation: {'SUCCESS - ' + test_invoice_url if test_invoice_url else 'FAILED - see [NOWPAYMENTS] logs above for the reason'}")
+        except Exception as e:
+            print(f"[NOWPAYMENTS TEST] Error: {e}")
+
+    job_queue.run_once(_temp_check_nowpayments_credentials, when=15, name="temp_nowpayments_test")
+
     print("Nexora AI Running...")
     print("Daily schedule (UTC):")
     for utc_time, post_type, data in DAILY_SCHEDULE:

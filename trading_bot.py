@@ -22113,6 +22113,36 @@ def main():
         job_kwargs={"misfire_grace_time": 300}
     )
 
+    # TEMPORARY DIAGNOSTIC, per explicit instruction - test whether a
+    # targeted request INSIDE a confirmed gap window (2022-11-03 to
+    # 2022-12-05 for XAUUSD) returns real data, to determine if the
+    # gap is a genuine broker-side data limitation or a fixable
+    # pagination artifact.
+    async def _temp_test_gap_fill(context: ContextTypes.DEFAULT_TYPE):
+        if not METAAPI_TOKEN or not METAAPI_ACCOUNT_ID:
+            print("[GAP TEST] Credentials not set")
+            return
+        headers = {"auth-token": METAAPI_TOKEN, "Accept": "application/json"}
+        url = (
+            f"https://mt-market-data-client-api-v1.new-york.agiliumtrade.ai"
+            f"/users/current/accounts/{METAAPI_ACCOUNT_ID}"
+            f"/historical-market-data/symbols/XAUUSDm/timeframes/1h/candles"
+            f"?limit=50&startTime=2022-11-20T00:00:00.000Z"
+        )
+        try:
+            response = await asyncio.to_thread(requests.get, url, headers=headers, timeout=30)
+            print(f"[GAP TEST] Status: {response.status_code}")
+            data = response.json()
+            print(f"[GAP TEST] Got {len(data)} candles")
+            if data:
+                times = sorted(c["time"] for c in data)
+                print(f"[GAP TEST] Range: {times[0]} to {times[-1]}")
+                print(f"[GAP TEST] First 5 times: {times[:5]}")
+        except Exception as e:
+            print(f"[GAP TEST] Error: {e}")
+
+    job_queue.run_once(_temp_test_gap_fill, when=10, name="temp_gap_test")
+
     print("Nexora AI Running...")
     print("Daily schedule (UTC):")
     for utc_time, post_type, data in DAILY_SCHEDULE:

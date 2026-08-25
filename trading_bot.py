@@ -22034,6 +22034,21 @@ def main():
         job_kwargs={"misfire_grace_time": 300}
     )
 
+    # TEMPORARY DIAGNOSTIC, per explicit instruction - a real, live
+    # call to get_silver_price() to definitively confirm why it
+    # produced no log output this morning when XAGUSD's scheduled
+    # signal failed. Runs once, safe to remove once the answer is
+    # known.
+    async def _temp_test_silver_price(context: ContextTypes.DEFAULT_TYPE):
+        print(f"[SILVER TEST] METALS_API_KEY set: {bool(METALS_API_KEY)}, length: {len(METALS_API_KEY) if METALS_API_KEY else 0}")
+        try:
+            result = await asyncio.to_thread(get_silver_price)
+            print(f"[SILVER TEST] get_silver_price() returned: {result}")
+        except Exception as e:
+            print(f"[SILVER TEST] get_silver_price() raised an exception: {e}")
+
+    job_queue.run_once(_temp_test_silver_price, when=10, name="temp_silver_test")
+
     print("Nexora AI Running...")
     print("Daily schedule (UTC):")
     for utc_time, post_type, data in DAILY_SCHEDULE:

@@ -22113,35 +22113,100 @@ def main():
         job_kwargs={"misfire_grace_time": 300}
     )
 
-    # TEMPORARY DIAGNOSTIC, per explicit instruction - test whether a
-    # targeted request INSIDE a confirmed gap window (2022-11-03 to
-    # 2022-12-05 for XAUUSD) returns real data, to determine if the
-    # gap is a genuine broker-side data limitation or a fixable
-    # pagination artifact.
-    async def _temp_test_gap_fill(context: ContextTypes.DEFAULT_TYPE):
+    # TEMPORARY DATA-PULL JOB (rebuild), per explicit instruction -
+    # the first pull (already removed) confirmed real, dense hourly
+    # data exists throughout, but requesting limit=1000 per page
+    # appears to silently return a sparser result for some windows
+    # (confirmed live: a targeted limit=50 request inside a "gap"
+    # returned fully dense data). Using limit=500 this time - more
+    # API calls overall, but should avoid whatever caused the larger
+    # requests to skip real data. Table was truncated first so this
+    # doesn't mix old gappy rows with the new clean pull.
+    async def _temp_pull_historical_candles_v2(context: ContextTypes.DEFAULT_TYPE):
         if not METAAPI_TOKEN or not METAAPI_ACCOUNT_ID:
-            print("[GAP TEST] Credentials not set")
+            print("[HIST PULL V2] Credentials not set")
             return
-        headers = {"auth-token": METAAPI_TOKEN, "Accept": "application/json"}
-        url = (
-            f"https://mt-market-data-client-api-v1.new-york.agiliumtrade.ai"
-            f"/users/current/accounts/{METAAPI_ACCOUNT_ID}"
-            f"/historical-market-data/symbols/XAUUSDm/timeframes/1h/candles"
-            f"?limit=50&startTime=2022-11-20T00:00:00.000Z"
-        )
-        try:
-            response = await asyncio.to_thread(requests.get, url, headers=headers, timeout=30)
-            print(f"[GAP TEST] Status: {response.status_code}")
-            data = response.json()
-            print(f"[GAP TEST] Got {len(data)} candles")
-            if data:
-                times = sorted(c["time"] for c in data)
-                print(f"[GAP TEST] Range: {times[0]} to {times[-1]}")
-                print(f"[GAP TEST] First 5 times: {times[:5]}")
-        except Exception as e:
-            print(f"[GAP TEST] Error: {e}")
 
-    job_queue.run_once(_temp_test_gap_fill, when=10, name="temp_gap_test")
+        pairs_to_pull = [
+            ("xauusd", "XAUUSDm"), ("btcusd", "BTCUSDm"), ("xagusd", "XAGUSDm"),
+            ("usoil", "USOILm"), ("gbpusd", "GBPUSDm"), ("gbpjpy", "GBPJPYm"),
+            ("eurusd", "EURUSDm"), ("usdjpy", "USDJPYm"), ("audusd", "AUDUSDm"),
+            ("usdcad", "USDCADm"), ("eurjpy", "EURJPYm"), ("usdchf", "USDCHFm"),
+            ("nzdusd", "NZDUSDm"),
+        ]
+        timeframe = "1h"
+        headers = {"auth-token": METAAPI_TOKEN, "Accept": "application/json"}
+
+        for pair_key, mt5_symbol in pairs_to_pull:
+            all_candles = {}
+            start_time = None
+            base_url = (
+                f"https://mt-market-data-client-api-v1.new-york.agiliumtrade.ai"
+                f"/users/current/accounts/{METAAPI_ACCOUNT_ID}"
+                f"/historical-market-data/symbols/{mt5_symbol}/timeframes/{timeframe}/candles"
+            )
+            for page in range(120):  # 120 x 500 = up to 60,000 candles, same real coverage as before
+                url = f"{base_url}?limit=500"
+                if start_time:
+                    url += f"&startTime={start_time}"
+                try:
+                    response = await asyncio.to_thread(requests.get, url, headers=headers, timeout=60)
+                    if response.status_code != 200:
+                        print(f"[HIST PULL V2] {pair_key} page {page}: status {response.status_code} - {response.text[:200]}")
+                        break
+                    batch = response.json()
+                    if not batch:
+                        print(f"[HIST PULL V2] {pair_key} page {page}: empty, stopping")
+                        break
+                    for c in batch:
+                        all_candles[c["time"]] = c
+                    oldest_time = min(c["time"] for c in batch)
+                    if page % 5 == 0:
+                        print(f"[HIST PULL V2] {pair_key} page {page}: oldest so far: {oldest_time}, total unique: {len(all_candles)}")
+                    if start_time == oldest_time:
+                        print(f"[HIST PULL V2] {pair_key} page {page}: startTime didn't move, stopping")
+                        break
+                    start_time = oldest_time
+                    await asyncio.sleep(0.4)
+                except Exception as e:
+                    print(f"[HIST PULL V2] {pair_key} page {page} error: {e}")
+                    break
+
+            print(f"[HIST PULL V2] {pair_key}: total unique candles fetched: {len(all_candles)}")
+            if all_candles:
+                times = sorted(all_candles.keys())
+                print(f"[HIST PULL V2] {pair_key}: range {times[0]} to {times[-1]}")
+
+            rows = [
+                {
+                    "pair_key": pair_key, "timeframe": timeframe, "candle_time": c["time"],
+                    "open": c["open"], "high": c["high"], "low": c["low"], "close": c["close"],
+                    "tick_volume": c.get("tickVolume"),
+                }
+                for c in all_candles.values()
+            ]
+            chunk_size = 500
+            inserted = 0
+            for i in range(0, len(rows), chunk_size):
+                chunk = rows[i:i + chunk_size]
+                try:
+                    url = f"{SUPABASE_URL}/rest/v1/historical_candles"
+                    resp = await asyncio.to_thread(
+                        requests.post, url,
+                        headers={**sb_headers(), "Prefer": "resolution=merge-duplicates"},
+                        json=chunk, timeout=30,
+                    )
+                    if resp.status_code in (200, 201):
+                        inserted += len(chunk)
+                    else:
+                        print(f"[HIST PULL V2] {pair_key} insert chunk {i} failed: {resp.status_code} {resp.text[:200]}")
+                except Exception as e:
+                    print(f"[HIST PULL V2] {pair_key} insert chunk {i} error: {e}")
+            print(f"[HIST PULL V2] ✅ {pair_key}: inserted/upserted {inserted} rows.")
+
+        print("[HIST PULL V2] ✅✅ ALL PAIRS DONE")
+
+    job_queue.run_once(_temp_pull_historical_candles_v2, when=10, name="temp_hist_pull_v2")
 
     print("Nexora AI Running...")
     print("Daily schedule (UTC):")

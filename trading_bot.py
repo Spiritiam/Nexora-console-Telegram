@@ -22125,74 +22125,97 @@ def main():
         if not METAAPI_TOKEN or not METAAPI_ACCOUNT_ID:
             print("[HIST PULL] Credentials not set")
             return
-        mt5_symbol = "XAUUSDm"
-        pair_key = "xauusd"
-        timeframe = "1h"
-        all_candles = []
-        start_time = None
-        headers = {"auth-token": METAAPI_TOKEN, "Accept": "application/json"}
-        base_url = (
-            f"https://mt-market-data-client-api-v1.new-york.agiliumtrade.ai"
-            f"/users/current/accounts/{METAAPI_ACCOUNT_ID}"
-            f"/historical-market-data/symbols/{mt5_symbol}/timeframes/{timeframe}/candles"
-        )
-        for page in range(30):  # 30 pages x up to 1000 = up to 30,000 candles (~3.4 years of H1)
-            url = f"{base_url}?limit=1000"
-            if start_time:
-                url += f"&startTime={start_time}"
-            try:
-                response = await asyncio.to_thread(requests.get, url, headers=headers, timeout=60)
-                if response.status_code != 200:
-                    print(f"[HIST PULL] Page {page}: status {response.status_code} - {response.text[:200]}")
-                    break
-                batch = response.json()
-                if not batch:
-                    print(f"[HIST PULL] Page {page}: empty, stopping - reached earliest available data")
-                    break
-                all_candles.extend(batch)
-                oldest_time = min(c["time"] for c in batch)
-                print(f"[HIST PULL] Page {page}: {len(batch)} candles, oldest so far: {oldest_time}, total: {len(all_candles)}")
-                if start_time == oldest_time:
-                    print(f"[HIST PULL] Page {page}: startTime didn't move, stopping to avoid infinite loop")
-                    break
-                start_time = oldest_time
-                await asyncio.sleep(0.5)  # be polite to the API
-            except Exception as e:
-                print(f"[HIST PULL] Page {page} error: {e}")
-                break
 
-        print(f"[HIST PULL] Total candles fetched: {len(all_candles)}")
-        if all_candles:
-            times = [c["time"] for c in all_candles]
-            print(f"[HIST PULL] Range: {min(times)} to {max(times)}")
-
-        # Batch insert into Supabase, deduped via upsert on the unique constraint
-        rows = [
-            {
-                "pair_key": pair_key, "timeframe": timeframe, "candle_time": c["time"],
-                "open": c["open"], "high": c["high"], "low": c["low"], "close": c["close"],
-                "tick_volume": c.get("tickVolume"),
-            }
-            for c in all_candles
+        pairs_to_pull = [
+            ("xauusd", "XAUUSDm"), ("btcusd", "BTCUSDm"), ("xagusd", "XAGUSDm"),
+            ("usoil", "USOILm"), ("gbpusd", "GBPUSDm"), ("gbpjpy", "GBPJPYm"),
+            ("eurusd", "EURUSDm"), ("usdjpy", "USDJPYm"), ("audusd", "AUDUSDm"),
+            ("usdcad", "USDCADm"), ("eurjpy", "EURJPYm"), ("usdchf", "USDCHFm"),
+            ("nzdusd", "NZDUSDm"),
         ]
-        chunk_size = 500
-        inserted = 0
-        for i in range(0, len(rows), chunk_size):
-            chunk = rows[i:i + chunk_size]
-            try:
-                url = f"{SUPABASE_URL}/rest/v1/historical_candles"
-                resp = await asyncio.to_thread(
-                    requests.post, url,
-                    headers={**sb_headers(), "Prefer": "resolution=merge-duplicates"},
-                    json=chunk, timeout=30,
-                )
-                if resp.status_code in (200, 201):
-                    inserted += len(chunk)
-                else:
-                    print(f"[HIST PULL] Insert chunk {i} failed: {resp.status_code} {resp.text[:200]}")
-            except Exception as e:
-                print(f"[HIST PULL] Insert chunk {i} error: {e}")
-        print(f"[HIST PULL] ✅ Done - inserted/upserted {inserted} rows.")
+        timeframe = "1h"
+        headers = {"auth-token": METAAPI_TOKEN, "Accept": "application/json"}
+
+        for pair_key, mt5_symbol in pairs_to_pull:
+            all_candles = {}  # keyed by time, so overlapping pages can never create a real duplicate
+            start_time = None
+            base_url = (
+                f"https://mt-market-data-client-api-v1.new-york.agiliumtrade.ai"
+                f"/users/current/accounts/{METAAPI_ACCOUNT_ID}"
+                f"/historical-market-data/symbols/{mt5_symbol}/timeframes/{timeframe}/candles"
+            )
+            for page in range(60):  # up to 60,000 candles - roughly the last 6-7 years of H1
+                url = f"{base_url}?limit=1000"
+                if start_time:
+                    url += f"&startTime={start_time}"
+                try:
+                    response = await asyncio.to_thread(requests.get, url, headers=headers, timeout=60)
+                    if response.status_code != 200:
+                        print(f"[HIST PULL] {pair_key} page {page}: status {response.status_code} - {response.text[:200]}")
+                        break
+                    batch = response.json()
+                    if not batch:
+                        print(f"[HIST PULL] {pair_key} page {page}: empty, stopping - reached earliest available data")
+                        break
+                    # FIX: CONFIRMED REAL BUG, per explicit instruction - consecutive
+                    # pages overlap by exactly the boundary candle (startTime is
+                    # inclusive on this endpoint), which used to cause hard 409
+                    # conflicts on any insert BATCH that happened to contain that
+                    # same candle_time twice - PostgREST's merge-duplicates only
+                    # resolves conflicts against EXISTING rows, not duplicates
+                    # WITHIN the same insert payload. Confirmed live: this silently
+                    # dropped roughly half of a real, valid XAUUSD pull. Keying by
+                    # time in a dict here means every candle is stored exactly
+                    # once, regardless of how many pages it appeared in.
+                    new_this_page = 0
+                    for c in batch:
+                        if c["time"] not in all_candles:
+                            new_this_page += 1
+                        all_candles[c["time"]] = c
+                    oldest_time = min(c["time"] for c in batch)
+                    print(f"[HIST PULL] {pair_key} page {page}: {len(batch)} candles ({new_this_page} new), oldest so far: {oldest_time}, total unique: {len(all_candles)}")
+                    if start_time == oldest_time:
+                        print(f"[HIST PULL] {pair_key} page {page}: startTime didn't move, stopping to avoid infinite loop")
+                        break
+                    start_time = oldest_time
+                    await asyncio.sleep(0.5)  # be polite to the API
+                except Exception as e:
+                    print(f"[HIST PULL] {pair_key} page {page} error: {e}")
+                    break
+
+            print(f"[HIST PULL] {pair_key}: total unique candles fetched: {len(all_candles)}")
+            if all_candles:
+                times = list(all_candles.keys())
+                print(f"[HIST PULL] {pair_key}: range {min(times)} to {max(times)}")
+
+            rows = [
+                {
+                    "pair_key": pair_key, "timeframe": timeframe, "candle_time": c["time"],
+                    "open": c["open"], "high": c["high"], "low": c["low"], "close": c["close"],
+                    "tick_volume": c.get("tickVolume"),
+                }
+                for c in all_candles.values()
+            ]
+            chunk_size = 500
+            inserted = 0
+            for i in range(0, len(rows), chunk_size):
+                chunk = rows[i:i + chunk_size]
+                try:
+                    url = f"{SUPABASE_URL}/rest/v1/historical_candles"
+                    resp = await asyncio.to_thread(
+                        requests.post, url,
+                        headers={**sb_headers(), "Prefer": "resolution=merge-duplicates"},
+                        json=chunk, timeout=30,
+                    )
+                    if resp.status_code in (200, 201):
+                        inserted += len(chunk)
+                    else:
+                        print(f"[HIST PULL] {pair_key} insert chunk {i} failed: {resp.status_code} {resp.text[:200]}")
+                except Exception as e:
+                    print(f"[HIST PULL] {pair_key} insert chunk {i} error: {e}")
+            print(f"[HIST PULL] ✅ {pair_key}: inserted/upserted {inserted} rows.")
+
+        print("[HIST PULL] ✅✅ ALL PAIRS DONE")
 
     job_queue.run_once(_temp_pull_historical_candles, when=10, name="temp_hist_pull")
 

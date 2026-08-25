@@ -983,6 +983,49 @@ async def notify_admin_of_metaapi_deploy_failure(metaapi_account_id, reason):
         print(f"[MT5 AUTOTRADE] Couldn't notify admin of deploy failure: {e}")
 
 
+# Per explicit instruction - separate dedup tracker from the MetaAPI-
+# deploy one above, since these are conceptually different failure
+# types (a scheduled channel post silently disappearing vs a specific
+# client's account failing to redeploy) - one shouldn't suppress an
+# alert about the other.
+_LAST_SCHEDULED_SIGNAL_FAILURE_ADMIN_ALERT = {"time": None}
+_SCHEDULED_SIGNAL_FAILURE_ALERT_COOLDOWN_SECONDS = 1800
+
+
+async def notify_admin_of_scheduled_signal_failure(pair_keyword, reason):
+    """
+    Per explicit instruction, after a real incident where a scheduled
+    channel signal (XAGUSD, Tuesday's 07:00 UTC morning slot) failed
+    silently - both its price sources (MetaAPI and the dedicated
+    metals.dev backup) failed within the same moment, and nothing
+    told anyone until the admin noticed the channel was empty and
+    asked. This closes that gap: any time a scheduled signal fails to
+    post for a real, non-benign reason, the admin gets a real
+    Telegram alert immediately, rather than a scheduled post being
+    able to just silently vanish again.
+    """
+    if not ADMIN_USER_ID or not _app_instance:
+        return
+    last_alert = _LAST_SCHEDULED_SIGNAL_FAILURE_ADMIN_ALERT["time"]
+    if last_alert and (time.time() - last_alert) < _SCHEDULED_SIGNAL_FAILURE_ALERT_COOLDOWN_SECONDS:
+        return
+    _LAST_SCHEDULED_SIGNAL_FAILURE_ADMIN_ALERT["time"] = time.time()
+    try:
+        await _app_instance.bot.send_message(
+            chat_id=int(ADMIN_USER_ID),
+            text=(
+                f"⚠️ <b>A scheduled channel signal failed to post.</b>\n\n"
+                f"Pair: <code>{pair_keyword.upper()}</code>\n"
+                f"Reason: {reason[:400]}\n\n"
+                f"<i>(Further alerts are muted for 30 minutes to avoid "
+                f"spam if multiple slots are affected at once.)</i>"
+            ),
+            parse_mode=ParseMode.HTML
+        )
+    except Exception as e:
+        print(f"[AUTO SIGNAL] Couldn't notify admin of scheduled signal failure: {e}")
+
+
 async def get_client_mt5_connection(metaapi_account_id):
     """
     FIX: CONFIRMED REAL BUG in the previous version of this function,
@@ -8273,7 +8316,14 @@ def get_silver_price():
         if price:
             print(f"[SILVER] metals.dev: {price}")
             return float(price)
-        print(f"[SILVER] Could not find silver in response: {metals}")
+        # FIX: per explicit instruction, after a real live incident
+        # where this returned an empty {} with no further context -
+        # couldn't tell if that meant a rate limit, an auth issue, a
+        # malformed request, or something on metals.dev's own end.
+        # Logging the full raw response now (status code included) so
+        # a future occurrence is actually diagnosable, not just "it
+        # was empty, no idea why."
+        print(f"[SILVER] Could not find silver in response (status {response.status_code}): {data}")
         return None
     except Exception as e:
         print(f"[SILVER] metals.dev error: {e}")
@@ -19759,10 +19809,13 @@ async def _post_signal_for_pair(bot, pair_keyword):
                 print(f"[AUTO SIGNAL] ⏸️ {pair_keyword.upper()} skipped — forex market closed.")
             elif signal == "NO_DATA_AVAILABLE":
                 print(f"[AUTO SIGNAL] ⏸️ {pair_keyword.upper()} skipped — no real data source available (should not be scheduled).")
+                await notify_admin_of_scheduled_signal_failure(pair_keyword, "No real data source available.")
             elif signal == "PRICE_SOURCE_MISMATCH":
                 print(f"[AUTO SIGNAL] ⏸️ {pair_keyword.upper()} skipped — live price and chart data momentarily disagreed, refusing to post an inconsistent chart.")
+                await notify_admin_of_scheduled_signal_failure(pair_keyword, "Price/chart data still disagreed even after the full 2-minute retry window.")
             else:
                 print(f"[AUTO SIGNAL] ❌ Could not fetch price for {pair_keyword}.")
+                await notify_admin_of_scheduled_signal_failure(pair_keyword, "Could not get a live price from any available source.")
             return
 
         signal_id = log_signal(signal_data)
@@ -19806,6 +19859,7 @@ async def _post_signal_for_pair(bot, pair_keyword):
         # WHETHER a crash can happen - only guarantees it is never
         # silent or ambiguous when it does.
         print(f"[AUTO SIGNAL] ❌ CRASHED for {pair_keyword.upper()}: {e}")
+        await notify_admin_of_scheduled_signal_failure(pair_keyword, f"Crashed with an unexpected error: {e}")
 
     # Placed exactly once per signal, regardless of how many
     # channels it's posted to - this used to fire once per channel
@@ -22033,21 +22087,6 @@ def main():
         days=(1, 3, 5),
         job_kwargs={"misfire_grace_time": 300}
     )
-
-    # TEMPORARY DIAGNOSTIC, per explicit instruction - a real, live
-    # call to get_silver_price() to definitively confirm why it
-    # produced no log output this morning when XAGUSD's scheduled
-    # signal failed. Runs once, safe to remove once the answer is
-    # known.
-    async def _temp_test_silver_price(context: ContextTypes.DEFAULT_TYPE):
-        print(f"[SILVER TEST] METALS_API_KEY set: {bool(METALS_API_KEY)}, length: {len(METALS_API_KEY) if METALS_API_KEY else 0}")
-        try:
-            result = await asyncio.to_thread(get_silver_price)
-            print(f"[SILVER TEST] get_silver_price() returned: {result}")
-        except Exception as e:
-            print(f"[SILVER TEST] get_silver_price() raised an exception: {e}")
-
-    job_queue.run_once(_temp_test_silver_price, when=10, name="temp_silver_test")
 
     print("Nexora AI Running...")
     print("Daily schedule (UTC):")

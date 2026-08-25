@@ -12969,6 +12969,39 @@ async def build_signal_response(question, user_id=None, retry_mismatch=False):
     current_price, price_1h_ago = await asyncio.to_thread(
         get_cached_price_data, matched_key, symbol, config, price_source_tracker
     )
+
+    # FIX: CONFIRMED REAL GAP, per explicit instruction - the retry
+    # window built earlier only covered "a price was found but
+    # disagreed with the chart", never "no price could be found at
+    # all". Confirmed live: XAGUSD's scheduled morning signal hit
+    # exactly this second, uncovered case and failed instantly, with
+    # the retry logic never even getting a chance to run. This closes
+    # that gap the same way - scheduled posts (retry_mismatch=True)
+    # get a genuine 2-minute window, retrying with force_fresh=True
+    # so it's never just re-reading the same cached failure, before
+    # giving up. Manual DM requests stay completely untouched -
+    # instant refuse, exactly as before, same reasoning as the
+    # mismatch retry below (nobody should wait 2 minutes for a signal
+    # they asked for right now).
+    if current_price is None and retry_mismatch:
+        retry_budget_seconds = 120
+        retry_interval_seconds = 20
+        elapsed = 0
+        while current_price is None and elapsed < retry_budget_seconds:
+            print(
+                f"[SIGNAL] ⏳ {pair_name}: no price from any source - "
+                f"retrying in {retry_interval_seconds}s "
+                f"({elapsed}s/{retry_budget_seconds}s elapsed)."
+            )
+            await asyncio.sleep(retry_interval_seconds)
+            elapsed += retry_interval_seconds
+            price_source_tracker = {}
+            current_price, price_1h_ago = await asyncio.to_thread(
+                get_cached_price_data, matched_key, symbol, config, price_source_tracker, True
+            )
+        if current_price is not None:
+            print(f"[SIGNAL] ✅ {pair_name}: price recovered after {elapsed}s.")
+
     if current_price is None:
         print(f"[SIGNAL] ❌ Could not get live price for {pair_name}")
         return None, None, None, None

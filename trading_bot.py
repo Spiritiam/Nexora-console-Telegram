@@ -22113,6 +22113,89 @@ def main():
         job_kwargs={"misfire_grace_time": 300}
     )
 
+    # TEMPORARY DATA-PULL JOB, per explicit instruction - proof of
+    # concept: pull ~6 months of real H1 XAUUSD candles from MetaAPI's
+    # historical-market-data endpoint (paging backward via startTime,
+    # since the live-signal endpoint caps at 1000 candles per call)
+    # and store them in the new historical_candles table, so this
+    # analysis can happen properly in a real data-science environment
+    # rather than through Railway logs. Safe to remove once confirmed
+    # working.
+    async def _temp_pull_historical_candles(context: ContextTypes.DEFAULT_TYPE):
+        if not METAAPI_TOKEN or not METAAPI_ACCOUNT_ID:
+            print("[HIST PULL] Credentials not set")
+            return
+        mt5_symbol = "XAUUSDm"
+        pair_key = "xauusd"
+        timeframe = "1h"
+        all_candles = []
+        start_time = None
+        headers = {"auth-token": METAAPI_TOKEN, "Accept": "application/json"}
+        base_url = (
+            f"https://mt-market-data-client-api-v1.new-york.agiliumtrade.ai"
+            f"/users/current/accounts/{METAAPI_ACCOUNT_ID}"
+            f"/historical-market-data/symbols/{mt5_symbol}/timeframes/{timeframe}/candles"
+        )
+        for page in range(30):  # 30 pages x up to 1000 = up to 30,000 candles (~3.4 years of H1)
+            url = f"{base_url}?limit=1000"
+            if start_time:
+                url += f"&startTime={start_time}"
+            try:
+                response = await asyncio.to_thread(requests.get, url, headers=headers, timeout=60)
+                if response.status_code != 200:
+                    print(f"[HIST PULL] Page {page}: status {response.status_code} - {response.text[:200]}")
+                    break
+                batch = response.json()
+                if not batch:
+                    print(f"[HIST PULL] Page {page}: empty, stopping - reached earliest available data")
+                    break
+                all_candles.extend(batch)
+                oldest_time = min(c["time"] for c in batch)
+                print(f"[HIST PULL] Page {page}: {len(batch)} candles, oldest so far: {oldest_time}, total: {len(all_candles)}")
+                if start_time == oldest_time:
+                    print(f"[HIST PULL] Page {page}: startTime didn't move, stopping to avoid infinite loop")
+                    break
+                start_time = oldest_time
+                await asyncio.sleep(0.5)  # be polite to the API
+            except Exception as e:
+                print(f"[HIST PULL] Page {page} error: {e}")
+                break
+
+        print(f"[HIST PULL] Total candles fetched: {len(all_candles)}")
+        if all_candles:
+            times = [c["time"] for c in all_candles]
+            print(f"[HIST PULL] Range: {min(times)} to {max(times)}")
+
+        # Batch insert into Supabase, deduped via upsert on the unique constraint
+        rows = [
+            {
+                "pair_key": pair_key, "timeframe": timeframe, "candle_time": c["time"],
+                "open": c["open"], "high": c["high"], "low": c["low"], "close": c["close"],
+                "tick_volume": c.get("tickVolume"),
+            }
+            for c in all_candles
+        ]
+        chunk_size = 500
+        inserted = 0
+        for i in range(0, len(rows), chunk_size):
+            chunk = rows[i:i + chunk_size]
+            try:
+                url = f"{SUPABASE_URL}/rest/v1/historical_candles"
+                resp = await asyncio.to_thread(
+                    requests.post, url,
+                    headers={**sb_headers(), "Prefer": "resolution=merge-duplicates"},
+                    json=chunk, timeout=30,
+                )
+                if resp.status_code in (200, 201):
+                    inserted += len(chunk)
+                else:
+                    print(f"[HIST PULL] Insert chunk {i} failed: {resp.status_code} {resp.text[:200]}")
+            except Exception as e:
+                print(f"[HIST PULL] Insert chunk {i} error: {e}")
+        print(f"[HIST PULL] ✅ Done - inserted/upserted {inserted} rows.")
+
+    job_queue.run_once(_temp_pull_historical_candles, when=10, name="temp_hist_pull")
+
     print("Nexora AI Running...")
     print("Daily schedule (UTC):")
     for utc_time, post_type, data in DAILY_SCHEDULE:

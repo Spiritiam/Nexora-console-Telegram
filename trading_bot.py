@@ -12970,37 +12970,92 @@ async def build_signal_response(question, user_id=None, retry_mismatch=False):
         get_cached_price_data, matched_key, symbol, config, price_source_tracker
     )
 
-    # FIX: CONFIRMED REAL GAP, per explicit instruction - the retry
-    # window built earlier only covered "a price was found but
-    # disagreed with the chart", never "no price could be found at
-    # all". Confirmed live: XAGUSD's scheduled morning signal hit
-    # exactly this second, uncovered case and failed instantly, with
-    # the retry logic never even getting a chance to run. This closes
-    # that gap the same way - scheduled posts (retry_mismatch=True)
-    # get a genuine 2-minute window, retrying with force_fresh=True
-    # so it's never just re-reading the same cached failure, before
-    # giving up. Manual DM requests stay completely untouched -
-    # instant refuse, exactly as before, same reasoning as the
-    # mismatch retry below (nobody should wait 2 minutes for a signal
-    # they asked for right now).
-    if current_price is None and retry_mismatch:
+    h1_candles = await asyncio.to_thread(get_cached_candles, matched_key, config, "1h", outputsize=210)
+    h4_candles = await asyncio.to_thread(get_cached_candles, matched_key, config, "4h", outputsize=60)
+    daily_candles = await asyncio.to_thread(get_cached_candles, matched_key, config, "1day", outputsize=10)
+
+    def _mismatch_gap_pct():
+        if current_price is not None and price_source_tracker.get("source") in ("oil_api", "metals_api") and h1_candles:
+            last_real_close = h1_candles[-1]["close"]
+            if last_real_close:
+                return abs(current_price - last_real_close) / last_real_close * 100
+        return 0
+
+    # FIX: CONFIRMED REAL GAP, per explicit instruction - the two
+    # retry cases ("no price at all" and "price found but mismatched
+    # with the chart") used to be two SEPARATE 2-minute loops running
+    # one after the other, so a rare unlucky signal could genuinely
+    # wait up to 4 minutes total, not the 2 minutes actually agreed
+    # on. That's not what was intended - one 2-minute window is
+    # supposed to give MetaAPI a real chance to recover, checking
+    # BOTH problems together and delivering ONE final decision at the
+    # end of that single window, not two independent budgets stacked
+    # on each other.
+    #
+    # Manual DM requests (retry_mismatch=False) are completely
+    # unaffected either way - instant refuse on either problem,
+    # exactly as before. Confirmed via the real schedule that this
+    # only ever matters for ONE scheduled forex/BTC signal at a time
+    # (07:00/11:00/17:00 UTC, hours apart, no overlap with anything
+    # else that uses this same retry path) - not a case of several
+    # pairs retrying against MetaAPI at once.
+    gap_pct = _mismatch_gap_pct()
+    needs_retry = current_price is None or gap_pct > 1.5
+
+    if needs_retry and not retry_mismatch:
+        if current_price is None:
+            print(f"[SIGNAL] ❌ Could not get live price for {pair_name}")
+            return None, None, None, None
+        print(
+            f"[SIGNAL] ❌ {pair_name}: live price ({current_price}) from "
+            f"{price_source_tracker['source']} disagrees with the last "
+            f"candle close by {gap_pct:.2f}% - refusing to build a "
+            f"signal on a chart/price mismatch (manual request, "
+            f"instant refuse per explicit instruction)."
+        )
+        return None, None, "PRICE_SOURCE_MISMATCH", None
+
+    elif needs_retry and retry_mismatch:
         retry_budget_seconds = 120
         retry_interval_seconds = 20
         elapsed = 0
-        while current_price is None and elapsed < retry_budget_seconds:
+        while needs_retry and elapsed < retry_budget_seconds:
+            reason_text = "no price from any source" if current_price is None else f"price/chart mismatch ({gap_pct:.2f}%)"
             print(
-                f"[SIGNAL] ⏳ {pair_name}: no price from any source - "
-                f"retrying in {retry_interval_seconds}s "
-                f"({elapsed}s/{retry_budget_seconds}s elapsed)."
+                f"[SIGNAL] ⏳ {pair_name}: {reason_text} - retrying in "
+                f"{retry_interval_seconds}s ({elapsed}s/{retry_budget_seconds}s "
+                f"elapsed, one shared 2-minute window covers both problems)."
             )
             await asyncio.sleep(retry_interval_seconds)
             elapsed += retry_interval_seconds
+
             price_source_tracker = {}
             current_price, price_1h_ago = await asyncio.to_thread(
                 get_cached_price_data, matched_key, symbol, config, price_source_tracker, True
             )
-        if current_price is not None:
-            print(f"[SIGNAL] ✅ {pair_name}: price recovered after {elapsed}s.")
+            h1_candles = await asyncio.to_thread(get_cached_candles, matched_key, config, "1h", outputsize=210, force_fresh=True)
+            h4_candles = await asyncio.to_thread(get_cached_candles, matched_key, config, "4h", outputsize=60, force_fresh=True)
+            daily_candles = await asyncio.to_thread(get_cached_candles, matched_key, config, "1day", outputsize=10, force_fresh=True)
+
+            gap_pct = _mismatch_gap_pct()
+            needs_retry = current_price is None or gap_pct > 1.5
+
+        if current_price is None:
+            # Genuinely no price after the full shared window - there
+            # is nothing to send, chart-anchoring can't help with a
+            # number that doesn't exist at all.
+            print(f"[SIGNAL] ❌ {pair_name}: still no price after the full {retry_budget_seconds}s window - giving up.")
+            return None, None, None, None
+        elif gap_pct > 1.5:
+            print(
+                f"[SIGNAL] ⚠️ {pair_name}: still mismatched ({gap_pct:.2f}%) "
+                f"after the full {retry_budget_seconds}s shared window - "
+                f"sending anyway per explicit instruction, relying on the "
+                f"chart-anchoring safety net to keep the chart's last "
+                f"point honest."
+            )
+        else:
+            print(f"[SIGNAL] ✅ {pair_name}: cleared after {elapsed}s (one shared window, final decision delivered).")
 
     if current_price is None:
         print(f"[SIGNAL] ❌ Could not get live price for {pair_name}")
@@ -13014,69 +13069,6 @@ async def build_signal_response(question, user_id=None, retry_mismatch=False):
     timeframe_confirmation = None
     used_smc = False
     used_ai_layer = False
-
-    h1_candles = await asyncio.to_thread(get_cached_candles, matched_key, config, "1h", outputsize=210)
-    h4_candles = await asyncio.to_thread(get_cached_candles, matched_key, config, "4h", outputsize=60)
-    daily_candles = await asyncio.to_thread(get_cached_candles, matched_key, config, "1day", outputsize=10)
-
-    def _mismatch_gap_pct():
-        if price_source_tracker.get("source") in ("oil_api", "metals_api") and h1_candles:
-            last_real_close = h1_candles[-1]["close"]
-            if last_real_close:
-                return abs(live_price - last_real_close) / last_real_close * 100
-        return 0
-
-    gap_pct = _mismatch_gap_pct()
-
-    if gap_pct > 1.5 and not retry_mismatch:
-        print(
-            f"[SIGNAL] ❌ {pair_name}: live price ({live_price}) from "
-            f"{price_source_tracker['source']} disagrees with the last "
-            f"candle close by {gap_pct:.2f}% - refusing to build a "
-            f"signal on a chart/price mismatch (manual request, "
-            f"instant refuse per explicit instruction)."
-        )
-        return None, None, "PRICE_SOURCE_MISMATCH", None
-
-    elif gap_pct > 1.5 and retry_mismatch:
-        retry_budget_seconds = 120
-        retry_interval_seconds = 20
-        elapsed = 0
-        while gap_pct > 1.5 and elapsed < retry_budget_seconds:
-            print(
-                f"[SIGNAL] ⏳ {pair_name}: price/chart mismatch "
-                f"({gap_pct:.2f}%) - retrying in {retry_interval_seconds}s "
-                f"({elapsed}s/{retry_budget_seconds}s elapsed, scheduled "
-                f"post can wait for MetaAPI to recover)."
-            )
-            await asyncio.sleep(retry_interval_seconds)
-            elapsed += retry_interval_seconds
-
-            price_source_tracker = {}
-            current_price, price_1h_ago = await asyncio.to_thread(
-                get_cached_price_data, matched_key, symbol, config, price_source_tracker, True
-            )
-            if current_price is None:
-                print(f"[SIGNAL] ❌ Could not get live price for {pair_name} during retry")
-                return None, None, None, None
-            live_price = current_price
-
-            h1_candles = await asyncio.to_thread(get_cached_candles, matched_key, config, "1h", outputsize=210, force_fresh=True)
-            h4_candles = await asyncio.to_thread(get_cached_candles, matched_key, config, "4h", outputsize=60, force_fresh=True)
-            daily_candles = await asyncio.to_thread(get_cached_candles, matched_key, config, "1day", outputsize=10, force_fresh=True)
-
-            gap_pct = _mismatch_gap_pct()
-
-        if gap_pct > 1.5:
-            print(
-                f"[SIGNAL] ⚠️ {pair_name}: still mismatched ({gap_pct:.2f}%) "
-                f"after the full {retry_budget_seconds}s retry window - "
-                f"sending anyway per explicit instruction, relying on the "
-                f"chart-anchoring safety net to keep the chart's last "
-                f"point honest."
-            )
-        else:
-            print(f"[SIGNAL] ✅ {pair_name}: price/chart mismatch cleared after {elapsed}s.")
 
     # min_agree=2 is the PREFERRED bar everywhere, scheduled and DM
     # alike - per explicit instruction, run_strategy_bank itself now

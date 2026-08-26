@@ -5,3 +5,4 @@ metaapi-cloud-sdk
 matplotlib
 cryptography
 aiohttp
+scikit-learn==1.8.0

@@ -22577,41 +22577,6 @@ def main():
         job_kwargs={"misfire_grace_time": 300}
     )
 
-    # TEMPORARY DIAGNOSTIC, per explicit instruction - place_client_mt5_trade's
-    # "Attempting to copy" and "Copy failed" log lines for real subscriber
-    # accounts are only ~1ms apart, far too fast for a real network call -
-    # testing whether the "london" region hardcoded for trade placement
-    # (confirmed different from the "new-york" region used for candles/
-    # prices, which IS working) is the real cause, using a real subscriber
-    # account's real metaapi_account_id.
-    async def _temp_test_trade_region(context: ContextTypes.DEFAULT_TYPE):
-        test_account_id = "1631a0af-e415-42e4-ab1e-96e53bb536da"
-        print(f"[REGION TEST] METAAPI_TOKEN set: {bool(METAAPI_TOKEN)}")
-        if not METAAPI_TOKEN:
-            print("[REGION TEST] Cannot proceed - token missing.")
-            return
-        try:
-            import time as _time
-            headers = {"auth-token": METAAPI_TOKEN, "Content-Type": "application/json"}
-            url = f"https://mt-client-api-v1.london.agiliumtrade.ai/users/current/accounts/{test_account_id}/trade"
-            payload = {"symbol": "EURUSDm", "volume": 0.01, "actionType": "ORDER_TYPE_BUY", "stopLoss": 1.0, "takeProfit": 2.0, "comment": "DiagTest"}
-            t0 = _time.time()
-            response = await asyncio.to_thread(requests.post, url, headers=headers, json=payload, timeout=30)
-            elapsed = _time.time() - t0
-            print(f"[REGION TEST] london region - status: {response.status_code}, elapsed: {elapsed:.2f}s, body: {response.text[:400]}")
-        except Exception as e:
-            print(f"[REGION TEST] london region - exception: {e}")
-
-        try:
-            account_url = f"https://mt-provisioning-api-v1.agiliumtrade.agiliumtrade.ai/users/current/accounts/{test_account_id}"
-            acc_response = await asyncio.to_thread(requests.get, account_url, headers={"auth-token": METAAPI_TOKEN, "Accept": "application/json"}, timeout=15)
-            print(f"[REGION TEST] Account details status: {acc_response.status_code}")
-            print(f"[REGION TEST] Account details body: {acc_response.text[:500]}")
-        except Exception as e:
-            print(f"[REGION TEST] Account details fetch error: {e}")
-
-    job_queue.run_once(_temp_test_trade_region, when=10, name="temp_region_test")
-
     print("Nexora AI Running...")
     print("Daily schedule (UTC):")
     for utc_time, post_type, data in DAILY_SCHEDULE:

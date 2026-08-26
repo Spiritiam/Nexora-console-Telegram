@@ -13,6 +13,7 @@ import secrets
 import base64
 import inspect
 import websockets
+import pickle
 import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
@@ -11314,7 +11315,11 @@ STRATEGY_BANK_ENTRIES = [
     strategy_rsi_extreme_reversal,
     strategy_ema_pullback_scalper,
     strategy_breakout,
-    strategy_atr_volatility_breakout,
+    # strategy_atr_volatility_breakout removed, per explicit instruction
+    # after a real backtest across 56,252 signals over 5 years of real
+    # data showed it was the clearest, most reliably negative
+    # performer on its own (-0.035% expected value per trade), while
+    # every other entry-tier strategy was at worst roughly breakeven.
     strategy_momentum_macd,
     strategy_williams_r,
     strategy_previous_day_high_low_manipulation,
@@ -11609,6 +11614,142 @@ def run_strategy_bank(pair_key, config, h1_candles, h4_candles, daily_candles, m
     direction = maybe_invert_direction(direction)
 
     return direction, confidence, reason, agreeing_names, winning_votes
+
+
+# ============================================
+# ML EV-PREDICTION MODEL (live signal filter)
+# Per explicit instruction: trained on 56,252 real, backtested
+# signals across 5 years of real historical data (July 2021-2026),
+# all 13 traded pairs, replaying the exact same strategy bank logic
+# above against real MetaAPI candle history and real forward outcomes
+# (did SL or TP actually hit first). Predicts the real expected value
+# (%) of a given signal from real price/indicator features at signal
+# time, honestly validated on a held-out, chronologically later slice
+# of data the model never trained on before this went live.
+#
+# EXPLICITLY ACKNOWLEDGED, per direct instruction to deploy this live
+# now rather than in shadow mode first: this is a genuinely modest,
+# not a strong, edge (test-set win rate on filtered signals is still
+# only ~33-34%, not dramatically higher than baseline) - validated
+# only against history, not yet against a single moment of the
+# future. The account owner made an informed, explicit choice to
+# accept this risk rather than validate further in shadow mode first.
+# ============================================
+ML_EV_MODEL = None
+ML_EV_FEATURE_COLS = None
+ML_EV_THRESHOLD = None
+
+def load_ml_ev_model():
+    global ML_EV_MODEL, ML_EV_FEATURE_COLS, ML_EV_THRESHOLD
+    try:
+        with open("ml_ev_model.pkl", "rb") as f:
+            data = pickle.load(f)
+        ML_EV_MODEL = data["model"]
+        ML_EV_FEATURE_COLS = data["feature_cols"]
+        # top-30% threshold, per explicit instruction - real,
+        # meaningful improvement over baseline (+0.009% vs +0.004%)
+        # without being so restrictive that almost nothing posts.
+        ML_EV_THRESHOLD = data["threshold_30pct"]
+        print(f"[ML EV MODEL] Loaded successfully. Threshold: {ML_EV_THRESHOLD:.4f}")
+    except Exception as e:
+        print(f"[ML EV MODEL] Failed to load - ML filtering will be skipped entirely, signals proceed unfiltered: {e}")
+        ML_EV_MODEL = None
+
+
+def compute_ml_signal_features(pair_key, direction, agreeing_strategies, entry_price, sl, tp, h1_candles, current_time):
+    """
+    Builds the exact same feature vector, in the exact same order,
+    that the model was trained on - any mismatch here would make
+    predictions meaningless even if the model loads fine. Returns
+    None if there isn't enough real candle history to compute
+    reliable indicators (mirrors the same real-data-only principle
+    used everywhere else in this file - never fabricate a feature).
+    """
+    if not h1_candles or len(h1_candles) < 100:
+        return None
+    window = h1_candles[-100:]
+    try:
+        rsi_series = calculate_rsi(window, period=14)
+        rsi = rsi_series[-1] if rsi_series else None
+        macd_line, signal_line = calculate_macd(window)
+        macd_hist = (macd_line[-1] - signal_line[-1]) if macd_line and signal_line else None
+        atr_series = calculate_atr_series(window, period=14)
+        atr = atr_series[-1] if atr_series else None
+        ema20 = calculate_ema_series(window, 20)[-1] if len(window) >= 20 else None
+        ema50 = calculate_ema_series(window, 50)[-1] if len(window) >= 50 else None
+    except Exception as e:
+        print(f"[ML EV MODEL] Indicator computation failed: {e}")
+        return None
+
+    if rsi is None or macd_hist is None or atr is None or ema20 is None or ema50 is None:
+        return None
+
+    closes = [c["close"] for c in window]
+    highs = [c["high"] for c in window]
+    lows = [c["low"] for c in window]
+    risk = abs(entry_price - sl)
+    reward = abs(tp - entry_price)
+
+    row = {
+        "rr_ratio": reward / risk if risk else 0,
+        "hour": current_time.hour if hasattr(current_time, "hour") else 0,
+        "day_of_week": current_time.weekday() if hasattr(current_time, "weekday") else 0,
+        "n_strategies": len(agreeing_strategies),
+        "is_buy": 1 if direction == "BUY" else 0,
+        "rsi": rsi,
+        "macd_hist": macd_hist,
+        "atr_pct": (atr / entry_price * 100) if entry_price else 0,
+        "dist_from_ema20_pct": ((entry_price - ema20) / entry_price * 100) if entry_price else 0,
+        "dist_from_ema50_pct": ((entry_price - ema50) / entry_price * 100) if entry_price else 0,
+        "recent_20candle_change_pct": ((closes[-1] - closes[0]) / closes[0] * 100) if len(closes) > 1 and closes[0] else 0,
+        "recent_100candle_range_pct": ((max(highs) - min(lows)) / entry_price * 100) if entry_price else 0,
+    }
+    for col in ML_EV_FEATURE_COLS:
+        if col.startswith("pair_"):
+            row[col] = 1 if col == f"pair_{pair_key}" else 0
+        elif col.startswith("strat_"):
+            strat_display_names = {
+                "strat_Support_Resistance_Bounce": "Support/Resistance Bounce",
+                "strat_EMA_Pullback_Scalper": "EMA Pullback Scalper",
+                "strat_Momentum_MACD": "Momentum (MACD)",
+                "strat_Fibonacci_Retracement": "Fibonacci Retracement",
+                "strat_Williams_pctR": "Williams %R",
+                "strat_Previous_Day_High_Low_Manipulation": "Previous Day High/Low Manipulation",
+                "strat_Breakout": "Breakout",
+                "strat_ATR_Volatility_Breakout": "ATR Volatility Breakout",
+                "strat_Unicorn_Model": "Unicorn Model",
+            }
+            real_name = strat_display_names.get(col)
+            row[col] = 1 if real_name and real_name in agreeing_strategies else 0
+
+    try:
+        return [row[c] for c in ML_EV_FEATURE_COLS]
+    except KeyError as e:
+        print(f"[ML EV MODEL] Feature vector build failed, missing {e}")
+        return None
+
+
+def predict_signal_ev(pair_key, direction, agreeing_strategies, entry_price, sl, tp, h1_candles, current_time):
+    """
+    Returns (predicted_ev, passed_threshold) or (None, True) if the
+    model isn't available or features couldn't be computed - fails
+    OPEN (signal proceeds unfiltered) rather than silently blocking
+    every signal if the model or a dependency ever has an issue,
+    matching this file's consistent "never let an enhancement layer
+    take down the core feature it's layered on top of" principle.
+    """
+    if ML_EV_MODEL is None:
+        return None, True
+    features = compute_ml_signal_features(pair_key, direction, agreeing_strategies, entry_price, sl, tp, h1_candles, current_time)
+    if features is None:
+        return None, True
+    try:
+        predicted_ev = ML_EV_MODEL.predict([features])[0]
+        return predicted_ev, predicted_ev >= ML_EV_THRESHOLD
+    except Exception as e:
+        print(f"[ML EV MODEL] Prediction failed: {e}")
+        return None, True
+
 
 async def check_fresh_momentum_veto_synthetic(index_key, config, h1_candles, direction):
     """
@@ -13084,6 +13225,7 @@ async def build_signal_response(question, user_id=None, retry_mismatch=False):
         matched_key, config, h1_candles, h4_candles, daily_candles, min_agree=min_agree
     )
     winning_votes = []
+    used_real_strategy_bank = bool(bank_result)
     if bank_result:
         direction, confidence, reason, agreeing_strategies, winning_votes = bank_result
         used_smc = "ICT/SMC" in agreeing_strategies
@@ -13226,6 +13368,23 @@ async def build_signal_response(question, user_id=None, retry_mismatch=False):
         take_profit = round(live_price - (pip_size * tp_multiplier), decimals)
         signal_emoji = "🔴"
         fallback_image_file_id = SELL_IMAGE_FILE_ID
+
+    # ML EV-PREDICTION FILTER, per explicit instruction to deploy this
+    # live now. Only applied to real strategy-bank signals - the
+    # model was trained exclusively on those (with real
+    # agreeing_strategies), so running it against the rule-based
+    # fallback path (used when no strategy fired at all) would be
+    # feeding it inputs it was never trained to judge, producing a
+    # meaningless prediction dressed up as a real one.
+    if used_real_strategy_bank:
+        predicted_ev, passed_ml_filter = predict_signal_ev(
+            matched_key, direction, agreeing_strategies, entry_price,
+            stop_loss, take_profit, h1_candles, datetime.utcnow()
+        )
+        if predicted_ev is not None:
+            print(f"[ML EV MODEL] {pair_name} {direction}: predicted EV = {predicted_ev:+.3f}% (threshold {ML_EV_THRESHOLD:+.3f}%) - {'PASSED' if passed_ml_filter else 'FILTERED OUT'}")
+        if not passed_ml_filter:
+            return None, None, "FILTERED_BY_ML_LOW_EV", None
 
     session = get_market_session()
 
@@ -19258,6 +19417,23 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 reply_markup=main_keyboard
             )
             schedule_auto_delete(sent_mismatch.chat_id, sent_mismatch.message_id)
+        elif signal == "FILTERED_BY_ML_LOW_EV":
+            # Per explicit instruction to deploy the ML EV filter live
+            # now - the strategy bank found a real setup, but the ML
+            # model rated it below the quality threshold, so it's
+            # deliberately not shown rather than posting a signal the
+            # model itself doesn't rate well.
+            sent_ml_filtered = await update.message.reply_text(
+                "📊 <b>No high-quality setup for this pair right now.</b>\n\n"
+                "Our system found a possible setup but rated it below "
+                "our quality threshold, so we're not showing it rather "
+                "than sending something we don't have real confidence "
+                "in.\n\n"
+                "Try another pair, or check back in a bit.",
+                parse_mode=ParseMode.HTML,
+                reply_markup=main_keyboard
+            )
+            schedule_auto_delete(sent_ml_filtered.chat_id, sent_ml_filtered.message_id)
         else:
             sent_fetch_failed = await update.message.reply_text(
                 "⚠️ <b>Unable to fetch live market data.</b>\n"
@@ -19838,6 +20014,12 @@ async def _post_signal_for_pair(bot, pair_keyword):
             elif signal == "PRICE_SOURCE_MISMATCH":
                 print(f"[AUTO SIGNAL] ⏸️ {pair_keyword.upper()} skipped — live price and chart data momentarily disagreed, refusing to post an inconsistent chart.")
                 await notify_admin_of_scheduled_signal_failure(pair_keyword, "Price/chart data still disagreed even after the full 2-minute retry window.")
+            elif signal == "FILTERED_BY_ML_LOW_EV":
+                # Per explicit instruction to deploy the ML EV filter
+                # live now - this is the filter working as intended,
+                # not a failure, so no admin alert here (that's
+                # reserved for genuine problems).
+                print(f"[AUTO SIGNAL] ⏸️ {pair_keyword.upper()} skipped — ML model rated this setup below the quality threshold.")
             else:
                 print(f"[AUTO SIGNAL] ❌ Could not fetch price for {pair_keyword}.")
                 await notify_admin_of_scheduled_signal_failure(pair_keyword, "Could not get a live price from any available source.")
@@ -21652,6 +21834,8 @@ async def post_daily_report(context: ContextTypes.DEFAULT_TYPE):
 def main():
 
     global _app_instance
+
+    load_ml_ev_model()
 
     app = (
         Application.builder()

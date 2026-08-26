@@ -1657,66 +1657,37 @@ async def run_mt5_autotrade_bot_scan(context: ContextTypes.DEFAULT_TYPE):
             if not primary_candles:
                 continue
 
-            # Two-tier per explicit instruction, mirroring the exact
-            # filter/entry split already built for channel/manual
-            # forex signals - a lagging trend-confirming strategy
-            # (Trend Following, Heikin-Ashi, Supertrend, Parabolic SAR,
-            # EMA Ribbon) can no longer trigger a trade alone; it only
-            # sets the direction lean, and a real entry-tier trigger
-            # in that same direction is required to actually fire.
-            #
-            # FALLBACK, per explicit instruction ("leave a gap so we
-            # don't miss any auto-trade calls"): if this bot's own
-            # strategy list doesn't have a genuine mix of both roles,
-            # or the two-tier check finds nothing this round, this
-            # falls straight through to the rule-based price-trend
-            # fallback below - per explicit instruction, the flat "2+
-            # of everything must agree" middle tier that used to sit
-            # here has been removed entirely, not just deprioritized.
-            filter_fns, entry_fns = split_strategies_by_role(strategy_fns)
+            # OPTION B, per explicit instruction: this bot's own
+            # two-tier gate (filter tier must lean, entry tier must
+            # confirm) no longer decides anything - replaced by the
+            # same ML-driven decision now used everywhere else. This
+            # bot's own strategy_fns still run and still inform the
+            # model's score, exactly like the main channel flow, just
+            # without the old pass/fail rule. HONEST LIMITATION,
+            # acknowledged directly rather than hidden: only whichever
+            # of this bot's strategies happen to share a name with the
+            # model's own trained 9 register as a named, contributing
+            # feature - the rest (Parabolic SAR, Ichimoku, Keltner,
+            # EMA Ribbon, Rate of Change, CCI, and similar, depending
+            # on the bot) still run and their real price action still
+            # feeds the model's other real indicator features, but
+            # won't show up as a specific recognized strategy the way
+            # they would in the main flow.
             direction = None
             winning_votes = []
 
-            if filter_fns and entry_fns:
-                filter_votes = []
-                for fn in filter_fns:
-                    try:
-                        result = fn(pair_key, pair_config, primary_candles, h4_candles, daily_candles)
-                        if result:
-                            filter_votes.append(result)
-                    except Exception as e:
-                        print(f"[MT5 AUTOTRADE] filter {fn.__name__} failed for {pair_key}: {e}")
-
-                f_buy = [v for v in filter_votes if v["direction"] == "BUY"]
-                f_sell = [v for v in filter_votes if v["direction"] == "SELL"]
-                if filter_votes and len(f_buy) != len(f_sell):
-                    filter_direction = "BUY" if len(f_buy) > len(f_sell) else "SELL"
-                    entry_votes = []
-                    for fn in entry_fns:
-                        try:
-                            result = fn(pair_key, pair_config, primary_candles, h4_candles, daily_candles)
-                            if result:
-                                entry_votes.append(result)
-                        except Exception as e:
-                            print(f"[MT5 AUTOTRADE] entry {fn.__name__} failed for {pair_key}: {e}")
-                    matching_entries = [v for v in entry_votes if v["direction"] == filter_direction]
-                    if matching_entries:
-                        direction = filter_direction
-                        winning_votes = matching_entries
+            ml_result = run_ml_driven_decision(
+                pair_key, pair_config, primary_candles, h4_candles, daily_candles,
+                strategy_fns=strategy_fns
+            )
+            if ml_result:
+                direction, ml_confidence, ml_reason, ml_agreeing, winning_votes = ml_result
 
             if not direction:
-                # THIRD tier, per explicit instruction (confirmed
-                # understanding real money would now act on a
-                # weaker, non-strategy-backed signal here) - the same
-                # rule-based price-trend fallback already used for
-                # manual/scheduled signals (forex and, since the last
-                # build, Deriv too), now also applied to real-money
-                # Auto-Trade specifically because that was explicitly
-                # asked for and confirmed, not because it's the
-                # default policy for every automated path (Auto-Copy
-                # is untouched - it has no bank of its own, it purely
-                # mirrors whatever the scheduled channel signal
-                # already decided).
+                # Only reached if the ML model itself is genuinely
+                # unavailable - same fail-open principle used
+                # everywhere else this model is wired in, not a
+                # normal, expected path anymore.
                 if primary_candles and len(primary_candles) >= 2:
                     current_price = primary_candles[-1]["close"]
                     price_1h_ago = primary_candles[-2]["close"]
@@ -1732,7 +1703,7 @@ async def run_mt5_autotrade_bot_scan(context: ContextTypes.DEFAULT_TYPE):
                         }]
 
             if not direction:
-                print(f"[MT5 AUTOTRADE] {bot_key}/{pair_key} - no qualifying setup (two-tier, fallback, or rule-based) this round")
+                print(f"[MT5 AUTOTRADE] {bot_key}/{pair_key} - no qualifying setup (ML model and fallback both unavailable) this round")
                 continue
 
             vote = winning_votes[0]
@@ -1960,33 +1931,36 @@ async def run_account_flip_entry_scan(context: ContextTypes.DEFAULT_TYPE):
             if not candles or len(candles) < 5:
                 continue
 
-            vote = account_flip_signal(pair_key, pair_config, candles)
-            if not vote:
-                # ML-driven fallback, per explicit instruction and
-                # explicit acknowledgment of a real mismatch: this
-                # scan runs on 15-minute candles, but the ML model was
-                # trained entirely on hourly (H1) data - a real
-                # distribution mismatch, not just a technicality. The
-                # account owner chose to accept this rather than leave
-                # Account Flip without any ML involvement. Reuses
-                # predict_direction_via_ml exactly as-is (it already
-                # computes hypothetical BUY/SELL SL/TP internally via
-                # the same real per-pair multiplier table) - genuinely
-                # scores both directions and picks the stronger one,
-                # same substantive use of the model as the other two
-                # fallback integrations, not a cosmetic one.
-                ml_result = predict_direction_via_ml(pair_key, candles[-1]["close"], candles, datetime.utcnow())
-                if not ml_result:
-                    continue
+            # OPTION B, per explicit instruction: ML is now the
+            # PRIMARY decision here too - account_flip_signal's own
+            # dedicated candlestick-pattern detector (Engulfing/Pin
+            # Bar/Inside Bar) no longer decides anything, it's now
+            # only the fallback-of-fallback if the model itself is
+            # genuinely unavailable. Same acknowledged real
+            # limitation as before: this scan runs on 15-minute
+            # candles, the model was trained entirely on hourly data -
+            # a genuine distribution mismatch the account owner chose
+            # to accept rather than leave Account Flip without ML
+            # involvement.
+            entry_price_ml = candles[-1]["close"]
+            ml_result = predict_direction_via_ml(pair_key, entry_price_ml, candles, datetime.utcnow())
+            if ml_result:
                 ml_direction, ml_reason, buy_ev, sell_ev = ml_result
-                print(f"[ML EV MODEL] Account Flip {pair_key} fallback: BUY={buy_ev:+.3f}% SELL={sell_ev:+.3f}% -> chose {ml_direction}")
-                entry_price_ml = candles[-1]["close"]
+                print(f"[ML EV MODEL] Account Flip {pair_key}: BUY={buy_ev:+.3f}% SELL={sell_ev:+.3f}% -> chose {ml_direction}")
                 sl_mult, _ = get_sl_tp_multipliers(pair_key)
                 if ml_direction == "BUY":
                     ml_stop_loss = entry_price_ml - (pair_config["pip_size"] * sl_mult)
                 else:
                     ml_stop_loss = entry_price_ml + (pair_config["pip_size"] * sl_mult)
                 vote = {"direction": ml_direction, "invalidation": ml_stop_loss}
+            else:
+                # Only reached if the model itself is genuinely
+                # unavailable - the original dedicated pattern
+                # detector as the last safety net, not the normal
+                # path anymore.
+                vote = account_flip_signal(pair_key, pair_config, candles)
+                if not vote:
+                    continue
 
             direction = vote["direction"]
             entry_price = candles[-1]["close"]
@@ -11775,7 +11749,7 @@ def predict_signal_ev(pair_key, direction, agreeing_strategies, entry_price, sl,
         return None, True
 
 
-def run_ml_driven_decision(pair_key, config, h1_candles, h4_candles, daily_candles):
+def run_ml_driven_decision(pair_key, config, h1_candles, h4_candles, daily_candles, strategy_fns=None):
     """
     OPTION B, per explicit instruction: the ML model is now the SOLE
     decision-maker for every signal - not a gate the strategy bank has
@@ -11795,6 +11769,19 @@ def run_ml_driven_decision(pair_key, config, h1_candles, h4_candles, daily_candl
     what's actually been validated, per explicit instruction to start
     here before attempting a version with no strategy input at all.
 
+    strategy_fns: per explicit instruction, generalized so callers
+    with their OWN strategy pool (Pick-a-Bot's per-bot lists) can pass
+    those instead of defaulting to the main channel's 9. HONEST
+    LIMITATION worth being explicit about: only whichever of a
+    caller's strategies happen to share a name with the model's own
+    trained 9 will register as a named, contributing feature - the
+    rest still run and their real price action still feeds the
+    model's other real indicator features, but they won't show up as
+    a specific recognized strategy the way they would in the main
+    flow. This isn't a broken state, just a real, honest ceiling on
+    how much of a different strategy pool the current model can
+    recognize by name.
+
     Scores BOTH hypothetical directions (BUY and SELL) using real
     entry-tier votes for THAT specific direction, picks whichever the
     model rates higher. ALWAYS returns a direction (never "no signal
@@ -11809,8 +11796,10 @@ def run_ml_driven_decision(pair_key, config, h1_candles, h4_candles, daily_candl
     if ML_EV_MODEL is None or not h1_candles:
         return None
 
+    strategy_fns = strategy_fns if strategy_fns is not None else STRATEGY_BANK_ENTRIES
+
     entry_votes = []
-    for strategy_fn in STRATEGY_BANK_ENTRIES:
+    for strategy_fn in strategy_fns:
         try:
             result = strategy_fn(pair_key, config, h1_candles, h4_candles, daily_candles)
             if result:

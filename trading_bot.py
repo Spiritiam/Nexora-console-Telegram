@@ -22028,10 +22028,7 @@ async def send_self_serve_reminder(context: ContextTypes.DEFAULT_TYPE):
         "signals sent to this channel!</b>\n\n"
         "Anytime you want a signal, a news call, or want your account "
         "trading automatically, you can just ask.\n\n"
-        "Tap the button below to:\n\n"
-        "📊 <b>Signal</b> — get one instantly\n\n"
-        "📰 <b>News</b> — get a call on breaking news\n\n"
-        "🤖 <b>Auto-Trade</b> — set up Exness or Deriv to trade for you\n\n"
+        "Tap the button below to:\n"
         "It's available 24/7, right here in your DMs. 👇"
     )
     markup = InlineKeyboardMarkup([

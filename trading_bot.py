@@ -11775,6 +11775,113 @@ def predict_signal_ev(pair_key, direction, agreeing_strategies, entry_price, sl,
         return None, True
 
 
+def run_ml_driven_decision(pair_key, config, h1_candles, h4_candles, daily_candles):
+    """
+    OPTION B, per explicit instruction: the ML model is now the SOLE
+    decision-maker for every signal - not a gate the strategy bank has
+    to pass through, not a background number. The old filter/entry
+    "must agree" rule from run_strategy_bank has NO power here at
+    all - it's completely removed, not just bypassed.
+
+    What the 13 strategies (well, 9 entry-tier ones, now that ATR
+    Volatility Breakout is gone - the 3 filter-tier ones were never
+    part of the model's trained features at all, confirmed by
+    checking the actual feature_cols list) still do: they still run,
+    and whichever ones vote for a given direction still genuinely
+    inform the model's score for that direction - exactly the same
+    real, contributing input the trained model was proven to use, just
+    with the old pass/fail gate deleted rather than the information
+    itself being thrown away. This is the closest configuration to
+    what's actually been validated, per explicit instruction to start
+    here before attempting a version with no strategy input at all.
+
+    Scores BOTH hypothetical directions (BUY and SELL) using real
+    entry-tier votes for THAT specific direction, picks whichever the
+    model rates higher. ALWAYS returns a direction (never "no signal
+    this round") as long as the model and real candle data are both
+    available - if either isn't, returns None so the caller can fall
+    back to the rule-based/momentum path, same fail-open principle
+    used everywhere else this model is wired in.
+
+    Returns (direction, confidence, reason, agreeing_strategies,
+    predicted_ev) or None.
+    """
+    if ML_EV_MODEL is None or not h1_candles:
+        return None
+
+    entry_votes = []
+    for strategy_fn in STRATEGY_BANK_ENTRIES:
+        try:
+            result = strategy_fn(pair_key, config, h1_candles, h4_candles, daily_candles)
+            if result:
+                entry_votes.append(result)
+        except Exception as e:
+            print(f"[ML DRIVEN] entry {strategy_fn.__name__} failed for {pair_key}: {e}")
+            continue
+
+    current_price = h1_candles[-1]["close"]
+    pip_size = config.get("pip_size")
+    if not pip_size:
+        return None
+    sl_mult, tp_mult = get_sl_tp_multipliers(pair_key)
+
+    results_by_direction = {}
+    for direction in ("BUY", "SELL"):
+        matching_votes = [v for v in entry_votes if v["direction"] == direction]
+        agreeing_names = [v["strategy_name"] for v in matching_votes]
+
+        if direction == "BUY":
+            hyp_sl = current_price - (pip_size * sl_mult)
+            hyp_tp = current_price + (pip_size * tp_mult)
+        else:
+            hyp_sl = current_price + (pip_size * sl_mult)
+            hyp_tp = current_price - (pip_size * tp_mult)
+
+        predicted_ev, _ = predict_signal_ev(pair_key, direction, agreeing_names, current_price, hyp_sl, hyp_tp, h1_candles, datetime.utcnow())
+        results_by_direction[direction] = (predicted_ev, agreeing_names, matching_votes)
+
+    buy_ev, buy_agreeing, buy_votes = results_by_direction["BUY"]
+    sell_ev, sell_agreeing, sell_votes = results_by_direction["SELL"]
+
+    if buy_ev is None or sell_ev is None:
+        return None
+
+    direction = "BUY" if buy_ev >= sell_ev else "SELL"
+    predicted_ev = buy_ev if direction == "BUY" else sell_ev
+    agreeing_strategies = buy_agreeing if direction == "BUY" else sell_agreeing
+    winning_votes = buy_votes if direction == "BUY" else sell_votes
+
+    print(f"[ML DRIVEN] {pair_key}: BUY={buy_ev:+.3f}% (entries: {buy_agreeing}) SELL={sell_ev:+.3f}% (entries: {sell_agreeing}) -> chose {direction}")
+
+    # Confidence derived from the real gap between the two directions'
+    # scores, not an arbitrary count-based formula - a direction that
+    # clearly beats its opposite is genuinely more backed than one
+    # that barely edges it out. Same 70-95 range every other
+    # confidence value in this file already uses, just a different,
+    # real basis for landing in it.
+    ev_gap = abs(buy_ev - sell_ev)
+    confidence = min(95, 70 + int(ev_gap * 300))
+
+    # Honest reasoning text built from what actually drove the score,
+    # per explicit instruction - the model doesn't hand back a
+    # sentence like a strategy function does, so this describes the
+    # real inputs plainly rather than inventing a narrative.
+    reason_parts = []
+    if agreeing_strategies:
+        reason_parts.append(f"{len(agreeing_strategies)} strateg{'y' if len(agreeing_strategies)==1 else 'ies'} leaning {direction.lower()} ({', '.join(agreeing_strategies)})")
+    else:
+        reason_parts.append(f"no individual strategy fired, but overall conditions favor {direction.lower()}")
+    reason = f"ML model rated {direction} higher (predicted edge {predicted_ev:+.2f}%) - " + "; ".join(reason_parts) + "."
+
+    # Returns winning_votes (the real vote dicts, not just names) as
+    # the 5th element, exactly matching run_strategy_bank's own return
+    # shape - build_signal_response uses this to pick a chart overlay
+    # style (winning_votes[0]["strategy_name"]), so keeping this
+    # identical means the caller needed zero changes beyond swapping
+    # which function gets called.
+    return direction, confidence, reason, agreeing_strategies, winning_votes
+
+
 async def check_fresh_momentum_veto_synthetic(index_key, config, h1_candles, direction):
     """
     Synthetic-index sibling of check_fresh_momentum_veto (used for
@@ -13309,18 +13416,14 @@ async def build_signal_response(question, user_id=None, retry_mismatch=False):
     used_smc = False
     used_ai_layer = False
 
-    # min_agree=2 is the PREFERRED bar everywhere, scheduled and DM
-    # alike - per explicit instruction, run_strategy_bank itself now
-    # always sends a real strategy-backed signal as long as AT LEAST
-    # ONE strategy fired (every strategy in the bank is individually
-    # trusted), only adjusting confidence % rather than gating
-    # whether it posts. generate_rule_based_bias below is now only
-    # reached in the genuinely rare case where literally no strategy
-    # produced any result at all (no usable candle data this round).
-    min_agree = 2
-
-    bank_result = run_strategy_bank(
-        matched_key, config, h1_candles, h4_candles, daily_candles, min_agree=min_agree
+    # OPTION B, per explicit instruction: the old min_agree/gate-based
+    # run_strategy_bank has been replaced entirely by
+    # run_ml_driven_decision - the ML model is now the sole decision-
+    # maker, using the same 9 entry-tier strategies' votes as
+    # informational input rather than a pass/fail rule. This is the
+    # PRIMARY reason a trade is sent now; nothing else decides.
+    bank_result = run_ml_driven_decision(
+        matched_key, config, h1_candles, h4_candles, daily_candles
     )
     winning_votes = []
     used_real_strategy_bank = bool(bank_result)
@@ -13460,24 +13563,11 @@ async def build_signal_response(question, user_id=None, retry_mismatch=False):
         signal_emoji = "🔴"
         fallback_image_file_id = SELL_IMAGE_FILE_ID
 
-    # ML EV MODEL, informational only - per explicit instruction, the
-    # model NEVER blocks or withholds a signal. Every signal that
-    # would have gone out before still goes out exactly the same way;
-    # this only computes and logs the model's real predicted EV for
-    # visibility, no gating whatsoever. Only applied to real
-    # strategy-bank signals - the model was trained exclusively on
-    # those (with real agreeing_strategies), so running it against the
-    # rule-based fallback path would be feeding it inputs it was never
-    # trained to judge.
-    predicted_signal_ev = None
-    if used_real_strategy_bank:
-        predicted_signal_ev, _ = predict_signal_ev(
-            matched_key, direction, agreeing_strategies, entry_price,
-            stop_loss, take_profit, h1_candles, datetime.utcnow()
-        )
-        if predicted_signal_ev is not None:
-            print(f"[ML EV MODEL] {pair_name} {direction}: predicted EV = {predicted_signal_ev:+.3f}% (informational only, not filtering)")
-
+    # Per explicit instruction: the redundant second ML computation
+    # that used to sit here (re-scoring the already-chosen direction
+    # purely for logging) is removed - run_ml_driven_decision above
+    # already IS the model's real decision, computed once, not
+    # recomputed a second time for the same signal.
     session = get_market_session()
 
     # Real generated chart, using the SAME candles and winning

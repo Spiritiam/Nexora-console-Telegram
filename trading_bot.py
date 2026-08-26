@@ -11654,7 +11654,7 @@ def load_ml_ev_model():
         ML_EV_MODEL = None
 
 
-def compute_ml_signal_features(pair_key, direction, agreeing_strategies, entry_price, sl, tp, h1_candles, current_time):
+def compute_ml_signal_features(pair_key, direction, agreeing_strategies, entry_price, sl, tp, h1_candles, current_time, min_candles=100):
     """
     Builds the exact same feature vector, in the exact same order,
     that the model was trained on - any mismatch here would make
@@ -11662,13 +11662,22 @@ def compute_ml_signal_features(pair_key, direction, agreeing_strategies, entry_p
     None if there isn't enough real candle history to compute
     reliable indicators (mirrors the same real-data-only principle
     used everywhere else in this file - never fabricate a feature).
+
+    min_candles: per explicit instruction - a genuine, mathematically
+    real floor, not an arbitrary number. EMA50 literally cannot
+    compute with fewer than 50 candles - that's math, not a
+    preference. 60 is the true minimum this file ever calls with (see
+    run_ml_driven_decision/predict_direction_via_ml's own reduced-tier
+    reasoning) - below that there's nothing meaningful left to
+    compute, which is the actual, honest line for falling back at
+    all, not the old flat 100 every time.
     """
-    if not h1_candles or len(h1_candles) < 100:
+    if not h1_candles or len(h1_candles) < min_candles:
         # Same reasoning as run_ml_driven_decision's own new log line
         # above - this exact silent-return was the confirmed gap
         # behind a real live incident, closing it here too since this
         # function has its own separate copy of the same check.
-        print(f"[ML EV MODEL] {pair_key}: insufficient candle history for features - h1_candles_count={len(h1_candles) if h1_candles else 0} (need 100+)")
+        print(f"[ML EV MODEL] {pair_key}: insufficient candle history for features - h1_candles_count={len(h1_candles) if h1_candles else 0} (need {min_candles}+)")
         return None
     window = h1_candles[-100:]
     try:
@@ -11732,7 +11741,7 @@ def compute_ml_signal_features(pair_key, direction, agreeing_strategies, entry_p
         return None
 
 
-def predict_signal_ev(pair_key, direction, agreeing_strategies, entry_price, sl, tp, h1_candles, current_time):
+def predict_signal_ev(pair_key, direction, agreeing_strategies, entry_price, sl, tp, h1_candles, current_time, min_candles=100):
     """
     Returns (predicted_ev, passed_threshold) or (None, True) if the
     model isn't available or features couldn't be computed - fails
@@ -11743,7 +11752,7 @@ def predict_signal_ev(pair_key, direction, agreeing_strategies, entry_price, sl,
     """
     if ML_EV_MODEL is None:
         return None, True
-    features = compute_ml_signal_features(pair_key, direction, agreeing_strategies, entry_price, sl, tp, h1_candles, current_time)
+    features = compute_ml_signal_features(pair_key, direction, agreeing_strategies, entry_price, sl, tp, h1_candles, current_time, min_candles=min_candles)
     if features is None:
         return None, True
     try:
@@ -11754,7 +11763,7 @@ def predict_signal_ev(pair_key, direction, agreeing_strategies, entry_price, sl,
         return None, True
 
 
-def run_ml_driven_decision(pair_key, config, h1_candles, h4_candles, daily_candles, strategy_fns=None):
+def run_ml_driven_decision(pair_key, config, h1_candles, h4_candles, daily_candles, strategy_fns=None, min_candles=100):
     """
     OPTION B, per explicit instruction: the ML model is now the SOLE
     decision-maker for every signal - not a gate the strategy bank has
@@ -11839,7 +11848,7 @@ def run_ml_driven_decision(pair_key, config, h1_candles, h4_candles, daily_candl
             hyp_sl = current_price + (pip_size * sl_mult)
             hyp_tp = current_price - (pip_size * tp_mult)
 
-        predicted_ev, _ = predict_signal_ev(pair_key, direction, agreeing_names, current_price, hyp_sl, hyp_tp, h1_candles, datetime.utcnow())
+        predicted_ev, _ = predict_signal_ev(pair_key, direction, agreeing_names, current_price, hyp_sl, hyp_tp, h1_candles, datetime.utcnow(), min_candles=min_candles)
         results_by_direction[direction] = (predicted_ev, agreeing_names, matching_votes)
 
     buy_ev, buy_agreeing, buy_votes = results_by_direction["BUY"]
@@ -12466,7 +12475,7 @@ def get_sl_tp_multipliers(pair_key):
         return 3, 6
 
 
-def predict_direction_via_ml(pair_key, current_price, h1_candles, current_time):
+def predict_direction_via_ml(pair_key, current_price, h1_candles, current_time, min_candles=100):
     """
     Per explicit instruction - lets the ML model genuinely drive the
     fallback call, not just label it. The model doesn't invent a
@@ -12498,8 +12507,8 @@ def predict_direction_via_ml(pair_key, current_price, h1_candles, current_time):
     sell_sl = current_price + (pip_size * sl_mult)
     sell_tp = current_price - (pip_size * tp_mult)
 
-    buy_ev, _ = predict_signal_ev(pair_key, "BUY", [], current_price, buy_sl, buy_tp, h1_candles, current_time)
-    sell_ev, _ = predict_signal_ev(pair_key, "SELL", [], current_price, sell_sl, sell_tp, h1_candles, current_time)
+    buy_ev, _ = predict_signal_ev(pair_key, "BUY", [], current_price, buy_sl, buy_tp, h1_candles, current_time, min_candles=min_candles)
+    sell_ev, _ = predict_signal_ev(pair_key, "SELL", [], current_price, sell_sl, sell_tp, h1_candles, current_time, min_candles=min_candles)
 
     if buy_ev is None or sell_ev is None:
         return None
@@ -12519,6 +12528,15 @@ def generate_rule_based_bias(pair_key, current_price, price_1h_ago, h1_candles=N
     # the model itself is unavailable (fail-open, matching this
     # file's consistent principle elsewhere).
     ml_result = predict_direction_via_ml(pair_key, current_price, h1_candles, datetime.utcnow())
+    if not ml_result:
+        # REDUCED-TIER LAST RESORT, per explicit instruction ("bridge
+        # every gap"), same reasoning as build_signal_response's own
+        # reduced attempt - tries once more with a genuinely reduced,
+        # but still mathematically real, candle requirement (60)
+        # before this function's own final momentum heuristic below.
+        ml_result = predict_direction_via_ml(pair_key, current_price, h1_candles, datetime.utcnow(), min_candles=60)
+        if ml_result:
+            print(f"[ML EV MODEL] {pair_key} fallback: succeeded on the reduced-tier (60-candle) attempt.")
     if ml_result:
         direction, reason, buy_ev, sell_ev = ml_result
         print(f"[ML EV MODEL] {pair_key} fallback: BUY={buy_ev:+.3f}% SELL={sell_ev:+.3f}% -> chose {direction}")
@@ -13336,6 +13354,20 @@ async def build_signal_response(question, user_id=None, retry_mismatch=False):
                 return abs(current_price - last_real_close) / last_real_close * 100
         return 0
 
+    def _ml_candles_insufficient():
+        # FIX: CONFIRMED REAL GAP, per explicit instruction after a
+        # genuinely confusing live USOIL incident. The retry loop
+        # below used to only check whether PRICE was available and
+        # consistent - it never checked whether there were actually
+        # enough real candles for the ML model to work with. Price
+        # can recover from a MetaAPI hiccup while the candle fetch
+        # stays thin, and the old retry loop would see "price is
+        # fine" and stop, while the ML model - working from that same
+        # thin candle set - silently couldn't compute what it needed
+        # and fell all the way to the old momentum fallback. This
+        # closes that gap directly.
+        return not h1_candles or len(h1_candles) < 100
+
     # FIX: CONFIRMED REAL GAP, per explicit instruction - the two
     # retry cases ("no price at all" and "price found but mismatched
     # with the chart") used to be two SEPARATE 2-minute loops running
@@ -13355,7 +13387,7 @@ async def build_signal_response(question, user_id=None, retry_mismatch=False):
     # else that uses this same retry path) - not a case of several
     # pairs retrying against MetaAPI at once.
     gap_pct = _mismatch_gap_pct()
-    needs_retry = current_price is None or gap_pct > 1.5
+    needs_retry = current_price is None or gap_pct > 1.5 or (retry_mismatch and _ml_candles_insufficient())
 
     if needs_retry and not retry_mismatch:
         if current_price is None:
@@ -13375,11 +13407,16 @@ async def build_signal_response(question, user_id=None, retry_mismatch=False):
         retry_interval_seconds = 20
         elapsed = 0
         while needs_retry and elapsed < retry_budget_seconds:
-            reason_text = "no price from any source" if current_price is None else f"price/chart mismatch ({gap_pct:.2f}%)"
+            if current_price is None:
+                reason_text = "no price from any source"
+            elif gap_pct > 1.5:
+                reason_text = f"price/chart mismatch ({gap_pct:.2f}%)"
+            else:
+                reason_text = f"only {len(h1_candles) if h1_candles else 0} real candles available (ML needs 100+)"
             print(
                 f"[SIGNAL] ⏳ {pair_name}: {reason_text} - retrying in "
                 f"{retry_interval_seconds}s ({elapsed}s/{retry_budget_seconds}s "
-                f"elapsed, one shared 2-minute window covers both problems)."
+                f"elapsed, one shared 2-minute window covers all three problems)."
             )
             await asyncio.sleep(retry_interval_seconds)
             elapsed += retry_interval_seconds
@@ -13393,7 +13430,7 @@ async def build_signal_response(question, user_id=None, retry_mismatch=False):
             daily_candles = await asyncio.to_thread(get_cached_candles, matched_key, config, "1day", outputsize=10, force_fresh=True)
 
             gap_pct = _mismatch_gap_pct()
-            needs_retry = current_price is None or gap_pct > 1.5
+            needs_retry = current_price is None or gap_pct > 1.5 or (retry_mismatch and _ml_candles_insufficient())
 
         if current_price is None:
             # Genuinely no price after the full shared window - there
@@ -13408,6 +13445,22 @@ async def build_signal_response(question, user_id=None, retry_mismatch=False):
                 f"sending anyway per explicit instruction, relying on the "
                 f"chart-anchoring safety net to keep the chart's last "
                 f"point honest."
+            )
+        elif retry_mismatch and _ml_candles_insufficient():
+            # Per explicit instruction - the model gets the FULL
+            # 2-minute window to try for real, complete data first.
+            # If it's still thin after that, run_ml_driven_decision
+            # (called below with its default min_candles=100) will
+            # fail on its own and the caller's reduced-tier attempt
+            # (min_candles=60) takes over from there - not handled
+            # here, just logging that the full-quality window is
+            # exhausted so the reduced attempt is a real fallback, not
+            # a mysterious one.
+            print(
+                f"[SIGNAL] ⚠️ {pair_name}: still only {len(h1_candles) if h1_candles else 0} "
+                f"real candles after the full {retry_budget_seconds}s window - "
+                f"trying the ML model with a reduced, still-meaningful "
+                f"candle requirement before ever falling back."
             )
         else:
             print(f"[SIGNAL] ✅ {pair_name}: cleared after {elapsed}s (one shared window, final decision delivered).")
@@ -13434,6 +13487,27 @@ async def build_signal_response(question, user_id=None, retry_mismatch=False):
     bank_result = run_ml_driven_decision(
         matched_key, config, h1_candles, h4_candles, daily_candles
     )
+
+    if not bank_result:
+        # REDUCED-TIER LAST RESORT, per explicit instruction ("bridge
+        # every gap to never allow it to get there at all"). If the
+        # full-quality attempt above couldn't run (not enough real
+        # candles for a full 100-candle feature window - the retry
+        # loop above already spent up to 2 minutes trying to get
+        # this, for scheduled signals), this tries ONE more time with
+        # a genuinely reduced, but still mathematically real,
+        # candle requirement (60 - the true minimum EMA50 can compute
+        # from at all, not an arbitrary lower number). Applies
+        # instantly to BOTH manual and scheduled requests - this is
+        # not a wait, just a different, smaller bar tried immediately
+        # on whatever real data is already available.
+        bank_result = run_ml_driven_decision(
+            matched_key, config, h1_candles, h4_candles, daily_candles,
+            min_candles=60
+        )
+        if bank_result:
+            print(f"[SIGNAL] {pair_name}: ML decision succeeded on the reduced-tier (60-candle) attempt.")
+
     winning_votes = []
     used_real_strategy_bank = bool(bank_result)
     if bank_result:

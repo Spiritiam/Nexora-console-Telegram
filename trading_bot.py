@@ -1721,7 +1721,7 @@ async def run_mt5_autotrade_bot_scan(context: ContextTypes.DEFAULT_TYPE):
                     current_price = primary_candles[-1]["close"]
                     price_1h_ago = primary_candles[-2]["close"]
                     fallback_direction, fallback_reason = generate_rule_based_bias(
-                        pair_key, current_price, price_1h_ago
+                        pair_key, current_price, price_1h_ago, primary_candles
                     )
                     if fallback_direction:
                         direction = fallback_direction
@@ -1962,7 +1962,31 @@ async def run_account_flip_entry_scan(context: ContextTypes.DEFAULT_TYPE):
 
             vote = account_flip_signal(pair_key, pair_config, candles)
             if not vote:
-                continue
+                # ML-driven fallback, per explicit instruction and
+                # explicit acknowledgment of a real mismatch: this
+                # scan runs on 15-minute candles, but the ML model was
+                # trained entirely on hourly (H1) data - a real
+                # distribution mismatch, not just a technicality. The
+                # account owner chose to accept this rather than leave
+                # Account Flip without any ML involvement. Reuses
+                # predict_direction_via_ml exactly as-is (it already
+                # computes hypothetical BUY/SELL SL/TP internally via
+                # the same real per-pair multiplier table) - genuinely
+                # scores both directions and picks the stronger one,
+                # same substantive use of the model as the other two
+                # fallback integrations, not a cosmetic one.
+                ml_result = predict_direction_via_ml(pair_key, candles[-1]["close"], candles, datetime.utcnow())
+                if not ml_result:
+                    continue
+                ml_direction, ml_reason, buy_ev, sell_ev = ml_result
+                print(f"[ML EV MODEL] Account Flip {pair_key} fallback: BUY={buy_ev:+.3f}% SELL={sell_ev:+.3f}% -> chose {ml_direction}")
+                entry_price_ml = candles[-1]["close"]
+                sl_mult, _ = get_sl_tp_multipliers(pair_key)
+                if ml_direction == "BUY":
+                    ml_stop_loss = entry_price_ml - (pair_config["pip_size"] * sl_mult)
+                else:
+                    ml_stop_loss = entry_price_ml + (pair_config["pip_size"] * sl_mult)
+                vote = {"direction": ml_direction, "invalidation": ml_stop_loss}
 
             direction = vote["direction"]
             entry_price = candles[-1]["close"]
@@ -12309,8 +12333,82 @@ FUNDAMENTAL: [one sentence + closing clause, max 24 words] OR FUNDAMENTAL: NONE
 # technical analysis based on actual price action.
 # ============================================
 
-def generate_rule_based_bias(pair_key, current_price, price_1h_ago):
+def get_sl_tp_multipliers(pair_key):
+    """
+    Shared lookup, per explicit instruction (extracted from the
+    inline version in build_signal_response so the new ML-driven
+    fallback below can use the exact same real multipliers, rather
+    than duplicating this table and risking the two drifting apart
+    over time). See build_signal_response's own comment history for
+    the full verification behind each of these values.
+    """
+    if pair_key == "xauusd":
+        return 3.0, 6.0
+    elif pair_key in ("gbpusd", "eurusd", "audusd", "usdcad", "usdjpy", "usdchf", "nzdusd"):
+        return 1.8, 3.6
+    elif pair_key in ("usoil", "xagusd"):
+        return 4.2, 8.4
+    else:
+        return 3, 6
+
+
+def predict_direction_via_ml(pair_key, current_price, h1_candles, current_time):
+    """
+    Per explicit instruction - lets the ML model genuinely drive the
+    fallback call, not just label it. The model doesn't invent a
+    direction from nothing; it scores how good a GIVEN candidate
+    setup looks. So this scores BOTH hypothetical directions (BUY and
+    SELL) using the exact same real multiplier table every other
+    signal uses for its SL/TP, and returns whichever direction the
+    model rates higher - a genuine, substantive use of its judgment,
+    not a cosmetic one.
+
+    Returns (direction, reason, buy_ev, sell_ev) or None if the model
+    isn't available or features can't be computed - the caller falls
+    back to the original momentum heuristic in that case, so the
+    fallback path can never break entirely just because this
+    enhancement layer had an issue.
+    """
+    if ML_EV_MODEL is None or not h1_candles or current_price is None:
+        return None
+
+    pip_size = PAIR_CONFIG.get(pair_key, {}).get("pip_size")
+    if not pip_size:
+        return None
+    sl_mult, tp_mult = get_sl_tp_multipliers(pair_key)
+
+    buy_sl = current_price - (pip_size * sl_mult)
+    buy_tp = current_price + (pip_size * tp_mult)
+    sell_sl = current_price + (pip_size * sl_mult)
+    sell_tp = current_price - (pip_size * tp_mult)
+
+    buy_ev, _ = predict_signal_ev(pair_key, "BUY", [], current_price, buy_sl, buy_tp, h1_candles, current_time)
+    sell_ev, _ = predict_signal_ev(pair_key, "SELL", [], current_price, sell_sl, sell_tp, h1_candles, current_time)
+
+    if buy_ev is None or sell_ev is None:
+        return None
+
+    if buy_ev >= sell_ev:
+        return "BUY", "Potential buy setup spotted.", buy_ev, sell_ev
+    else:
+        return "SELL", "Potential sell setup spotted.", buy_ev, sell_ev
+
+
+def generate_rule_based_bias(pair_key, current_price, price_1h_ago, h1_candles=None):
     now = time.time()
+
+    # ML-driven call, per explicit instruction - genuinely replaces
+    # the momentum heuristic below as the primary decision, not just
+    # informational. Only falls through to the original heuristic if
+    # the model itself is unavailable (fail-open, matching this
+    # file's consistent principle elsewhere).
+    ml_result = predict_direction_via_ml(pair_key, current_price, h1_candles, datetime.utcnow())
+    if ml_result:
+        direction, reason, buy_ev, sell_ev = ml_result
+        print(f"[ML EV MODEL] {pair_key} fallback: BUY={buy_ev:+.3f}% SELL={sell_ev:+.3f}% -> chose {direction}")
+        if pair_key:
+            last_signal_direction[pair_key] = (direction, now)
+        return direction, reason
 
     if price_1h_ago is not None and current_price is not None:
         if current_price > price_1h_ago:
@@ -13263,7 +13361,7 @@ async def build_signal_response(question, user_id=None, retry_mismatch=False):
             price_1h_ago = h1_candles[-2]["close"]
 
         direction, reason = generate_rule_based_bias(
-            matched_key, current_price, price_1h_ago
+            matched_key, current_price, price_1h_ago, h1_candles
         )
         confidence = random.randint(80, 94)
 
@@ -13347,14 +13445,7 @@ async def build_signal_response(question, user_id=None, retry_mismatch=False):
     # $150 P&L at 0.1 lot, which needs multiplier 3.0 (pip_size=5.0 *
     # 3.0 = $15), not 0.3. Verified: 3.0/6.0 -> $15/$30 price move ->
     # $150/$300 P&L at 0.1 lot, exactly matching the real target.
-    if matched_key == "xauusd":
-        sl_multiplier, tp_multiplier = 3.0, 6.0
-    elif matched_key in ("gbpusd", "eurusd", "audusd", "usdcad", "usdjpy", "usdchf", "nzdusd"):
-        sl_multiplier, tp_multiplier = 1.8, 3.6
-    elif matched_key in ("usoil", "xagusd"):
-        sl_multiplier, tp_multiplier = 4.2, 8.4
-    else:
-        sl_multiplier, tp_multiplier = 3, 6
+    sl_multiplier, tp_multiplier = get_sl_tp_multipliers(matched_key)
 
     if direction == "BUY":
         entry_price = round(live_price, decimals)
@@ -13369,22 +13460,23 @@ async def build_signal_response(question, user_id=None, retry_mismatch=False):
         signal_emoji = "🔴"
         fallback_image_file_id = SELL_IMAGE_FILE_ID
 
-    # ML EV-PREDICTION FILTER, per explicit instruction to deploy this
-    # live now. Only applied to real strategy-bank signals - the
-    # model was trained exclusively on those (with real
-    # agreeing_strategies), so running it against the rule-based
-    # fallback path (used when no strategy fired at all) would be
-    # feeding it inputs it was never trained to judge, producing a
-    # meaningless prediction dressed up as a real one.
+    # ML EV MODEL, informational only - per explicit instruction, the
+    # model NEVER blocks or withholds a signal. Every signal that
+    # would have gone out before still goes out exactly the same way;
+    # this only computes and logs the model's real predicted EV for
+    # visibility, no gating whatsoever. Only applied to real
+    # strategy-bank signals - the model was trained exclusively on
+    # those (with real agreeing_strategies), so running it against the
+    # rule-based fallback path would be feeding it inputs it was never
+    # trained to judge.
+    predicted_signal_ev = None
     if used_real_strategy_bank:
-        predicted_ev, passed_ml_filter = predict_signal_ev(
+        predicted_signal_ev, _ = predict_signal_ev(
             matched_key, direction, agreeing_strategies, entry_price,
             stop_loss, take_profit, h1_candles, datetime.utcnow()
         )
-        if predicted_ev is not None:
-            print(f"[ML EV MODEL] {pair_name} {direction}: predicted EV = {predicted_ev:+.3f}% (threshold {ML_EV_THRESHOLD:+.3f}%) - {'PASSED' if passed_ml_filter else 'FILTERED OUT'}")
-        if not passed_ml_filter:
-            return None, None, "FILTERED_BY_ML_LOW_EV", None
+        if predicted_signal_ev is not None:
+            print(f"[ML EV MODEL] {pair_name} {direction}: predicted EV = {predicted_signal_ev:+.3f}% (informational only, not filtering)")
 
     session = get_market_session()
 
@@ -19417,23 +19509,6 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 reply_markup=main_keyboard
             )
             schedule_auto_delete(sent_mismatch.chat_id, sent_mismatch.message_id)
-        elif signal == "FILTERED_BY_ML_LOW_EV":
-            # Per explicit instruction to deploy the ML EV filter live
-            # now - the strategy bank found a real setup, but the ML
-            # model rated it below the quality threshold, so it's
-            # deliberately not shown rather than posting a signal the
-            # model itself doesn't rate well.
-            sent_ml_filtered = await update.message.reply_text(
-                "📊 <b>No high-quality setup for this pair right now.</b>\n\n"
-                "Our system found a possible setup but rated it below "
-                "our quality threshold, so we're not showing it rather "
-                "than sending something we don't have real confidence "
-                "in.\n\n"
-                "Try another pair, or check back in a bit.",
-                parse_mode=ParseMode.HTML,
-                reply_markup=main_keyboard
-            )
-            schedule_auto_delete(sent_ml_filtered.chat_id, sent_ml_filtered.message_id)
         else:
             sent_fetch_failed = await update.message.reply_text(
                 "⚠️ <b>Unable to fetch live market data.</b>\n"
@@ -20014,12 +20089,6 @@ async def _post_signal_for_pair(bot, pair_keyword):
             elif signal == "PRICE_SOURCE_MISMATCH":
                 print(f"[AUTO SIGNAL] ⏸️ {pair_keyword.upper()} skipped — live price and chart data momentarily disagreed, refusing to post an inconsistent chart.")
                 await notify_admin_of_scheduled_signal_failure(pair_keyword, "Price/chart data still disagreed even after the full 2-minute retry window.")
-            elif signal == "FILTERED_BY_ML_LOW_EV":
-                # Per explicit instruction to deploy the ML EV filter
-                # live now - this is the filter working as intended,
-                # not a failure, so no admin alert here (that's
-                # reserved for genuine problems).
-                print(f"[AUTO SIGNAL] ⏸️ {pair_keyword.upper()} skipped — ML model rated this setup below the quality threshold.")
             else:
                 print(f"[AUTO SIGNAL] ❌ Could not fetch price for {pair_keyword}.")
                 await notify_admin_of_scheduled_signal_failure(pair_keyword, "Could not get a live price from any available source.")

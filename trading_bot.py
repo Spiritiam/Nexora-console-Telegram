@@ -11664,6 +11664,11 @@ def compute_ml_signal_features(pair_key, direction, agreeing_strategies, entry_p
     used everywhere else in this file - never fabricate a feature).
     """
     if not h1_candles or len(h1_candles) < 100:
+        # Same reasoning as run_ml_driven_decision's own new log line
+        # above - this exact silent-return was the confirmed gap
+        # behind a real live incident, closing it here too since this
+        # function has its own separate copy of the same check.
+        print(f"[ML EV MODEL] {pair_key}: insufficient candle history for features - h1_candles_count={len(h1_candles) if h1_candles else 0} (need 100+)")
         return None
     window = h1_candles[-100:]
     try:
@@ -11794,6 +11799,14 @@ def run_ml_driven_decision(pair_key, config, h1_candles, h4_candles, daily_candl
     predicted_ev) or None.
     """
     if ML_EV_MODEL is None or not h1_candles:
+        # FIX: CONFIRMED REAL GAP, per explicit instruction after a
+        # genuinely confusing live incident (a USOIL signal silently
+        # fell all the way back to the original momentum heuristic
+        # with zero visibility into why). This was the ONLY early-
+        # return path with no logging at all - every other failure
+        # mode in this file already explains itself. Logging directly
+        # now instead of leaving a future occurrence just as opaque.
+        print(f"[ML DRIVEN] {pair_key}: skipping - model_loaded={ML_EV_MODEL is not None}, h1_candles_count={len(h1_candles) if h1_candles else 0}")
         return None
 
     strategy_fns = strategy_fns if strategy_fns is not None else STRATEGY_BANK_ENTRIES
@@ -12471,10 +12484,12 @@ def predict_direction_via_ml(pair_key, current_price, h1_candles, current_time):
     enhancement layer had an issue.
     """
     if ML_EV_MODEL is None or not h1_candles or current_price is None:
+        print(f"[ML EV MODEL] {pair_key}: fallback skipped - model_loaded={ML_EV_MODEL is not None}, h1_candles_count={len(h1_candles) if h1_candles else 0}, current_price={current_price}")
         return None
 
     pip_size = PAIR_CONFIG.get(pair_key, {}).get("pip_size")
     if not pip_size:
+        print(f"[ML EV MODEL] {pair_key}: fallback skipped - no pip_size configured for this pair_key")
         return None
     sl_mult, tp_mult = get_sl_tp_multipliers(pair_key)
 

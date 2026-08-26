@@ -13723,16 +13723,25 @@ async def build_signal_response(question, user_id=None, retry_mismatch=False):
         if chart_ok:
             image_file_id = chart_path
 
-    # FBS-style narrative: reason comes FIRST, Entry/SL/TP after, per
-    # explicit instruction. Falls back to the original bullet-style
-    # "reason" text (already real, already accurate) if winning_votes
-    # is empty - happens only when generate_rule_based_bias was the
-    # source instead of the strategy bank (no usable candle data this
-    # round), which has no structured votes to build prose from.
-    if winning_votes:
-        narrative = generate_signal_narrative(display, direction, winning_votes)
-    else:
-        narrative = reason
+    # FIX: CONFIRMED REAL BUG, per explicit instruction after a
+    # genuinely confusing live incident. This used to prefer
+    # generate_signal_narrative (the OLD per-strategy detail text,
+    # e.g. "Price rejected a key level: ...") whenever ANY strategy
+    # agreed, only falling back to the new ML-driven `reason` text
+    # when winning_votes was empty. That assumption predates Option
+    # B: winning_votes being non-empty used to mean "the old gate-
+    # based system decided this," but now it just means "some
+    # strategies happened to agree with what the model independently
+    # decided" - a genuinely different thing, and reason (built by
+    # run_ml_driven_decision/generate_rule_based_bias) already
+    # describes it correctly either way. Confirmed live: a real signal
+    # where the model chose SELL and Support/Resistance Bounce agreed
+    # still showed the strategy's own old internal wording instead of
+    # the new, approved "X is also lining up with this call" text.
+    # reason is now always used - it's the actual decision-maker's own
+    # explanation, in every case, not a fallback for when the old
+    # narrative can't run.
+    narrative = reason
 
     response = (
         f"{signal_emoji} <b>{strength} {direction} {display}</b>\n\n"

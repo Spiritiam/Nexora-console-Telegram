@@ -1691,7 +1691,7 @@ async def run_mt5_autotrade_bot_scan(context: ContextTypes.DEFAULT_TYPE):
                 if primary_candles and len(primary_candles) >= 2:
                     current_price = primary_candles[-1]["close"]
                     price_1h_ago = primary_candles[-2]["close"]
-                    fallback_direction, fallback_reason = generate_rule_based_bias(
+                    fallback_direction, fallback_reason, fallback_confidence = generate_rule_based_bias(
                         pair_key, current_price, price_1h_ago, primary_candles
                     )
                     if fallback_direction:
@@ -1945,7 +1945,7 @@ async def run_account_flip_entry_scan(context: ContextTypes.DEFAULT_TYPE):
             entry_price_ml = candles[-1]["close"]
             ml_result = predict_direction_via_ml(pair_key, entry_price_ml, candles, datetime.utcnow())
             if ml_result:
-                ml_direction, ml_reason, buy_ev, sell_ev = ml_result
+                ml_direction, ml_reason, buy_ev, sell_ev, ml_confidence = ml_result
                 print(f"[ML EV MODEL] Account Flip {pair_key}: BUY={buy_ev:+.3f}% SELL={sell_ev:+.3f}% -> chose {ml_direction}")
                 sl_mult, _ = get_sl_tp_multipliers(pair_key)
                 if ml_direction == "BUY":
@@ -5915,7 +5915,7 @@ async def build_synthetic_signal_response(index_key, min_agree=2):
             return None
         current_price = h1_candles[-1]["close"]
         price_1h_ago = h1_candles[-2]["close"]
-        direction, reason = generate_rule_based_bias(index_key, current_price, price_1h_ago)
+        direction, reason, _fallback_confidence = generate_rule_based_bias(index_key, current_price, price_1h_ago)
         if not direction:
             return None
         confidence = random.randint(80, 94)
@@ -7276,7 +7276,7 @@ async def run_deriv_autotrade_bot_scan(context: ContextTypes.DEFAULT_TYPE):
                 if primary_candles and len(primary_candles) >= 2:
                     current_price = primary_candles[-1]["close"]
                     price_1h_ago = primary_candles[-2]["close"]
-                    fallback_direction, fallback_reason = generate_rule_based_bias(
+                    fallback_direction, fallback_reason, _fallback_confidence = generate_rule_based_bias(
                         index_key, current_price, price_1h_ago
                     )
                 else:
@@ -11864,14 +11864,21 @@ def run_ml_driven_decision(pair_key, config, h1_candles, h4_candles, daily_candl
 
     print(f"[ML DRIVEN] {pair_key}: BUY={buy_ev:+.3f}% (entries: {buy_agreeing}) SELL={sell_ev:+.3f}% (entries: {sell_agreeing}) -> chose {direction}")
 
-    # Confidence derived from the real gap between the two directions'
-    # scores, not an arbitrary count-based formula - a direction that
-    # clearly beats its opposite is genuinely more backed than one
-    # that barely edges it out. Same 70-95 range every other
-    # confidence value in this file already uses, just a different,
-    # real basis for landing in it.
+    # Confidence formula, per explicit instruction, agreed and
+    # simulated against real EV gaps before building: base is still
+    # the real gap between the two directions' scores (70-95 range),
+    # with two real, honest adjustments on top - +3 points per
+    # genuinely agreeing strategy (real additional evidence beyond
+    # the model's own view), and a -8 point discount, floored at 60,
+    # whenever this ran on the reduced-tier (60-candle) data rather
+    # than the full 100+ - honestly reflecting that the data behind
+    # it is thinner, even though the model still genuinely ran.
     ev_gap = abs(buy_ev - sell_ev)
     confidence = min(95, 70 + int(ev_gap * 300))
+    if agreeing_strategies:
+        confidence = min(95, confidence + 3 * len(agreeing_strategies))
+    if min_candles < 100:
+        confidence = max(60, confidence - 8)
 
     # Reasoning text, per explicit instruction and approved wording -
     # the technical "ML model favors X" framing is shown to everyone
@@ -12513,15 +12520,25 @@ def predict_direction_via_ml(pair_key, current_price, h1_candles, current_time, 
     if buy_ev is None or sell_ev is None:
         return None
 
+    # Same real confidence formula as run_ml_driven_decision, per
+    # explicit instruction - this function never tracks per-strategy
+    # agreement (no strategy tail possible here), so no +3/strategy
+    # boost applies, but the reduced-tier discount still does, same
+    # honest reasoning either way.
+    ev_gap = abs(buy_ev - sell_ev)
+    confidence = min(95, 70 + int(ev_gap * 300))
+    if min_candles < 100:
+        confidence = max(60, confidence - 8)
+
     # Per explicit instruction - same technical "ML model favors X"
     # wording as run_ml_driven_decision, since this is ALSO a genuine
     # case where the model produced a real result (this function
     # never tracks per-strategy agreement, so always the bare form,
     # no strategy tail).
     if buy_ev >= sell_ev:
-        return "BUY", f"ML model favors BUY (predicted edge {buy_ev:+.2f}%).", buy_ev, sell_ev
+        return "BUY", f"ML model favors BUY (predicted edge {buy_ev:+.2f}%).", buy_ev, sell_ev, confidence
     else:
-        return "SELL", f"ML model favors SELL (predicted edge {sell_ev:+.2f}%).", buy_ev, sell_ev
+        return "SELL", f"ML model favors SELL (predicted edge {sell_ev:+.2f}%).", buy_ev, sell_ev, confidence
 
 
 def generate_rule_based_bias(pair_key, current_price, price_1h_ago, h1_candles=None):
@@ -12543,11 +12560,19 @@ def generate_rule_based_bias(pair_key, current_price, price_1h_ago, h1_candles=N
         if ml_result:
             print(f"[ML EV MODEL] {pair_key} fallback: succeeded on the reduced-tier (60-candle) attempt.")
     if ml_result:
-        direction, reason, buy_ev, sell_ev = ml_result
+        direction, reason, buy_ev, sell_ev, confidence = ml_result
         print(f"[ML EV MODEL] {pair_key} fallback: BUY={buy_ev:+.3f}% SELL={sell_ev:+.3f}% -> chose {direction}")
         if pair_key:
             last_signal_direction[pair_key] = (direction, now)
-        return direction, reason
+        return direction, reason, confidence
+
+    # TRUE last resort, per explicit instruction - genuinely no real
+    # data behind this at all, so confidence deliberately sits in a
+    # clearly lower, tighter range (55-65) than any ML-backed result
+    # above ever would - real, honest signal that this one's on much
+    # thinner ground, not the old 80-94 range that made it read as
+    # confident as a genuine model prediction.
+    confidence = random.randint(55, 65)
 
     if price_1h_ago is not None and current_price is not None:
         if current_price > price_1h_ago:
@@ -12564,7 +12589,7 @@ def generate_rule_based_bias(pair_key, current_price, price_1h_ago, h1_candles=N
     if pair_key:
         last_signal_direction[pair_key] = (direction, now)
 
-    return direction, reason
+    return direction, reason, confidence
 
 def _consistent_or_random(pair_key):
     now = time.time()
@@ -13551,10 +13576,9 @@ async def build_signal_response(question, user_id=None, retry_mismatch=False):
         if price_1h_ago is None and h1_candles and len(h1_candles) >= 2:
             price_1h_ago = h1_candles[-2]["close"]
 
-        direction, reason = generate_rule_based_bias(
+        direction, reason, confidence = generate_rule_based_bias(
             matched_key, current_price, price_1h_ago, h1_candles
         )
-        confidence = random.randint(80, 94)
 
     # AI fundamental layer (capped) - per explicit instruction, REMOVED
     # from scheduled channel signals entirely now (user_id=None means

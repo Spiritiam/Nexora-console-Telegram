@@ -628,22 +628,30 @@ def clean_mt5_provision_error(raw_error):
     error_lower = raw_error.lower()
     if "e_auth" in error_lower or "failed to authenticate" in error_lower:
         return (
-            "We couldn't verify your login and password with your "
-            "broker. Please double-check both are typed exactly right "
-            "(no extra spaces) and try again.\n\n"
-            "If you're sure they're correct, this can also happen if "
-            "your Exness account has been archived due to inactivity - "
-            "Exness does this automatically after a period of no "
-            "activity. Log into your Exness Personal Area and check "
-            "if this account needs to be restored/unarchived first, "
-            "then try connecting again."
+            "We couldn't connect to your account. This is usually one "
+            "of three things:\n\n"
+            "1️⃣ Your login or password was typed incorrectly (check "
+            "for extra spaces)\n"
+            "2️⃣ Your server name doesn't match exactly (e.g. "
+            "Exness-MT5Real10)\n"
+            "3️⃣ Your Exness account has been archived due to 3+ days "
+            "of inactivity - log into your Exness Personal Area and "
+            "restore it if so\n\n"
+            "Double-check all three, then try again."
         )
     if "e_srv_not_found" in error_lower or "not found, please check the server" in error_lower:
         return (
-            "We couldn't find a server with that exact name. "
-            "Double-check your server name (e.g. Exness-MT5Real10) - "
-            "you can find the exact spelling in your MT5 app under "
-            "your account settings."
+            "We couldn't connect to your account. This is usually one "
+            "of three things:\n\n"
+            "1️⃣ Your login or password was typed incorrectly (check "
+            "for extra spaces)\n"
+            "2️⃣ Your server name doesn't match exactly (e.g. "
+            "Exness-MT5Real10) - you can find the exact spelling in "
+            "your MT5 app under your account settings\n"
+            "3️⃣ Your Exness account has been archived due to 3+ days "
+            "of inactivity - log into your Exness Personal Area and "
+            "restore it if so\n\n"
+            "Double-check all three, then try again."
         )
     if "timed out after 3 attempts" in error_lower:
         return (

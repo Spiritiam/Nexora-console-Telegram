@@ -11851,16 +11851,21 @@ def run_ml_driven_decision(pair_key, config, h1_candles, h4_candles, daily_candl
     ev_gap = abs(buy_ev - sell_ev)
     confidence = min(95, 70 + int(ev_gap * 300))
 
-    # Honest reasoning text built from what actually drove the score,
-    # per explicit instruction - the model doesn't hand back a
-    # sentence like a strategy function does, so this describes the
-    # real inputs plainly rather than inventing a narrative.
-    reason_parts = []
+    # Reasoning text, per explicit instruction and approved wording -
+    # no technical "ML model rated X higher" framing, reads naturally
+    # next to the other reasoning bullets regardless of which branch
+    # fires.
     if agreeing_strategies:
-        reason_parts.append(f"{len(agreeing_strategies)} strateg{'y' if len(agreeing_strategies)==1 else 'ies'} leaning {direction.lower()} ({', '.join(agreeing_strategies)})")
+        if len(agreeing_strategies) == 1:
+            strat_text = agreeing_strategies[0]
+        elif len(agreeing_strategies) == 2:
+            strat_text = f"{agreeing_strategies[0]} and {agreeing_strategies[1]}"
+        else:
+            strat_text = ", ".join(agreeing_strategies[:-1]) + f", and {agreeing_strategies[-1]}"
+        verb = "is" if len(agreeing_strategies) == 1 else "are"
+        reason = f"{strat_text} {verb} also lining up with this call."
     else:
-        reason_parts.append(f"no individual strategy fired, but overall conditions favor {direction.lower()}")
-    reason = f"ML model rated {direction} higher (predicted edge {predicted_ev:+.2f}%) - " + "; ".join(reason_parts) + "."
+        reason = f"Overall market conditions favor {'buyers' if direction == 'BUY' else 'sellers'} here."
 
     # Returns winning_votes (the real vote dicts, not just names) as
     # the 5th element, exactly matching run_strategy_bank's own return

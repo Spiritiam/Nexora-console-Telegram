@@ -1447,7 +1447,19 @@ async def place_client_mt5_trade(metaapi_account_id, mt5_symbol, direction, volu
                 # their MT5 account at all. Now returns None (real
                 # failure) instead, and logs the full raw response for
                 # diagnosis.
-                print(f"[MT5 AUTOTRADE] ⚠️ Trade response for {metaapi_account_id} had no real orderId - full raw response: {result!r}")
+                #
+                # FIX: CONFIRMED REAL GAP, per explicit instruction
+                # after a real live investigation - MetaAPI returns
+                # HTTP 200 even for a genuine BROKER-level rejection
+                # (e.g. TRADE_RETCODE_NO_MONEY), with the real reason
+                # buried in the response body rather than surfaced as
+                # a non-200 status. The raw repr() dump above required
+                # a live diagnostic to actually read - this parses the
+                # real broker reason out directly so it's immediately
+                # visible in every future occurrence, no investigation
+                # required.
+                broker_reason = result.get("message") or result.get("stringCode") or "unknown reason"
+                print(f"[MT5 AUTOTRADE] ⚠️ Trade REJECTED by broker for {metaapi_account_id}: {broker_reason} (full response: {result!r})")
                 return None
             print(f"[MT5 AUTOTRADE] ✅ Trade placed for {metaapi_account_id} — Order ID: {order_id}")
             return order_id
@@ -16053,7 +16065,16 @@ async def place_mt5_trade(signal_data, signal_id=None):
                 # actual return value - now genuinely returns None
                 # (real failure) so every caller correctly treats this
                 # as "did not place", not "placed, ID unknown".
-                print(f"[MT5 PERSONAL COPY] ⚠️ Trade response had no real orderId - full raw response: {result!r}")
+                #
+                # FIX: CONFIRMED REAL GAP, per explicit instruction,
+                # same as place_client_mt5_trade's own matching fix -
+                # MetaAPI returns HTTP 200 even for a genuine BROKER-
+                # level rejection (e.g. TRADE_RETCODE_NO_MONEY), with
+                # the real reason buried in the response body. Parses
+                # it out directly now instead of requiring a live
+                # diagnostic to read a raw repr() dump.
+                broker_reason = result.get("message") or result.get("stringCode") or "unknown reason"
+                print(f"[MT5 PERSONAL COPY] ⚠️ Trade REJECTED by broker: {broker_reason} (full response: {result!r})")
                 return None
             print(f"[MT5 PERSONAL COPY] ✅ Trade placed — Order ID: {order_id}")
             return order_id

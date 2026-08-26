@@ -630,7 +630,13 @@ def clean_mt5_provision_error(raw_error):
         return (
             "We couldn't verify your login and password with your "
             "broker. Please double-check both are typed exactly right "
-            "(no extra spaces) and try again."
+            "(no extra spaces) and try again.\n\n"
+            "If you're sure they're correct, this can also happen if "
+            "your Exness account has been archived due to inactivity - "
+            "Exness does this automatically after a period of no "
+            "activity. Log into your Exness Personal Area and check "
+            "if this account needs to be restored/unarchived first, "
+            "then try connecting again."
         )
     if "e_srv_not_found" in error_lower or "not found, please check the server" in error_lower:
         return (
@@ -2526,6 +2532,62 @@ def run_korapay_webhook_server():
     # Without this, the whole thread crashed with "set_wakeup_fd only
     # works in main thread of the main interpreter" every time.
     web.run_app(webhook_app, host="0.0.0.0", port=port, print=None, handle_signals=False)
+
+
+async def check_mt5_zero_balance_notifications(context: ContextTypes.DEFAULT_TYPE):
+    """
+    Runs once daily, per explicit instruction - a genuine, real
+    scheduled check across every active Exness Auto-Trade account
+    (not event-driven like Deriv's own low-balance check, which only
+    fires when a real trade attempt happens to occur that day).
+    Checks EVERY active, connected account's real balance once a day
+    regardless of whether a signal fires for them, and tells anyone
+    genuinely at $0 that no trades have been happening because of it -
+    a real, deliberate design choice per explicit instruction, not
+    copied from Deriv's pattern.
+    """
+    try:
+        url = (
+            f"{SUPABASE_URL}/rest/v1/mt5_auto_trade_accounts"
+            f"?is_active=eq.true&metaapi_account_id=not.is.null&select=user_id,metaapi_account_id"
+        )
+        response = requests.get(url, headers=sb_headers(), timeout=10)
+        active_accounts = response.json()
+    except Exception as e:
+        print(f"[MT5 ZERO BALANCE] Error fetching active accounts: {e}")
+        return
+
+    if not active_accounts:
+        return
+
+    bot = context.bot
+    for row in active_accounts:
+        user_id = row.get("user_id")
+        metaapi_account_id = row.get("metaapi_account_id")
+        if not user_id or not metaapi_account_id:
+            continue
+        try:
+            balance = await get_client_mt5_balance(metaapi_account_id)
+            if balance is None:
+                continue  # couldn't read it this round - real value unknown, not the same as genuinely zero
+            if balance > 0.01:
+                continue  # real funds present, nothing to say
+            await bot.send_message(
+                chat_id=int(user_id),
+                text=(
+                    "⚠️ <b>No trades have been taken on your account - "
+                    "your balance is too low.</b>\n\n"
+                    "Your Exness Auto-Trade subscription is still active, "
+                    "but with a $0 balance, there's nothing for it to "
+                    "trade with.\n\n"
+                    "Fund your account to take full advantage of Nexora "
+                    "AI copy trading."
+                ),
+                parse_mode=ParseMode.HTML
+            )
+            print(f"[MT5 ZERO BALANCE] Notified {user_id} - balance is ${balance}")
+        except Exception as e:
+            print(f"[MT5 ZERO BALANCE] Error checking/notifying {user_id}: {e}")
 
 
 async def check_mt5_autotrade_expiry(context: ContextTypes.DEFAULT_TYPE):
@@ -22597,6 +22659,16 @@ def main():
         wipe_expired_mt5_credentials,
         time=parse_time("00:15"),
         name="mt5_credential_wipe_check"
+    )
+
+    # MT5 auto-trade: daily zero-balance check, per explicit
+    # instruction - genuinely scheduled, checks every active,
+    # connected account's real balance once a day regardless of
+    # whether a signal fires for them that day.
+    job_queue.run_daily(
+        check_mt5_zero_balance_notifications,
+        time=parse_time("08:00"),
+        name="mt5_zero_balance_check"
     )
 
     # MT5 auto-trade: live execution for the 4 bot presets - checks

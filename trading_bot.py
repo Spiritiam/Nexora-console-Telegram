@@ -11874,20 +11874,20 @@ def run_ml_driven_decision(pair_key, config, h1_candles, h4_candles, daily_candl
     confidence = min(95, 70 + int(ev_gap * 300))
 
     # Reasoning text, per explicit instruction and approved wording -
-    # no technical "ML model rated X higher" framing, reads naturally
-    # next to the other reasoning bullets regardless of which branch
-    # fires.
+    # the technical "ML model favors X" framing is shown to everyone
+    # (channel and DM) whenever the model genuinely produced this
+    # result, so it's clear the model is actually doing the work.
+    # "Overall market conditions favor..." is reserved exclusively for
+    # the true last-resort case where the model couldn't run at all
+    # (see generate_rule_based_bias's final fallback) - not used here,
+    # since this function only ever returns when the model DID work.
     if agreeing_strategies:
-        if len(agreeing_strategies) == 1:
-            strat_text = agreeing_strategies[0]
-        elif len(agreeing_strategies) == 2:
-            strat_text = f"{agreeing_strategies[0]} and {agreeing_strategies[1]}"
-        else:
-            strat_text = ", ".join(agreeing_strategies[:-1]) + f", and {agreeing_strategies[-1]}"
-        verb = "is" if len(agreeing_strategies) == 1 else "are"
-        reason = f"{strat_text} {verb} also lining up with this call."
+        n = len(agreeing_strategies)
+        strat_word = "strategy" if n == 1 else "strategies"
+        strat_list = agreeing_strategies[0] if n == 1 else ", ".join(agreeing_strategies)
+        reason = f"ML model favors {direction} (predicted edge {predicted_ev:+.2f}%) - {n} {strat_word} leaning {direction.lower()} ({strat_list})."
     else:
-        reason = f"Overall market conditions favor {'buyers' if direction == 'BUY' else 'sellers'} here."
+        reason = f"ML model favors {direction} (predicted edge {predicted_ev:+.2f}%)."
 
     # Returns winning_votes (the real vote dicts, not just names) as
     # the 5th element, exactly matching run_strategy_bank's own return
@@ -12513,10 +12513,15 @@ def predict_direction_via_ml(pair_key, current_price, h1_candles, current_time, 
     if buy_ev is None or sell_ev is None:
         return None
 
+    # Per explicit instruction - same technical "ML model favors X"
+    # wording as run_ml_driven_decision, since this is ALSO a genuine
+    # case where the model produced a real result (this function
+    # never tracks per-strategy agreement, so always the bare form,
+    # no strategy tail).
     if buy_ev >= sell_ev:
-        return "BUY", "Potential buy setup spotted.", buy_ev, sell_ev
+        return "BUY", f"ML model favors BUY (predicted edge {buy_ev:+.2f}%).", buy_ev, sell_ev
     else:
-        return "SELL", "Potential sell setup spotted.", buy_ev, sell_ev
+        return "SELL", f"ML model favors SELL (predicted edge {sell_ev:+.2f}%).", buy_ev, sell_ev
 
 
 def generate_rule_based_bias(pair_key, current_price, price_1h_ago, h1_candles=None):
@@ -12547,10 +12552,10 @@ def generate_rule_based_bias(pair_key, current_price, price_1h_ago, h1_candles=N
     if price_1h_ago is not None and current_price is not None:
         if current_price > price_1h_ago:
             direction = "BUY"
-            reason = "Potential buy setup spotted."
+            reason = "Overall market conditions favor buyers here."
         elif current_price < price_1h_ago:
             direction = "SELL"
-            reason = "Potential sell setup spotted."
+            reason = "Overall market conditions favor sellers here."
         else:
             direction, reason = _consistent_or_random(pair_key)
     else:
@@ -12566,9 +12571,9 @@ def _consistent_or_random(pair_key):
     if pair_key and pair_key in last_signal_direction:
         prev_direction, prev_time = last_signal_direction[pair_key]
         if now - prev_time < SIGNAL_CONSISTENCY_SECONDS:
-            return prev_direction, "Potential " + ("buy" if prev_direction == "BUY" else "sell") + " setup spotted."
+            return prev_direction, "Overall market conditions favor " + ("buyers" if prev_direction == "BUY" else "sellers") + " here."
     direction = random.choice(["BUY", "SELL"])
-    return direction, "Potential " + ("buy" if direction == "BUY" else "sell") + " setup spotted."
+    return direction, "Overall market conditions favor " + ("buyers" if direction == "BUY" else "sellers") + " here."
 
 # ============================================
 # SIGNAL BUILDER

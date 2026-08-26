@@ -2535,12 +2535,25 @@ async def check_mt5_autotrade_expiry(context: ContextTypes.DEFAULT_TYPE):
     manual intervention needed. Sets is_active=false (auto-trading
     stops immediately) and notifies the user, rather than silently
     letting an expired subscription keep trading.
+
+    FIX: CONFIRMED REAL COST ISSUE, per explicit instruction - expired
+    accounts used to just sit provisioned on MetaAPI forever, still
+    consuming a resource slot MetaAPI bills for indefinitely, with no
+    way to tell an active account from one that's been inactive for
+    months without checking each one individually. Now genuinely
+    deprovisions from MetaAPI right away on expiry (stops the real
+    cost immediately, and the account disappears from the MetaAPI
+    dashboard right away, not after any grace period) - the grace
+    period below is about how long the account's own LOGIN DETAILS
+    stay saved in OUR database for a fast resubscribe, completely
+    separate from the MetaAPI resource itself, which is gone
+    immediately either way.
     """
     try:
         now_iso = datetime.utcnow().isoformat()
         url = (
             f"{SUPABASE_URL}/rest/v1/mt5_auto_trade_accounts"
-            f"?is_active=eq.true&subscription_expires_at=lt.{now_iso}&select=user_id"
+            f"?is_active=eq.true&subscription_expires_at=lt.{now_iso}&select=user_id,metaapi_account_id"
         )
         response = requests.get(url, headers=sb_headers(), timeout=10)
         expired_accounts = response.json()
@@ -2554,22 +2567,119 @@ async def check_mt5_autotrade_expiry(context: ContextTypes.DEFAULT_TYPE):
     bot = context.bot
     for row in expired_accounts:
         user_id = row.get("user_id")
+        metaapi_account_id = row.get("metaapi_account_id")
         if not user_id:
             continue
         try:
-            upsert_mt5_autotrade_account(user_id, {"is_active": False})
-            print(f"[MT5 AUTOTRADE EXPIRY] ⏸️ Deactivated expired subscription for {user_id}")
+            if metaapi_account_id:
+                await deprovision_mt5_account(metaapi_account_id)
+            upsert_mt5_autotrade_account(user_id, {"is_active": False, "metaapi_account_id": None})
+            print(f"[MT5 AUTOTRADE EXPIRY] ⏸️ Deactivated and deprovisioned expired subscription for {user_id}")
             await bot.send_message(
                 chat_id=int(user_id),
                 text=(
                     "⏸️ <b>Your Exness Auto-Trade subscription has expired.</b>\n\n"
                     "Auto-trading has been paused. Tap 🤖 Exness Auto-Trade "
-                    "to renew."
+                    "to renew - if you renew within 90 days, we'll "
+                    "automatically reconnect your same account, no need "
+                    "to re-enter anything."
                 ),
                 parse_mode=ParseMode.HTML
             )
         except Exception as e:
             print(f"[MT5 AUTOTRADE EXPIRY] ❌ Failed to deactivate/notify {user_id}: {e}")
+
+
+async def wipe_expired_mt5_credentials(context: ContextTypes.DEFAULT_TYPE):
+    """
+    Runs once daily, per explicit instruction - a real, deliberate
+    90-day grace period after expiry for a fast resubscribe using
+    saved credentials (see the reprovisioning logic in
+    process_confirmed_korapay_payments/process_confirmed_nowpayments_
+    payments). Past that window, holding someone's real broker login
+    indefinitely with no real reason to isn't something to do without
+    cause - this wipes the actual credentials (account_number,
+    encrypted_password, server, account_name) while keeping the row
+    itself for historical/analytics purposes. Anyone past this point
+    who resubscribes goes through full onboarding again, same as a
+    brand new client.
+    """
+    try:
+        cutoff_iso = (datetime.utcnow() - timedelta(days=90)).isoformat()
+        url = (
+            f"{SUPABASE_URL}/rest/v1/mt5_auto_trade_accounts"
+            f"?is_active=eq.false&subscription_expires_at=lt.{cutoff_iso}"
+            f"&account_number=not.is.null&select=user_id"
+        )
+        response = requests.get(url, headers=sb_headers(), timeout=10)
+        stale_accounts = response.json()
+    except Exception as e:
+        print(f"[MT5 CREDENTIAL WIPE] Error fetching stale accounts: {e}")
+        return
+
+    if not stale_accounts:
+        return
+
+    for row in stale_accounts:
+        user_id = row.get("user_id")
+        if not user_id:
+            continue
+        try:
+            upsert_mt5_autotrade_account(user_id, {
+                "account_number": None, "encrypted_password": None,
+                "server": None, "account_name": None,
+            })
+            print(f"[MT5 CREDENTIAL WIPE] 🗑️ Wiped saved credentials for {user_id} - past the 90-day grace period")
+        except Exception as e:
+            print(f"[MT5 CREDENTIAL WIPE] ❌ Failed to wipe credentials for {user_id}: {e}")
+
+
+async def try_auto_reprovision_on_resubscribe(user_id, account, bot):
+    """
+    Shared by both KoraPay and NOWPayments activation, per explicit
+    instruction - a client resubscribing within the 90-day grace
+    period (see wipe_expired_mt5_credentials) still has their real
+    login saved, even though the MetaAPI account itself was
+    deprovisioned on expiry to stop the ongoing MetaAPI cost. This
+    genuinely reconnects using the exact same saved details, no
+    re-entry needed - only falls through to asking for fresh
+    credentials if the real reconnection attempt itself fails (e.g.
+    their MT5 password genuinely changed since they last used this).
+
+    Returns True if reconnected successfully (and already notified
+    the user), False if the caller should fall back to asking for
+    fresh credentials.
+    """
+    if not (account and account.get("account_number") and account.get("encrypted_password") and account.get("server")):
+        return False
+
+    try:
+        raw_password = decrypt_credential(account["encrypted_password"])
+        account_id, error = await provision_mt5_account(
+            account["account_number"], raw_password, account["server"],
+            account_name=account.get("account_name")
+        )
+        if error:
+            print(f"[MT5 AUTOTRADE] Auto-reprovision on resubscribe failed for {user_id}: {error}")
+            return False
+
+        upsert_mt5_autotrade_account(user_id, {"metaapi_account_id": account_id, "is_active": True})
+        print(f"[MT5 AUTOTRADE] ✅ Auto-reconnected {user_id} on resubscribe using saved credentials.")
+        await bot.send_message(
+            chat_id=int(user_id),
+            text=(
+                "✅ <b>Payment confirmed - and you're already reconnected!</b>\n\n"
+                f"Your subscription is active for {MT5_SUBSCRIPTION_DAYS} more "
+                "days, and we've automatically reconnected your same "
+                "trading account - no need to re-enter anything.\n\n"
+                "Tap 🤖 Exness Auto-Trade to check your dashboard."
+            ),
+            parse_mode=ParseMode.HTML
+        )
+        return True
+    except Exception as e:
+        print(f"[MT5 AUTOTRADE] Auto-reprovision on resubscribe error for {user_id}: {e}")
+        return False
 
 
 async def process_confirmed_korapay_payments(context: ContextTypes.DEFAULT_TYPE):
@@ -2613,6 +2723,8 @@ async def process_confirmed_korapay_payments(context: ContextTypes.DEFAULT_TYPE)
                         [InlineKeyboardButton("🔄 Connect a new account", callback_data="mt5renew_new")],
                     ])
                 )
+            elif await try_auto_reprovision_on_resubscribe(user_id, account, bot):
+                pass  # already fully handled and notified inside the helper
             else:
                 user_modes[user_id] = "mt5_awaiting_account_number"
                 await bot.send_message(
@@ -2670,6 +2782,8 @@ async def process_confirmed_nowpayments_payments(context: ContextTypes.DEFAULT_T
                         [InlineKeyboardButton("🔄 Connect a new account", callback_data="mt5renew_new")],
                     ])
                 )
+            elif await try_auto_reprovision_on_resubscribe(user_id, account, bot):
+                pass  # already fully handled and notified inside the helper
             else:
                 user_modes[user_id] = "mt5_awaiting_account_number"
                 await bot.send_message(
@@ -22474,6 +22588,15 @@ def main():
         check_mt5_autotrade_expiry,
         time=parse_time("00:05"),
         name="mt5_autotrade_expiry_check"
+    )
+
+    # MT5 auto-trade: daily wipe of saved credentials for anyone still
+    # inactive 90 days past expiry, per explicit instruction - the
+    # real, deliberate end of the grace period started above.
+    job_queue.run_daily(
+        wipe_expired_mt5_credentials,
+        time=parse_time("00:15"),
+        name="mt5_credential_wipe_check"
     )
 
     # MT5 auto-trade: live execution for the 4 bot presets - checks

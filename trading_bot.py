@@ -13496,6 +13496,34 @@ def generate_signal_narrative(display_name, direction, winning_votes):
 # rare case where no usable candle data exists.
 # ============================================
 
+async def animate_analyzing_message(wait_message):
+    """
+    Per explicit instruction - cycles through real process-step
+    phrases (not just decorative moving dots) while the real signal
+    work runs concurrently in the caller, so it reads as genuine
+    progress rather than a generic loading spinner. Runs as a
+    background task the caller starts with asyncio.create_task and
+    cancels once the real work finishes - paced at once per second,
+    safely within Telegram's message-edit rate limits.
+    """
+    phrases = [
+        "🧠 <b>Reading live price action...</b>",
+        "🧠 <b>Checking market conditions...</b>",
+        "🧠 <b>Finalizing your signal...</b>",
+    ]
+    i = 0
+    try:
+        while True:
+            await asyncio.sleep(1)
+            i = (i + 1) % len(phrases)
+            try:
+                await wait_message.edit_text(phrases[i], parse_mode=ParseMode.HTML)
+            except Exception:
+                pass  # transient Telegram hiccup - the next cycle will just try again
+    except asyncio.CancelledError:
+        pass  # expected, real work finished - not an error
+
+
 async def build_signal_response(question, user_id=None, retry_mismatch=False):
     matched_key = match_pair_key(question)
 
@@ -19727,7 +19755,11 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 parse_mode=ParseMode.HTML
             )
 
-            result = await build_synthetic_signal_response(synthetic_key, min_agree=2)
+            animation_task = asyncio.create_task(animate_analyzing_message(wait_message))
+            try:
+                result = await build_synthetic_signal_response(synthetic_key, min_agree=2)
+            finally:
+                animation_task.cancel()
 
             try:
                 await wait_message.delete()
@@ -19827,11 +19859,13 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
             parse_mode=ParseMode.HTML
         )
 
-        await asyncio.sleep(1)
-
-        image_file_id, direction, signal, signal_data = (
-            await build_signal_response(message, user_id=user_id)
-        )
+        animation_task = asyncio.create_task(animate_analyzing_message(wait_message))
+        try:
+            image_file_id, direction, signal, signal_data = (
+                await build_signal_response(message, user_id=user_id)
+            )
+        finally:
+            animation_task.cancel()
 
         # ADDED: manual/DM-generated signals were never logged at all -
         # only the scheduled auto-post path was, meaning per-strategy

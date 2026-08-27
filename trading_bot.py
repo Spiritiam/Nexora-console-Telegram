@@ -13503,8 +13503,20 @@ async def animate_analyzing_message(wait_message):
     work runs concurrently in the caller, so it reads as genuine
     progress rather than a generic loading spinner. Runs as a
     background task the caller starts with asyncio.create_task and
-    cancels once the real work finishes - paced at once per second,
-    safely within Telegram's message-edit rate limits.
+    cancels once the real work finishes.
+
+    FIX: CONFIRMED REAL GAP, per explicit instruction after a live
+    report that this genuinely didn't show at all. The loop used to
+    wait a full second BEFORE its very first edit - if the real
+    signal work (very plausible with cached data) finished in under a
+    second, the animation task got cancelled before ever reaching its
+    first edit, meaning the person only ever saw the static initial
+    message the whole time. First transition now happens almost
+    immediately (0.4s) instead, then settles into the normal 1s pace.
+    Also added real logging on edit failures - the old bare `except:
+    pass` gave no way to tell "genuinely working, just too fast to
+    see" apart from "silently broken", which is exactly why this took
+    a live report to catch instead of being visible in logs directly.
     """
     phrases = [
         "🧠 <b>Reading live price action...</b>",
@@ -13512,14 +13524,16 @@ async def animate_analyzing_message(wait_message):
         "🧠 <b>Finalizing your signal...</b>",
     ]
     i = 0
+    first = True
     try:
         while True:
-            await asyncio.sleep(1)
+            await asyncio.sleep(0.4 if first else 1)
+            first = False
             i = (i + 1) % len(phrases)
             try:
                 await wait_message.edit_text(phrases[i], parse_mode=ParseMode.HTML)
-            except Exception:
-                pass  # transient Telegram hiccup - the next cycle will just try again
+            except Exception as e:
+                print(f"[SIGNAL ANIMATION] edit failed (may just be a transient Telegram hiccup): {e}")
     except asyncio.CancelledError:
         pass  # expected, real work finished - not an error
 

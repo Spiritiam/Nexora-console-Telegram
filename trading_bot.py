@@ -13616,7 +13616,21 @@ async def build_signal_response(question, user_id=None, retry_mismatch=False):
     daily_candles = await asyncio.to_thread(get_cached_candles, matched_key, config, "1day", outputsize=10)
 
     def _mismatch_gap_pct():
-        if current_price is not None and price_source_tracker.get("source") in ("oil_api", "metals_api") and h1_candles:
+        # FIX: CONFIRMED REAL BUG, per explicit instruction after a
+        # live XAUUSD signal shipped with its candles visibly
+        # disagreeing with Entry/SL/TP by dozens of points. This used
+        # to only check the gap when price_source_tracker["source"]
+        # was "oil_api" or "metals_api" - built for USOIL/XAGUSD only.
+        # Every METAAPI_FIRST_PAIRS pair (XAUUSD, BTCUSD, and every FX
+        # pair) gets its live price from "metaapi", which was never in
+        # that tuple, so this always returned 0 for them regardless of
+        # how large the real gap was - the 2-minute MetaAPI-recovery
+        # retry loop below never triggered for the pairs that actually
+        # needed it. The chart's live-point anchor still kept the
+        # LAST candle honest, but every candle before it could be
+        # silently sourced from a feed that had drifted from the true
+        # entry price. Now checks the gap for any source.
+        if current_price is not None and h1_candles:
             last_real_close = h1_candles[-1]["close"]
             if last_real_close:
                 return abs(current_price - last_real_close) / last_real_close * 100

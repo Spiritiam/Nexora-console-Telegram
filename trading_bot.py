@@ -1127,6 +1127,18 @@ async def get_client_mt5_balance(metaapi_account_id):
             return None
         info = await asyncio.wait_for(connection.get_account_information(), timeout=15)
         return info.get("balance")
+    except asyncio.TimeoutError:
+        # FIX: CONFIRMED REAL GAP, per explicit instruction after a
+        # live "balance unavailable" report - asyncio.TimeoutError has
+        # an EMPTY str() by default, so the old bare `except Exception
+        # as e: print(...{e})` genuinely printed nothing after the
+        # colon, hiding the real cause. This wasn't covered by the
+        # earlier get_client_mt5_connection fix - that one only
+        # touched the CONNECTION step; this is a separate timeout on
+        # the balance query itself, on an already-connected account.
+        print(f"[MT5 AUTOTRADE] Balance lookup TIMED OUT for {metaapi_account_id} (15s) - account is connected, but this specific query didn't respond in time.")
+        _reset_client_mt5_connection(metaapi_account_id)
+        return None
     except Exception as e:
         print(f"[MT5 AUTOTRADE] Balance lookup failed for {metaapi_account_id}: {e}")
         _reset_client_mt5_connection(metaapi_account_id)
@@ -1146,6 +1158,13 @@ async def has_client_open_mt5_position(metaapi_account_id, mt5_symbol):
             pos_symbol = (pos.get("symbol") if isinstance(pos, dict) else None) or ""
             if pos_symbol.upper().startswith(target) or target.startswith(pos_symbol.upper()):
                 return True
+        return False
+    except asyncio.TimeoutError:
+        # Same fix and reasoning as get_client_mt5_balance's matching
+        # one, per explicit instruction - TimeoutError has an empty
+        # str() by default, hiding the real cause behind a blank log.
+        print(f"[MT5 AUTOTRADE] Position check TIMED OUT for {metaapi_account_id} (15s) - account is connected, but this specific query didn't respond in time.")
+        _reset_client_mt5_connection(metaapi_account_id)
         return False
     except Exception as e:
         print(f"[MT5 AUTOTRADE] Position check failed for {metaapi_account_id}: {e}")

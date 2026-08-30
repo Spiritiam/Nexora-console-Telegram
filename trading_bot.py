@@ -964,6 +964,10 @@ _CLIENT_MT5_FAILURE_COOLDOWN_SECONDS = 60
 # notification per this window is enough to prompt action.
 _LAST_METAAPI_DEPLOY_FAILURE_ADMIN_ALERT = {"time": None}
 _METAAPI_DEPLOY_FAILURE_ALERT_COOLDOWN_SECONDS = 1800
+# Per explicit instruction - tracks the last alert's real message ID
+# so a new alert can delete the previous one, keeping the admin's
+# chat from accumulating repeated near-identical alerts over time.
+_LAST_METAAPI_DEPLOY_FAILURE_MESSAGE_ID = {"id": None}
 
 
 async def notify_admin_of_metaapi_deploy_failure(metaapi_account_id, reason):
@@ -980,8 +984,17 @@ async def notify_admin_of_metaapi_deploy_failure(metaapi_account_id, reason):
     if last_alert and (time.time() - last_alert) < _METAAPI_DEPLOY_FAILURE_ALERT_COOLDOWN_SECONDS:
         return
     _LAST_METAAPI_DEPLOY_FAILURE_ADMIN_ALERT["time"] = time.time()
+    # Per explicit instruction - delete the previous alert of this
+    # same type before sending the new one, so the chat only ever
+    # shows the most recent, current one rather than piling up.
+    prev_id = _LAST_METAAPI_DEPLOY_FAILURE_MESSAGE_ID["id"]
+    if prev_id:
+        try:
+            await _app_instance.bot.delete_message(chat_id=int(ADMIN_USER_ID), message_id=prev_id)
+        except Exception:
+            pass  # already deleted/too old to delete - not worth failing over
     try:
-        await _app_instance.bot.send_message(
+        sent = await _app_instance.bot.send_message(
             chat_id=int(ADMIN_USER_ID),
             text=(
                 f"⚠️ <b>A client's MetaAPI account failed to redeploy.</b>\n\n"
@@ -994,6 +1007,7 @@ async def notify_admin_of_metaapi_deploy_failure(metaapi_account_id, reason):
             ),
             parse_mode=ParseMode.HTML
         )
+        _LAST_METAAPI_DEPLOY_FAILURE_MESSAGE_ID["id"] = sent.message_id
     except Exception as e:
         print(f"[MT5 AUTOTRADE] Couldn't notify admin of deploy failure: {e}")
 
@@ -1005,6 +1019,7 @@ async def notify_admin_of_metaapi_deploy_failure(metaapi_account_id, reason):
 # alert about the other.
 _LAST_SCHEDULED_SIGNAL_FAILURE_ADMIN_ALERT = {"time": None}
 _SCHEDULED_SIGNAL_FAILURE_ALERT_COOLDOWN_SECONDS = 1800
+_LAST_SCHEDULED_SIGNAL_FAILURE_MESSAGE_ID = {"id": None}
 
 
 async def notify_admin_of_scheduled_signal_failure(pair_keyword, reason):
@@ -1025,8 +1040,14 @@ async def notify_admin_of_scheduled_signal_failure(pair_keyword, reason):
     if last_alert and (time.time() - last_alert) < _SCHEDULED_SIGNAL_FAILURE_ALERT_COOLDOWN_SECONDS:
         return
     _LAST_SCHEDULED_SIGNAL_FAILURE_ADMIN_ALERT["time"] = time.time()
+    prev_id = _LAST_SCHEDULED_SIGNAL_FAILURE_MESSAGE_ID["id"]
+    if prev_id:
+        try:
+            await _app_instance.bot.delete_message(chat_id=int(ADMIN_USER_ID), message_id=prev_id)
+        except Exception:
+            pass
     try:
-        await _app_instance.bot.send_message(
+        sent = await _app_instance.bot.send_message(
             chat_id=int(ADMIN_USER_ID),
             text=(
                 f"⚠️ <b>A scheduled channel signal failed to post.</b>\n\n"
@@ -1037,6 +1058,7 @@ async def notify_admin_of_scheduled_signal_failure(pair_keyword, reason):
             ),
             parse_mode=ParseMode.HTML
         )
+        _LAST_SCHEDULED_SIGNAL_FAILURE_MESSAGE_ID["id"] = sent.message_id
     except Exception as e:
         print(f"[AUTO SIGNAL] Couldn't notify admin of scheduled signal failure: {e}")
 

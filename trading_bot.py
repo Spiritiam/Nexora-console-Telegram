@@ -597,6 +597,15 @@ async def deprovision_mt5_account(metaapi_account_id):
         print(f"[MT5 PROVISION] Removed old account {metaapi_account_id}")
     except Exception as e:
         print(f"[MT5 PROVISION] Couldn't remove old account {metaapi_account_id}: {e}")
+    finally:
+        # FIX: CONFIRMED REAL MEMORY LEAK, per explicit instruction -
+        # this used to only remove the account from MetaAPI itself,
+        # never clearing this account's entry from the local
+        # connection cache - the now-dead connection object (and its
+        # failure-tracking entries) just sat in memory forever. Runs
+        # in `finally` so this cleanup happens even if the MetaAPI
+        # removal call itself fails.
+        _reset_client_mt5_connection(metaapi_account_id)
 
 
 def clean_mt5_provision_error(raw_error):
@@ -1139,7 +1148,17 @@ async def get_client_mt5_connection(metaapi_account_id):
 
 
 def _reset_client_mt5_connection(metaapi_account_id):
+    # FIX: CONFIRMED REAL MEMORY LEAK, per explicit instruction after
+    # a genuine Railway OOM crash. _CLIENT_MT5_CONNECTIONS only ever
+    # had entries added, never removed - every live websocket
+    # connection object for every client account accumulated in
+    # memory forever, even long after a subscription expired and the
+    # account was deprovisioned from MetaAPI itself. Now also clears
+    # the smaller failure-tracking dicts for the same account, so
+    # nothing keeps accumulating for an account that no longer exists.
     _CLIENT_MT5_CONNECTIONS.pop(metaapi_account_id, None)
+    _CLIENT_MT5_CONNECTION_FAILURES.pop(metaapi_account_id, None)
+    _CLIENT_MT5_CONNECTION_FAILURE_REASONS.pop(metaapi_account_id, None)
 
 
 async def get_client_mt5_balance(metaapi_account_id):

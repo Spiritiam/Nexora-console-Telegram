@@ -2033,7 +2033,7 @@ async def run_account_flip_entry_scan(context: ContextTypes.DEFAULT_TYPE):
             if ml_result:
                 ml_direction, ml_reason, buy_ev, sell_ev, ml_confidence = ml_result
                 print(f"[ML EV MODEL] Account Flip {pair_key}: BUY={buy_ev:+.3f}% SELL={sell_ev:+.3f}% -> chose {ml_direction}")
-                sl_mult, _ = get_sl_tp_multipliers(pair_key)
+                sl_mult, _ = get_sl_tp_multipliers(pair_key, entry_price_ml)
                 if ml_direction == "BUY":
                     ml_stop_loss = entry_price_ml - (pair_config["pip_size"] * sl_mult)
                 else:
@@ -8485,7 +8485,74 @@ PAIR_CONFIG = {
         "av_type": "forex",
         "td_symbol": "NZD/USD",
     },
+    # STOCK CFDs, per explicit instruction - Phase 1, launching with
+    # the 7 most recognizable names. Confirmed directly against
+    # Exness's own official help center: pip_size 0.1, 100-share
+    # contract size, real symbol list of 90 stocks total. mt5_symbol
+    # follows the same "m" suffix every other pair in this file uses
+    # (unverified for stocks specifically until a live test confirms
+    # it - see the startup diagnostic). decimals=2 matches standard
+    # US stock price quoting.
+    "aapl": {
+        "symbol": "AAPL", "pair_name": "AAPL", "pip_size": 0.1, "pip_value": 0.01,
+        "pip_label": "pips", "decimals": 2, "mt5_symbol": "AAPLm",
+        "display": "Apple (AAPL) 🍎", "av_symbol": "AAPL", "av_type": "stock", "td_symbol": "AAPL",
+    },
+    "msft": {
+        "symbol": "MSFT", "pair_name": "MSFT", "pip_size": 0.1, "pip_value": 0.01,
+        "pip_label": "pips", "decimals": 2, "mt5_symbol": "MSFTm",
+        "display": "Microsoft (MSFT) 💻", "av_symbol": "MSFT", "av_type": "stock", "td_symbol": "MSFT",
+    },
+    "googl": {
+        "symbol": "GOOGL", "pair_name": "GOOGL", "pip_size": 0.1, "pip_value": 0.01,
+        "pip_label": "pips", "decimals": 2, "mt5_symbol": "GOOGLm",
+        "display": "Alphabet (GOOGL) 🔍", "av_symbol": "GOOGL", "av_type": "stock", "td_symbol": "GOOGL",
+    },
+    "amzn": {
+        "symbol": "AMZN", "pair_name": "AMZN", "pip_size": 0.1, "pip_value": 0.01,
+        "pip_label": "pips", "decimals": 2, "mt5_symbol": "AMZNm",
+        "display": "Amazon (AMZN) 📦", "av_symbol": "AMZN", "av_type": "stock", "td_symbol": "AMZN",
+    },
+    "nvda": {
+        "symbol": "NVDA", "pair_name": "NVDA", "pip_size": 0.1, "pip_value": 0.01,
+        "pip_label": "pips", "decimals": 2, "mt5_symbol": "NVDAm",
+        "display": "Nvidia (NVDA) 🖥️", "av_symbol": "NVDA", "av_type": "stock", "td_symbol": "NVDA",
+    },
+    "meta": {
+        "symbol": "META", "pair_name": "META", "pip_size": 0.1, "pip_value": 0.01,
+        "pip_label": "pips", "decimals": 2, "mt5_symbol": "METAm",
+        "display": "Meta (META) 📱", "av_symbol": "META", "av_type": "stock", "td_symbol": "META",
+    },
+    "tsla": {
+        "symbol": "TSLA", "pair_name": "TSLA", "pip_size": 0.1, "pip_value": 0.01,
+        "pip_label": "pips", "decimals": 2, "mt5_symbol": "TSLAm",
+        "display": "Tesla (TSLA) 🚗", "av_symbol": "TSLA", "av_type": "stock", "td_symbol": "TSLA",
+    },
 }
+
+# Per explicit instruction - identifies which PAIR_CONFIG keys are
+# stocks, used for trading-hours awareness and percentage-based SL/TP
+# (a fixed pip multiplier doesn't scale sensibly across stocks priced
+# anywhere from ~$150 to ~$900+, unlike forex pairs which sit in a
+# much narrower relative price band).
+STOCK_TICKERS = {"aapl", "msft", "googl", "amzn", "nvda", "meta", "tsla"}
+
+
+def is_stock_market_open():
+    """
+    Real Exness stock trading hours, per explicit instruction -
+    confirmed directly against Exness's own official documentation:
+    roughly 13:40-19:45 GMT, Monday-Friday (some pre-market extends
+    earlier, but per Exness's own note, pre-market only allows
+    CLOSING existing positions, not opening new ones - so this
+    deliberately uses the real, full-open-allowed window only).
+    """
+    now = datetime.utcnow()
+    if now.weekday() >= 5:  # Saturday=5, Sunday=6
+        return False
+    market_open = now.replace(hour=13, minute=40, second=0, microsecond=0)
+    market_close = now.replace(hour=19, minute=45, second=0, microsecond=0)
+    return market_open <= now <= market_close
 
 # ============================================
 # PAIR ALIASES — natural language matching
@@ -8505,6 +8572,14 @@ PAIR_ALIASES = {
     "eurjpy": ["eurjpy", "eur/jpy", "eur jpy", "euro yen"],
     "usdchf": ["usdchf", "usd/chf", "usd chf", "swissy", "swiss franc"],
     "nzdusd": ["nzdusd", "nzd/usd", "nzd usd", "kiwi", "new zealand dollar"],
+    # STOCKS, per explicit instruction - Phase 1 launch set.
+    "aapl": ["aapl", "apple", "apple stock"],
+    "msft": ["msft", "microsoft", "microsoft stock"],
+    "googl": ["googl", "google", "alphabet", "google stock"],
+    "amzn": ["amzn", "amazon", "amazon stock"],
+    "nvda": ["nvda", "nvidia", "nvidia stock"],
+    "meta": ["meta stock", "facebook", "meta platforms"],
+    "tsla": ["tsla", "tesla", "tesla stock"],
 }
 
 def match_pair_key(question):
@@ -12090,7 +12165,7 @@ def run_ml_driven_decision(pair_key, config, h1_candles, h4_candles, daily_candl
     pip_size = config.get("pip_size")
     if not pip_size:
         return None
-    sl_mult, tp_mult = get_sl_tp_multipliers(pair_key)
+    sl_mult, tp_mult = get_sl_tp_multipliers(pair_key, current_price)
 
     results_by_direction = {}
     for direction in ("BUY", "SELL"):
@@ -12719,7 +12794,7 @@ FUNDAMENTAL: [one sentence + closing clause, max 24 words] OR FUNDAMENTAL: NONE
 # technical analysis based on actual price action.
 # ============================================
 
-def get_sl_tp_multipliers(pair_key):
+def get_sl_tp_multipliers(pair_key, entry_price=None):
     """
     Shared lookup, per explicit instruction (extracted from the
     inline version in build_signal_response so the new ML-driven
@@ -12727,7 +12802,22 @@ def get_sl_tp_multipliers(pair_key):
     than duplicating this table and risking the two drifting apart
     over time). See build_signal_response's own comment history for
     the full verification behind each of these values.
+
+    entry_price: per explicit instruction, added for stocks - a fixed
+    pip multiplier doesn't scale sensibly across stocks priced
+    anywhere from ~$150 to ~$900+, unlike forex pairs which sit in a
+    much narrower relative price band. For stocks, this returns a
+    multiplier that yields a genuine 1.5%/3% (1:2 risk:reward) SL/TP
+    of the REAL current price, not a flat dollar amount regardless of
+    which stock it is. Falls back to a flat, real dollar amount only
+    if entry_price genuinely isn't available at the call site.
     """
+    if pair_key in STOCK_TICKERS:
+        if entry_price:
+            sl_mult = (entry_price * 0.015) / 0.1
+            tp_mult = (entry_price * 0.03) / 0.1
+            return sl_mult, tp_mult
+        return 20, 40  # fallback only - genuine entry_price unavailable
     if pair_key == "xauusd":
         return 3.0, 6.0
     elif pair_key in ("gbpusd", "eurusd", "audusd", "usdcad", "usdjpy", "usdchf", "nzdusd"):
@@ -12763,7 +12853,7 @@ def predict_direction_via_ml(pair_key, current_price, h1_candles, current_time, 
     if not pip_size:
         print(f"[ML EV MODEL] {pair_key}: fallback skipped - no pip_size configured for this pair_key")
         return None
-    sl_mult, tp_mult = get_sl_tp_multipliers(pair_key)
+    sl_mult, tp_mult = get_sl_tp_multipliers(pair_key, current_price)
 
     buy_sl = current_price - (pip_size * sl_mult)
     buy_tp = current_price + (pip_size * tp_mult)
@@ -13609,6 +13699,16 @@ async def build_signal_response(question, user_id=None, retry_mismatch=False):
         print(f"[SIGNAL] ⏸️ {matched_key} blocked — forex market closed for the week")
         return None, None, "MARKET_CLOSED", None
 
+    # Per explicit instruction - stocks have their own, much tighter
+    # real trading hours (confirmed directly against Exness's own
+    # documentation: roughly 13:40-19:45 GMT, Monday-Friday), unlike
+    # forex/BTC's near-24/5 availability. Blocks stock signals outside
+    # that real window rather than generating one the market can't
+    # actually act on.
+    if matched_key in STOCK_TICKERS and not is_stock_market_open():
+        print(f"[SIGNAL] ⏸️ {matched_key} blocked — stock market closed right now")
+        return None, None, "MARKET_CLOSED", None
+
     config = PAIR_CONFIG[matched_key]
 
     symbol = config["symbol"]
@@ -13972,7 +14072,7 @@ async def build_signal_response(question, user_id=None, retry_mismatch=False):
     # $150 P&L at 0.1 lot, which needs multiplier 3.0 (pip_size=5.0 *
     # 3.0 = $15), not 0.3. Verified: 3.0/6.0 -> $15/$30 price move ->
     # $150/$300 P&L at 0.1 lot, exactly matching the real target.
-    sl_multiplier, tp_multiplier = get_sl_tp_multipliers(matched_key)
+    sl_multiplier, tp_multiplier = get_sl_tp_multipliers(matched_key, live_price)
 
     if direction == "BUY":
         entry_price = round(live_price, decimals)

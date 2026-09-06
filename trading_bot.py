@@ -23034,24 +23034,6 @@ def main():
         job_kwargs={"misfire_grace_time": 300}
     )
 
-    # TEMPORARY DIAGNOSTIC, per explicit instruction - verify the "m"
-    # suffix assumption for stock MT5 symbols (e.g. AAPLm) against a
-    # real MetaAPI candle fetch, before trusting it for live signals.
-    async def _temp_verify_stock_symbols(context: ContextTypes.DEFAULT_TYPE):
-        for ticker in ["aapl", "msft", "googl", "amzn", "nvda", "meta", "tsla"]:
-            config = PAIR_CONFIG[ticker]
-            mt5_symbol = config["mt5_symbol"]
-            try:
-                candles = await asyncio.to_thread(get_candles_metaapi, mt5_symbol, "1h", 5)
-                if candles:
-                    print(f"[STOCK SYMBOL TEST] {mt5_symbol}: ✅ got {len(candles)} real candles, last close: {candles[-1]['close']}")
-                else:
-                    print(f"[STOCK SYMBOL TEST] {mt5_symbol}: ❌ empty/no candles returned")
-            except Exception as e:
-                print(f"[STOCK SYMBOL TEST] {mt5_symbol}: ❌ error: {e}")
-
-    job_queue.run_once(_temp_verify_stock_symbols, when=10, name="temp_stock_symbol_test")
-
     print("Nexora AI Running...")
     print("Daily schedule (UTC):")
     for utc_time, post_type, data in DAILY_SCHEDULE:

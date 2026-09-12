@@ -19679,7 +19679,18 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
         email = message.strip().lower()
 
-        if "@" not in email or "." not in email:
+        # FIX: CONFIRMED REAL BUG, per explicit report of a live
+        # verification request where a TikTok share URL
+        # (https://www.tiktok.com/@user/photo/...) sailed through
+        # this check and landed in the admin approval queue looking
+        # like a valid submission. The old check only looked for the
+        # bare characters "@" and "." anywhere in the string - a
+        # TikTok profile URL contains both ("@username" in the path,
+        # "." in the domain and query params), so it isn't just
+        # theoretically weak, it demonstrably passed. Now requires an
+        # actual email shape: one "@", a domain with a dot, no
+        # whitespace, nothing after the TLD.
+        if not re.match(r'^[a-z0-9._%+\-]+@[a-z0-9.\-]+\.[a-z]{2,}$', email):
             sent_invalid_email = await update.message.reply_text(
                 "⚠️ <b>That doesn't look like a valid email address.</b>\n\n"
                 "Please enter the email address you used to "

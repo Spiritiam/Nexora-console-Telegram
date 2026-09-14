@@ -9093,6 +9093,33 @@ def get_price_metaapi(mt5_symbol):
         return None
 
 
+# FIX: CONFIRMED REAL BUG, per explicit instruction after a real live
+# incident - USOIL's dedicated fallback price source (used whenever
+# MetaAPI's live price fails, which it did with a genuine 429 rate-
+# limit error) returned the EXACT SAME price across three separate,
+# genuinely-fresh calls spanning 16 real minutes - our own cache is
+# only 60 seconds, confirmed too short to explain this, meaning the
+# underlying third-party provider itself was returning stale data.
+# That stale entry price, combined with real fresh candles for the
+# chart, caused both a misaligned chart AND a suspiciously fast
+# TP-hit (the real price had already moved well past the frozen
+# entry by the time it posted). Tracks the last genuinely-fetched
+# value (not a cache hit - a real new call) per pair for the
+# oil_api/metals_api fallbacks specifically, so a repeated identical
+# value after enough time has passed gets treated as stale rather
+# than trusted as live.
+_LAST_FALLBACK_PRICE = {}
+_FALLBACK_STALENESS_SECONDS = 90
+
+
+def _is_fallback_price_stale(pair_key, price):
+    now = time.time()
+    last = _LAST_FALLBACK_PRICE.get(pair_key)
+    is_stale = bool(last and last["price"] == price and (now - last["time"]) > _FALLBACK_STALENESS_SECONDS)
+    _LAST_FALLBACK_PRICE[pair_key] = {"price": price, "time": now}
+    return is_stale
+
+
 def get_live_price(symbol="XAU/USD", config=None, source_tracker=None):
     # FIX: per explicit instruction, MetaAPI is now the PRIMARY live-
     # price source for every pair that has an mt5_symbol - not just
@@ -9128,6 +9155,9 @@ def get_live_price(symbol="XAU/USD", config=None, source_tracker=None):
     if config and config.get("use_metals_api"):
         price = get_silver_price()
         if price:
+            if _is_fallback_price_stale(symbol, price):
+                print(f"[PRICE] ⚠️ metals.dev returned the SAME price ({price}) as the last genuinely-fresh call, {_FALLBACK_STALENESS_SECONDS}s+ ago for {symbol} - treating as stale, not trusting it as live.")
+                return None
             if source_tracker is not None:
                 source_tracker["source"] = "metals_api"
             return price
@@ -9137,6 +9167,9 @@ def get_live_price(symbol="XAU/USD", config=None, source_tracker=None):
     if config and config.get("use_oil_api"):
         price = get_oil_price()
         if price:
+            if _is_fallback_price_stale(symbol, price):
+                print(f"[PRICE] ⚠️ Oil API returned the SAME price ({price}) as the last genuinely-fresh call, {_FALLBACK_STALENESS_SECONDS}s+ ago for {symbol} - treating as stale, not trusting it as live.")
+                return None
             if source_tracker is not None:
                 source_tracker["source"] = "oil_api"
             return price

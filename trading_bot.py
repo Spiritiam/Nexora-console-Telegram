@@ -3484,6 +3484,25 @@ def is_verified(user_id):
         print(f"[DB] is_verified error: {e}")
         return False
 
+
+async def is_verified_async(user_id):
+    # FIX: CONFIRMED REAL BUG, per explicit report of the bot going
+    # unresponsive for ~a minute after a broadcast reminder - multiple
+    # people tapping "Open Nexora AI" / sending /start around the same
+    # time all landed on this same is_verified() call, which uses the
+    # blocking `requests` library directly inside code that runs on
+    # the bot's single asyncio event loop. Every one of those calls
+    # (up to its 10s timeout) froze processing for EVERY user's
+    # message, not just the one who triggered it - explaining why taps
+    # appeared to do nothing and then everything caught up at once.
+    # This wrapper runs the same blocking call in a worker thread via
+    # asyncio.to_thread instead, so it no longer blocks the event
+    # loop. is_verified() itself is left as-is (unchanged, still
+    # synchronous) since it's also called from a couple of genuinely
+    # synchronous, non-async contexts (is_mt5_autotrade_active,
+    # is_first_time_user) that this fix doesn't touch.
+    return await asyncio.to_thread(is_verified, user_id)
+
 # ============================================
 # PER-USER TIMEZONE (for auto-localized news/event times)
 # Telegram's Bot API has no way to read a user's device timezone
@@ -17124,7 +17143,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
             schedule_auto_delete(sent_expired_news.chat_id, sent_expired_news.message_id)
             return
 
-        if not is_verified(user_id):
+        if not (await is_verified_async(user_id)):
             count = increment_trial(user_id)
             if count > FREE_TRIAL_LIMIT:
                 user_modes[user_id] = "awaiting_email"
@@ -17136,7 +17155,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
             batch_events=batch
         )
 
-        if not is_verified(user_id):
+        if not (await is_verified_async(user_id)):
             remaining = trial_remaining(user_id)
             if remaining <= 0:
                 user_modes[user_id] = "awaiting_email"
@@ -17227,7 +17246,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
             )
             return
 
-    if is_verified(user_id):
+    if (await is_verified_async(user_id)):
         # Delete the previous welcome message first, if one exists -
         # per explicit instruction, prevents repeated taps of a
         # deep-link button (channelcta, chantrade_) or repeated manual
@@ -17590,7 +17609,7 @@ async def handle_buttons(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await send_connect_instructions(context.bot, user_id)
         return
 
-    if not is_verified(user_id) and get_trial_count(user_id) >= FREE_TRIAL_LIMIT:
+    if not (await is_verified_async(user_id)) and get_trial_count(user_id) >= FREE_TRIAL_LIMIT:
         user_modes[user_id] = "awaiting_email"
         await send_verification_gate(update)
         return
@@ -17732,7 +17751,7 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     if data == "show_main_menu":
         user_id = str(query.from_user.id)
-        if is_verified(user_id):
+        if (await is_verified_async(user_id)):
             await query.message.reply_text(
                 "👇 <b>What would you like to do today?</b>",
                 parse_mode=ParseMode.HTML,
@@ -18024,7 +18043,7 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if data == "mt5auto_continue":
         user_id = str(query.from_user.id)
 
-        if not is_verified(user_id):
+        if not (await is_verified_async(user_id)):
             user_modes[user_id] = "awaiting_email"
             await send_verification_gate(
                 update,
@@ -18840,7 +18859,7 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if data.startswith("newsevent_"):
         user_id = str(query.from_user.id)
 
-        if not is_verified(user_id):
+        if not (await is_verified_async(user_id)):
             count = increment_trial(user_id)
             if count > FREE_TRIAL_LIMIT:
                 user_modes[user_id] = "awaiting_email"
@@ -18867,7 +18886,7 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             batch_events=batch
         )
 
-        if not is_verified(user_id):
+        if not (await is_verified_async(user_id)):
             remaining = trial_remaining(user_id)
             if remaining <= 0:
                 user_modes[user_id] = "awaiting_email"
@@ -19200,7 +19219,7 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 )
                 return
 
-        if is_verified(user_id):
+        if (await is_verified_async(user_id)):
             await context.bot.send_message(
                 chat_id=int(user_id),
                 text=(
@@ -19678,7 +19697,7 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
     # regardless of how they got here. Only for unverified users, and
     # only when not already in a mode that owns this exact turn's input.
     if (
-        not is_verified(user_id)
+        not (await is_verified_async(user_id))
         and user_modes.get(user_id) not in ("awaiting_email", "awaiting_timezone_location")
         and re.match(r"^[^\s@]+@[^\s@]+\.[^\s@]+$", message)
     ):
@@ -20025,7 +20044,7 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
             schedule_auto_delete(sent_synth_signal.chat_id, sent_synth_signal.message_id)
             return
 
-    if not is_verified(user_id) and get_trial_count(user_id) >= FREE_TRIAL_LIMIT:
+    if not (await is_verified_async(user_id)) and get_trial_count(user_id) >= FREE_TRIAL_LIMIT:
         user_modes[user_id] = "awaiting_email"
         await send_verification_gate(update)
         return
@@ -20079,7 +20098,7 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
             schedule_auto_delete(sent_market_closed.chat_id, sent_market_closed.message_id)
             return
 
-        if not is_verified(user_id):
+        if not (await is_verified_async(user_id)):
             count = increment_trial(user_id)
             if count > FREE_TRIAL_LIMIT:
                 user_modes[user_id] = "awaiting_email"
@@ -20133,7 +20152,7 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
             )
             schedule_auto_delete(sent_signal.chat_id, sent_signal.message_id)
 
-            if not is_verified(user_id):
+            if not (await is_verified_async(user_id)):
                 remaining = trial_remaining(user_id)
                 if remaining > 0:
                     # FIX, per explicit instruction: this message invited
@@ -20601,7 +20620,7 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     if mode == "breakdown":
 
-        if not is_verified(user_id):
+        if not (await is_verified_async(user_id)):
             count = increment_trial(user_id)
             if count > FREE_TRIAL_LIMIT:
                 user_modes[user_id] = "awaiting_email"
@@ -20635,7 +20654,7 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         schedule_auto_delete(wait_message.chat_id, wait_message.message_id)
 
-        if not is_verified(user_id):
+        if not (await is_verified_async(user_id)):
             remaining = trial_remaining(user_id)
             if remaining > 0:
                 # Same fix as the Signal-side trial notice, per explicit

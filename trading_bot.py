@@ -3163,7 +3163,7 @@ GROQ_URL = "https://api.groq.com/openai/v1/chat/completions"
 # ============================================
 
 main_keyboard = ReplyKeyboardMarkup(
-    [["📊 Signal", "📰 News", "🔗 Connect Deriv"], ["🤖 Exness Auto-Trade"]],
+    [["📊 Signal", "📰 News", "🔗 Connect Deriv"], ["🤖 Exness Auto-Trade", "🎓 Education"]],
     resize_keyboard=True,
     is_persistent=True,
     one_time_keyboard=False
@@ -17481,6 +17481,36 @@ async def build_exness_autotrade_dashboard(user_id, account, expiry, now):
     return text, markup
 
 
+async def send_education_content(bot, chat_id):
+    """
+    Per explicit instruction - exact approved content, sent only
+    after real, confirmed channel membership (see the "education" in
+    text check and education_check callback, both above).
+    """
+    await bot.send_message(
+        chat_id=chat_id,
+        text=(
+            "🎓 <b>TO START YOUR TRADING JOURNEY, FOLLOW THE INSTRUCTIONS BELOW!</b>\n\n"
+            "You need two important applications:\n"
+            "1️⃣ Broker (Exness)\n"
+            "2️⃣ Trading platform (MetaTrader)\n\n"
+            f"👉 <a href=\"{EXNESS_LINK}\">Click here to create your Exness account</a>\n\n"
+            "After creating your Exness account, follow the simple beginner's tutorial video below!\n\n"
+            "━━━━━━━━━━━━━━━━━━━━━\n\n"
+            "🟢 <b>BEGINNERS</b>\n"
+            "SpiritFX Trading Academy (Basic/Beginners Forex Trading Class)\n"
+            "https://www.youtube.com/playlist?list=PLte-3rrxXOgt-LofM1Sg79wwHumXgeoAb\n\n"
+            "🔵 <b>ADVANCED</b>\n"
+            "SpiritFX Trading Academy (Introduction to Advanced/Professional Forex Class)\n"
+            "https://www.youtube.com/playlist?list=PLte-3rrxXOgu1RY40b8yA1z2f56yzkk1C\n\n"
+            "━━━━━━━━━━━━━━━━━━━━━\n\n"
+            "ℹ️ For more information and further assistance, contact: @SpiritFXtrading"
+        ),
+        parse_mode=ParseMode.HTML,
+        disable_web_page_preview=True,
+    )
+
+
 async def send_exness_autotrade_intro(bot, chat_id):
     """
     Shared by the normal "🤖 Exness Auto-Trade" button tap (handle_buttons
@@ -17714,6 +17744,26 @@ async def handle_buttons(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await send_exness_autotrade_intro(context.bot, update.message.chat_id)
         return
 
+    if "education" in text:
+        # Per explicit instruction - real channel membership required
+        # before the actual training links are sent, same real check
+        # (is_following_channel) already used elsewhere in this file,
+        # not a separate/weaker one.
+        following = await is_following_channel(context.bot, user_id)
+        if not following:
+            await update.message.reply_text(
+                "📢 <b>Follow our channel first to unlock free training!</b>\n\n"
+                f"Follow {FOLLOW_GATE_CHANNEL}, then tap the button below.",
+                parse_mode=ParseMode.HTML,
+                reply_markup=InlineKeyboardMarkup([
+                    [InlineKeyboardButton("📢 Follow Nexora AI Channel", url=f"https://t.me/{FOLLOW_GATE_CHANNEL.lstrip('@')}")],
+                    [InlineKeyboardButton("✅ I've Followed", callback_data="education_check")],
+                ])
+            )
+            return
+        await send_education_content(context.bot, update.message.chat_id)
+        return
+
 # ============================================
 # CALLBACK HANDLER — APPROVE / REJECT
 # ============================================
@@ -17881,6 +17931,31 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 [InlineKeyboardButton("⬅️ Back", callback_data="mt5auto_start")],
             ])
         )
+        return
+
+    if data == "education_check":
+        # Per explicit instruction - real re-check, never just trusts
+        # the tap itself, same principle as every other follow-gate
+        # recheck in this file.
+        user_id = str(query.from_user.id)
+        now_following = await is_following_channel(context.bot, user_id)
+        if not now_following:
+            await context.bot.send_message(
+                chat_id=int(user_id),
+                text=(
+                    "⚠️ <b>We couldn't confirm you've followed the "
+                    "channel yet.</b>\n\n"
+                    f"Please follow {FOLLOW_GATE_CHANNEL} first, then "
+                    "tap the button again."
+                ),
+                parse_mode=ParseMode.HTML,
+                reply_markup=InlineKeyboardMarkup([
+                    [InlineKeyboardButton("📢 Follow Nexora AI Channel", url=f"https://t.me/{FOLLOW_GATE_CHANNEL.lstrip('@')}")],
+                    [InlineKeyboardButton("✅ I've Followed", callback_data="education_check")],
+                ])
+            )
+            return
+        await send_education_content(context.bot, int(user_id))
         return
 
     if data == "mt5auto_copy_channel":

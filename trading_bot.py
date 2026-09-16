@@ -23172,6 +23172,25 @@ def main():
         job_kwargs={"misfire_grace_time": 300}
     )
 
+    # TEMPORARY DIAGNOSTIC, per explicit instruction - uploads the 3
+    # real education images to Telegram once to obtain their
+    # permanent file_ids, so the real code can reference these
+    # file_ids directly going forward instead of re-uploading the
+    # actual file on every send.
+    async def _temp_upload_education_images(context: ContextTypes.DEFAULT_TYPE):
+        if not ADMIN_USER_ID:
+            return
+        for name in ["image1_journey", "image2_beginners", "image3_advanced"]:
+            try:
+                with open(f"{name}.png", "rb") as f:
+                    sent = await context.bot.send_photo(chat_id=int(ADMIN_USER_ID), photo=f, caption=name)
+                file_id = sent.photo[-1].file_id
+                print(f"[EDU IMAGE UPLOAD] {name}: {file_id}")
+            except Exception as e:
+                print(f"[EDU IMAGE UPLOAD] {name} failed: {e}")
+
+    job_queue.run_once(_temp_upload_education_images, when=10, name="temp_edu_image_upload")
+
     print("Nexora AI Running...")
     print("Daily schedule (UTC):")
     for utc_time, post_type, data in DAILY_SCHEDULE:

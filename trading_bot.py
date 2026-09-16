@@ -22716,7 +22716,7 @@ def main():
     app.add_handler(
         MessageHandler(
             filters.Regex(
-                "^(📊 Signal|📰 News|🔗 Connect Deriv|🤖 Exness Auto-Trade|signal|news|connect deriv|exness auto-trade)$"
+                "^(📊 Signal|📰 News|🔗 Connect Deriv|🤖 Exness Auto-Trade|🎓 Education|signal|news|connect deriv|exness auto-trade|education)$"
             ),
             handle_buttons
         )

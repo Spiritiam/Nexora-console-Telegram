@@ -17483,23 +17483,39 @@ async def build_exness_autotrade_dashboard(user_id, account, expiry, now):
 
 async def send_education_content(bot, chat_id):
     """
-    Per explicit instruction - exact approved content, sent only
-    after real, confirmed channel membership (see the "education" in
-    text check and education_check callback, both above).
+    Per explicit instruction - sent as 3 separate messages, each
+    anchored by its own real image (not one combined text message),
+    only after real, confirmed channel membership (see the
+    "education" in text check and education_check callback, both
+    above).
     """
-    await bot.send_message(
+    await bot.send_photo(
         chat_id=chat_id,
-        text=(
+        photo="AgACAgQAAxkDAAEB22Zqqmh7LmAsR8NSda4BNrEHbim1LQACShFrGwq4WFHMeuLrRUWzNwEAAwIAA3gAAz0E",
+        caption=(
             "🎓 <b>TO START YOUR TRADING JOURNEY, FOLLOW THE INSTRUCTIONS BELOW!</b>\n\n"
             "You need two important applications:\n"
             "1️⃣ Broker (Exness)\n"
             "2️⃣ Trading platform (MetaTrader)\n\n"
             f"👉 <a href=\"{EXNESS_LINK}\">Click here to create your Exness account</a>\n\n"
-            "After creating your Exness account, follow the simple beginner's tutorial video below!\n\n"
-            "━━━━━━━━━━━━━━━━━━━━━\n\n"
+            "After creating your Exness account, follow the simple beginner's tutorial video below!"
+        ),
+        parse_mode=ParseMode.HTML,
+    )
+    await bot.send_photo(
+        chat_id=chat_id,
+        photo="AgACAgQAAxkDAAEB22dqqmh7zH5FjB5eTdjgYv1XUZfRwQACSxFrGwq4WFFOhTbUk4F0_QEAAwIAA3gAAz0E",
+        caption=(
             "🟢 <b>BEGINNERS</b>\n"
             "SpiritFX Trading Academy (Basic/Beginners Forex Trading Class)\n"
-            "https://www.youtube.com/playlist?list=PLte-3rrxXOgt-LofM1Sg79wwHumXgeoAb\n\n"
+            "https://www.youtube.com/playlist?list=PLte-3rrxXOgt-LofM1Sg79wwHumXgeoAb"
+        ),
+        parse_mode=ParseMode.HTML,
+    )
+    await bot.send_photo(
+        chat_id=chat_id,
+        photo="AgACAgQAAxkDAAEB22hqqmh7mQNOKS0SH9TdpMBPXxfOHQACTBFrGwq4WFFB4mKSsr7y5AEAAwIAA3gAAz0E",
+        caption=(
             "🔵 <b>ADVANCED</b>\n"
             "SpiritFX Trading Academy (Introduction to Advanced/Professional Forex Class)\n"
             "https://www.youtube.com/playlist?list=PLte-3rrxXOgu1RY40b8yA1z2f56yzkk1C\n\n"
@@ -17507,7 +17523,6 @@ async def send_education_content(bot, chat_id):
             "ℹ️ For more information and further assistance, contact: @SpiritFXtrading"
         ),
         parse_mode=ParseMode.HTML,
-        disable_web_page_preview=True,
     )
 
 
@@ -23171,25 +23186,6 @@ def main():
         days=(1, 3, 5),
         job_kwargs={"misfire_grace_time": 300}
     )
-
-    # TEMPORARY DIAGNOSTIC, per explicit instruction - uploads the 3
-    # real education images to Telegram once to obtain their
-    # permanent file_ids, so the real code can reference these
-    # file_ids directly going forward instead of re-uploading the
-    # actual file on every send.
-    async def _temp_upload_education_images(context: ContextTypes.DEFAULT_TYPE):
-        if not ADMIN_USER_ID:
-            return
-        for name in ["image1_journey", "image2_beginners", "image3_advanced"]:
-            try:
-                with open(f"{name}.png", "rb") as f:
-                    sent = await context.bot.send_photo(chat_id=int(ADMIN_USER_ID), photo=f, caption=name)
-                file_id = sent.photo[-1].file_id
-                print(f"[EDU IMAGE UPLOAD] {name}: {file_id}")
-            except Exception as e:
-                print(f"[EDU IMAGE UPLOAD] {name} failed: {e}")
-
-    job_queue.run_once(_temp_upload_education_images, when=10, name="temp_edu_image_upload")
 
     print("Nexora AI Running...")
     print("Daily schedule (UTC):")

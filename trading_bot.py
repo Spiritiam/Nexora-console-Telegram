@@ -17506,8 +17506,8 @@ async def send_education_content(bot, chat_id):
         chat_id=chat_id,
         photo="AgACAgQAAxkDAAEB22dqqmh7zH5FjB5eTdjgYv1XUZfRwQACSxFrGwq4WFFOhTbUk4F0_QEAAwIAA3gAAz0E",
         caption=(
-            "🟢 <b>BEGINNERS</b>\n"
-            "SpiritFX Trading Academy (Basic/Beginners Forex Trading Class)\n"
+            "🟢 <b>BEGINNERS</b>\n\n"
+            "<b>SpiritFX Trading Academy (Basic/Beginners Forex Trading Class)</b>\n\n"
             "https://www.youtube.com/playlist?list=PLte-3rrxXOgt-LofM1Sg79wwHumXgeoAb"
         ),
         parse_mode=ParseMode.HTML,
@@ -17516,8 +17516,8 @@ async def send_education_content(bot, chat_id):
         chat_id=chat_id,
         photo="AgACAgQAAxkDAAEB22hqqmh7mQNOKS0SH9TdpMBPXxfOHQACTBFrGwq4WFFB4mKSsr7y5AEAAwIAA3gAAz0E",
         caption=(
-            "🔵 <b>ADVANCED</b>\n"
-            "SpiritFX Trading Academy (Introduction to Advanced/Professional Forex Class)\n"
+            "🔵 <b>ADVANCED</b>\n\n"
+            "<b>SpiritFX Trading Academy (Introduction to Advanced/Professional Forex Class)</b>\n\n"
             "https://www.youtube.com/playlist?list=PLte-3rrxXOgu1RY40b8yA1z2f56yzkk1C\n\n"
             "━━━━━━━━━━━━━━━━━━━━━\n\n"
             "ℹ️ For more information and further assistance, contact: @SpiritFXtrading"

@@ -2029,7 +2029,7 @@ async def run_account_flip_entry_scan(context: ContextTypes.DEFAULT_TYPE):
             # to accept rather than leave Account Flip without ML
             # involvement.
             entry_price_ml = candles[-1]["close"]
-            ml_result = predict_direction_via_ml(pair_key, entry_price_ml, candles, datetime.utcnow())
+            ml_result = await asyncio.to_thread(predict_direction_via_ml, pair_key, entry_price_ml, candles, datetime.utcnow())
             if ml_result:
                 ml_direction, ml_reason, buy_ev, sell_ev, ml_confidence = ml_result
                 print(f"[ML EV MODEL] Account Flip {pair_key}: BUY={buy_ev:+.3f}% SELL={sell_ev:+.3f}% -> chose {ml_direction}")
@@ -6277,7 +6277,8 @@ async def build_synthetic_signal_response(index_key, min_agree=2):
     if chart_strategy_name:
         chart_candles = m1_candles if chart_strategy_name in M1_BASED_STRATEGIES else h1_candles
         chart_path = os.path.join(CHART_OUTPUT_DIR, f"{index_key}_{int(time.time())}.png")
-        chart_ok = generate_signal_chart(
+        chart_ok = await asyncio.to_thread(
+            generate_signal_chart,
             config["display"], chart_strategy_name, direction, chart_candles,
             entry_price, sl_price, tp_price, chart_path,
         )
@@ -6293,7 +6294,8 @@ async def build_synthetic_signal_response(index_key, min_agree=2):
             else:
                 retry_candles = await get_cached_synthetic_candles(index_key, symbol, "1h", 3600, 210)
             if retry_candles:
-                chart_ok = generate_signal_chart(
+                chart_ok = await asyncio.to_thread(
+                    generate_signal_chart,
                     config["display"], chart_strategy_name, direction, retry_candles,
                     entry_price, sl_price, tp_price, chart_path,
                 )
@@ -14187,7 +14189,8 @@ async def build_signal_response(question, user_id=None, retry_mismatch=False):
         # entry/SL/TP lines, exactly like every other chart).
         chart_strategy_name = winning_votes[0]["strategy_name"] if winning_votes else "Momentum"
         chart_path = os.path.join(CHART_OUTPUT_DIR, f"{matched_key}_{int(time.time())}.png")
-        chart_ok = generate_signal_chart(
+        chart_ok = await asyncio.to_thread(
+            generate_signal_chart,
             display, chart_strategy_name, direction, h1_candles,
             entry_price, stop_loss, take_profit, chart_path,
         )
@@ -14209,7 +14212,8 @@ async def build_signal_response(question, user_id=None, retry_mismatch=False):
             await asyncio.sleep(2)
             retry_candles = await asyncio.to_thread(get_cached_candles, matched_key, config, "1h", outputsize=210)
             if retry_candles:
-                chart_ok = generate_signal_chart(
+                chart_ok = await asyncio.to_thread(
+                    generate_signal_chart,
                     display, chart_strategy_name, direction, retry_candles,
                     entry_price, stop_loss, take_profit, chart_path,
                 )

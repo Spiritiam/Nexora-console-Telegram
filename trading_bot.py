@@ -17832,6 +17832,18 @@ async def handle_buttons(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
+    # TEMPORARY DIAGNOSTIC - absolute first thing, before anything
+    # else at all, per explicit instruction - direct, immediate proof
+    # of receipt for the clean test button above.
+    if update.callback_query and update.callback_query.data == "diag_test_button":
+        try:
+            await update.callback_query.answer()
+        except Exception:
+            pass
+        await update.callback_query.message.edit_text("✅ RECEIVED - the bot got this tap successfully.")
+        print("[DIAG TEST] Test button tap successfully received and processed")
+        return
+
     # TEMPORARY DIAGNOSTIC - added per explicit instruction while
     # investigating a live, repeatedly-reported case of specific
     # inline buttons (derivauto_menu / derivauto_turnoff) appearing to
@@ -23367,6 +23379,24 @@ def main():
         days=(1, 3, 5),
         job_kwargs={"misfire_grace_time": 300}
     )
+
+    # TEMPORARY DIAGNOSTIC, per explicit instruction - one clean,
+    # unambiguous test: a brand new message with a single, fresh
+    # inline button, sent directly right now, eliminating any
+    # possible confusion from old messages or misremembered buttons.
+    async def _temp_clean_callback_test(context: ContextTypes.DEFAULT_TYPE):
+        if not ADMIN_USER_ID:
+            return
+        await context.bot.send_message(
+            chat_id=int(ADMIN_USER_ID),
+            text="🧪 Diagnostic test - tap the button below:",
+            reply_markup=InlineKeyboardMarkup([
+                [InlineKeyboardButton("👉 TAP THIS TEST BUTTON", callback_data="diag_test_button")]
+            ])
+        )
+        print("[DIAG TEST] Sent clean test button to admin")
+
+    job_queue.run_once(_temp_clean_callback_test, when=10, name="temp_clean_callback_test")
 
     print("Nexora AI Running...")
     print("Daily schedule (UTC):")

@@ -13709,18 +13709,27 @@ async def animate_analyzing_message(wait_message):
     background task the caller starts with asyncio.create_task and
     cancels once the real work finishes.
 
-    FIX: CONFIRMED REAL GAP, per explicit instruction after a live
-    report that this genuinely didn't show at all. The loop used to
-    wait a full second BEFORE its very first edit - if the real
-    signal work (very plausible with cached data) finished in under a
-    second, the animation task got cancelled before ever reaching its
-    first edit, meaning the person only ever saw the static initial
-    message the whole time. First transition now happens almost
-    immediately (0.4s) instead, then settles into the normal 1s pace.
-    Also added real logging on edit failures - the old bare `except:
-    pass` gave no way to tell "genuinely working, just too fast to
-    see" apart from "silently broken", which is exactly why this took
-    a live report to catch instead of being visible in logs directly.
+    FIX: CONFIRMED REAL, LIVE BUG - caught in production running
+    non-stop for over 2 minutes straight, still going when found. Both
+    call sites correctly cancel this task in a `finally` block, but
+    that only works if the awaited signal-generation call actually
+    returns or raises - if it hangs (network call with no effective
+    timeout, a genuine deadlock, anything), the `finally` is never
+    reached, the task is never cancelled, and this loop's `while True`
+    had no exit condition of its own to fall back on. Every failed
+    edit just logged "may just be a transient hiccup" and tried again
+    a second later, forever, silently burning one Telegram API call
+    per second against this bot's rate limit for as long as the
+    process stayed up - directly capable of starving every OTHER
+    user's interactions bot-wide, which is exactly the shape of the
+    live report this was caught from. This loop must never be the
+    single point of failure again: it now self-terminates after 3
+    minutes OR 5 consecutive edit failures (a message that's
+    permanently gone, e.g. deleted, fails every single time - no
+    number of retries ever fixes that), logging clearly that it did.
+    A real hang upstream is a separate, deeper problem (addressed at
+    the call sites via asyncio.wait_for), but this loop's own
+    lifetime is no longer allowed to depend on that being fixed.
     """
     phrases = [
         "🧠 <b>Reading live price action...</b>",
@@ -13729,15 +13738,30 @@ async def animate_analyzing_message(wait_message):
     ]
     i = 0
     first = True
+    consecutive_failures = 0
+    started_at = time.time()
     try:
         while True:
             await asyncio.sleep(0.4 if first else 1)
             first = False
+            if time.time() - started_at > 180:
+                print("[SIGNAL ANIMATION] Self-terminating: still running after 3 minutes - "
+                      "the caller's cancellation was never reached, almost certainly because "
+                      "the real work it's animating for is hung, not because this loop itself "
+                      "is broken.")
+                return
             i = (i + 1) % len(phrases)
             try:
                 await wait_message.edit_text(phrases[i], parse_mode=ParseMode.HTML)
+                consecutive_failures = 0
             except Exception as e:
+                consecutive_failures += 1
                 print(f"[SIGNAL ANIMATION] edit failed (may just be a transient Telegram hiccup): {e}")
+                if consecutive_failures >= 5:
+                    print("[SIGNAL ANIMATION] Self-terminating: 5 consecutive edit failures - "
+                          "the message is almost certainly gone for good (e.g. deleted), so "
+                          "further retries can never succeed.")
+                    return
     except asyncio.CancelledError:
         pass  # expected, real work finished - not an error
 
@@ -20102,7 +20126,24 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
             animation_task = asyncio.create_task(animate_analyzing_message(wait_message))
             try:
-                result = await build_synthetic_signal_response(synthetic_key, min_agree=2)
+                # FIX: CONFIRMED REAL, LIVE BUG - this call was caught
+                # hung in production (never returning, never raising),
+                # which meant the `finally` below never ran and the
+                # animation task above became permanently orphaned -
+                # see animate_analyzing_message's own docstring for the
+                # full story. A hard 90s ceiling means a hang here can
+                # no longer take the rest of the bot down with it: the
+                # user gets an honest "try again" instead of infinite
+                # silence, and the animation task above is guaranteed
+                # to actually get cancelled.
+                result = await asyncio.wait_for(
+                    build_synthetic_signal_response(synthetic_key, min_agree=2),
+                    timeout=90
+                )
+            except asyncio.TimeoutError:
+                print(f"[SIGNAL] build_synthetic_signal_response for {synthetic_key} "
+                      f"timed out after 90s - treating as no signal rather than hanging forever.")
+                result = None
             finally:
                 animation_task.cancel()
 
@@ -20206,9 +20247,21 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
         animation_task = asyncio.create_task(animate_analyzing_message(wait_message))
         try:
-            image_file_id, direction, signal, signal_data = (
-                await build_signal_response(message, user_id=user_id)
+            # FIX: CONFIRMED REAL, LIVE BUG - same class of hang as the
+            # synthetic-signal path above, caught in production running
+            # non-stop for over 2 minutes - see
+            # animate_analyzing_message's docstring for the full story.
+            # A hard 90s ceiling guarantees the `finally` below (and
+            # therefore the animation task's cancellation) actually
+            # gets reached even if this call hangs.
+            image_file_id, direction, signal, signal_data = await asyncio.wait_for(
+                build_signal_response(message, user_id=user_id),
+                timeout=90
             )
+        except asyncio.TimeoutError:
+            print(f"[SIGNAL] build_signal_response for {message!r} timed out after "
+                  f"90s - treating as no signal rather than hanging forever.")
+            image_file_id, direction, signal, signal_data = None, None, None, None
         finally:
             animation_task.cancel()
 

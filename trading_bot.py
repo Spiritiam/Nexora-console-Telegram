@@ -19804,6 +19804,19 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
     username = update.message.from_user.username or "Trader"
     message = update.message.text.strip()
 
+    # FIX: CONFIRMED REAL BUG, caught live - a failed/invalid Deriv
+    # token attempt (awaiting_deriv_token) left the user permanently
+    # stuck: every subsequent message, including tapping one of their
+    # own main-menu keyboard buttons, kept getting swallowed and
+    # re-validated as yet another token attempt, with no way out
+    # short of pasting a valid token. Tapping any of the 5 known
+    # main-menu button labels now always clears whatever mode is
+    # currently set before anything else runs, regardless of what
+    # that mode was - a menu button must always be a reliable way
+    # out, never something that can itself get trapped.
+    if message in ("📊 Signal", "📰 News", "🔗 Connect Deriv", "🤖 Exness Auto-Trade", "🎓 Education"):
+        user_modes[user_id] = None
+
     # FIX, per explicit instruction: an unverified user who types their
     # email directly - a completely reasonable reaction to the trial-
     # remaining notice inviting verification, especially for anyone who

@@ -18685,8 +18685,22 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             [InlineKeyboardButton("🎯 Pick a Bot", callback_data="derivauto_choose_bot")],
             [InlineKeyboardButton("🚀 Account Flip", callback_data="derivauto_account_flip")],
         ]
+        # FIX: CONFIRMED REAL BUG, per explicit instruction after a
+        # live "no response at all" report. This only ever added the
+        # "Turn Bot OFF" button when already on - there was no
+        # matching branch to show "Turn Bot ON" when off, meaning
+        # anyone whose auto-trade was currently off (including via
+        # the earlier direct database fix) opened this menu to find
+        # NEITHER button present - nothing there to tap at all.
+        bot_choice = account.get("deriv_bot_choice") if account else None
         if autotrade_on:
             buttons.append([InlineKeyboardButton("🔴 Turn Bot OFF", callback_data="derivauto_turnoff")])
+        elif bot_choice in DERIV_AUTOTRADE_BOTS or bot_choice == "account_flip":
+            # Only offer a direct "Turn Bot ON" toggle if a mode was
+            # already configured before - matches derivauto_turnon's
+            # own real requirement, so this button never leads to a
+            # dead end for someone who's never set anything up yet.
+            buttons.append([InlineKeyboardButton("🟢 Turn Bot ON", callback_data="derivauto_turnon")])
 
         await query.message.edit_text(
             "🎲 <b>How should Deriv Auto-Trade decide your trades?</b>\n\n"

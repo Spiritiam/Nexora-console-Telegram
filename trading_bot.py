@@ -5168,12 +5168,31 @@ def update_deriv_account_fields(user_id, fields):
     pattern as save_auto_copy_settings but for the newer bot_choice/
     pair_choice/flip_* columns, which don't need their own named
     setter since there's nothing bespoke about how they're saved.
+
+    FIX: CONFIRMED REAL BUG, per explicit instruction after a live
+    report and direct database confirmation - this never checked
+    whether the PATCH actually succeeded. requests.patch only raises
+    on genuine network-level failures, never on the database itself
+    rejecting the request, so a failed update passed through
+    completely silently - every single caller (including "Turn Bot
+    OFF") showed a success message regardless of whether the database
+    was ever actually updated. Confirmed live: the account owner's
+    own account still showed deriv_autotrade_enabled=true after
+    explicitly turning it off. Now returns True only on a genuinely
+    confirmed success, False otherwise, so callers can tell the
+    difference and stop claiming success when nothing actually
+    changed.
     """
     try:
         url = f"{SUPABASE_URL}/rest/v1/deriv_accounts?user_id=eq.{user_id}"
-        requests.patch(url, headers=sb_headers(), json=fields, timeout=10)
+        response = requests.patch(url, headers=sb_headers(), json=fields, timeout=10)
+        if response.status_code not in (200, 204):
+            print(f"[DERIV] update_deriv_account_fields FAILED for {user_id}: {response.status_code} {response.text[:300]}")
+            return False
+        return True
     except Exception as e:
         print(f"[DERIV] update_deriv_account_fields error for {user_id}: {e}")
+        return False
 
 
 async def get_deriv_trading_ws_url(token):
@@ -18683,7 +18702,16 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     if data == "derivauto_turnoff":
         user_id = str(query.from_user.id)
-        update_deriv_account_fields(user_id, {"deriv_autotrade_enabled": False})
+        success = update_deriv_account_fields(user_id, {"deriv_autotrade_enabled": False})
+        if not success:
+            await query.message.edit_text(
+                "⚠️ <b>Something went wrong - we couldn't confirm this "
+                "was actually turned off.</b>\n\n"
+                "Please try again in a moment. If this keeps happening, "
+                "contact support rather than assume it's off.",
+                parse_mode=ParseMode.HTML
+            )
+            return
         await query.message.edit_text(
             "🛑 <b>Auto-Trade turned off.</b>\n\n"
             "Your bot/mode settings are kept, so turning it back on "
@@ -18708,7 +18736,15 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 ])
             )
             return
-        update_deriv_account_fields(user_id, {"deriv_autotrade_enabled": True})
+        success = update_deriv_account_fields(user_id, {"deriv_autotrade_enabled": True})
+        if not success:
+            await query.message.edit_text(
+                "⚠️ <b>Something went wrong - we couldn't confirm this "
+                "was actually turned on.</b>\n\n"
+                "Please try again in a moment.",
+                parse_mode=ParseMode.HTML
+            )
+            return
         mode_label = (
             f"{DERIV_AUTOTRADE_BOTS[bot_choice]['label']} Bot" if bot_choice in DERIV_AUTOTRADE_BOTS
             else "🚀 Account Flip"
@@ -18794,7 +18830,7 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if not tier:
             return
 
-        update_deriv_account_fields(user_id, {
+        success = update_deriv_account_fields(user_id, {
             "deriv_bot_choice": bot_key,
             "deriv_pair_choice": pair_key,
             "deriv_autotrade_enabled": True,
@@ -18802,6 +18838,13 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             "deriv_bot_risk": tier["risk"],
             "deriv_bot_win": tier["win"],
         })
+        if not success:
+            await query.message.edit_text(
+                "⚠️ <b>Something went wrong saving your settings.</b>\n\n"
+                "Please try again in a moment.",
+                parse_mode=ParseMode.HTML
+            )
+            return
         await query.message.edit_text(
             f"✅ <b>Auto-Trade connected successfully.</b>\n\n"
             f"Mode: {DERIV_AUTOTRADE_BOTS[bot_key]['label']}\n"
@@ -20725,7 +20768,7 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
         pair_key = signup.get("pair_choice")
         defaults = get_deriv_flip_defaults(flip_base)
 
-        update_deriv_account_fields(user_id, {
+        success = update_deriv_account_fields(user_id, {
             "deriv_bot_choice": "account_flip",
             "deriv_pair_choice": pair_key,
             "deriv_autotrade_enabled": True,
@@ -20737,6 +20780,13 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
             "deriv_flip_trail_amount": defaults["flip_trail_amount"],
             "deriv_flip_disclaimer_accepted": True,
         })
+        if not success:
+            sent_fail = await update.message.reply_text(
+                "⚠️ Something went wrong saving your settings. Please try again in a moment.",
+                reply_markup=main_keyboard
+            )
+            schedule_auto_delete(sent_fail.chat_id, sent_fail.message_id)
+            return
 
         summary = (
             f"Index: {SYNTHETIC_CONFIG.get(pair_key, {}).get('display', '—')}\n"

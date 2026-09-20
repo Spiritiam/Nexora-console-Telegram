@@ -23424,6 +23424,29 @@ def main():
     # decoupled from the bot's own polling loop below (see
     # run_korapay_webhook_server's docstring for why). daemon=True so
     # it doesn't block the process from exiting on shutdown.
+    # TEMPORARY DIAGNOSTIC, per explicit instruction - direct check
+    # for a stale webhook conflicting with polling. Telegram bots can
+    # only run in ONE mode at a time (polling or webhook) - if a
+    # webhook was ever set (even from an old test), it would directly
+    # explain the repeated "Conflict: terminated by other getUpdates
+    # request" error, and could plausibly explain callback queries
+    # behaving differently from regular messages. Explicitly deletes
+    # any webhook found (safe no-op if none exists) before polling
+    # starts, since this bot is designed to use polling only.
+    async def _temp_check_and_clear_webhook(context: ContextTypes.DEFAULT_TYPE):
+        try:
+            info = await context.bot.get_webhook_info()
+            print(f"[WEBHOOK CHECK] url={info.url!r} pending_update_count={info.pending_update_count} last_error_message={info.last_error_message!r}")
+            if info.url:
+                result = await context.bot.delete_webhook(drop_pending_updates=True)
+                print(f"[WEBHOOK CHECK] Found a real webhook set - deleted it. Result: {result}")
+            else:
+                print("[WEBHOOK CHECK] No webhook set - this wasn't the cause.")
+        except Exception as e:
+            print(f"[WEBHOOK CHECK] Error checking/clearing webhook: {e}")
+
+    job_queue.run_once(_temp_check_and_clear_webhook, when=1, name="temp_webhook_check")
+
     threading.Thread(target=run_korapay_webhook_server, daemon=True).start()
 
     app.run_polling(drop_pending_updates=True)

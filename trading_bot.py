@@ -49,7 +49,7 @@ from telegram.ext import (
 )
 
 from telegram.constants import ParseMode
-from telegram.error import TimedOut
+from telegram.error import TimedOut, Conflict as TelegramConflictError
 
 # ============================================
 # ENV VARIABLES
@@ -22715,6 +22715,38 @@ def main():
         .build()
     )
     _app_instance = app
+
+    async def global_error_handler(update, context):
+        # FIX: CONFIRMED REAL BUG, per explicit report of the bot being
+        # completely unresponsive for an unknown stretch of time - every
+        # button tap and /start produced total silence. Root cause: a
+        # webhook got registered on this bot's token WHILE this process
+        # was already running (python-telegram-bot only clears a webhook
+        # once, at its own startup bootstrap - it never checks again
+        # afterward), so every single get_updates call failed forever
+        # with telegram.error.Conflict, and the only way back to life
+        # was a manual restart. Worse: this bot had NO error handler
+        # registered at all ("No error handlers are registered, logging
+        # exception" in the logs) - every failure, this one included,
+        # was invisible to anyone. This handler does two things: (1) it
+        # makes every otherwise-silent exception bot-wide actually get
+        # logged with a clear tag instead of vanishing, and (2) it
+        # specifically self-heals from exactly this failure by deleting
+        # the webhook the moment a Conflict error naming one is seen, so
+        # the NEXT polling cycle recovers on its own instead of needing
+        # someone to notice the bot is dead and restart it by hand.
+        error = context.error
+        if isinstance(error, TelegramConflictError) and "webhook" in str(error).lower():
+            print(f"[SELF-HEAL] Conflict error mentions a webhook - clearing it now: {error}")
+            try:
+                await context.bot.delete_webhook(drop_pending_updates=False)
+                print("[SELF-HEAL] Webhook cleared. Polling should recover on its own.")
+            except Exception as heal_exc:
+                print(f"[SELF-HEAL] Failed to clear webhook: {heal_exc}")
+        else:
+            print(f"[UNHANDLED ERROR] {type(error).__name__}: {error}")
+
+    app.add_error_handler(global_error_handler)
 
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("broadcast", broadcast_command))

@@ -17813,6 +17813,21 @@ async def handle_buttons(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
+    # TEMPORARY DIAGNOSTIC - added per explicit instruction while
+    # investigating a live, repeatedly-reported case of specific
+    # inline buttons (derivauto_menu / derivauto_turnoff) appearing to
+    # do nothing when tapped, with no corresponding trace anywhere
+    # else in this handler's logging. This is the single earliest
+    # possible point in callback processing - before query.answer(),
+    # before reading query.data, before any mode/verification checks
+    # - so if a tap truly isn't reaching the bot at all, this line
+    # simply won't appear for it, which is itself the answer. If it
+    # DOES appear, the problem is downstream of this point instead,
+    # in which case the exact data value logged here narrows it
+    # immediately. Remove once resolved.
+    print(f"[CALLBACK RECEIVED] user={update.callback_query.from_user.id if update.callback_query and update.callback_query.from_user else '?'} "
+          f"data={update.callback_query.data if update.callback_query else '?'!r}")
+
     query = update.callback_query
     try:
         await query.answer()

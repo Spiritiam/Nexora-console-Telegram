@@ -23449,6 +23449,42 @@ def main():
 
     threading.Thread(target=run_korapay_webhook_server, daemon=True).start()
 
+    # FIX: CONFIRMED REAL ROOT CAUSE, per explicit instruction after a
+    # serious, business-impacting live report - multiple different
+    # subscribers reported multiple different inline buttons across
+    # the whole bot (Deriv Manage Bot, News Calendar, Exness Auto-
+    # Trade's Continue button) all silently failing, while regular
+    # text-based buttons kept working fine. Combined with a real,
+    # repeated "Conflict: terminated by other getUpdates request"
+    # error every single startup, and every other explanation (a
+    # duplicate entry point in this code, an external instance, a
+    # stale webhook) already ruled out directly - this pointed at
+    # lingering old Railway containers from this bot's extremely
+    # frequent redeploys still alive and polling in the background,
+    # racing the current instance for each update. Whichever instance
+    # wins a given update decides if it gets handled at all, which
+    # explains exactly the random, inconsistent pattern reported -
+    # some buttons working, others not, for different people, with no
+    # clear cause visible in this file's own code.
+    #
+    # This forcefully claims the polling session before starting,
+    # using Telegram's own documented technique: a direct getUpdates
+    # call with offset=-1 acknowledges every update up to the latest
+    # and asks for nothing back, which Telegram only allows one active
+    # session to hold at a time - any other still-lingering instance's
+    # own next getUpdates call will itself now fail with the same
+    # Conflict error and stop, rather than continuing to silently
+    # steal a share of every update meant for this one.
+    try:
+        takeover_response = requests.get(
+            f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/getUpdates",
+            params={"offset": -1, "limit": 1, "timeout": 0},
+            timeout=15,
+        )
+        print(f"[POLLING TAKEOVER] Forceful takeover request sent - status {takeover_response.status_code}")
+    except Exception as e:
+        print(f"[POLLING TAKEOVER] Takeover request failed (proceeding anyway): {e}")
+
     app.run_polling(drop_pending_updates=True)
 
 

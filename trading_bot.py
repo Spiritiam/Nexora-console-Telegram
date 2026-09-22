@@ -22850,6 +22850,8 @@ def main():
     )
     _app_instance = app
 
+    _error_alert_last_sent = {}  # error signature -> last alert datetime, for rate-limiting
+
     async def global_error_handler(update, context):
         # FIX: CONFIRMED REAL BUG, per explicit report of the bot being
         # completely unresponsive for an unknown stretch of time - every
@@ -22879,6 +22881,45 @@ def main():
                 print(f"[SELF-HEAL] Failed to clear webhook: {heal_exc}")
         else:
             print(f"[UNHANDLED ERROR] {type(error).__name__}: {error}")
+
+        # FIX: per explicit instruction after an extended live incident
+        # where several real, serious bugs (a dead-for-hours bot, buttons
+        # silently failing bot-wide) sat undetected until a person
+        # noticed and asked, because the only place any of this was
+        # visible was Railway logs nobody was watching. Logging alone
+        # doesn't achieve "works without needing a person" - it just
+        # moves the silent failure from Telegram's side to Railway's
+        # side. Every unhandled error now also DMs ADMIN_USER_ID
+        # directly, so the person who can act on it finds out within
+        # seconds instead of whenever they happen to check or a user
+        # complains. Rate-limited per distinct error type+message to
+        # once per 15 minutes, so a recurring/looping error alerts once
+        # promptly rather than flooding the admin's DMs - the same
+        # cooldown shape already used for the Deriv service token
+        # alert. Deliberately best-effort: if sending this alert itself
+        # fails, it's logged and swallowed, never re-raised, so a
+        # broken alert can never itself become a new unhandled error
+        # feeding back into this same handler.
+        if ADMIN_USER_ID:
+            try:
+                signature = f"{type(error).__name__}:{str(error)[:200]}"
+                now = datetime.now(timezone.utc)
+                last_sent = _error_alert_last_sent.get(signature)
+                if last_sent is None or (now - last_sent).total_seconds() > 900:
+                    _error_alert_last_sent[signature] = now
+                    await context.bot.send_message(
+                        chat_id=int(ADMIN_USER_ID),
+                        text=(
+                            f"🚨 <b>Nexora AI error</b>\n\n"
+                            f"<b>Type:</b> {type(error).__name__}\n"
+                            f"<b>Message:</b> {str(error)[:500]}\n\n"
+                            f"Check Railway logs for the full traceback. "
+                            f"(Repeats of this exact error are silenced for 15 min.)"
+                        ),
+                        parse_mode=ParseMode.HTML,
+                    )
+            except Exception as alert_exc:
+                print(f"[ERROR ALERT] Failed to DM admin about the error above: {alert_exc}")
 
     app.add_error_handler(global_error_handler)
 

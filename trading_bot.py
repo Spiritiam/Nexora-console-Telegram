@@ -23485,7 +23485,27 @@ def main():
     except Exception as e:
         print(f"[POLLING TAKEOVER] Takeover request failed (proceeding anyway): {e}")
 
-    app.run_polling(drop_pending_updates=True)
+    # FIX: CONFIRMED REAL BUG, per an extended live investigation -
+    # every single inline button (Manage Bot, Turn Bot ON/OFF, and
+    # even a dedicated, deliberately trivial diagnostic test button
+    # with nothing else that could fail) produced zero response and
+    # zero trace anywhere in the logs, while plain text messages
+    # worked completely normally throughout. That specific pattern -
+    # one whole update TYPE silently vanishing while others work fine
+    # - is not explained by any handler-level bug; it's explained by
+    # Telegram's allowed_updates setting, which is STICKY across mode
+    # switches (set once via setWebhook or getUpdates, it stays in
+    # effect until a later call explicitly overrides it - clearing a
+    # webhook does not reset it). This bot never once specified
+    # allowed_updates, so whatever the earlier rogue webhook (found
+    # and cleared earlier in this same investigation) requested -
+    # very plausibly "message" only - would have kept silently
+    # filtering out every callback_query update ever since, with nothing
+    # to log because Telegram never even sends them. Explicitly
+    # requesting every update type here forces Telegram to reset that
+    # filter on every single startup, regardless of what any external
+    # caller set it to before.
+    app.run_polling(drop_pending_updates=True, allowed_updates=Update.ALL_TYPES)
 
 
 if __name__ == "__main__":

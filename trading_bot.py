@@ -16502,7 +16502,54 @@ async def place_mt5_trade(signal_data, signal_id=None):
         idempotent_match = None
         attempt_started_at = datetime.utcnow()
         for attempt in range(1, max_attempts + 1):
-            response = await asyncio.to_thread(requests.post, url, headers=headers, json=payload, timeout=30)
+            # FIX: CONFIRMED REAL, LIVE BUG - caught directly via a
+            # user's own /testsignal test. The retry loop above only
+            # ever handled TRANSIENT STATUS CODES (429/502/503/504) -
+            # it required a response object to exist at all. A genuine
+            # network-level failure (confirmed live: "Read timed out
+            # (read timeout=30)" connecting to MetaAPI's broker relay,
+            # very plausibly right after a redeploy while the MetaAPI
+            # connection was still settling in) raises a Python
+            # exception instead of returning any response, so it
+            # skipped this entire retry loop completely and fell
+            # straight through to the outer except block with ZERO
+            # retries - one bad-timing moment during a restart meant a
+            # real signal's trade was simply never placed, silently.
+            # This is now caught INSIDE the loop and treated exactly
+            # like a transient 504: before ever resubmitting, the same
+            # idempotency check confirms the prior attempt didn't
+            # actually reach the broker despite the client-side
+            # timeout (a request can time out on the RESPONSE while
+            # still succeeding on the broker's side) - so this adds
+            # real resilience without reopening the exact duplicate-
+            # order risk the 504 fix above was written to prevent.
+            try:
+                response = await asyncio.to_thread(requests.post, url, headers=headers, json=payload, timeout=30)
+            except requests.exceptions.RequestException as network_exc:
+                if attempt == max_attempts:
+                    print(f"[MT5 PERSONAL COPY] ❌ Network error on final attempt {attempt}/{max_attempts}: {network_exc}")
+                    return None
+                check_result = await check_for_matching_recent_position(
+                    METAAPI_ACCOUNT_ID, mt5_symbol, trade_comment, attempt_started_at
+                )
+                if check_result == "CHECK_FAILED":
+                    print(f"[MT5] ⚠️ Idempotency check itself failed after a network error - stopping rather than risk a duplicate order.")
+                    return None
+                if check_result:
+                    idempotent_match = check_result
+                    print(
+                        f"[MT5] ✅ Attempt {attempt} actually succeeded despite a client-side network error "
+                        f"(found matching open position {idempotent_match.get('id')}) - using it, NOT resubmitting."
+                    )
+                    break
+                wait_seconds = 2 * attempt
+                print(
+                    f"[MT5] ⚠️ Network error on attempt {attempt}/{max_attempts}: {network_exc} "
+                    f"- retrying in {wait_seconds}s..."
+                )
+                await asyncio.sleep(wait_seconds)
+                continue
+
             last_response = response
             if response.status_code in (200, 201):
                 break

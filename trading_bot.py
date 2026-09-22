@@ -22900,7 +22900,27 @@ def main():
         # fails, it's logged and swallowed, never re-raised, so a
         # broken alert can never itself become a new unhandled error
         # feeding back into this same handler.
-        if ADMIN_USER_ID:
+        #
+        # FIX: CONFIRMED FALSE ALARM, caught live the very first time
+        # this alerting shipped - it fired for exactly the routine,
+        # one-time "terminated by other getUpdates request" Conflict
+        # that fires on essentially every redeploy (the new container's
+        # own [POLLING TAKEOVER] claiming the session from the old
+        # one's final in-flight request), confirmed harmless and
+        # self-resolving every single time it's been observed across
+        # this entire investigation. Alerting a person about something
+        # that requires no action from them is worse than not alerting
+        # at all - it trains them to stop trusting the alerts. This
+        # specific, well-understood Conflict variant is now logged as
+        # before but never DMed; every other error, including a webhook
+        # Conflict (a real problem even though it's self-healed above)
+        # and anything never seen before, still alerts as normal.
+        is_routine_handover_conflict = (
+            isinstance(error, TelegramConflictError)
+            and "terminated by other getupdates request" in str(error).lower()
+        )
+
+        if ADMIN_USER_ID and not is_routine_handover_conflict:
             try:
                 signature = f"{type(error).__name__}:{str(error)[:200]}"
                 now = datetime.now(timezone.utc)

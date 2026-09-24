@@ -3817,6 +3817,12 @@ def log_signal(signal_data, source="scheduled"):
             # same pair, which would be a real behavior change, not
             # just added tracking.
             "source": source,
+            # ADDED, per explicit instruction - see signal_data's own
+            # comment for why this exists. ML_EV_FEATURE_COLS order is
+            # fixed and known, so this is stored as a plain ordered
+            # array; reconstructing it back into named columns at
+            # training time is a simple zip() against that same list.
+            "ml_features": signal_data.get("ml_features"),
         }
         headers = sb_headers()
         headers["Prefer"] = "return=representation"
@@ -9521,6 +9527,302 @@ def get_candles_metaapi(mt5_symbol, interval, outputsize):
 # currently offered - the XAGUSD/USOIL test confirmed the mechanism
 # works, so this is now the real default for both scheduled and
 # manual signals across the board, not a limited trial anymore.
+def get_metaapi_historical_series(mt5_symbol, interval, end_time_iso, limit):
+    """
+    ADDED for the ML retrain backfill, per explicit instruction -
+    NOT used by the live signal path. Unlike get_candles_metaapi
+    above (which always fetches "the most recent N candles right
+    now"), this takes an explicit historical anchor via MetaAPI's own
+    documented startTime parameter (confirmed directly against
+    MetaAPI's official API docs, which show startTime returning
+    candles ending at/before that point, not just live ones) - the
+    real capability that makes reconstructing features for signals
+    logged before ml_features existed possible at all. Longer timeout
+    (60s) than the live path's - this runs as a background admin-
+    triggered job with no user waiting on it, so it can afford to be
+    patient with a large historical request, which MetaAPI's own docs
+    warn can take longer than the usual timeout for a lot of data.
+    """
+    if not METAAPI_TOKEN or not METAAPI_ACCOUNT_ID:
+        print("[METAAPI HISTORICAL] Credentials not set")
+        return None
+
+    timeframe_map = {"1h": "1h", "4h": "4h", "1day": "1d"}
+    mt5_timeframe = timeframe_map.get(interval)
+    if not mt5_timeframe:
+        print(f"[METAAPI HISTORICAL] No mapping for internal timeframe '{interval}'")
+        return None
+
+    url = (
+        f"https://mt-market-data-client-api-v1.new-york.agiliumtrade.ai"
+        f"/users/current/accounts/{METAAPI_ACCOUNT_ID}"
+        f"/historical-market-data/symbols/{mt5_symbol}/timeframes/{mt5_timeframe}/candles"
+        f"?startTime={end_time_iso}&limit={min(limit, 1000)}"
+    )
+    headers = {"auth-token": METAAPI_TOKEN, "Accept": "application/json"}
+    try:
+        response = requests.get(url, headers=headers, timeout=60)
+        if response.status_code != 200:
+            print(f"[METAAPI HISTORICAL] {mt5_symbol} failed {response.status_code}: {response.text[:300]}")
+            return None
+        raw = response.json()
+        if not raw:
+            print(f"[METAAPI HISTORICAL] Empty response for {mt5_symbol}")
+            return None
+        candles = []
+        for c in raw:
+            candles.append({
+                "time": c.get("time"),
+                "open": float(c["open"]),
+                "high": float(c["high"]),
+                "low": float(c["low"]),
+                "close": float(c["close"]),
+                "volume": float(c.get("tickVolume") or 0),
+            })
+        print(f"[METAAPI HISTORICAL] ✅ {mt5_symbol} - {len(candles)} historical candles")
+        return candles
+    except Exception as e:
+        print(f"[METAAPI HISTORICAL] {mt5_symbol} error: {e}")
+        return None
+
+
+def get_twelvedata_historical_series(symbol, interval, start_date_str, end_date_str):
+    """
+    ADDED for the ML retrain backfill, per explicit instruction -
+    TwelveData's equivalent of get_metaapi_historical_series above,
+    same purpose, not used by the live signal path. Uses TwelveData's
+    own documented start_date/end_date parameters (confirmed against
+    their official docs) to pull an entire multi-week range in ONE
+    request rather than one call per signal - a 35-40 day H1 range is
+    under 1000 candles, comfortably inside TwelveData's 5000-point
+    single-request cap, so this is one API call per PAIR for the
+    whole backfill, not one per signal.
+    """
+    try:
+        url = (
+            f"https://api.twelvedata.com/time_series"
+            f"?symbol={symbol}&interval={interval}"
+            f"&start_date={start_date_str}&end_date={end_date_str}"
+            f"&apikey={TWELVEDATA_API_KEY}"
+        )
+        response = requests.get(url, timeout=30)
+        data = response.json()
+        values = data.get("values")
+        if not values:
+            print(f"[TWELVEDATA HISTORICAL] No values for {symbol} {interval}: {data}")
+            return None
+        candles = []
+        for v in values:
+            candles.append({
+                "time": v.get("datetime"),
+                "open": float(v["open"]),
+                "high": float(v["high"]),
+                "low": float(v["low"]),
+                "close": float(v["close"]),
+                "volume": float(v["volume"]) if v.get("volume") not in (None, "") else None,
+            })
+        candles.reverse()  # twelvedata returns newest first
+        print(f"[TWELVEDATA HISTORICAL] ✅ {symbol} - {len(candles)} historical candles")
+        return candles
+    except Exception as e:
+        print(f"[TWELVEDATA HISTORICAL] Error fetching {symbol}: {e}")
+        return None
+
+
+async def backfill_signal_ml_features(progress_callback=None):
+    """
+    ONE-OFF ADMIN-TRIGGERED JOB, per explicit instruction to backfill
+    ml_features for every real signal already in signal_log before
+    this field existed (~3,240 signals, all pairs, including USOIL/
+    XAGUSD/BTCUSD explicitly per instruction - nothing excluded), so
+    the upcoming retrain can use the full accumulated history instead
+    of only signals logged from today onward. Not part of the live
+    signal path - triggered once via /backfillmlfeatures.
+
+    Strategy: fetch each PAIR's full historical H1 series ONCE (one
+    API call, covering the entire backfill window), then slice the
+    correct ~100-candle window for every signal on that pair locally
+    - not one API call per signal, which would be thousands of calls
+    and risk real rate-limit problems.
+    """
+    reverse_pair_map = {cfg["pair_name"]: key for key, cfg in PAIR_CONFIG.items()}
+
+    # Fetch every signal_log row still missing ml_features, paginated
+    # - Supabase's REST API caps a single response at 1000 rows and
+    # there are ~3,240 of these.
+    rows = []
+    offset = 0
+    while True:
+        url = (
+            f"{SUPABASE_URL}/rest/v1/signal_log"
+            f"?ml_features=is.null&select=id,pair_name,direction,entry_price,"
+            f"stop_loss,take_profit,posted_at,agreeing_strategies"
+            f"&order=posted_at.asc&limit=1000&offset={offset}"
+        )
+        response = requests.get(url, headers=sb_headers(), timeout=30)
+        if response.status_code != 200:
+            print(f"[ML BACKFILL] Failed to fetch rows at offset {offset}: {response.status_code}")
+            break
+        batch = response.json()
+        if not batch:
+            break
+        rows.extend(batch)
+        offset += 1000
+        if len(batch) < 1000:
+            break
+
+    print(f"[ML BACKFILL] {len(rows)} signals missing ml_features")
+
+    by_pair = {}
+    for row in rows:
+        by_pair.setdefault(row["pair_name"], []).append(row)
+
+    now_utc = datetime.utcnow()
+    results = {}
+
+    for pair_name, pair_rows in by_pair.items():
+        pair_key = reverse_pair_map.get(pair_name)
+        if not pair_key:
+            print(f"[ML BACKFILL] {pair_name}: no matching PAIR_CONFIG entry, skipping {len(pair_rows)} signals")
+            results[pair_name] = {"updated": 0, "skipped": len(pair_rows), "reason": "unknown pair"}
+            continue
+
+        config = PAIR_CONFIG[pair_key]
+        earliest_posted_at = min(
+            datetime.fromisoformat(r["posted_at"].replace("Z", "").split("+")[0])
+            for r in pair_rows
+        )
+        # Buffer: need ~100 H1 candles (~4.2 days) BEFORE the earliest
+        # signal too, so even that one's own feature window has
+        # enough real history behind it to compute from.
+        needed_start = earliest_posted_at - timedelta(days=6)
+        total_hours_needed = int((now_utc - needed_start).total_seconds() / 3600) + 24
+
+        candles = None
+        if pair_key in METAAPI_FIRST_PAIRS and config.get("mt5_symbol"):
+            end_anchor = now_utc.strftime("%Y-%m-%dT%H:%M:%S.000Z")
+            candles = get_metaapi_historical_series(config["mt5_symbol"], "1h", end_anchor, total_hours_needed)
+
+        if not candles:
+            candidates = get_candle_symbol_candidates(config)
+            for symbol in candidates:
+                candles = get_twelvedata_historical_series(
+                    symbol, "1h",
+                    needed_start.strftime("%Y-%m-%d %H:%M:%S"),
+                    now_utc.strftime("%Y-%m-%d %H:%M:%S"),
+                )
+                if candles:
+                    break
+
+        if not candles:
+            print(f"[ML BACKFILL] {pair_name}: no historical data source available, skipping {len(pair_rows)} signals")
+            results[pair_name] = {"updated": 0, "skipped": len(pair_rows), "reason": "no data source available"}
+            if progress_callback:
+                await progress_callback(pair_name, 0, len(pair_rows))
+            continue
+
+        # Normalize every candle's time to a naive UTC datetime once,
+        # so slicing per-signal below is a cheap comparison, not a
+        # re-parse per row.
+        parsed_candles = []
+        for c in candles:
+            t = c.get("time")
+            if not isinstance(t, str):
+                continue
+            try:
+                t_clean = t.replace("Z", "").split(".")[0].replace("T", " ")
+                dt = datetime.fromisoformat(t_clean)
+            except Exception:
+                continue
+            parsed_candles.append((dt, c))
+        parsed_candles.sort(key=lambda x: x[0])
+
+        updated = 0
+        skipped = 0
+        for row in pair_rows:
+            try:
+                posted_dt = datetime.fromisoformat(row["posted_at"].replace("Z", "").split("+")[0])
+            except Exception:
+                skipped += 1
+                continue
+
+            window = [c for dt, c in parsed_candles if dt <= posted_dt][-100:]
+            if len(window) < 60:
+                skipped += 1
+                continue
+
+            features = compute_ml_signal_features(
+                pair_key, row["direction"], row.get("agreeing_strategies") or [],
+                row["entry_price"], row["stop_loss"], row["take_profit"],
+                window, posted_dt, min_candles=60
+            )
+            if features is None:
+                skipped += 1
+                continue
+
+            patch_url = f"{SUPABASE_URL}/rest/v1/signal_log?id=eq.{row['id']}"
+            try:
+                patch_response = requests.patch(
+                    patch_url, headers=sb_headers(),
+                    json={"ml_features": features}, timeout=15
+                )
+                if patch_response.status_code in (200, 204):
+                    updated += 1
+                else:
+                    skipped += 1
+            except Exception:
+                skipped += 1
+
+        results[pair_name] = {"updated": updated, "skipped": skipped}
+        print(f"[ML BACKFILL] {pair_name}: {updated} updated, {skipped} skipped")
+
+        if progress_callback:
+            await progress_callback(pair_name, updated, skipped)
+
+    return results
+
+
+async def backfillmlfeatures_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """
+    Admin-only, one-off command that runs backfill_signal_ml_features
+    above and reports back here in Telegram when done - per explicit
+    instruction to start the ML retrain effort.
+    """
+    user_id = str(update.message.from_user.id)
+    if not ADMIN_USER_ID or user_id != ADMIN_USER_ID:
+        return
+
+    status_msg = await update.message.reply_text(
+        "🔄 Starting ML feature backfill across every pair in signal_log - "
+        "this covers all instruments, including USOIL/XAGUSD/BTCUSD. "
+        "This will take a while; I'll report progress here."
+    )
+
+    async def progress(pair_name, updated, skipped):
+        try:
+            await status_msg.edit_text(
+                f"🔄 ML feature backfill in progress...\n\n"
+                f"Last completed: <b>{pair_name}</b> ({updated} updated, {skipped} skipped)",
+                parse_mode=ParseMode.HTML,
+            )
+        except Exception:
+            pass
+
+    results = await backfill_signal_ml_features(progress_callback=progress)
+
+    lines = ["✅ <b>ML feature backfill complete</b>\n"]
+    total_updated = 0
+    total_skipped = 0
+    for pair_name, r in sorted(results.items()):
+        reason = f" — {r['reason']}" if "reason" in r else ""
+        lines.append(f"{pair_name}: {r['updated']} updated, {r['skipped']} skipped{reason}")
+        total_updated += r["updated"]
+        total_skipped += r["skipped"]
+    lines.append(f"\n<b>Total: {total_updated} updated, {total_skipped} skipped</b>")
+
+    await update.message.reply_text("\n".join(lines), parse_mode=ParseMode.HTML)
+
+
 METAAPI_FIRST_PAIRS = {
     "xauusd", "btcusd", "xagusd", "usoil",
     "gbpusd", "gbpjpy", "eurusd", "usdjpy",
@@ -14311,6 +14613,29 @@ async def build_signal_response(question, user_id=None, retry_mismatch=False):
         # instead of a guess, the next time it comes up.
         "agreeing_strategies": agreeing_strategies if bank_result else [],
         "confidence": confidence,
+        # ADDED, per explicit instruction to start retraining the ML
+        # EV model on real accumulated outcomes: signal_log never
+        # stored the actual feature vector each decision was based on,
+        # only the trade's own numbers - reconstructing it later would
+        # mean re-fetching candles AS OF each signal's exact past
+        # timestamp, which most of this file's data sources (TwelveData
+        # especially) have no way to do at all. Capturing it now, at
+        # the moment of decision, with the exact same inputs
+        # (matched_key, direction, agreeing_strategies, entry/sl/tp,
+        # h1_candles) the real decision used, means every signal from
+        # today onward is retrain-ready with zero reconstruction ever
+        # needed again. min_candles=60 here (not the default 100)
+        # deliberately matches the lowest bar either the full or
+        # reduced-tier decision path could have actually used - this
+        # recomputes the SAME deterministic result either way, not a
+        # different one.
+        "ml_features": (
+            compute_ml_signal_features(
+                matched_key, direction, agreeing_strategies if bank_result else [],
+                entry_price, stop_loss, take_profit, h1_candles, datetime.utcnow(),
+                min_candles=60
+            ) if h1_candles else None
+        ),
     }
 
     print(
@@ -22993,6 +23318,7 @@ def main():
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("broadcast", broadcast_command))
     app.add_handler(CommandHandler("broadcastchannels", broadcastchannels_command))
+    app.add_handler(CommandHandler("backfillmlfeatures", backfillmlfeatures_command))
     app.add_handler(MessageHandler(filters.PHOTO, broadcast_photo_handler))
     app.add_handler(CommandHandler("mt5revenue", mt5revenue_command))
     app.add_handler(CommandHandler("testsynth", testsynth_command))

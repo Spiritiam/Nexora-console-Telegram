@@ -6206,6 +6206,9 @@ async def backtestderivbot_command(update: Update, context: ContextTypes.DEFAULT
     lines.append(f"\n<b>Total: {total} backtested signals generated and saved</b>")
 
     await update.message.reply_text("\n".join(lines), parse_mode=ParseMode.HTML)
+
+
+async def deriv_get_candles(symbol, granularity, count=60):
     """
     Fetches real candle history directly from Deriv using the
     service token, via the exact same OTP connection flow already

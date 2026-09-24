@@ -1477,6 +1477,10 @@ async def place_client_mt5_trade(metaapi_account_id, mt5_symbol, direction, volu
             if response.status_code not in transient_statuses or attempt == max_attempts:
                 break
 
+            # Same settle delay as the personal-copy path, same reason
+            # - confirmed real duplicate there, same underlying gap
+            # here since both share check_for_matching_recent_position.
+            await asyncio.sleep(3)
             check_result = await check_for_matching_recent_position(
                 metaapi_account_id, mt5_symbol, comment, attempt_started_at
             )
@@ -17112,6 +17116,22 @@ async def check_for_matching_recent_position(metaapi_account_id, mt5_symbol, com
     proceed". A duplicate real order is worse than a missed one, so
     when this safety check can't be trusted, the safe direction is to
     NOT resubmit, not to fall back to the old blind-retry behavior.
+
+    FIX: CONFIRMED REAL BUG, caught live via a direct report - a
+    scheduled XAUUSD signal placed TWO real positions on the user's
+    own account. Traced exactly: attempt 1 timed out client-side but
+    actually succeeded on the broker; its check ran too soon (before
+    the position was visible yet on Deriv/MetaAPI's side) and found
+    nothing, so it retried; attempt 2 genuinely submitted a SECOND
+    real order, then ALSO timed out; by the time ITS check ran, both
+    real positions existed - but this function used to just return
+    the FIRST match it found (`for pos in positions: return pos`)
+    and declare success, never checking whether more than one
+    matched. Now collects every match; a single match behaves exactly
+    as before, but finding more than one means a duplicate has
+    already happened, which the caller needs to know about
+    immediately rather than discover later by checking the account
+    directly.
     """
     try:
         url = (
@@ -17125,6 +17145,7 @@ async def check_for_matching_recent_position(metaapi_account_id, mt5_symbol, com
             return "CHECK_FAILED"
         positions = response.json()
         target_symbol = mt5_symbol.upper()
+        matches = []
         for pos in positions:
             if not isinstance(pos, dict):
                 continue
@@ -17140,7 +17161,33 @@ async def check_for_matching_recent_position(metaapi_account_id, mt5_symbol, com
             except ValueError:
                 continue
             if open_time >= since_dt - timedelta(seconds=5):  # small buffer for clock drift
-                return pos
+                matches.append(pos)
+
+        if len(matches) > 1:
+            print(
+                f"[MT5] 🚨 DUPLICATE DETECTED - {len(matches)} real positions match "
+                f"{target_symbol}/{comment}, not 1: {[p.get('id') for p in matches]}"
+            )
+            if ADMIN_USER_ID and _app_instance:
+                try:
+                    ids_str = ", ".join(str(p.get("id")) for p in matches)
+                    await _app_instance.bot.send_message(
+                        chat_id=int(ADMIN_USER_ID),
+                        text=(
+                            f"🚨 <b>Duplicate MT5 position detected</b>\n\n"
+                            f"{len(matches)} real open positions match {target_symbol} / \"{comment}\", "
+                            f"not 1.\nPosition IDs: {ids_str}\n\n"
+                            f"This happened because a retry after a timeout couldn't yet see the "
+                            f"first attempt's position on the broker's side. Please check your MT5 "
+                            f"account and close the extra position manually if needed."
+                        ),
+                        parse_mode=ParseMode.HTML,
+                    )
+                except Exception as alert_exc:
+                    print(f"[MT5] Failed to alert admin about duplicate: {alert_exc}")
+            return matches[0]
+        if matches:
+            return matches[0]
         return None
     except Exception as e:
         print(f"[MT5] Idempotency check error: {e}")
@@ -17249,6 +17296,18 @@ async def place_mt5_trade(signal_data, signal_id=None):
                 if attempt == max_attempts:
                     print(f"[MT5 PERSONAL COPY] ❌ Network error on final attempt {attempt}/{max_attempts}: {network_exc}")
                     return None
+                # FIX: CONFIRMED REAL BUG, caught live via a direct
+                # report - a real duplicate position happened because
+                # this check used to run immediately after the
+                # timeout, before a genuinely-already-placed order
+                # had become visible yet on the broker's side, so it
+                # found nothing and retried into a real duplicate.
+                # This settle delay doesn't guarantee visibility, but
+                # meaningfully narrows that exact window - combined
+                # with check_for_matching_recent_position now
+                # detecting and alerting on duplicates if one still
+                # slips through.
+                await asyncio.sleep(3)
                 check_result = await check_for_matching_recent_position(
                     METAAPI_ACCOUNT_ID, mt5_symbol, trade_comment, attempt_started_at
                 )
@@ -17282,7 +17341,10 @@ async def place_mt5_trade(signal_data, signal_id=None):
             # unique per signal, not the old shared constant) so this
             # can never cross-match a DIFFERENT signal's position for
             # the same pair, even one that happened to open seconds
-            # earlier.
+            # earlier. Same settle delay as the network-exception path
+            # above, for the same reason - a 504 still reached the
+            # server, so the same broker-side visibility lag applies.
+            await asyncio.sleep(3)
             check_result = await check_for_matching_recent_position(
                 METAAPI_ACCOUNT_ID, mt5_symbol, trade_comment, attempt_started_at
             )

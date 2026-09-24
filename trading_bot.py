@@ -23363,10 +23363,13 @@ def get_week_start():
 
 async def send_self_serve_reminder(context: ContextTypes.DEFAULT_TYPE):
     """
-    Per explicit instruction: a short reminder, 3x weekly (Mon/Wed/Fri
-    2PM WAT / 13:00 UTC), telling people they don't have to wait for
-    the channel's scheduled signals - they can request their own
-    signals, news calls, and set up Exness/Deriv Auto-Trade anytime.
+    Per explicit instruction: a short reminder, 1x weekly (Wednesday
+    2PM WAT / 13:00 UTC) - reduced from 3x weekly after a review of
+    everything the bot sends found this was the one message going to
+    every known user regardless of activity, telling people they don't
+    have to wait for the channel's scheduled signals - they can request
+    their own signals, news calls, and set up Exness/Deriv Auto-Trade
+    anytime.
     Posted to all 3 channels AND every known individual user, same
     proven patterns already used elsewhere in this file (channel loop
     + per-user DM loop with safe ~20/sec pacing). Uses a url= deep
@@ -24232,16 +24235,18 @@ def main():
         job_kwargs={"misfire_grace_time": 300}
     )
 
-    # Self-serve reminder - 3x weekly, per explicit instruction:
-    # Monday, Wednesday, Friday at 2PM WAT (13:00 UTC, WAT is
-    # DEFAULT_UTC_OFFSET_MINUTES = UTC+1). Same cron-style day
-    # indexing as every other run_daily call in this file (0=Sunday)
-    # - days=(1, 3, 5) is Monday, Wednesday, Friday.
+    # Self-serve reminder - REDUCED to 1x weekly (Wednesday, 2PM WAT /
+    # 13:00 UTC), per explicit instruction after a review of everything
+    # the bot sends found this was the one message going out to every
+    # known user regardless of activity, 3x a week - genuinely the
+    # spammiest thing in the whole schedule by that measure. Same
+    # cron-style day indexing as every other run_daily call in this
+    # file (0=Sunday) - days=(3,) is Wednesday.
     job_queue.run_daily(
         send_self_serve_reminder,
         time=parse_time("13:00"),
         name="self_serve_reminder",
-        days=(1, 3, 5),
+        days=(3,),
         job_kwargs={"misfire_grace_time": 300}
     )
 

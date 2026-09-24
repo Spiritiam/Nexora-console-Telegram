@@ -5862,6 +5862,50 @@ async def _deriv_get_candles_once(symbol, granularity, count):
         return None
 
 
+async def deriv_get_deep_historical_series(symbol, granularity, target_count):
+    """
+    ADDED per explicit instruction, after the first backtest run
+    (208 days, one request per granularity) produced too few
+    signals to train on (171 total across 5 indices - confirmed too
+    thin, some indices as low as 3). Deriv's synthetic indices are
+    artificially generated 24/7, not tied to real market hours or a
+    listing date, so there's no real reason to stop at whatever one
+    request returns - this pages BACKWARD in time, each request
+    anchored (via `end`) to the earliest candle the previous request
+    returned, stitching the results into one long, deduplicated,
+    oldest-to-newest series, until target_count is reached or Deriv
+    genuinely has no more history to give (an empty/non-progressing
+    response, which correctly stops the loop rather than looping
+    forever on a data source that's simply run dry).
+    """
+    all_candles = []
+    seen_times = set()
+    end_epoch = int(time.time())
+    page_size = 5000
+    max_pages = 40  # hard ceiling - real safety net, not expected to bind
+
+    for _ in range(max_pages):
+        if len(all_candles) >= target_count:
+            break
+        batch = await deriv_get_historical_candles(symbol, granularity, page_size, end_epoch)
+        if not batch:
+            break
+        new_candles = [c for c in batch if c["time"] not in seen_times]
+        if not new_candles:
+            break
+        for c in new_candles:
+            seen_times.add(c["time"])
+        all_candles.extend(new_candles)
+        earliest_time = min(c["time"] for c in batch)
+        if earliest_time >= end_epoch:
+            break
+        end_epoch = earliest_time - 1
+        await asyncio.sleep(0.3)  # be a reasonable citizen of Deriv's API, not a hammer
+
+    all_candles.sort(key=lambda c: c["time"])
+    return all_candles
+
+
 async def deriv_get_historical_candles(symbol, granularity, count, end_epoch):
     """
     ADDED for the Deriv strategy-bank backtest, per explicit
@@ -6028,10 +6072,15 @@ async def backtest_deriv_strategy_bank(progress_callback=None):
         symbol = config["symbol"]
         multiplier = config["default_multiplier"]
         try:
-            now_epoch = int(time.time())
-            h1_series = await deriv_get_historical_candles(symbol, 3600, 5000, now_epoch)
-            h4_series = await deriv_get_historical_candles(symbol, 14400, 1200, now_epoch)
-            daily_series = await deriv_get_historical_candles(symbol, 86400, 300, now_epoch)
+            # UPDATED per explicit instruction, after the first run
+            # (single request per granularity, ~208 days) produced
+            # only 171 signals total - too thin to train on, some
+            # indices as low as 3. Now pages back roughly 2 years via
+            # deriv_get_deep_historical_series instead of whatever one
+            # request happens to return.
+            h1_series = await deriv_get_deep_historical_series(symbol, 3600, 17520)
+            h4_series = await deriv_get_deep_historical_series(symbol, 14400, 4380)
+            daily_series = await deriv_get_deep_historical_series(symbol, 86400, 730)
 
             if not h1_series or len(h1_series) < 300 or not h4_series or not daily_series:
                 print(f"[DERIV BACKTEST] {index_key}: insufficient historical data, skipping")

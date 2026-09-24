@@ -5862,7 +5862,350 @@ async def _deriv_get_candles_once(symbol, granularity, count):
         return None
 
 
-async def deriv_get_candles(symbol, granularity, count=60):
+async def deriv_get_historical_candles(symbol, granularity, count, end_epoch):
+    """
+    ADDED for the Deriv strategy-bank backtest, per explicit
+    instruction - NOT used by the live signal path. Same OTP/
+    WebSocket connection flow as _deriv_get_candles_once above, the
+    one real difference being an explicit `end` epoch instead of
+    always "latest", which is what actually makes historical (not
+    just current) data reachable - confirmed as a real, documented
+    Deriv API capability before building this, not assumed.
+    """
+    if not DERIV_SERVICE_TOKEN:
+        print("[DERIV BACKTEST] No DERIV_SERVICE_TOKEN set")
+        return None
+
+    accounts_data = await deriv_get_options_accounts(DERIV_SERVICE_TOKEN)
+    if not accounts_data:
+        return None
+    accounts_list = accounts_data.get("data")
+    if not isinstance(accounts_list, list):
+        accounts_list = accounts_data.get("accounts")
+    if not accounts_list:
+        return None
+    account_id = (
+        accounts_list[0].get("account_id")
+        or accounts_list[0].get("loginid")
+        or accounts_list[0].get("id")
+    )
+    if not account_id:
+        return None
+
+    ws_url = await deriv_get_otp_url(DERIV_SERVICE_TOKEN, account_id)
+    if not ws_url:
+        return None
+
+    try:
+        async with websockets.connect(ws_url, open_timeout=15, close_timeout=5) as ws:
+            await ws.send(json.dumps({
+                "ticks_history": symbol,
+                "style": "candles",
+                "granularity": granularity,
+                "count": count,
+                "end": int(end_epoch),
+            }))
+            response = json.loads(await ws.recv())
+            if "error" in response:
+                print(f"[DERIV BACKTEST] ticks_history error for {symbol}: {response['error'].get('message')}")
+                return None
+            raw_candles = response.get("candles", [])
+            if not raw_candles:
+                return None
+            candles = []
+            for c in raw_candles:
+                try:
+                    candles.append({
+                        "time": c.get("epoch"),
+                        "open": float(c["open"]),
+                        "high": float(c["high"]),
+                        "low": float(c["low"]),
+                        "close": float(c["close"]),
+                    })
+                except (KeyError, TypeError, ValueError):
+                    continue
+            return candles if candles else None
+    except Exception as e:
+        print(f"[DERIV BACKTEST] Connection error for {symbol}: {e}")
+        return None
+
+
+def compute_synthetic_backtest_features(pair_key, direction, agreeing_strategies, entry_price, sl, tp, h1_candles, current_time):
+    """
+    ADDED for the Deriv strategy-bank backtest, per explicit
+    instruction - deliberately a separate function from
+    compute_ml_signal_features rather than reusing it directly:
+    that function builds its output indexed against the LIVE global
+    ML_EV_FEATURE_COLS, which only has pair_ columns for the 13
+    forex/gold/oil/crypto pairs - passing a synthetic index's
+    pair_key through it would silently leave every pair_ column at 0
+    (no match), the same invisible-failure shape already confirmed
+    once elsewhere in this file for an unrecognized pair. This
+    returns a plain named dict instead, using the EXACT SAME
+    indicator math (RSI/MACD/ATR/EMA20/EMA50/range), so the eventual
+    combined model's feature_cols can be assembled correctly once
+    both forex and synthetic data exist side by side, without ever
+    risking a silent zero-column bug for either.
+    """
+    if not h1_candles or len(h1_candles) < 60:
+        return None
+    window = h1_candles[-100:]
+    try:
+        rsi_series = calculate_rsi(window, period=14)
+        rsi = rsi_series[-1] if rsi_series else None
+        macd_line, signal_line = calculate_macd(window)
+        macd_hist = (macd_line[-1] - signal_line[-1]) if macd_line and signal_line else None
+        atr_series = calculate_atr_series(window, period=14)
+        atr = atr_series[-1] if atr_series else None
+        ema20 = calculate_ema_series(window, 20)[-1] if len(window) >= 20 else None
+        ema50 = calculate_ema_series(window, 50)[-1] if len(window) >= 50 else None
+    except Exception:
+        return None
+    if rsi is None or macd_hist is None or atr is None or ema20 is None or ema50 is None:
+        return None
+
+    closes = [c["close"] for c in window]
+    highs = [c["high"] for c in window]
+    lows = [c["low"] for c in window]
+    risk = abs(entry_price - sl)
+    reward = abs(tp - entry_price)
+
+    return {
+        f"pair_{pair_key}": 1,
+        "rr_ratio": reward / risk if risk else 0,
+        "hour": current_time.hour,
+        "day_of_week": current_time.weekday(),
+        "n_strategies": len(agreeing_strategies),
+        "is_buy": 1 if direction == "BUY" else 0,
+        "rsi": rsi,
+        "macd_hist": macd_hist,
+        "atr_pct": (atr / entry_price * 100) if entry_price else 0,
+        "dist_from_ema20_pct": ((entry_price - ema20) / entry_price * 100) if entry_price else 0,
+        "dist_from_ema50_pct": ((entry_price - ema50) / entry_price * 100) if entry_price else 0,
+        "recent_20candle_change_pct": ((closes[-1] - closes[0]) / closes[0] * 100) if len(closes) > 1 and closes[0] else 0,
+        "recent_100candle_range_pct": ((max(highs) - min(lows)) / entry_price * 100) if entry_price else 0,
+        "strat_names": list(agreeing_strategies),
+    }
+
+
+async def backtest_deriv_strategy_bank(progress_callback=None):
+    """
+    ONE-OFF ADMIN-TRIGGERED JOB, per explicit instruction: Deriv's
+    Pick a Bot has no real signal-outcome history to train an ML
+    model on (confirmed - no table logs individual strategy-bank
+    decisions the way signal_log does for forex), so this generates
+    one by running the EXACT SAME live decision code
+    (run_strategy_bank_synthetic) against real historical Deriv
+    candles, walking forward through subsequent real candles to
+    determine each hypothetical signal's real outcome. Not part of
+    the live signal path.
+
+    Pick a Bot uses DOLLAR risk/target on a multiplier contract, not
+    price-level SL/TP like forex - converted here using the real
+    contract math (dollar P/L = stake * multiplier * price_move_pct),
+    at the bot's own DEFAULT_SYNTHETIC_STAKE/DEFAULT_RISK/DEFAULT_WIN
+    (the same real defaults used throughout this file), since
+    individual subscribers can choose their own amounts and there's
+    no single "the" real value to backtest against - this is the
+    same kind of representative-default approximation forex
+    backtesting already makes with a fixed pip-based SL/TP.
+
+    Deliberately excludes m1_candles (passed as None) - the 3 m1-only
+    strategies simply won't vote this round, exactly like the live
+    bot already handles missing m1 data; fetching enough M1 history
+    for a multi-month backtest across 5 indices would be a very large
+    amount of additional data for a real but bounded gain (5 of the
+    13 strategies are h1-based and already fully covered). Account
+    Flip is NOT covered here - it has no take-profit at all, just a
+    trailing stop across a multi-layer stack, which doesn't reduce to
+    a clean "TP or SL, which hit first" backtest the way Pick a Bot
+    does. That would need its own dedicated simulation, separately.
+    """
+    results = {}
+    all_rows = []
+
+    for index_key, config in SYNTHETIC_CONFIG.items():
+        symbol = config["symbol"]
+        multiplier = config["default_multiplier"]
+        try:
+            now_epoch = int(time.time())
+            h1_series = await deriv_get_historical_candles(symbol, 3600, 5000, now_epoch)
+            h4_series = await deriv_get_historical_candles(symbol, 14400, 1200, now_epoch)
+            daily_series = await deriv_get_historical_candles(symbol, 86400, 300, now_epoch)
+
+            if not h1_series or len(h1_series) < 300 or not h4_series or not daily_series:
+                print(f"[DERIV BACKTEST] {index_key}: insufficient historical data, skipping")
+                results[index_key] = {"signals": 0, "reason": "insufficient historical data"}
+                if progress_callback:
+                    await progress_callback(index_key, 0, "insufficient historical data")
+                continue
+
+            print(f"[DERIV BACKTEST] {index_key}: {len(h1_series)} H1 candles, "
+                  f"{h4_series[0]['time']} to {h1_series[-1]['time']}")
+
+            signal_count = 0
+            i = 210
+            while i < len(h1_series) - 1:
+                primary_candles = h1_series[i - 209:i + 1]
+                current_epoch = primary_candles[-1]["time"]
+
+                h4_slice = [c for c in h4_series if c["time"] <= current_epoch][-60:]
+                daily_slice = [c for c in daily_series if c["time"] <= current_epoch][-10:]
+                if len(h4_slice) < 10 or len(daily_slice) < 3:
+                    i += 1
+                    continue
+
+                try:
+                    result = await run_strategy_bank_synthetic(
+                        index_key, config, primary_candles, h4_slice, daily_slice,
+                        m1_candles=None, min_agree=1
+                    )
+                except Exception as e:
+                    print(f"[DERIV BACKTEST] {index_key} strategy bank error at candle {i}: {e}")
+                    i += 1
+                    continue
+
+                if not result:
+                    i += 1
+                    continue
+
+                direction, confidence, reason, agreeing_names, winning_votes = result
+                entry_price = primary_candles[-1]["close"]
+                entry_time = datetime.utcfromtimestamp(current_epoch)
+
+                # Real Deriv multiplier contract math: dollar P/L =
+                # stake * multiplier * price_move_pct. Solving for the
+                # price move at a given dollar amount gives the real
+                # price-equivalent SL/TP this contract would actually
+                # close at.
+                risk_price_move = (DEFAULT_RISK * entry_price) / (DEFAULT_SYNTHETIC_STAKE * multiplier)
+                win_price_move = (DEFAULT_WIN * entry_price) / (DEFAULT_SYNTHETIC_STAKE * multiplier)
+                if direction == "BUY":
+                    sl_price = entry_price - risk_price_move
+                    tp_price = entry_price + win_price_move
+                else:
+                    sl_price = entry_price + risk_price_move
+                    tp_price = entry_price - win_price_move
+
+                # Walk forward through real subsequent candles to see
+                # which threshold was touched first - up to 200 H1
+                # candles (~8 days) ahead. Neither touched in that
+                # window = excluded (not a real, determined outcome).
+                status = None
+                for j in range(i + 1, min(i + 201, len(h1_series))):
+                    c = h1_series[j]
+                    if direction == "BUY":
+                        if c["low"] <= sl_price:
+                            status = "SL_HIT"
+                            break
+                        if c["high"] >= tp_price:
+                            status = "TP_HIT"
+                            break
+                    else:
+                        if c["high"] >= sl_price:
+                            status = "SL_HIT"
+                            break
+                        if c["low"] <= tp_price:
+                            status = "TP_HIT"
+                            break
+
+                if status is None:
+                    i += 1
+                    continue
+
+                features = compute_synthetic_backtest_features(
+                    index_key, direction, agreeing_names, entry_price, sl_price, tp_price,
+                    primary_candles, entry_time
+                )
+                if features is None:
+                    i += 1
+                    continue
+
+                realized_pct = (
+                    (DEFAULT_WIN if status == "TP_HIT" else -DEFAULT_RISK) / DEFAULT_SYNTHETIC_STAKE * 100
+                )
+
+                row = {
+                    "pair_name": index_key.upper(),
+                    "direction": direction,
+                    "status": status,
+                    "realized_pct": realized_pct,
+                    "posted_at": entry_time.isoformat(),
+                    "data": features,
+                }
+                all_rows.append(row)
+                signal_count += 1
+
+                # Jump past this signal's own resolution point rather
+                # than re-scanning candle by candle through a window
+                # this same hypothetical trade was already open for -
+                # avoids generating a wall of near-duplicate
+                # overlapping signals off the same real move.
+                i = j + 1
+
+            print(f"[DERIV BACKTEST] {index_key}: {signal_count} backtested signals generated")
+            results[index_key] = {"signals": signal_count}
+            if progress_callback:
+                await progress_callback(index_key, signal_count, None)
+
+        except Exception as e:
+            print(f"[DERIV BACKTEST] {index_key}: fatal error - {e}")
+            results[index_key] = {"signals": 0, "reason": str(e)}
+            if progress_callback:
+                await progress_callback(index_key, 0, str(e))
+
+    # Persist the raw backtested rows so they can be pulled out and
+    # combined with the real forex signal_log data for the actual
+    # retrain step, the same way the forex backfill's ml_features got
+    # stored for its retrain.
+    if all_rows:
+        try:
+            chunk_size = 500
+            for start in range(0, len(all_rows), chunk_size):
+                chunk = all_rows[start:start + chunk_size]
+                url = f"{SUPABASE_URL}/rest/v1/deriv_backtest_signals"
+                requests.post(url, headers=sb_headers(), json=chunk, timeout=30)
+        except Exception as e:
+            print(f"[DERIV BACKTEST] Failed to persist rows to Supabase: {e}")
+
+    return results, all_rows
+
+
+async def backtestderivbot_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """
+    Admin-only, one-off command that runs backtest_deriv_strategy_bank
+    above and reports back here in Telegram when done - per explicit
+    instruction to backtest Deriv's Pick a Bot instead of waiting on
+    organic data.
+    """
+    user_id = str(update.message.from_user.id)
+    if not ADMIN_USER_ID or user_id != ADMIN_USER_ID:
+        return
+
+    status_msg = await update.message.reply_text(
+        "🔄 Starting Deriv Pick a Bot backtest across R_10/R_25/R_50/R_75/R_100 "
+        "using real historical candles - this will take a while, I'll report progress here."
+    )
+
+    async def progress(index_key, count, reason):
+        try:
+            text = f"🔄 Deriv backtest in progress...\n\nLast completed: <b>{index_key.upper()}</b>"
+            text += f" ({count} signals)" if reason is None else f" - {reason}"
+            await status_msg.edit_text(text, parse_mode=ParseMode.HTML)
+        except Exception:
+            pass
+
+    results, all_rows = await backtest_deriv_strategy_bank(progress_callback=progress)
+
+    lines = ["✅ <b>Deriv Pick a Bot backtest complete</b>\n"]
+    total = 0
+    for index_key, r in sorted(results.items()):
+        reason = f" — {r['reason']}" if "reason" in r else ""
+        lines.append(f"{index_key.upper()}: {r.get('signals', 0)} signals{reason}")
+        total += r.get("signals", 0)
+    lines.append(f"\n<b>Total: {total} backtested signals generated and saved</b>")
+
+    await update.message.reply_text("\n".join(lines), parse_mode=ParseMode.HTML)
     """
     Fetches real candle history directly from Deriv using the
     service token, via the exact same OTP connection flow already
@@ -23319,6 +23662,7 @@ def main():
     app.add_handler(CommandHandler("broadcast", broadcast_command))
     app.add_handler(CommandHandler("broadcastchannels", broadcastchannels_command))
     app.add_handler(CommandHandler("backfillmlfeatures", backfillmlfeatures_command))
+    app.add_handler(CommandHandler("backtestderivbot", backtestderivbot_command))
     app.add_handler(MessageHandler(filters.PHOTO, broadcast_photo_handler))
     app.add_handler(CommandHandler("mt5revenue", mt5revenue_command))
     app.add_handler(CommandHandler("testsynth", testsynth_command))

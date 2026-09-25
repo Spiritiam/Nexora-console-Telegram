@@ -17056,34 +17056,80 @@ async def post_news(context: ContextTypes.DEFAULT_TYPE):
     if session_type == "morning" and calendar:
         summary += calendar
 
+    # FIX: per explicit instruction, after a direct report that the
+    # morning briefing posted without its picture - confirmed live in
+    # the logs as "Failed to get http url content" for all 3 channels
+    # at the exact same moment, meaning Telegram's server-side fetch
+    # of the Pollinations.ai image genuinely failed that round (a
+    # free, no-guarantee image service - this is a real, if
+    # infrequent, failure mode of the service itself, not a bug in
+    # how it's called). The existing text-only fallback already
+    # worked exactly as designed, but a single fresh attempt a few
+    # seconds later - giving Pollinations a little more time to
+    # finish rendering - is worth trying before giving up on the
+    # image entirely, the same one-retry-before-fallback shape
+    # already used for the article fetch and the AI summary above.
+    #
+    # FIX: per explicit instruction, "Morning Market Briefing" is now
+    # bolded in the actual posted message - done here via code on the
+    # already-generated summary rather than trusting the AI prompt to
+    # add HTML tags itself, since the prompt explicitly forbids
+    # markdown/formatting symbols in its own output (to keep the AI
+    # from inventing its own inconsistent formatting). Bolds the first
+    # line directly, rather than an exact string match against
+    # session_label, since the prompt's FORMAT EXACTLY LIKE THIS
+    # instruction guarantees the header IS the first line, but doesn't
+    # guarantee the AI reproduces session_label character-for-
+    # character (spacing, emoji placement) - an exact match could
+    # silently bold nothing if the AI's output drifted even slightly.
+    # Scoped to morning only, matching what was actually asked - not
+    # extended to midday/afternoon without being asked to.
+    if session_type == "morning":
+        summary_lines = summary.split("\n", 1)
+        if summary_lines and summary_lines[0].strip():
+            summary_lines[0] = f"<b>{summary_lines[0]}</b>"
+            summary = "\n".join(summary_lines)
+
     for channel_id in [CHANNEL_1_ID, CHANNEL_2_ID, CHANNEL_3_ID]:
-        try:
-            await context.bot.send_photo(
-                chat_id=channel_id,
-                photo=image_url,
-                caption=summary,
-                parse_mode=ParseMode.HTML,
-                read_timeout=60,
-                write_timeout=60,
-                connect_timeout=30,
-            )
-            print(f"[NEWS] ✅ {session_type} posted to {channel_id}")
-        except TimedOut:
-            # Confirmed real PTB behavior: send_photo can raise
-            # TimedOut for a request that Telegram actually completed
-            # successfully (the bot's own read timeout expires while
-            # waiting for Telegram's confirmation, even though
-            # Telegram already finished posting it - especially
-            # likely here since image_url points to Pollinations.ai,
-            # which Telegram has to fetch server-side and can be
-            # slow). This was the actual cause of the photo AND a
-            # text-only duplicate both posting - treating a timeout
-            # as "uncertain" rather than "definitely failed" means no
-            # automatic duplicate gets sent, since the photo most
-            # likely did go through.
-            print(f"[NEWS] ⚠️ {session_type} timed out for {channel_id} - likely posted anyway, NOT sending a duplicate")
-        except Exception as e:
-            print(f"[NEWS] AI image failed for {channel_id}, posting text only: {e}")
+        photo_sent = False
+        for photo_attempt in (1, 2):
+            try:
+                await context.bot.send_photo(
+                    chat_id=channel_id,
+                    photo=image_url,
+                    caption=summary,
+                    parse_mode=ParseMode.HTML,
+                    read_timeout=60,
+                    write_timeout=60,
+                    connect_timeout=30,
+                )
+                print(f"[NEWS] ✅ {session_type} posted to {channel_id}")
+                photo_sent = True
+                break
+            except TimedOut:
+                # Confirmed real PTB behavior: send_photo can raise
+                # TimedOut for a request that Telegram actually completed
+                # successfully (the bot's own read timeout expires while
+                # waiting for Telegram's confirmation, even though
+                # Telegram already finished posting it - especially
+                # likely here since image_url points to Pollinations.ai,
+                # which Telegram has to fetch server-side and can be
+                # slow). This was the actual cause of the photo AND a
+                # text-only duplicate both posting - treating a timeout
+                # as "uncertain" rather than "definitely failed" means no
+                # automatic duplicate gets sent, since the photo most
+                # likely did go through.
+                print(f"[NEWS] ⚠️ {session_type} timed out for {channel_id} - likely posted anyway, NOT sending a duplicate")
+                photo_sent = True  # uncertain, but treat like the rest of this file already does
+                break
+            except Exception as e:
+                if photo_attempt == 1:
+                    print(f"[NEWS] Image failed for {channel_id} (attempt 1/2): {e} - retrying once in 5s...")
+                    await asyncio.sleep(5)
+                    continue
+                print(f"[NEWS] AI image failed for {channel_id} on both attempts, posting text only: {e}")
+
+        if not photo_sent:
             try:
                 await context.bot.send_message(
                     chat_id=channel_id,

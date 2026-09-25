@@ -49,7 +49,7 @@ from telegram.ext import (
 )
 
 from telegram.constants import ParseMode
-from telegram.error import TimedOut, Conflict as TelegramConflictError
+from telegram.error import TimedOut, Conflict as TelegramConflictError, BadRequest
 
 # ============================================
 # ENV VARIABLES
@@ -23798,7 +23798,28 @@ def main():
             and "terminated by other getupdates request" in str(error).lower()
         )
 
-        if ADMIN_USER_ID and not is_routine_handover_conflict:
+        # FIX: per explicit instruction, after a direct report this
+        # showed up twice across two days with no user action behind
+        # either occurrence - checked the surrounding logs both times
+        # and couldn't reliably trace it to one exact call site (this
+        # bot runs many things concurrently, so adjacent log lines
+        # aren't necessarily from the same task). What IS certain:
+        # this specific BadRequest variant is definitionally harmless
+        # - it only ever fires when an edit's new content is byte-for-
+        # byte identical to the message's current content, meaning
+        # Telegram is correctly saying "there's nothing to change,"
+        # not reporting any real failure. No message goes unsent, no
+        # signal or trade is affected. Same "don't alert on something
+        # that needs no action" reasoning as the routine handover
+        # Conflict above - silencing this specific, well-understood
+        # case rather than continuing to page a person about something
+        # that was never actually broken.
+        is_harmless_no_op_edit = (
+            isinstance(error, BadRequest)
+            and "message is not modified" in str(error).lower()
+        )
+
+        if ADMIN_USER_ID and not is_routine_handover_conflict and not is_harmless_no_op_edit:
             try:
                 signature = f"{type(error).__name__}:{str(error)[:200]}"
                 now = datetime.now(timezone.utc)

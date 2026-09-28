@@ -14051,9 +14051,28 @@ def generate_signal_chart(display_name, strategy_name, direction, candles, entry
         # shipped. Fixed by giving it a real "now" timestamp, so it's
         # indistinguishable in type from every other candle.
         if entry and candles:
+            # FIX: per explicit instruction, after a real 8AM XAUUSD
+            # chart (signal 5562) showed no visible candle at the
+            # Entry level: this live point used to be open=high=low=
+            # close=entry, a flat dash with no body, so when the saved
+            # candles were behind the live price (there, a ~15 point
+            # gap in a fast drop) the chart showed the last real
+            # candle, then a jump, then an almost invisible tick at
+            # Entry. It now opens at the last real candle's close and
+            # closes at Entry, so it draws as a real candle bridging
+            # the two (red if price fell, green if it rose). The close
+            # is still exactly Entry, and the high/low it adds are
+            # only the last close and Entry themselves, so every
+            # close-based indicator (MA, RSI, MACD) and ATR computed
+            # from it come out the same as with the old flat point.
+            last_close = candles[-1].get("close")
+            bridge_open = float(last_close) if last_close is not None else entry
             live_point = {
                 "time": datetime.utcnow(),
-                "open": entry, "high": entry, "low": entry, "close": entry,
+                "open": bridge_open,
+                "high": max(bridge_open, entry),
+                "low": min(bridge_open, entry),
+                "close": entry,
                 "volume": 0,
             }
             candles = candles + [live_point]

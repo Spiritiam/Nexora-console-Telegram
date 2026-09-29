@@ -20894,6 +20894,34 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
         # but never should have reached that point.
         return
 
+    # FIX: per explicit instruction, after a direct, repeated live
+    # report that /milestone fell through to this handler's own
+    # generic fallback instead of ever reaching CommandHandler -
+    # confirmed live via logs both times (the exact same downstream
+    # line fired at the exact moment of each retry), even though
+    # testing the real filter logic (filters.TEXT & ~filters.COMMAND)
+    # against text built the same way confirms it SHOULD exclude a
+    # message starting with "/milestone". Root cause not yet
+    # identified - could not be reproduced outside the live bot. This
+    # is a direct, plain-string safeguard so the feature works
+    # regardless of whatever is happening with command entity
+    # recognition for this specific update: checked here, first, by
+    # exact text rather than relying on CommandHandler at all.
+    if update.message.text.strip().startswith("/milestone"):
+        user_id = str(update.message.from_user.id)
+        if not ADMIN_USER_ID or user_id != ADMIN_USER_ID:
+            return
+        remainder = update.message.text.strip()[len("/milestone"):].strip()
+        if not remainder:
+            await update.message.reply_text(
+                "Usage: /milestone <your announcement text>\n\n"
+                "Example: /milestone 🎉 Nexora AI just crossed 10,000 signals sent!"
+            )
+            return
+        posted = await post_milestone_to_channels(context.bot, remainder)
+        await update.message.reply_text(f"✅ Posted to {posted}/3 channels.")
+        return
+
     user_id = str(update.message.from_user.id)
     username = update.message.from_user.username or "Trader"
     message = update.message.text.strip()

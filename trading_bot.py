@@ -6224,6 +6224,121 @@ async def backtest_deriv_strategy_bank(progress_callback=None):
     return results, all_rows
 
 
+# ADDED, per explicit instruction: milestone announcements for
+# verified-user count. Round numbers, since these are the only ones
+# worth publicly celebrating - not every raw count crossed.
+MILESTONE_THRESHOLDS = [
+    100, 250, 500, 750, 1000, 1500, 2000, 2500, 3000, 4000, 5000,
+    7500, 10000, 15000, 20000, 25000, 50000, 75000, 100000,
+]
+
+
+def build_milestone_announcement(headline_text):
+    """
+    Shared by both the automatic milestone check and the manual
+    /milestone command, per explicit instruction, so a human-written
+    and a bot-detected announcement always look identical to
+    subscribers - one message builder, one button, no drift between
+    the two paths over time.
+    """
+    text = f"{headline_text}\n\nEvery signal, every session, all in one place. 🚀"
+    keyboard = InlineKeyboardMarkup([
+        [InlineKeyboardButton("🚀 Try Nexora AI Now", url=f"https://t.me/{BOT_USERNAME}?start=milestone")]
+    ])
+    return text, keyboard
+
+
+async def post_milestone_to_channels(bot, headline_text):
+    text, keyboard = build_milestone_announcement(headline_text)
+    posted = 0
+    for channel_id in [CHANNEL_1_ID, CHANNEL_2_ID, CHANNEL_3_ID]:
+        try:
+            await bot.send_message(chat_id=channel_id, text=text, reply_markup=keyboard, parse_mode=ParseMode.HTML)
+            posted += 1
+        except Exception as e:
+            print(f"[MILESTONE] Failed to post to {channel_id}: {e}")
+    return posted
+
+
+async def check_milestone_progress(context: ContextTypes.DEFAULT_TYPE):
+    """
+    ADDED, per explicit instruction: runs daily, checks the real
+    verified_users count against MILESTONE_THRESHOLDS, and - if a NEW
+    threshold has been crossed since the last one announced - DMs the
+    admin a ready-made draft with a "Post to channels" button, rather
+    than posting automatically. Per explicit instruction this is
+    deliberate: a bot-generated public announcement about the
+    product's own numbers should get a human's eyes before it goes
+    out, the same review step verification requests already get -
+    unlike /milestone below, where the admin is the one who wrote the
+    words, so no separate approval step is needed there.
+    """
+    if not ADMIN_USER_ID:
+        return
+    try:
+        url = f"{SUPABASE_URL}/rest/v1/verified_users?select=user_id"
+        response = requests.get(url, headers=sb_headers(), timeout=15)
+        if response.status_code != 200:
+            print(f"[MILESTONE] Failed to count verified users: {response.status_code}")
+            return
+        current_count = len(response.json())
+
+        state_url = f"{SUPABASE_URL}/rest/v1/milestone_state?id=eq.1&select=last_announced_milestone"
+        state_response = requests.get(state_url, headers=sb_headers(), timeout=15)
+        if state_response.status_code != 200 or not state_response.json():
+            print(f"[MILESTONE] Failed to read milestone_state: {state_response.status_code}")
+            return
+        last_announced = state_response.json()[0]["last_announced_milestone"]
+
+        next_milestone = next(
+            (m for m in MILESTONE_THRESHOLDS if m > last_announced and current_count >= m),
+            None
+        )
+        if next_milestone is None:
+            return
+
+        headline = f"🎉 Nexora AI just crossed <b>{next_milestone:,} verified traders</b>!"
+        text, keyboard = build_milestone_announcement(headline)
+        await context.bot.send_message(
+            chat_id=int(ADMIN_USER_ID),
+            text=(
+                f"🎉 <b>Milestone reached: {next_milestone:,} verified users</b> "
+                f"(actual count: {current_count})\n\nHere's the draft:\n\n{text}"
+            ),
+            reply_markup=InlineKeyboardMarkup([
+                [InlineKeyboardButton("✅ Post to channels", callback_data=f"milestone_post_{next_milestone}")],
+                [InlineKeyboardButton("❌ Skip this one", callback_data=f"milestone_skip_{next_milestone}")],
+            ]),
+            parse_mode=ParseMode.HTML,
+        )
+    except Exception as e:
+        print(f"[MILESTONE] check_milestone_progress error: {e}")
+
+
+async def milestone_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """
+    Admin-only, per explicit instruction: same directness as
+    /testsignal - the admin wrote the words themselves, so it posts
+    straight to all 3 channels with the same button and styling as
+    the automatic version, no separate approval step needed.
+    """
+    user_id = str(update.message.from_user.id)
+    if not ADMIN_USER_ID or user_id != ADMIN_USER_ID:
+        return
+
+    message_text = update.message.text.split(" ", 1)
+    if len(message_text) < 2 or not message_text[1].strip():
+        await update.message.reply_text(
+            "Usage: /milestone <your announcement text>\n\n"
+            "Example: /milestone 🎉 Nexora AI just crossed 10,000 signals sent!"
+        )
+        return
+
+    headline = message_text[1].strip()
+    posted = await post_milestone_to_channels(context.bot, headline)
+    await update.message.reply_text(f"✅ Posted to {posted}/3 channels.")
+
+
 async def backtestderivbot_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """
     Admin-only, one-off command that runs backtest_deriv_strategy_bank
@@ -19555,6 +19670,34 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         return
 
+    if data.startswith("milestone_post_"):
+        user_id = str(query.from_user.id)
+        if not ADMIN_USER_ID or user_id != ADMIN_USER_ID:
+            return
+        milestone = data.replace("milestone_post_", "")
+        headline = f"🎉 Nexora AI just crossed <b>{int(milestone):,} verified traders</b>!"
+        posted = await post_milestone_to_channels(context.bot, headline)
+        try:
+            patch_url = f"{SUPABASE_URL}/rest/v1/milestone_state?id=eq.1"
+            requests.patch(patch_url, headers=sb_headers(), json={"last_announced_milestone": int(milestone)}, timeout=15)
+        except Exception as e:
+            print(f"[MILESTONE] Failed to update milestone_state: {e}")
+        await query.message.edit_text(f"✅ Posted to {posted}/3 channels.")
+        return
+
+    if data.startswith("milestone_skip_"):
+        user_id = str(query.from_user.id)
+        if not ADMIN_USER_ID or user_id != ADMIN_USER_ID:
+            return
+        milestone = data.replace("milestone_skip_", "")
+        try:
+            patch_url = f"{SUPABASE_URL}/rest/v1/milestone_state?id=eq.1"
+            requests.patch(patch_url, headers=sb_headers(), json={"last_announced_milestone": int(milestone)}, timeout=15)
+        except Exception as e:
+            print(f"[MILESTONE] Failed to update milestone_state: {e}")
+        await query.message.edit_text("Skipped - won't ask about this milestone again.")
+        return
+
     if data == "derivauto_menu":
         user_id = str(query.from_user.id)
         account = get_deriv_account(user_id)
@@ -23866,6 +24009,7 @@ def main():
     app.add_handler(CommandHandler("broadcastchannels", broadcastchannels_command))
     app.add_handler(CommandHandler("backfillmlfeatures", backfillmlfeatures_command))
     app.add_handler(CommandHandler("backtestderivbot", backtestderivbot_command))
+    app.add_handler(CommandHandler("milestone", milestone_command))
     app.add_handler(MessageHandler(filters.PHOTO, broadcast_photo_handler))
     app.add_handler(CommandHandler("mt5revenue", mt5revenue_command))
     app.add_handler(CommandHandler("testsynth", testsynth_command))
@@ -24333,6 +24477,17 @@ def main():
         time=parse_time("13:00"),
         name="self_serve_reminder",
         days=(3,),
+        job_kwargs={"misfire_grace_time": 300}
+    )
+
+    # ADDED, per explicit instruction: checks the real verified-user
+    # count daily against MILESTONE_THRESHOLDS and DMs the admin a
+    # ready-made draft (not an automatic post) when a new one is
+    # crossed - see check_milestone_progress's own docstring.
+    job_queue.run_daily(
+        check_milestone_progress,
+        time=parse_time("09:00"),
+        name="check_milestone_progress",
         job_kwargs={"misfire_grace_time": 300}
     )
 

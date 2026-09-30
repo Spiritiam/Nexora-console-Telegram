@@ -3036,6 +3036,7 @@ EXNESS_LINK = "https://www.exness.com/boarding/sign-up/a/vlnafmua"
 # then copy the file_ids it reports back here.
 FALLBACK_NEWS_IMAGE_FILE_IDS = [
     "AgACAgQAAxkDAAECIrVqvKiSBnsNW4IlswyD1Omgasg3hAACHhBrGwf-6VGZ7X_MNLfhTgEAAwIAA3gAAz0E",
+    "AgACAgQAAxkDAAECIr5qvKlu42BlE8AtmE0NEqtbmp1gRwACHxBrGwf-6VEOR566QyZcRgEAAwIAA3gAAz0E",
 ]
 
 BOT_USERNAME = "NexoraConsoleBot"

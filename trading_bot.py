@@ -3034,7 +3034,9 @@ EXNESS_LINK = "https://www.exness.com/boarding/sign-up/a/vlnafmua"
 # "couldn't fetch the URL" way Pollinations just did. Starts empty -
 # run /registerfallbackimages once (admin-only) to generate a few,
 # then copy the file_ids it reports back here.
-FALLBACK_NEWS_IMAGE_FILE_IDS = []
+FALLBACK_NEWS_IMAGE_FILE_IDS = [
+    "AgACAgQAAxkDAAECIrVqvKiSBnsNW4IlswyD1Omgasg3hAACHhBrGwf-6VGZ7X_MNLfhTgEAAwIAA3gAAz0E",
+]
 
 BOT_USERNAME = "NexoraConsoleBot"
 

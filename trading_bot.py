@@ -21037,6 +21037,18 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text(f"✅ Posted to {posted}/3 channels.")
         return
 
+    # FIX: per explicit instruction - same real, repeated live bug as
+    # /milestone above, confirmed via a direct report showing the
+    # exact same generic-fallback reply for /registerfallbackimages.
+    # Same fix, for the same reason: a direct plain-string safeguard
+    # rather than relying on CommandHandler for this command either.
+    # Calls registerfallbackimages_command directly rather than
+    # duplicating its body, since that function already does
+    # everything needed from (update, context) alone.
+    if update.message.text.strip().startswith("/registerfallbackimages"):
+        await registerfallbackimages_command(update, context)
+        return
+
     user_id = str(update.message.from_user.id)
     username = update.message.from_user.username or "Trader"
     message = update.message.text.strip()

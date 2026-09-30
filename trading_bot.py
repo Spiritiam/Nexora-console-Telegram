@@ -39,6 +39,7 @@ from telegram import (
     BotCommand,
     InputMediaPhoto,
     InputFile,
+    BotCommandScopeChat,
 )
 
 from telegram.ext import (
@@ -23238,6 +23239,48 @@ async def catch_up_missed_signals(app):
         print("[STARTUP] ✅ Menu button reset to Telegram default.")
     except Exception as e:
         print(f"[STARTUP] ⚠️ Couldn't reset menu button: {e}")
+
+    # ADDED, per explicit instruction: a private command menu, visible
+    # ONLY in the admin's own chat with the bot - uses BotCommandScopeChat
+    # so nothing above changes for anyone else (the default empty list
+    # and default menu button stay exactly as before for every other
+    # user). Two real benefits from registering these properly rather
+    # than leaving Telegram with no knowledge of them at all: (1) tapping
+    # the menu button in this one chat now shows every admin command in
+    # one place with a description, instead of needing to remember them;
+    # (2) it's possible - not confirmed, but plausible - that some of the
+    # command-routing issues chased earlier (messages not reaching
+    # CommandHandler) trace back to Telegram not recognizing an
+    # unregistered command reliably in every case. Worth watching for
+    # whether the plain-text safeguards on /milestone and
+    # /registerfallbackimages ever actually needed to fire again after this.
+    if ADMIN_USER_ID:
+        try:
+            admin_commands = [
+                BotCommand("testsignal", "Post a real test signal for any pair"),
+                BotCommand("testsynth", "Test a synthetic index signal (r10-r100)"),
+                BotCommand("discoversymbols", "Look up real Deriv symbol codes"),
+                BotCommand("broadcast", "DM a message to every bot user"),
+                BotCommand("broadcastchannels", "Post a message to all 3 channels"),
+                BotCommand("milestone", "Post a milestone announcement with CTA button"),
+                BotCommand("welcome", "Repost the welcome message to all 3 channels"),
+                BotCommand("backfillmlfeatures", "Backfill ML features for old forex signals"),
+                BotCommand("backtestderivbot", "Backtest Deriv Pick a Bot on real history"),
+                BotCommand("registerfallbackimages", "Generate backup images for news posts"),
+                BotCommand("mt5revenue", "View MT5 Auto-Trade revenue (KoraPay)"),
+                BotCommand("purgedigests", "Clean up stale daily-digest message links"),
+            ]
+            await app.bot.set_my_commands(
+                admin_commands,
+                scope=BotCommandScopeChat(chat_id=int(ADMIN_USER_ID)),
+            )
+            await app.bot.set_chat_menu_button(
+                chat_id=int(ADMIN_USER_ID),
+                menu_button=MenuButtonCommands(),
+            )
+            print("[STARTUP] ✅ Private admin command menu registered.")
+        except Exception as e:
+            print(f"[STARTUP] ⚠️ Couldn't register admin command menu: {e}")
 
     try:
         await app.bot.set_my_description(

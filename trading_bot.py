@@ -1,4 +1,5 @@
 import os
+import io
 import asyncio
 import random
 import math
@@ -37,6 +38,7 @@ from telegram import (
     MenuButtonDefault,
     BotCommand,
     InputMediaPhoto,
+    InputFile,
 )
 
 from telegram.ext import (
@@ -3023,6 +3025,16 @@ EXNESS_LINK = "https://www.exness.com/boarding/sign-up/a/vlnafmua"
 # ============================================
 # BOT USERNAME
 # ============================================
+
+# ADDED, per explicit instruction: Telegram file_ids for a small set
+# of pre-made, on-brand fallback images used by post_news when
+# Pollinations.ai fails on every retry - since these are already
+# stored on Telegram's own servers, sending by file_id doesn't
+# require fetching anything externally, so it can't fail the same
+# "couldn't fetch the URL" way Pollinations just did. Starts empty -
+# run /registerfallbackimages once (admin-only) to generate a few,
+# then copy the file_ids it reports back here.
+FALLBACK_NEWS_IMAGE_FILE_IDS = []
 
 BOT_USERNAME = "NexoraConsoleBot"
 
@@ -6313,6 +6325,76 @@ async def check_milestone_progress(context: ContextTypes.DEFAULT_TYPE):
         )
     except Exception as e:
         print(f"[MILESTONE] check_milestone_progress error: {e}")
+
+
+async def registerfallbackimages_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """
+    Admin-only, one-off setup command, per explicit instruction: to
+    build a real backup image source for post_news, generates a
+    small set of generic, on-brand images via Pollinations right now
+    (while it's presumably working), downloads each one's actual
+    bytes and re-uploads them directly to this chat - not by passing
+    the URL through, so this doesn't inherit the exact "Telegram
+    couldn't fetch the URL" failure this whole feature exists to work
+    around. Re-uploading gets back a Telegram file_id for each, valid
+    forever regardless of whether Pollinations is reachable later -
+    that's what makes it a real fallback rather than a second copy of
+    the same risk. Reports every file_id back here; copy them into
+    FALLBACK_NEWS_IMAGE_FILE_IDS in the code once, and this command
+    never needs to run again.
+    """
+    user_id = str(update.message.from_user.id)
+    if not ADMIN_USER_ID or user_id != ADMIN_USER_ID:
+        return
+
+    prompts = [
+        "forex trading floor, candlestick chart screens, currency symbols, "
+        "financial trading terminal, professional financial illustration, "
+        "cinematic digital art, dramatic lighting, high quality",
+        "stock market trading desk, multiple monitors with forex charts, "
+        "gold and currency price tickers, professional financial illustration, "
+        "cinematic digital art, dramatic lighting, high quality",
+        "global finance concept, world map overlaid with candlestick charts "
+        "and currency symbols, professional financial illustration, "
+        "cinematic digital art, dramatic lighting, high quality",
+    ]
+
+    await update.message.reply_text(f"🔄 Generating {len(prompts)} fallback images, this'll take a moment...")
+
+    collected_ids = []
+    for i, prompt in enumerate(prompts, start=1):
+        try:
+            image_url = (
+                f"https://image.pollinations.ai/prompt/"
+                f"{requests.utils.quote(prompt)}?width=800&height=450&nologo=true"
+            )
+            response = await asyncio.to_thread(requests.get, image_url, timeout=60)
+            if response.status_code != 200 or not response.content:
+                await update.message.reply_text(f"❌ Image {i}/{len(prompts)}: failed to generate ({response.status_code})")
+                continue
+            photo_bytes = io.BytesIO(response.content)
+            photo_bytes.name = f"fallback_{i}.png"
+            sent = await context.bot.send_photo(
+                chat_id=update.message.chat_id,
+                photo=InputFile(photo_bytes),
+                caption=f"Fallback image {i}/{len(prompts)} - file_id below",
+            )
+            file_id = sent.photo[-1].file_id
+            collected_ids.append(file_id)
+            await update.message.reply_text(f"✅ file_id {i}: <code>{file_id}</code>", parse_mode=ParseMode.HTML)
+        except Exception as e:
+            await update.message.reply_text(f"❌ Image {i}/{len(prompts)} failed: {e}")
+
+    if collected_ids:
+        joined = ",\n    ".join(f'"{fid}"' for fid in collected_ids)
+        await update.message.reply_text(
+            f"✅ Done - {len(collected_ids)}/{len(prompts)} succeeded.\n\n"
+            f"Paste this into FALLBACK_NEWS_IMAGE_FILE_IDS:\n\n"
+            f"<code>[\n    {joined},\n]</code>",
+            parse_mode=ParseMode.HTML,
+        )
+    else:
+        await update.message.reply_text("❌ None of the images generated successfully - try again later.")
 
 
 async def milestone_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -17226,7 +17308,13 @@ async def post_news(context: ContextTypes.DEFAULT_TYPE):
 
     for channel_id in [CHANNEL_1_ID, CHANNEL_2_ID, CHANNEL_3_ID]:
         photo_sent = False
-        for photo_attempt in (1, 2):
+        # FIX: extended from 2 to 3 attempts with escalating waits
+        # (5s, 10s), per explicit instruction after a morning where
+        # the single 5s retry wasn't enough - both attempts failed
+        # identically that day, meaning the outage lasted longer than
+        # 5s that time, not just a one-off slow render.
+        image_retry_waits = [5, 10]
+        for photo_attempt in range(1, len(image_retry_waits) + 2):
             try:
                 await context.bot.send_photo(
                     chat_id=channel_id,
@@ -17257,11 +17345,38 @@ async def post_news(context: ContextTypes.DEFAULT_TYPE):
                 photo_sent = True  # uncertain, but treat like the rest of this file already does
                 break
             except Exception as e:
-                if photo_attempt == 1:
-                    print(f"[NEWS] Image failed for {channel_id} (attempt 1/2): {e} - retrying once in 5s...")
-                    await asyncio.sleep(5)
+                if photo_attempt <= len(image_retry_waits):
+                    wait_s = image_retry_waits[photo_attempt - 1]
+                    print(f"[NEWS] Image failed for {channel_id} (attempt {photo_attempt}/{len(image_retry_waits)+1}): {e} - retrying in {wait_s}s...")
+                    await asyncio.sleep(wait_s)
                     continue
-                print(f"[NEWS] AI image failed for {channel_id} on both attempts, posting text only: {e}")
+                print(f"[NEWS] AI image failed for {channel_id} on all {len(image_retry_waits)+1} attempts: {e}")
+
+        # FIX: per explicit instruction - a genuine backup image
+        # source, not just more retries against the same provider.
+        # Any second EXTERNAL url-based service has the exact same
+        # weakness Pollinations just showed (Telegram still has to
+        # fetch it live, and it can fail the same way) - a real fix
+        # is a picture that doesn't depend on fetching anything
+        # externally at all. FALLBACK_NEWS_IMAGE_FILE_IDS holds
+        # Telegram's own file_ids for a small set of pre-made, on-
+        # brand images - sending by file_id re-uses what's already
+        # stored on Telegram's servers, so it can't fail for the same
+        # "couldn't fetch the URL" reason. Starts empty; see
+        # register_fallback_image_command for how to populate it.
+        if not photo_sent and FALLBACK_NEWS_IMAGE_FILE_IDS:
+            try:
+                fallback_id = random.choice(FALLBACK_NEWS_IMAGE_FILE_IDS)
+                await context.bot.send_photo(
+                    chat_id=channel_id,
+                    photo=fallback_id,
+                    caption=summary,
+                    parse_mode=ParseMode.HTML,
+                )
+                print(f"[NEWS] ✅ {session_type} posted to {channel_id} using fallback image (Pollinations unavailable)")
+                photo_sent = True
+            except Exception as e:
+                print(f"[NEWS] Fallback image also failed for {channel_id}: {e}")
 
         if not photo_sent:
             try:
@@ -24038,6 +24153,7 @@ def main():
     app.add_handler(CommandHandler("backfillmlfeatures", backfillmlfeatures_command))
     app.add_handler(CommandHandler("backtestderivbot", backtestderivbot_command))
     app.add_handler(CommandHandler("milestone", milestone_command))
+    app.add_handler(CommandHandler("registerfallbackimages", registerfallbackimages_command))
     app.add_handler(MessageHandler(filters.PHOTO, broadcast_photo_handler))
     app.add_handler(CommandHandler("mt5revenue", mt5revenue_command))
     app.add_handler(CommandHandler("testsynth", testsynth_command))

@@ -17518,12 +17518,70 @@ async def place_mt5_trade(signal_data, signal_id=None):
         # (keeps this function callable exactly as before from
         # anywhere that doesn't have one).
         trade_comment = f"NexoraAI #{signal_id}" if signal_id else "NexoraAI Signal"
+
+        # FIX: CONFIRMED REAL BUG, caught via a direct live report - a
+        # USOIL signal quoted entry 90.42 (built right after the live
+        # price fetch timed out, so it fell back to a stale candle
+        # close), but the real account's market-order fill was 89.765,
+        # 0.655 away. stopLoss/takeProfit below used to be the FIXED
+        # absolute prices computed from that stale quoted entry, sent
+        # unchanged regardless of where the market order actually
+        # filled - since this is a market order with no openPrice,
+        # whatever the real fill turned out to be, the stop stayed
+        # pinned to the old price. Here that meant the real distance
+        # to stop shrank from the intended 0.70 to 0.045, and the
+        # trade closed almost immediately for a small loss instead of
+        # behaving like the 70-cent-stop trade it was supposed to be.
+        # Now fetches one fresh real-time price right before
+        # submitting and, if it's meaningfully different from the
+        # quoted entry, recomputes stopLoss/takeProfit around the
+        # REAL price using the ORIGINAL risk and reward distances from
+        # signal_data - so the actual risk taken matches what was
+        # intended regardless of how much the market moved between
+        # signal time and execution. Falls back to the original
+        # stopLoss/takeProfit unchanged if this fresh price fetch
+        # fails, rather than blocking the trade over one extra call
+        # that didn't need to be perfect to begin with.
+        stop_loss = signal_data["stop_loss"]
+        take_profit = signal_data["take_profit"]
+        try:
+            fresh_price = await asyncio.to_thread(get_price_metaapi, mt5_symbol)
+        except Exception as e:
+            fresh_price = None
+            print(f"[MT5] Fresh price refresh before placing failed: {e}")
+
+        if fresh_price is not None:
+            quoted_entry = signal_data["entry_price"]
+            risk_distance = abs(quoted_entry - signal_data["stop_loss"])
+            reward_distance = abs(signal_data["take_profit"] - quoted_entry)
+            # Round to the same decimal precision as the original
+            # stop_loss value, so recomputed prices can't come out as
+            # float noise (e.g. 89.71999999999999) that a broker could
+            # reject - matches whatever precision this pair already
+            # uses rather than assuming a fixed number of decimals.
+            decimals = len(str(signal_data["stop_loss"]).split(".")[-1]) if "." in str(signal_data["stop_loss"]) else 2
+            if direction == "BUY":
+                recomputed_sl = round(fresh_price - risk_distance, decimals)
+                recomputed_tp = round(fresh_price + reward_distance, decimals)
+            else:
+                recomputed_sl = round(fresh_price + risk_distance, decimals)
+                recomputed_tp = round(fresh_price - reward_distance, decimals)
+            drift_pct = abs(fresh_price - quoted_entry) / quoted_entry * 100 if quoted_entry else 0
+            if drift_pct > 0.05:
+                print(
+                    f"[MT5] Price drifted {drift_pct:.2f}% between signal and placement "
+                    f"({quoted_entry} -> {fresh_price}) - recalculated SL/TP around the real "
+                    f"price to keep the intended risk/reward distance."
+                )
+            stop_loss = recomputed_sl
+            take_profit = recomputed_tp
+
         payload = {
             "symbol": mt5_symbol,
             "volume": 0.1,
             "actionType": order_type,
-            "stopLoss": signal_data["stop_loss"],
-            "takeProfit": signal_data["take_profit"],
+            "stopLoss": stop_loss,
+            "takeProfit": take_profit,
             "comment": trade_comment
         }
         url = (

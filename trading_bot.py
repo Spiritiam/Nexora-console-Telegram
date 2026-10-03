@@ -6052,6 +6052,139 @@ def compute_synthetic_backtest_features(pair_key, direction, agreeing_strategies
     }
 
 
+def predict_signal_ev_synthetic(pair_key, direction, agreeing_strategies, entry_price, sl, tp, h1_candles, current_time):
+    """
+    Deriv/synthetic sibling of predict_signal_ev - same fail-open
+    principle (returns None rather than blocking a signal if the
+    model or a feature can't be computed). Reuses
+    compute_synthetic_backtest_features directly for the raw numbers,
+    so live prediction can never drift from the exact math the
+    training data itself was built with - only the final step (laying
+    the raw dict out as an ordered vector matching this model's own
+    feature_cols, converting strat_names into the same individual
+    strat_X flags used in training) is new here.
+    """
+    if ML_EV_MODEL_SYNTHETIC is None:
+        return None
+    raw = compute_synthetic_backtest_features(pair_key, direction, agreeing_strategies, entry_price, sl, tp, h1_candles, current_time)
+    if raw is None:
+        return None
+    strat_names = raw.get("strat_names") or []
+    vector = []
+    for col in ML_EV_FEATURE_COLS_SYNTHETIC:
+        if col in SYNTHETIC_STRAT_FEATURE_NAMES:
+            vector.append(1 if SYNTHETIC_STRAT_FEATURE_NAMES[col] in strat_names else 0)
+        else:
+            vector.append(raw.get(col, 0))
+    try:
+        predicted_ev = ML_EV_MODEL_SYNTHETIC.predict([vector])[0]
+        return predicted_ev
+    except Exception as e:
+        print(f"[ML EV MODEL SYNTHETIC] Prediction failed for {pair_key}: {e}")
+        return None
+
+
+async def run_ml_driven_decision_synthetic(index_key, config, h1_candles, h4_candles, daily_candles, strategy_fns=None, min_agree=2):
+    """
+    Deriv/synthetic sibling of run_ml_driven_decision, per explicit
+    instruction to deploy the synthetic ML model after being shown
+    the honest research and choosing to proceed anyway. Mirrors the
+    proven forex integration exactly: the model is the SOLE decision-
+    maker, scoring both hypothetical directions and always picking
+    whichever scores higher - no threshold gates whether a signal
+    fires at all, matching the same "Option B" shape already proven
+    out for forex's own MT5 bots, where Aggressive and Conservative
+    fire identically once ML is in charge rather than gating on vote
+    count. min_agree is accepted (so every existing call site needs
+    zero changes beyond swapping which function gets called) but,
+    same as forex, doesn't gate anything - kept only for signature
+    compatibility with run_strategy_bank_synthetic.
+
+    SYNTHETIC_STRATEGY_BANK (all 13 strategies, filters+entries
+    together) still runs and whichever vote for a given direction
+    still genuinely inform the model's score - exactly the same real
+    input the model was trained on, since the backtest's own training
+    data was built from this same bank's votes.
+
+    Hypothetical SL/TP for feature purposes only (never the real
+    trade's actual risk) use the same dollar-to-price conversion as
+    the backtest (DEFAULT_RISK/DEFAULT_WIN/DEFAULT_SYNTHETIC_STAKE via
+    the index's own multiplier) - keeps live rr_ratio consistent with
+    what the model was trained on. The caller's own existing dollar-
+    based stake/risk/win logic still decides the real trade
+    afterward, untouched.
+
+    Returns (direction, confidence, reason, agreeing_strategies,
+    winning_votes) or None - same shape as run_strategy_bank_synthetic,
+    so callers need no other changes.
+    """
+    if ML_EV_MODEL_SYNTHETIC is None or not h1_candles:
+        print(f"[ML DRIVEN SYNTHETIC] {index_key}: skipping - model_loaded={ML_EV_MODEL_SYNTHETIC is not None}, h1_candles_count={len(h1_candles) if h1_candles else 0}")
+        return None
+
+    strategy_fns = strategy_fns if strategy_fns is not None else SYNTHETIC_STRATEGY_BANK
+
+    entry_votes = []
+    for strategy_fn in strategy_fns:
+        try:
+            result = strategy_fn(index_key, config, h1_candles, h4_candles, daily_candles)
+            if result:
+                entry_votes.append(result)
+        except Exception as e:
+            print(f"[ML DRIVEN SYNTHETIC] entry {strategy_fn.__name__} failed for {index_key}: {e}")
+            continue
+
+    current_price = h1_candles[-1]["close"]
+    multiplier = config.get("default_multiplier")
+    if not multiplier:
+        return None
+    risk_price_move = (DEFAULT_RISK * current_price) / (DEFAULT_SYNTHETIC_STAKE * multiplier)
+    win_price_move = (DEFAULT_WIN * current_price) / (DEFAULT_SYNTHETIC_STAKE * multiplier)
+
+    results_by_direction = {}
+    for direction in ("BUY", "SELL"):
+        matching_votes = [v for v in entry_votes if v["direction"] == direction]
+        agreeing_names = [v["strategy_name"] for v in matching_votes]
+
+        if direction == "BUY":
+            hyp_sl = current_price - risk_price_move
+            hyp_tp = current_price + win_price_move
+        else:
+            hyp_sl = current_price + risk_price_move
+            hyp_tp = current_price - win_price_move
+
+        predicted_ev = predict_signal_ev_synthetic(index_key, direction, agreeing_names, current_price, hyp_sl, hyp_tp, h1_candles, datetime.utcnow())
+        results_by_direction[direction] = (predicted_ev, agreeing_names, matching_votes)
+
+    buy_ev, buy_agreeing, buy_votes = results_by_direction["BUY"]
+    sell_ev, sell_agreeing, sell_votes = results_by_direction["SELL"]
+
+    if buy_ev is None or sell_ev is None:
+        return None
+
+    direction = "BUY" if buy_ev >= sell_ev else "SELL"
+    predicted_ev = buy_ev if direction == "BUY" else sell_ev
+    agreeing_strategies = buy_agreeing if direction == "BUY" else sell_agreeing
+    winning_votes = buy_votes if direction == "BUY" else sell_votes
+
+    print(f"[ML DRIVEN SYNTHETIC] {index_key}: BUY={buy_ev:+.3f}% (entries: {buy_agreeing}) SELL={sell_ev:+.3f}% (entries: {sell_agreeing}) -> chose {direction}")
+
+    ev_gap = abs(buy_ev - sell_ev)
+    confidence = min(95, 70 + int(ev_gap * 300))
+    if agreeing_strategies:
+        confidence = min(95, confidence + 3 * len(agreeing_strategies))
+
+    if agreeing_strategies:
+        n = len(agreeing_strategies)
+        strat_word = "strategy" if n == 1 else "strategies"
+        strat_list = agreeing_strategies[0] if n == 1 else ", ".join(agreeing_strategies)
+        reason = f"ML model favors {direction} (predicted edge {predicted_ev:+.2f}%) - {n} {strat_word} leaning {direction.lower()} ({strat_list})."
+    else:
+        reason = f"ML model favors {direction} (predicted edge {predicted_ev:+.2f}%)."
+
+    return direction, confidence, reason, agreeing_strategies, winning_votes
+
+
 async def backtest_deriv_strategy_bank(progress_callback=None):
     """
     ONE-OFF ADMIN-TRIGGERED JOB, per explicit instruction: Deriv's
@@ -6796,9 +6929,18 @@ async def build_synthetic_signal_response(index_key, min_agree=2):
     daily_candles = await get_cached_synthetic_candles(index_key, symbol, "1day", 86400, 10)
     m1_candles = await get_cached_synthetic_candles(index_key, symbol, "1m", 60, 60)
 
-    result = await run_strategy_bank_synthetic(
-        index_key, config, h1_candles, h4_candles, daily_candles, m1_candles=m1_candles, min_agree=min_agree
+    # FIX: per explicit instruction, after being shown the honest
+    # research and choosing to proceed anyway - ML is now tried first,
+    # falling back to the existing rule-based bank only if the model
+    # itself is genuinely unavailable (fail-open, same principle used
+    # everywhere else this pattern exists in this file).
+    result = await run_ml_driven_decision_synthetic(
+        index_key, config, h1_candles, h4_candles, daily_candles, min_agree=min_agree
     )
+    if not result:
+        result = await run_strategy_bank_synthetic(
+            index_key, config, h1_candles, h4_candles, daily_candles, m1_candles=m1_candles, min_agree=min_agree
+        )
     if not result:
         # FIX: CONFIRMED REAL GAP, now fixed per explicit instruction -
         # this used to just return None here, meaning a manual/
@@ -7944,9 +8086,13 @@ async def run_auto_copy_scan(context: ContextTypes.DEFAULT_TYPE):
         h4_candles = await get_cached_synthetic_candles(index_key, symbol, "4h", 14400, 60)
         daily_candles = await get_cached_synthetic_candles(index_key, symbol, "1day", 86400, 10)
         m1_candles = await get_cached_synthetic_candles(index_key, symbol, "1m", 60, 60)
-        result = await run_strategy_bank_synthetic(
-            index_key, config, h1_candles, h4_candles, daily_candles, m1_candles=m1_candles, min_agree=2
+        result = await run_ml_driven_decision_synthetic(
+            index_key, config, h1_candles, h4_candles, daily_candles, min_agree=2
         )
+        if not result:
+            result = await run_strategy_bank_synthetic(
+                index_key, config, h1_candles, h4_candles, daily_candles, m1_candles=m1_candles, min_agree=2
+            )
         if not result:
             continue
         direction, confidence, reason, agreeing_strategies, _winning_votes = result
@@ -8161,10 +8307,14 @@ async def run_deriv_autotrade_bot_scan(context: ContextTypes.DEFAULT_TYPE):
             # trigger is enough either way, same floor the two-tier
             # bank already uses for manual/scheduled signals.
             min_agree = 1
-            result = await run_strategy_bank_synthetic(
-                index_key, config, primary_candles, h4_candles, daily_candles,
-                m1_candles=m1_candles, min_agree=min_agree
+            result = await run_ml_driven_decision_synthetic(
+                index_key, config, primary_candles, h4_candles, daily_candles, min_agree=min_agree
             )
+            if not result:
+                result = await run_strategy_bank_synthetic(
+                    index_key, config, primary_candles, h4_candles, daily_candles,
+                    m1_candles=m1_candles, min_agree=min_agree
+                )
             if not result:
                 # THIRD tier, per explicit instruction (confirmed
                 # understanding real money would now act on a weaker,
@@ -12958,6 +13108,57 @@ def load_ml_ev_model():
     except Exception as e:
         print(f"[ML EV MODEL] Failed to load - ML filtering will be skipped entirely, signals proceed unfiltered: {e}")
         ML_EV_MODEL = None
+
+
+# ADDED, per explicit instruction: a SEPARATE model for Deriv's
+# synthetic indices, deliberately not sharing ML_EV_MODEL above - the
+# honest research shown before building this found the forex model's
+# instrument mix and this one's real-money edge are different enough
+# (confirmed: filtering helped on the full synthetic test set but
+# actively hurt once the two structurally-tight-stop indices were
+# excluded) that treating them as one combined thing risked
+# contaminating forex's proven, consistent model with synthetics'
+# noisier one. Trained on 1,821 real backtested signals (every
+# synthetic index, nothing excluded) - see
+# backtest_deriv_strategy_bank's own docstring for exactly how that
+# data was generated.
+ML_EV_MODEL_SYNTHETIC = None
+ML_EV_FEATURE_COLS_SYNTHETIC = None
+ML_EV_THRESHOLD_SYNTHETIC = None
+
+# Same strategy-name -> feature-column mapping used to build the
+# training data in backtest_deriv_strategy_bank - kept as one shared
+# constant so live prediction and the data the model was trained on
+# can never silently drift apart from each other.
+SYNTHETIC_STRAT_FEATURE_NAMES = {
+    "strat_Support_Resistance_Bounce": "Support/Resistance Bounce",
+    "strat_EMA_Pullback_Scalper": "EMA Pullback Scalper",
+    "strat_Momentum_MACD": "Momentum (MACD)",
+    "strat_Fibonacci_Retracement": "Fibonacci Retracement",
+    "strat_Williams_pctR": "Williams %R",
+    "strat_Previous_Day_High_Low_Manipulation": "Previous Day High/Low Manipulation",
+    "strat_Breakout": "Breakout",
+    "strat_ATR_Volatility_Breakout": "ATR Volatility Breakout",
+    "strat_Unicorn_Model": "Unicorn Model",
+    "strat_Trend_Following": "Trend Following",
+    "strat_Heikin_Ashi_Trend": "Heikin-Ashi Trend",
+    "strat_Supertrend": "Supertrend",
+    "strat_RSI_Extreme_Reversal": "RSI Extreme Reversal",
+}
+
+
+def load_ml_ev_model_synthetic():
+    global ML_EV_MODEL_SYNTHETIC, ML_EV_FEATURE_COLS_SYNTHETIC, ML_EV_THRESHOLD_SYNTHETIC
+    try:
+        with open("ml_ev_model_synthetic.pkl", "rb") as f:
+            data = pickle.load(f)
+        ML_EV_MODEL_SYNTHETIC = data["model"]
+        ML_EV_FEATURE_COLS_SYNTHETIC = data["feature_cols"]
+        ML_EV_THRESHOLD_SYNTHETIC = data["threshold_30pct"]
+        print(f"[ML EV MODEL SYNTHETIC] Loaded successfully. Threshold: {ML_EV_THRESHOLD_SYNTHETIC:.4f}")
+    except Exception as e:
+        print(f"[ML EV MODEL SYNTHETIC] Failed to load - Deriv signals fall back to the rule-based strategy bank: {e}")
+        ML_EV_MODEL_SYNTHETIC = None
 
 
 def compute_ml_signal_features(pair_key, direction, agreeing_strategies, entry_price, sl, tp, h1_candles, current_time, min_candles=100):
@@ -24156,6 +24357,7 @@ def main():
     global _app_instance
 
     load_ml_ev_model()
+    load_ml_ev_model_synthetic()
 
     app = (
         Application.builder()

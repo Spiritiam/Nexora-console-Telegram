@@ -7102,12 +7102,23 @@ async def build_synthetic_signal_response(index_key, min_agree=2):
         if chart_ok:
             image_file_id = chart_path
 
-    # FBS-style narrative: reason comes FIRST, per explicit
-    # instruction (synthetics never had a separate Entry/SL/TP block
-    # to reorder around in the first place - this just replaces the
-    # flat "N independent strategies agree..." sentence with varied
-    # prose built from the same real winning_votes).
-    narrative = generate_signal_narrative(config["display"], direction, winning_votes)
+    # FIX: per explicit instruction, same real bug forex already had
+    # and fixed - this used to always build a separate narrative from
+    # winning_votes (generate_signal_narrative), regardless of what
+    # actually decided the signal. Since Option B, winning_votes being
+    # non-empty just means "some strategies happened to agree with
+    # what the model independently decided," not "the old gate-based
+    # system decided this" - and when the model's own winning
+    # direction has NO agreeing strategies (confirmed live: an R25 BUY
+    # where SELL had a real strategy vote and BUY had none, tied on
+    # score, model chose BUY anyway), the narrative fell back to flat,
+    # generic prose with no mention of the model at all - exactly the
+    # case that prompted this fix. reason (the actual decision-maker's
+    # own explanation - "ML model favors X (predicted edge +Y%)..."
+    # when ML decided it, the rule-based bank/bias's own wording
+    # otherwise) is now always used instead, in every case - same
+    # fix, same reasoning, as build_signal_response already has.
+    narrative = reason
 
     entry_sl_tp_block = ""
     if entry_price is not None and sl_price is not None and tp_price is not None:

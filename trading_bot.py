@@ -6182,6 +6182,39 @@ async def run_ml_driven_decision_synthetic(index_key, config, h1_candles, h4_can
     else:
         reason = f"ML model favors {direction} (predicted edge {predicted_ev:+.2f}%)."
 
+    # ADDED, per explicit instruction: "a room to gather more
+    # information as time goes on" - logs every real live decision
+    # this function makes, across all 3 callers, in one place (not
+    # duplicated per call site). This is forward-logging only - the
+    # backtest data this model was trained on stays exactly as it is,
+    # this just starts accumulating genuine organic outcomes
+    # alongside it for whenever a future retrain is worth doing.
+    # Deliberately logged here (one shared place) rather than in each
+    # caller, same reasoning as why the forex equivalent was logged
+    # inside build_signal_response rather than at every poster.
+    if direction == "BUY":
+        chosen_sl = current_price - risk_price_move
+        chosen_tp = current_price + win_price_move
+    else:
+        chosen_sl = current_price + risk_price_move
+        chosen_tp = current_price - win_price_move
+    try:
+        log_url = f"{SUPABASE_URL}/rest/v1/deriv_live_signals"
+        requests.post(
+            log_url, headers=sb_headers(),
+            json={
+                "index_key": index_key,
+                "direction": direction,
+                "entry_price": current_price,
+                "stop_loss": chosen_sl,
+                "take_profit": chosen_tp,
+                "agreeing_strategies": agreeing_strategies,
+            },
+            timeout=10,
+        )
+    except Exception as e:
+        print(f"[ML DRIVEN SYNTHETIC] Failed to log live signal for future retraining: {e}")
+
     return direction, confidence, reason, agreeing_strategies, winning_votes
 
 
@@ -23661,6 +23694,97 @@ async def check_open_signals(context: ContextTypes.DEFAULT_TYPE):
             elif current_price >= stop_loss:
                 update_signal_status(sig["id"], "SL_HIT")
 
+
+# ============================================
+# DERIV LIVE SIGNAL OUTCOME TRACKER
+# ADDED, per explicit instruction - sibling of check_open_signals
+# above for the new deriv_live_signals table (see
+# run_ml_driven_decision_synthetic's own logging). Runs every 15
+# minutes, same cadence as the forex tracker. No real-trade ground
+# truth to check here the way MT5's mt5_order_id provides - most
+# logged rows are channel/manual signals, not guaranteed to have an
+# actual placed trade behind them - so this always uses price
+# inference: fetches real candles since the signal posted and walks
+# them the same way the backtest itself does, checking whichever
+# threshold (stop_loss/take_profit) was touched first.
+# ============================================
+
+async def check_deriv_live_signal_outcomes(context: ContextTypes.DEFAULT_TYPE):
+    try:
+        url = f"{SUPABASE_URL}/rest/v1/deriv_live_signals?status=eq.OPEN&select=*"
+        response = await asyncio.to_thread(requests.get, url, headers=sb_headers(), timeout=15)
+        if response.status_code != 200:
+            print(f"[DERIV LIVE SIGNALS] Failed to fetch open rows: {response.status_code}")
+            return
+        open_rows = response.json()
+    except Exception as e:
+        print(f"[DERIV LIVE SIGNALS] Error fetching open rows: {e}")
+        return
+
+    if not open_rows:
+        return
+
+    for row in open_rows:
+        index_key = row.get("index_key")
+        config = SYNTHETIC_CONFIG.get(index_key)
+        if not config:
+            continue
+
+        try:
+            posted_at = datetime.fromisoformat(row["posted_at"].replace("Z", "+00:00")).replace(tzinfo=None)
+        except Exception:
+            continue
+
+        # A generous 300-candle H1 lookback comfortably covers any
+        # signal still open from the last ~12 days - older than that,
+        # a row is almost certainly stuck (an index that stopped
+        # trading, or similar) rather than genuinely still pending;
+        # left OPEN rather than guessed at, same as the forex tracker
+        # does for a lookup it can't resolve.
+        candles = await get_cached_synthetic_candles(index_key, config["symbol"], "1h", 3600, 300)
+        if not candles:
+            continue
+
+        direction = row.get("direction")
+        stop_loss = float(row["stop_loss"])
+        take_profit = float(row["take_profit"])
+        status = None
+
+        for c in candles:
+            c_time = c.get("time")
+            if isinstance(c_time, (int, float)):
+                c_dt = datetime.utcfromtimestamp(c_time)
+            else:
+                continue
+            if c_dt <= posted_at:
+                continue
+            if direction == "BUY":
+                if c["low"] <= stop_loss:
+                    status = "SL_HIT"
+                    break
+                if c["high"] >= take_profit:
+                    status = "TP_HIT"
+                    break
+            else:
+                if c["high"] >= stop_loss:
+                    status = "SL_HIT"
+                    break
+                if c["low"] <= take_profit:
+                    status = "TP_HIT"
+                    break
+
+        if status:
+            try:
+                patch_url = f"{SUPABASE_URL}/rest/v1/deriv_live_signals?id=eq.{row['id']}"
+                await asyncio.to_thread(
+                    requests.patch, patch_url, headers=sb_headers(),
+                    json={"status": status, "closed_at": datetime.utcnow().isoformat()},
+                    timeout=10,
+                )
+            except Exception as e:
+                print(f"[DERIV LIVE SIGNALS] Failed to update row {row['id']}: {e}")
+
+
 # ============================================
 # MT5 AUTO-TRADE CLOSE MONITOR (NEW)
 # Deriv equivalent is check_open_auto_copy_trades below - this is the
@@ -24617,6 +24741,15 @@ def main():
         interval=900,
         first=60,
         name="tp_sl_monitor"
+    )
+
+    # ADDED, per explicit instruction: Deriv sibling of the TP/SL
+    # monitor above, same 15-minute cadence, for deriv_live_signals.
+    job_queue.run_repeating(
+        check_deriv_live_signal_outcomes,
+        interval=900,
+        first=90,
+        name="deriv_live_signal_outcome_tracker"
     )
 
     # MT5 auto-trade close monitor - detects closed orders every 15

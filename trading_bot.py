@@ -20927,6 +20927,22 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
                         await wait_message.delete()
                     except Exception as e:
                         print(f"[SIGNAL] Couldn't delete wait message: {e}")
+                    # FIX: CONFIRMED REAL BUG, caught via a direct live
+                    # report - trade_context was popped from
+                    # pending_trades unconditionally at the top of this
+                    # block (to stop a double-tap re-executing an
+                    # ALREADY-confirmed trade), but this specific path
+                    # is a balance FAILURE - nothing was confirmed or
+                    # executed, so there's no double-tap risk here to
+                    # guard against. The message below explicitly says
+                    # "Try a smaller amount," but tapping Edit right
+                    # after looked up the same now-missing
+                    # pending_trades entry and reported the trade
+                    # expired instead, forcing a full restart. Restoring
+                    # it here means Edit finds the same trade context
+                    # again, matching what the message actually tells
+                    # the user to do.
+                    pending_trades[user_id] = trade_context
                     await send_and_auto_delete(
                         context.bot, int(user_id),
                         f"⚠️ <b>Not enough balance for this stake.</b>\n\n"

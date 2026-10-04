@@ -21709,6 +21709,23 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 parse_mode=ParseMode.HTML
             )
 
+            # FIX: per explicit instruction, after a direct live report
+            # that synthetic signals could resolve in under 1-2
+            # seconds - fast enough that the analyzing animation above
+            # barely got to show a single cycle before being replaced
+            # by the result, making it look instant/simulated rather
+            # than genuinely analyzed, unlike forex's own signal flow
+            # which naturally takes a few seconds from its own API
+            # calls and retries. Confirmed first that the animation
+            # itself is already the exact same shared function forex
+            # uses, not a separate template - the actual gap was pure
+            # speed, not a missing display. request_started_at anchors
+            # a minimum 7s wait below, timed from here (right as the
+            # animation starts), not from when the real work finishes -
+            # so the perceived wait matches what's actually been
+            # showing on screen the whole time.
+            request_started_at = time.time()
+
             animation_task = asyncio.create_task(animate_analyzing_message(wait_message))
             try:
                 # FIX: CONFIRMED REAL, LIVE BUG - this call was caught
@@ -21731,6 +21748,14 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 result = None
             finally:
                 animation_task.cancel()
+
+            # Minimum 7s from when "analyzing" first appeared - only
+            # waits out the REMAINDER if the real work already took a
+            # while on its own (e.g. a retry), never adds a full 7s on
+            # top of genuinely slow processing.
+            elapsed = time.time() - request_started_at
+            if elapsed < 7:
+                await asyncio.sleep(7 - elapsed)
 
             try:
                 await wait_message.delete()

@@ -3815,6 +3815,50 @@ def is_first_time_user(user_id):
 # TP/SL monitor and the weekly performance report.
 # ============================================
 
+# SpiritFX Academy app sync - every scheduled signal is mirrored to the
+# SpiritFX backend so it shows in the app's Signals tab, and its TP/SL
+# outcome follows when it closes.
+# Requests are HMAC-signed with a shared secret. Both env vars must be
+# set on Railway; if either is missing this is a silent no-op.
+SPIRITFX_WEBHOOK_URL = os.getenv("SPIRITFX_WEBHOOK_URL")
+SPIRITFX_WEBHOOK_SECRET = os.getenv("SPIRITFX_WEBHOOK_SECRET")
+
+
+def notify_spiritfx(event, signal):
+    """
+    Sends one signed event ("signal.created" / "signal.closed") to the
+    SpiritFX backend. Runs in a background thread so a slow or
+    unreachable backend never delays channel posting or the TP/SL
+    monitor - failures are logged, never raised.
+    """
+    if not SPIRITFX_WEBHOOK_URL or not SPIRITFX_WEBHOOK_SECRET:
+        return
+
+    def _send():
+        body = json.dumps({"event": event, "signal": signal}, separators=(",", ":"))
+        timestamp = str(int(time.time()))
+        signature = hmac.new(
+            SPIRITFX_WEBHOOK_SECRET.encode(), f"{timestamp}.{body}".encode(), hashlib.sha256
+        ).hexdigest()
+        try:
+            response = requests.post(
+                SPIRITFX_WEBHOOK_URL,
+                data=body,
+                headers={
+                    "Content-Type": "application/json",
+                    "X-Nexora-Timestamp": timestamp,
+                    "X-Nexora-Signature": signature,
+                },
+                timeout=10,
+            )
+            if response.status_code != 200:
+                print(f"[SPIRITFX] {event} for signal {signal.get('id')} got {response.status_code}: {response.text}")
+        except Exception as e:
+            print(f"[SPIRITFX] {event} for signal {signal.get('id')} failed: {e}")
+
+    threading.Thread(target=_send, daemon=True).start()
+
+
 def log_signal(signal_data, source="scheduled"):
     try:
         url = f"{SUPABASE_URL}/rest/v1/signal_log"
@@ -3854,6 +3898,17 @@ def log_signal(signal_data, source="scheduled"):
                 f"[SIGNAL LOG] ✅ Logged {signal_data['pair_name']} "
                 f"{signal_data['direction']} (id={signal_id})"
             )
+            if signal_id:
+                notify_spiritfx("signal.created", {
+                    "id": signal_id,
+                    "pair_name": payload["pair_name"],
+                    "direction": payload["direction"],
+                    "entry_price": payload["entry_price"],
+                    "stop_loss": payload["stop_loss"],
+                    "take_profit": payload["take_profit"],
+                    "posted_at": payload["posted_at"],
+                    "source": source,
+                })
             return signal_id
         else:
             print(
@@ -4119,7 +4174,7 @@ def has_open_signal_for_pair(pair_name):
         # smaller than missing scheduled signals indefinitely.
         return False
 
-def update_signal_status(signal_id, status):
+def update_signal_status(signal_id, status, source=None):
     try:
         url = f"{SUPABASE_URL}/rest/v1/signal_log?id=eq.{signal_id}"
         payload = {
@@ -4129,6 +4184,10 @@ def update_signal_status(signal_id, status):
         response = requests.patch(url, headers=sb_headers(), json=payload, timeout=10)
         if response.status_code in (200, 204):
             print(f"[SIGNAL LOG] ✅ Signal {signal_id} -> {status}")
+            # Only scheduled signals were ever mirrored to SpiritFX (see
+            # log_signal), so only those have an outcome to sync there.
+            if source == "scheduled":
+                notify_spiritfx("signal.closed", {"id": signal_id, "status": status})
             return True
         else:
             print(
@@ -23719,7 +23778,7 @@ async def check_open_signals(context: ContextTypes.DEFAULT_TYPE):
             outcome, profit = await get_mt5_trade_outcome(mt5_order_id)
             if outcome == "CLOSED":
                 status = "TP_HIT" if profit >= 0 else "SL_HIT"
-                update_signal_status(sig["id"], status)
+                update_signal_status(sig["id"], status, sig.get("source"))
             # outcome == "OPEN" -> still running, nothing to do
             # outcome is None -> lookup failed, retry next sweep
             continue
@@ -23746,14 +23805,14 @@ async def check_open_signals(context: ContextTypes.DEFAULT_TYPE):
 
         if direction == "BUY":
             if current_price >= take_profit:
-                update_signal_status(sig["id"], "TP_HIT")
+                update_signal_status(sig["id"], "TP_HIT", sig.get("source"))
             elif current_price <= stop_loss:
-                update_signal_status(sig["id"], "SL_HIT")
+                update_signal_status(sig["id"], "SL_HIT", sig.get("source"))
         else:
             if current_price <= take_profit:
-                update_signal_status(sig["id"], "TP_HIT")
+                update_signal_status(sig["id"], "TP_HIT", sig.get("source"))
             elif current_price >= stop_loss:
-                update_signal_status(sig["id"], "SL_HIT")
+                update_signal_status(sig["id"], "SL_HIT", sig.get("source"))
 
 
 # ============================================

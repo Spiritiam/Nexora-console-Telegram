@@ -14538,6 +14538,31 @@ def generate_signal_chart(display_name, strategy_name, direction, candles, entry
             print(f"[CHART] {display_name}/{strategy_name}: no usable candles ({len(candles) if candles else 0} given), falling back to static image")
             return False
 
+        # FIX: CONFIRMED REAL BUG, reproduced exactly from a live
+        # report and a direct side-by-side test - a real 8AM XAUUSD
+        # chart showed the Entry/SL/TP lines correctly, but zero
+        # visible candlesticks anywhere. Traced to the actual cause:
+        # every candle in that list had open=high=low=close, all
+        # identical (degenerate/flat data, not empty - which is why
+        # it never crashed or hit the check above). With zero real
+        # price range, every candle body and wick collapses to zero
+        # height, rendering nothing - confirmed by reproducing this
+        # exact scenario directly and getting back the identical
+        # broken-looking chart. The true upstream cause of flat data
+        # reaching here wasn't conclusively pinned down, so this
+        # checks for the SYMPTOM directly and falls back the same way
+        # the "not enough candles" case above already does, rather
+        # than silently shipping a chart with an invisible candle
+        # series regardless of what produces one in the future.
+        real_highs = [c["high"] for c in candles]
+        real_lows = [c["low"] for c in candles]
+        real_range = max(real_highs) - min(real_lows)
+        reference_price = candles[-1]["close"] or entry or 1
+        if reference_price and (real_range / abs(reference_price)) < 0.0001:
+            print(f"[CHART] {display_name}/{strategy_name}: candle data is flat/degenerate "
+                  f"(range {real_range} across {len(candles)} candles) - falling back to static image")
+            return False
+
         needs_subpanel = strategy_name in ("RSI Extreme Reversal", "Bollinger+RSI Mean Reversion", "Momentum (MACD)")
         closes = [c["close"] for c in candles]
 

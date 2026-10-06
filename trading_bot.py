@@ -23503,6 +23503,9 @@ async def _exness_call_backoff(fn, *args):
         r, err = await asyncio.to_thread(fn, *args)
         if r is None:
             return None, err
+        if r.status_code in (502, 503, 504) and attempt < 2:
+            await asyncio.sleep(2 * (attempt + 1))
+            continue
         if r.status_code == 429 and attempt < 4:
             try:
                 wait = min(30, float(r.headers.get("Retry-After", 2 * (attempt + 1))))
@@ -23515,13 +23518,13 @@ async def _exness_call_backoff(fn, *args):
 
 
 async def _fetch_exness_last_trades():
-    """Pulls the whole accounts report (paginated) and returns
-    ({client_account: last_trade_date_or_None}, {client_uid: [accounts]}),
-    or (None, error_text)."""
+    """Pulls the whole accounts report (paginated by what the server
+    actually returns, not by the requested page size) and returns
+    ((by_account, by_uid, stats), None) or (None, error_text)."""
     by_account = {}
     by_uid = {}
-    offset, limit = 0, 500
-    while True:
+    offset, limit, total, rows_read, pages = 0, 500, 0, 0, 0
+    while pages < 400:
         r, err = await _exness_call_backoff(
             _exness_get_sync, "/api/reports/clients/accounts/",
             {"limit": limit, "offset": offset})
@@ -23536,6 +23539,7 @@ async def _fetch_exness_last_trades():
         rows = body.get("data") if isinstance(body, dict) else None
         if rows is None:
             return None, "accounts report had no data field"
+        pages += 1
         for row in rows:
             acct = str(row.get("client_account") or "")
             lt = str(row.get("client_account_last_trade") or "")[:10] or None
@@ -23544,12 +23548,16 @@ async def _fetch_exness_last_trades():
             uid = str(row.get("client_uid") or "")
             if uid and acct:
                 by_uid.setdefault(uid, []).append(acct)
+        rows_read += len(rows)
         total = (body.get("meta") or {}).get("count", 0) if isinstance(body, dict) else 0
-        offset += limit
-        if not rows or offset >= (total or 0):
+        if not rows:
+            break
+        offset += len(rows)          # advance by what we really got
+        if total and offset >= total:
             break
         await asyncio.sleep(0.3)
-    return (by_account, by_uid), None
+    stats = {"rows": rows_read, "total": total, "clients": len(by_uid), "pages": pages}
+    return (by_account, by_uid, stats), None
 
 
 def _all_verified_users_sync():
@@ -23582,15 +23590,15 @@ async def run_inactive_report(bot, admin_chat_id, days):
             await bot.send_message(chat_id=admin_chat_id,
                                    text=f"⚠️ Report stopped: couldn't read Exness accounts report ({err}).")
             return
-        by_account, by_uid = report
+        by_account, by_uid, rstats = report
         cutoff = (datetime.utcnow() - timedelta(days=days)).strftime("%Y-%m-%d")
         sem = asyncio.Semaphore(2)
         results = []
 
         async def one(u):
             email = (u.get("email") or "").strip().lower()
-            if "@" not in email:
-                return (u, "unknown", "no valid email on record", None)
+            if "@" not in email or " " in email or email == "unknown":
+                return (u, "bad_email", "no valid email on record", None)
             async with sem:
                 r, e = await _exness_call_backoff(
                     _exness_post_sync, EXNESS_AFFILIATION_PATH, {"email": email})
@@ -23599,6 +23607,8 @@ async def run_inactive_report(bot, admin_chat_id, days):
                 return (u, "unknown", e or "request failed", None)
             if r.status_code == 404:
                 return (u, "not_affiliated", "not under your partner account", None)
+            if r.status_code == 400:
+                return (u, "bad_email", "Exness rejected the saved email as invalid", None)
             if r.status_code != 200:
                 return (u, "unknown", f"HTTP {r.status_code}", None)
             try:
@@ -23612,7 +23622,7 @@ async def run_inactive_report(bot, admin_chat_id, days):
             accts |= set(by_uid.get(uid, []))
             dates = [by_account[a] for a in accts if by_account.get(a)]
             if not accts or not any(a in by_account for a in accts):
-                return (u, "unknown", "accounts not found in Exness report", None)
+                return (u, "no_rows", "under you, but no rows in Exness accounts report", None)
             last = max(dates) if dates else None
             if last is None:
                 return (u, "never_traded", "no trade on any account", None)
@@ -23624,9 +23634,11 @@ async def run_inactive_report(bot, admin_chat_id, days):
         buckets = {}
         for u, cat, detail, last in results:
             buckets.setdefault(cat, []).append((u, detail))
-        order = ["inactive", "never_traded", "not_affiliated", "unknown", "active"]
+        order = ["inactive", "never_traded", "no_rows", "not_affiliated", "bad_email", "unknown", "active"]
         lines = [f"Inactive-client report - window {days} days - {datetime.utcnow():%Y-%m-%d %H:%M} UTC",
-                 f"Total verified users checked: {len(users)}", ""]
+                 f"Total verified users checked: {len(users)}",
+                 f"Exness accounts report: {rstats['rows']} account rows read (server total {rstats['total']}), {rstats['clients']} clients, {rstats['pages']} pages",
+                 ""]
         for cat in order:
             lines.append(f"{cat.upper().replace('_',' ')}: {len(buckets.get(cat, []))}")
         lines.append("")
@@ -23642,8 +23654,11 @@ async def run_inactive_report(bot, admin_chat_id, days):
             f"🟢 Active: <b>{len(buckets.get('active', []))}</b>\n"
             f"🟡 Inactive (last trade older than {days}d): <b>{len(buckets.get('inactive', []))}</b>\n"
             f"🔴 Never traded: <b>{len(buckets.get('never_traded', []))}</b>\n"
+            f"🟠 Under you but no rows in Exness report: <b>{len(buckets.get('no_rows', []))}</b>\n"
             f"⚪ No longer under your partner account: <b>{len(buckets.get('not_affiliated', []))}</b>\n"
-            f"❔ Couldn't check: <b>{len(buckets.get('unknown', []))}</b>\n\n"
+            f"✉️ Bad/missing email on record: <b>{len(buckets.get('bad_email', []))}</b>\n"
+            f"❔ Couldn't check (errors): <b>{len(buckets.get('unknown', []))}</b>\n\n"
+            f"📑 Exness report rows read: {rstats['rows']} of {rstats['total']} ({rstats['clients']} clients)\n\n"
             f"<i>Read-only - nobody was changed. Full list attached.</i>")
         await bot.send_message(chat_id=admin_chat_id, text=summary, parse_mode=ParseMode.HTML)
         buf = io.BytesIO("\n".join(lines).encode("utf-8"))

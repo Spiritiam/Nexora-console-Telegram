@@ -23275,11 +23275,7 @@ async def deliver_rejection(bot, target_id):
 from html import escape as _esc
 
 EXNESS_API_BASE = "https://my.exnessaffiliates.com"
-EXNESS_ALLOCATION_PATH = "/api/affiliate/partner/allocation"
-# JSON template for the allocation query; {email} is substituted.
-# Overridable via EXNESS_ALLOC_PARAMS once /exnesstest shows which
-# parameter names the endpoint really takes.
-EXNESS_DEFAULT_ALLOC_PARAMS = {"value": "{email}", "type": "email"}
+EXNESS_AFFILIATION_PATH = "/api/partner/affiliation/"  # POST {"email": ...}
 
 _exness_token = {"jwt": None}
 _exness_lock = threading.Lock()
@@ -23325,8 +23321,8 @@ def _exness_login_sync():
     return token, None
 
 
-def _exness_get_sync(path, params):
-    """GET with JWT; logs in on demand and once more on a 401.
+def _exness_post_sync(path, payload):
+    """POST JSON with the JWT; logs in on demand and once more on a 401.
     Returns (response_or_None, error_text)."""
     for attempt in range(2):
         with _exness_lock:
@@ -23337,9 +23333,9 @@ def _exness_get_sync(path, params):
                 _exness_token["jwt"] = tok
             tok = _exness_token["jwt"]
         try:
-            r = requests.get(
+            r = requests.post(
                 f"{EXNESS_API_BASE}{path}",
-                params=params,
+                json=payload,
                 headers={"Authorization": f"JWT {tok}"},
                 timeout=20,
             )
@@ -23353,38 +23349,25 @@ def _exness_get_sync(path, params):
     return None, "unauthorized after re-login"
 
 
-def _exness_alloc_params(email):
-    tpl = EXNESS_DEFAULT_ALLOC_PARAMS
-    raw = os.getenv("EXNESS_ALLOC_PARAMS")
-    if raw:
-        try:
-            tpl = json.loads(raw)
-        except Exception:
-            pass
-    return {k: (v.replace("{email}", email) if isinstance(v, str) else v) for k, v in tpl.items()}
-
-
 def classify_exness_allocation(status, body):
-    """('approved'|'declined'|'unknown', detail). Deliberately
-    conservative: only a clear match approves and only a clear
-    'not found' declines. Anything odd stays for the admin."""
+    """('approved'|'declined'|'unknown', detail) for the response of
+    POST /api/partner/affiliation/ ({affiliation: bool, accounts: [...],
+    client_uid}). Deliberately conservative: only affiliation == True
+    approves and only affiliation == False (or a clear 404) declines;
+    anything else stays for the admin."""
     if status == 404:
         return "declined", "no client found for this email under your partner account"
     if status != 200:
         return "unknown", f"Exness API HTTP {status}"
-    if isinstance(body, list):
-        body = body[0] if body else {}
-    if not isinstance(body, dict):
+    if not isinstance(body, dict) or "affiliation" not in body:
         return "unknown", "unexpected response shape"
-    if body.get("code") and body.get("message") and not body.get("client_uid"):
-        return "unknown", f"API error: {str(body.get('code'))[:40]}"
-    uid = body.get("client_uid")
-    if uid:
-        st = str(body.get("client_status") or "n/a")
-        return "approved", f"client {str(uid)[:12]} · status {st[:30]}"
-    if not body:
-        return "declined", "no client found for this email under your partner account"
-    return "unknown", "response had no client_uid"
+    if body.get("affiliation") is True:
+        n = len(body.get("accounts") or [])
+        uid = str(body.get("client_uid") or "n/a")[:12]
+        return "approved", f"client {uid} · {n} account(s) under you"
+    if body.get("affiliation") is False:
+        return "declined", "this email is not a client under your partner account"
+    return "unknown", "affiliation value unclear"
 
 
 async def exness_check_email(email):
@@ -23396,7 +23379,7 @@ async def exness_check_email(email):
     async with _exness_sem:
         for attempt in range(4):
             r, err = await asyncio.to_thread(
-                _exness_get_sync, EXNESS_ALLOCATION_PATH, _exness_alloc_params(email)
+                _exness_post_sync, EXNESS_AFFILIATION_PATH, {"email": email}
             )
             if r is None:
                 return "unknown", err or "request failed"
@@ -23497,22 +23480,19 @@ async def exnesstest_command(update: Update, context: ContextTypes.DEFAULT_TYPE)
             _exness_token["jwt"] = tok
         email = (context.args[0].strip().lower() if context.args else "")
         if email:
-            variants = [_exness_alloc_params(email), {"value": email}]
-            for _t in ("email", "account", "client_uid", "uid", "login",
-                       "trading_account", "client_account", "mt5", "id"):
-                variants.append({"value": email, "type": _t})
-            for params in variants:
-                r, e2 = await asyncio.to_thread(_exness_get_sync, EXNESS_ALLOCATION_PATH, params)
-                keys = ",".join(f"{k}={params[k]}" if k == "type" else k for k in params)
-                if r is None:
-                    lines.append(f"params[{keys}] -> {e2}")
-                    continue
-                snippet = (r.text or "")[:160].replace("\n", " ")
+            r, e2 = await asyncio.to_thread(
+                _exness_post_sync, EXNESS_AFFILIATION_PATH, {"email": email})
+            if r is None:
+                lines.append(f"Check failed: {e2}")
+            else:
                 try:
-                    verdict = classify_exness_allocation(r.status_code, r.json())
+                    body = r.json()
                 except Exception:
-                    verdict = ("unknown", "non-JSON")
-                lines.append(f"params[{keys}] -> HTTP {r.status_code} -> {verdict[0]} | {snippet}")
+                    body = None
+                verdict, detail = classify_exness_allocation(r.status_code, body)
+                lines.append(f"HTTP {r.status_code} -> {verdict.upper()} ({detail})")
+                if isinstance(body, dict):
+                    lines.append("fields: " + ", ".join(sorted(body.keys())))
         else:
             lines.append("Add an email: /exnesstest someone@example.com")
     await update.message.reply_text("\n".join(lines)[:3900])

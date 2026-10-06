@@ -23461,6 +23461,222 @@ async def auto_verify_request(bot, user_id, email, group_msg, username):
         print(f"[AUTOVERIFY] error for {user_id}: {type(e).__name__}: {e}")
 
 
+# ============================================
+# INACTIVE-CLIENT REPORT (REPORT ONLY - changes nothing)
+# ============================================
+# /inactivereport [days]  (admin only, default 30 days)
+# For every verified user: asks Exness (affiliation-by-email) which
+# client + accounts they are, then compares against Exness's accounts
+# report (client_account_last_trade) to find who hasn't traded in N
+# days. Strictly read-only: nobody is un-verified, messaged or touched.
+# It only DMs the admin a summary + a full list file.
+
+def _exness_get_sync(path, params):
+    """GET with JWT (same login/401-retry logic as the POST helper)."""
+    for attempt in range(2):
+        with _exness_lock:
+            if not _exness_token["jwt"]:
+                tok, err = _exness_login_sync()
+                if not tok:
+                    return None, err
+                _exness_token["jwt"] = tok
+            tok = _exness_token["jwt"]
+        try:
+            r = requests.get(
+                f"{EXNESS_API_BASE}{path}", params=params,
+                headers={"Authorization": f"JWT {tok}"}, timeout=30,
+            )
+        except Exception as e:
+            return None, f"request failed: {type(e).__name__}"
+        if r.status_code == 401 and attempt == 0:
+            with _exness_lock:
+                _exness_token["jwt"] = None
+            continue
+        return r, None
+    return None, "unauthorized after re-login"
+
+
+async def _exness_call_backoff(fn, *args):
+    """Run a sync Exness call in a thread with 429 backoff.
+    Returns (response_or_None, error_text)."""
+    for attempt in range(5):
+        r, err = await asyncio.to_thread(fn, *args)
+        if r is None:
+            return None, err
+        if r.status_code == 429 and attempt < 4:
+            try:
+                wait = min(30, float(r.headers.get("Retry-After", 2 * (attempt + 1))))
+            except Exception:
+                wait = 2 * (attempt + 1)
+            await asyncio.sleep(wait)
+            continue
+        return r, None
+    return None, "throttled by Exness API"
+
+
+async def _fetch_exness_last_trades():
+    """Pulls the whole accounts report (paginated) and returns
+    ({client_account: last_trade_date_or_None}, {client_uid: [accounts]}),
+    or (None, error_text)."""
+    by_account = {}
+    by_uid = {}
+    offset, limit = 0, 500
+    while True:
+        r, err = await _exness_call_backoff(
+            _exness_get_sync, "/api/reports/clients/accounts/",
+            {"limit": limit, "offset": offset})
+        if r is None:
+            return None, err
+        if r.status_code != 200:
+            return None, f"accounts report HTTP {r.status_code}"
+        try:
+            body = r.json()
+        except Exception:
+            return None, "accounts report was not JSON"
+        rows = body.get("data") if isinstance(body, dict) else None
+        if rows is None:
+            return None, "accounts report had no data field"
+        for row in rows:
+            acct = str(row.get("client_account") or "")
+            lt = str(row.get("client_account_last_trade") or "")[:10] or None
+            if acct:
+                by_account[acct] = lt
+            uid = str(row.get("client_uid") or "")
+            if uid and acct:
+                by_uid.setdefault(uid, []).append(acct)
+        total = (body.get("meta") or {}).get("count", 0) if isinstance(body, dict) else 0
+        offset += limit
+        if not rows or offset >= (total or 0):
+            break
+        await asyncio.sleep(0.3)
+    return (by_account, by_uid), None
+
+
+def _all_verified_users_sync():
+    users, offset = [], 0
+    while True:
+        r = requests.get(
+            f"{SUPABASE_URL}/rest/v1/verified_users"
+            f"?select=user_id,email,verified_at&order=verified_at.asc"
+            f"&limit=1000&offset={offset}",
+            headers=sb_headers(), timeout=20)
+        if r.status_code != 200:
+            raise RuntimeError(f"verified_users HTTP {r.status_code}")
+        batch = r.json()
+        users += batch
+        if len(batch) < 1000:
+            return users
+        offset += 1000
+
+
+async def run_inactive_report(bot, admin_chat_id, days):
+    try:
+        users = await asyncio.to_thread(_all_verified_users_sync)
+        await bot.send_message(
+            chat_id=admin_chat_id,
+            text=(f"🔎 Inactive-client report started: {len(users)} verified users, "
+                  f"window {days} days. Read-only - nobody will be changed. "
+                  f"I'll message you when it's done."))
+        report, err = await _fetch_exness_last_trades()
+        if report is None:
+            await bot.send_message(chat_id=admin_chat_id,
+                                   text=f"⚠️ Report stopped: couldn't read Exness accounts report ({err}).")
+            return
+        by_account, by_uid = report
+        cutoff = (datetime.utcnow() - timedelta(days=days)).strftime("%Y-%m-%d")
+        sem = asyncio.Semaphore(2)
+        results = []
+
+        async def one(u):
+            email = (u.get("email") or "").strip().lower()
+            if "@" not in email:
+                return (u, "unknown", "no valid email on record", None)
+            async with sem:
+                r, e = await _exness_call_backoff(
+                    _exness_post_sync, EXNESS_AFFILIATION_PATH, {"email": email})
+                await asyncio.sleep(0.3)
+            if r is None:
+                return (u, "unknown", e or "request failed", None)
+            if r.status_code == 404:
+                return (u, "not_affiliated", "not under your partner account", None)
+            if r.status_code != 200:
+                return (u, "unknown", f"HTTP {r.status_code}", None)
+            try:
+                body = r.json()
+            except Exception:
+                return (u, "unknown", "bad response", None)
+            if body.get("affiliation") is not True:
+                return (u, "not_affiliated", "not under your partner account", None)
+            accts = {str(a) for a in (body.get("accounts") or [])}
+            uid = str(body.get("client_uid") or "")
+            accts |= set(by_uid.get(uid, []))
+            dates = [by_account[a] for a in accts if by_account.get(a)]
+            if not accts or not any(a in by_account for a in accts):
+                return (u, "unknown", "accounts not found in Exness report", None)
+            last = max(dates) if dates else None
+            if last is None:
+                return (u, "never_traded", "no trade on any account", None)
+            if last < cutoff:
+                return (u, "inactive", f"last trade {last}", last)
+            return (u, "active", f"last trade {last}", last)
+
+        results = await asyncio.gather(*(one(u) for u in users))
+        buckets = {}
+        for u, cat, detail, last in results:
+            buckets.setdefault(cat, []).append((u, detail))
+        order = ["inactive", "never_traded", "not_affiliated", "unknown", "active"]
+        lines = [f"Inactive-client report - window {days} days - {datetime.utcnow():%Y-%m-%d %H:%M} UTC",
+                 f"Total verified users checked: {len(users)}", ""]
+        for cat in order:
+            lines.append(f"{cat.upper().replace('_',' ')}: {len(buckets.get(cat, []))}")
+        lines.append("")
+        for cat in order[:-1]:
+            if buckets.get(cat):
+                lines.append(f"=== {cat.upper().replace('_',' ')} ===")
+                for u, detail in buckets[cat]:
+                    lines.append(f"{u.get('user_id')} | {u.get('email')} | verified {str(u.get('verified_at'))[:10]} | {detail}")
+                lines.append("")
+        summary = (
+            f"✅ <b>Inactive-client report ready</b> ({days}-day window)\n\n"
+            f"👥 Checked: <b>{len(users)}</b>\n"
+            f"🟢 Active: <b>{len(buckets.get('active', []))}</b>\n"
+            f"🟡 Inactive (last trade older than {days}d): <b>{len(buckets.get('inactive', []))}</b>\n"
+            f"🔴 Never traded: <b>{len(buckets.get('never_traded', []))}</b>\n"
+            f"⚪ No longer under your partner account: <b>{len(buckets.get('not_affiliated', []))}</b>\n"
+            f"❔ Couldn't check: <b>{len(buckets.get('unknown', []))}</b>\n\n"
+            f"<i>Read-only - nobody was changed. Full list attached.</i>")
+        await bot.send_message(chat_id=admin_chat_id, text=summary, parse_mode=ParseMode.HTML)
+        buf = io.BytesIO("\n".join(lines).encode("utf-8"))
+        buf.name = f"inactive_report_{datetime.utcnow():%Y%m%d_%H%M}.txt"
+        await bot.send_document(chat_id=admin_chat_id, document=buf)
+    except Exception as e:
+        print(f"[INACTIVE REPORT] error: {type(e).__name__}: {e}")
+        try:
+            await bot.send_message(chat_id=admin_chat_id,
+                                   text=f"⚠️ Inactive-client report failed: {type(e).__name__}")
+        except Exception:
+            pass
+
+
+async def inactivereport_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = str(update.message.from_user.id)
+    if not ADMIN_USER_ID or user_id != str(ADMIN_USER_ID):
+        return
+    if not exness_creds_present():
+        await update.message.reply_text("Exness credentials aren't set in Railway.")
+        return
+    days = 30
+    if context.args:
+        try:
+            days = max(1, min(365, int(context.args[0])))
+        except ValueError:
+            pass
+    t = asyncio.create_task(run_inactive_report(context.bot, update.message.chat_id, days))
+    _auto_verify_tasks.add(t)
+    t.add_done_callback(_auto_verify_tasks.discard)
+    await update.message.reply_text("⏳ Starting the report - this can take a few minutes.")
+
+
 async def exnesstest_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Admin-only diagnostic: /exnesstest <email>. Logs in to the Exness
     partner API, runs the allocation check on that email and shows the
@@ -24995,6 +25211,7 @@ def main():
     app.add_handler(MessageHandler(filters.PHOTO, broadcast_photo_handler))
     app.add_handler(CommandHandler("mt5revenue", mt5revenue_command))
     app.add_handler(CommandHandler("exnesstest", exnesstest_command))
+    app.add_handler(CommandHandler("inactivereport", inactivereport_command))
     app.add_handler(CommandHandler("testsynth", testsynth_command))
     app.add_handler(CommandHandler("discoversymbols", discoversymbols_command))
     app.add_handler(CommandHandler("testsignal", testsignal_command))

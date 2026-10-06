@@ -23497,19 +23497,17 @@ async def exnesstest_command(update: Update, context: ContextTypes.DEFAULT_TYPE)
             _exness_token["jwt"] = tok
         email = (context.args[0].strip().lower() if context.args else "")
         if email:
-            variants = [
-                _exness_alloc_params(email),
-                {"value": email},
-                {"email": email},
-                {"client_email": email},
-            ]
+            variants = [_exness_alloc_params(email), {"value": email}]
+            for _t in ("email", "account", "client_uid", "uid", "login",
+                       "trading_account", "client_account", "mt5", "id"):
+                variants.append({"value": email, "type": _t})
             for params in variants:
                 r, e2 = await asyncio.to_thread(_exness_get_sync, EXNESS_ALLOCATION_PATH, params)
-                keys = ",".join(k for k in params)
+                keys = ",".join(f"{k}={params[k]}" if k == "type" else k for k in params)
                 if r is None:
                     lines.append(f"params[{keys}] -> {e2}")
                     continue
-                snippet = (r.text or "")[:300].replace("\n", " ")
+                snippet = (r.text or "")[:160].replace("\n", " ")
                 try:
                     verdict = classify_exness_allocation(r.status_code, r.json())
                 except Exception:

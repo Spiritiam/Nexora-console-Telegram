@@ -23398,6 +23398,36 @@ async def exness_check_email(email):
     return "unknown", "throttled by Exness API"
 
 
+async def _reverify_gate(user_id, email):
+    """For users who were moved back to unverified by the inactivity
+    cycle: they must show a trade within REVERIFY_TRADE_DAYS before the
+    automatic approval. Returns 'ok', 'needs_trade' or ('error', why)."""
+    notice = await asyncio.to_thread(_inact_notice_get_sync, str(user_id))
+    if not notice or not notice.get("removed_at"):
+        return "ok"
+    days = _inact_cfg()["reverify_days"]
+    r, err = await _exness_call_backoff(_exness_post_sync, EXNESS_AFFILIATION_PATH, {"email": email})
+    if r is None or r.status_code != 200:
+        return ("error", err or f"HTTP {getattr(r, 'status_code', '?')}")
+    try:
+        accts = [str(a) for a in (r.json().get("accounts") or [])]
+    except Exception:
+        return ("error", "bad response")
+    if not accts:
+        return "needs_trade"
+    cutoff = (datetime.utcnow() - timedelta(days=days)).strftime("%Y-%m-%d")
+    r2, err2 = await _exness_call_backoff(
+        _exness_get_sync, "/api/reports/clients/accounts/",
+        {"client_account": accts[:50], "client_account_last_trade_from": cutoff, "limit": 1})
+    if r2 is None or r2.status_code != 200:
+        return ("error", err2 or f"report HTTP {getattr(r2, 'status_code', '?')}")
+    try:
+        rows = r2.json().get("data")
+    except Exception:
+        return ("error", "bad report response")
+    return "ok" if rows else "needs_trade"
+
+
 async def auto_verify_request(bot, user_id, email, group_msg, username):
     """Runs after the request has been posted to the group. Decides it
     automatically (when enabled) and edits that same group message so
@@ -23432,6 +23462,35 @@ async def auto_verify_request(bot, user_id, email, group_msg, username):
                 print(f"[AUTOVERIFY] could not edit group message: {e}")
 
         if verdict == "approved":
+            gate_res = await _reverify_gate(user_id, email)
+            if isinstance(gate_res, tuple):
+                await _edit(
+                    "🔔 <b>NEW VERIFICATION REQUEST</b>\n\n" + head +
+                    f"⚠️ <i>Returning user - couldn't check recent trading ({_esc(str(gate_res[1]))}). "
+                    f"Please approve or reject manually:</i>",
+                    keep_buttons=True)
+                return
+            if gate_res == "needs_trade":
+                if user_id in pending_verifications:
+                    del pending_verifications[user_id]
+                days_rv = _inact_cfg()["reverify_days"]
+                try:
+                    await bot.send_message(
+                        chat_id=int(user_id), parse_mode=ParseMode.HTML,
+                        text=(
+                            "⏳ <b>Almost there!</b>\n\n"
+                            "We found your Exness account under our link, but to get your "
+                            f"verified access back we need to see a <b>trade in the last {days_rv} days</b>.\n\n"
+                            "Place a trade on your Exness account, wait up to 24 hours for it "
+                            "to show, then send your email here again and you'll be verified automatically. 🚀"))
+                except Exception as e:
+                    print(f"[AUTOVERIFY] could not message held user: {type(e).__name__}")
+                await _edit(
+                    "⏳ <b>AUTO-HELD - needs a recent trade</b>\n\n" + head +
+                    f"<i>Returning user (moved to unverified for inactivity). Account is under you "
+                    f"but no trade in the last {_inact_cfg()['reverify_days']} days. "
+                    f"User told to trade and resubmit · {now}</i>")
+                return
             ok = await deliver_approval(bot, user_id, email, require_saved=True)
             if not ok:
                 await _edit(
@@ -23439,6 +23498,7 @@ async def auto_verify_request(bot, user_id, email, group_msg, username):
                     f"<i>{_esc(detail)}. Database save failed - tap Approve to retry.</i>",
                     keep_buttons=True)
                 return
+            await asyncio.to_thread(_inact_notice_delete_sync, str(user_id))
             await _edit(
                 "✅ <b>AUTO-APPROVED</b>\n\n" + head +
                 f"<i>Matched your Exness partner account: {_esc(detail)}.\n"
@@ -23577,6 +23637,58 @@ def _all_verified_users_sync():
         offset += 1000
 
 
+async def classify_verified_users(users, days):
+    """Shared by the report and the inactivity cycle. Returns
+    (results, rstats, error). results = [(user, category, detail, last)]
+    with category in: active, inactive, never_traded, no_rows,
+    not_affiliated, bad_email, unknown."""
+    report, err = await _fetch_exness_last_trades()
+    if report is None:
+        return None, None, err
+    by_account, by_uid, rstats = report
+    cutoff = (datetime.utcnow() - timedelta(days=days)).strftime("%Y-%m-%d")
+    sem = asyncio.Semaphore(2)
+    results = []
+
+    async def one(u):
+        email = (u.get("email") or "").strip().lower()
+        if "@" not in email or " " in email or email == "unknown":
+            return (u, "bad_email", "no valid email on record", None)
+        async with sem:
+            r, e = await _exness_call_backoff(
+                _exness_post_sync, EXNESS_AFFILIATION_PATH, {"email": email})
+            await asyncio.sleep(0.3)
+        if r is None:
+            return (u, "unknown", e or "request failed", None)
+        if r.status_code == 404:
+            return (u, "not_affiliated", "not under your partner account", None)
+        if r.status_code == 400:
+            return (u, "bad_email", "Exness rejected the saved email as invalid", None)
+        if r.status_code != 200:
+            return (u, "unknown", f"HTTP {r.status_code}", None)
+        try:
+            body = r.json()
+        except Exception:
+            return (u, "unknown", "bad response", None)
+        if body.get("affiliation") is not True:
+            return (u, "not_affiliated", "not under your partner account", None)
+        accts = {str(a) for a in (body.get("accounts") or [])}
+        uid = str(body.get("client_uid") or "")
+        accts |= set(by_uid.get(uid, []))
+        dates = [by_account[a] for a in accts if by_account.get(a)]
+        if not accts or not any(a in by_account for a in accts):
+            return (u, "no_rows", "under you, but no rows in Exness accounts report", None)
+        last = max(dates) if dates else None
+        if last is None:
+            return (u, "never_traded", "no trade on any account", None)
+        if last < cutoff:
+            return (u, "inactive", f"last trade {last}", last)
+        return (u, "active", f"last trade {last}", last)
+
+    results = await asyncio.gather(*(one(u) for u in users))
+    return results, rstats, None
+
+
 async def run_inactive_report(bot, admin_chat_id, days):
     try:
         users = await asyncio.to_thread(_all_verified_users_sync)
@@ -23585,52 +23697,11 @@ async def run_inactive_report(bot, admin_chat_id, days):
             text=(f"🔎 Inactive-client report started: {len(users)} verified users, "
                   f"window {days} days. Read-only - nobody will be changed. "
                   f"I'll message you when it's done."))
-        report, err = await _fetch_exness_last_trades()
-        if report is None:
+        results, rstats, err = await classify_verified_users(users, days)
+        if results is None:
             await bot.send_message(chat_id=admin_chat_id,
                                    text=f"⚠️ Report stopped: couldn't read Exness accounts report ({err}).")
             return
-        by_account, by_uid, rstats = report
-        cutoff = (datetime.utcnow() - timedelta(days=days)).strftime("%Y-%m-%d")
-        sem = asyncio.Semaphore(2)
-        results = []
-
-        async def one(u):
-            email = (u.get("email") or "").strip().lower()
-            if "@" not in email or " " in email or email == "unknown":
-                return (u, "bad_email", "no valid email on record", None)
-            async with sem:
-                r, e = await _exness_call_backoff(
-                    _exness_post_sync, EXNESS_AFFILIATION_PATH, {"email": email})
-                await asyncio.sleep(0.3)
-            if r is None:
-                return (u, "unknown", e or "request failed", None)
-            if r.status_code == 404:
-                return (u, "not_affiliated", "not under your partner account", None)
-            if r.status_code == 400:
-                return (u, "bad_email", "Exness rejected the saved email as invalid", None)
-            if r.status_code != 200:
-                return (u, "unknown", f"HTTP {r.status_code}", None)
-            try:
-                body = r.json()
-            except Exception:
-                return (u, "unknown", "bad response", None)
-            if body.get("affiliation") is not True:
-                return (u, "not_affiliated", "not under your partner account", None)
-            accts = {str(a) for a in (body.get("accounts") or [])}
-            uid = str(body.get("client_uid") or "")
-            accts |= set(by_uid.get(uid, []))
-            dates = [by_account[a] for a in accts if by_account.get(a)]
-            if not accts or not any(a in by_account for a in accts):
-                return (u, "no_rows", "under you, but no rows in Exness accounts report", None)
-            last = max(dates) if dates else None
-            if last is None:
-                return (u, "never_traded", "no trade on any account", None)
-            if last < cutoff:
-                return (u, "inactive", f"last trade {last}", last)
-            return (u, "active", f"last trade {last}", last)
-
-        results = await asyncio.gather(*(one(u) for u in users))
         buckets = {}
         for u, cat, detail, last in results:
             buckets.setdefault(cat, []).append((u, detail))
@@ -23690,6 +23761,302 @@ async def inactivereport_command(update: Update, context: ContextTypes.DEFAULT_T
     _auto_verify_tasks.add(t)
     t.add_done_callback(_auto_verify_tasks.discard)
     await update.message.reply_text("⏳ Starting the report - this can take a few minutes.")
+
+
+# ============================================
+# INACTIVITY CYCLE: WARN -> (grace period) -> BACK TO UNVERIFIED
+# ============================================
+# Runs daily (08:00 UTC = 9AM Lagos) and via /inactivityrun [dry].
+#  1. Verified user with no Exness trading in INACTIVITY_DAYS (or no
+#     trading account / never traded), verified more than
+#     INACTIVITY_NEW_USER_GRACE_DAYS ago -> friendly WARNING, once.
+#  2. Still inactive INACTIVITY_GRACE_AFTER_WARNING_DAYS after the
+#     warning -> removed from verified (unverified) + told how to return.
+#  3. Traded in the meantime -> warning cleared silently.
+# Never touched: the admin, anyone with an Exness Auto-Trade account or
+# a payment on record, anyone Exness can't clearly classify (errors,
+# bad email, not-under-you stay manual). Aborts the whole run if the
+# Exness data looks unreliable. Everything is posted to the
+# verification group. Kill switch: INACTIVITY_ENFORCE=0.
+# Re-verification (removed users): the normal automatic check, PLUS a
+# trade within REVERIFY_TRADE_DAYS.
+
+def _inact_cfg():
+    def _i(name, default):
+        try:
+            return int(os.getenv(name, str(default)))
+        except ValueError:
+            return default
+    return {
+        "enabled": os.getenv("INACTIVITY_ENFORCE", "1").strip().lower() in ("1", "true", "yes", "on"),
+        "days": _i("INACTIVITY_DAYS", 30),
+        "new_grace": _i("INACTIVITY_NEW_USER_GRACE_DAYS", 14),
+        "warn_grace": _i("INACTIVITY_GRACE_AFTER_WARNING_DAYS", 7),
+        "reverify_days": _i("REVERIFY_TRADE_DAYS", 14),
+        "max_removals": _i("INACTIVITY_MAX_REMOVALS_PER_RUN", 120),
+    }
+
+
+def _parse_ts(v):
+    if not v:
+        return None
+    try:
+        return datetime.fromisoformat(str(v).replace("Z", "+00:00")).replace(tzinfo=None)
+    except Exception:
+        return None
+
+
+def _inact_notices_sync():
+    r = requests.get(f"{SUPABASE_URL}/rest/v1/inactivity_notices?select=*&limit=5000",
+                     headers=sb_headers(), timeout=20)
+    if r.status_code != 200:
+        raise RuntimeError(f"inactivity_notices HTTP {r.status_code}")
+    return {str(x["user_id"]): x for x in r.json()}
+
+
+def _inact_notice_get_sync(user_id):
+    try:
+        r = requests.get(
+            f"{SUPABASE_URL}/rest/v1/inactivity_notices?user_id=eq.{user_id}&select=*",
+            headers=sb_headers(), timeout=15)
+        if r.status_code == 200 and r.json():
+            return r.json()[0]
+    except Exception as e:
+        print(f"[INACTIVITY] notice get failed: {type(e).__name__}")
+    return None
+
+
+def _inact_notice_upsert_sync(user_id, **fields):
+    payload = {"user_id": str(user_id), "updated_at": datetime.utcnow().isoformat() + "Z", **fields}
+    r = requests.post(
+        f"{SUPABASE_URL}/rest/v1/inactivity_notices?on_conflict=user_id",
+        headers={**sb_headers(), "Prefer": "resolution=merge-duplicates"},
+        json=payload, timeout=15)
+    return r.status_code in (200, 201, 204)
+
+
+def _inact_notice_delete_sync(user_id):
+    r = requests.delete(f"{SUPABASE_URL}/rest/v1/inactivity_notices?user_id=eq.{user_id}",
+                        headers=sb_headers(), timeout=15)
+    return r.status_code in (200, 204)
+
+
+def _remove_verified_user_sync(user_id):
+    r = requests.delete(f"{SUPABASE_URL}/rest/v1/verified_users?user_id=eq.{user_id}",
+                        headers=sb_headers(), timeout=15)
+    return r.status_code in (200, 204)
+
+
+def _inact_exempt_ids_sync():
+    """Users who must never be touched: Exness Auto-Trade accounts and
+    anyone with a successful payment on record."""
+    ids = set()
+    for path in ("mt5_auto_trade_accounts?select=user_id",
+                 "korapay_transactions?status=eq.success&select=user_id",
+                 "nowpayments_transactions?processed=eq.true&select=user_id"):
+        r = requests.get(f"{SUPABASE_URL}/rest/v1/{path}&limit=10000",
+                         headers=sb_headers(), timeout=20)
+        if r.status_code != 200:
+            raise RuntimeError(f"exempt lookup HTTP {r.status_code}")
+        ids |= {str(x["user_id"]) for x in r.json()}
+    if ADMIN_USER_ID:
+        ids.add(str(ADMIN_USER_ID))
+    return ids
+
+
+def _inact_warning_text(cat, detail, deadline, days):
+    if cat == "inactive":
+        what = (f"Your Exness account linked to Nexora AI hasn't traded in the last "
+                f"<b>{days} days</b> ({_esc(detail)}).")
+    else:
+        what = ("We couldn't find any trading activity on the Exness account linked to "
+                "Nexora AI - either no trading account was created yet, or it has never traded.")
+    return (
+        "⚠️ <b>Action needed to keep your Nexora AI access</b>\n\n"
+        f"{what}\n\n"
+        "Nexora AI is built for active traders, and verified access is reserved "
+        "for traders who actually use their Exness account.\n\n"
+        "━━━━━━━━━━━━━━━━━━━━━\n"
+        "✅ <b>HOW TO KEEP YOUR ACCESS:</b>\n"
+        "━━━━━━━━━━━━━━━━━━━━━\n\n"
+        "1️⃣ Make sure you have a real <b>Exness trading account</b> "
+        f"(create one with our link if you haven't): {EXNESS_LINK}\n"
+        "2️⃣ Fund it and place a trade.\n\n"
+        f"⏳ <b>Do this by {deadline}.</b> If we don't see trading by then, your "
+        "account goes back to <b>unverified</b>.\n\n"
+        "<i>You can always get back in later: trade, then send your Exness email here to re-verify.</i>"
+    )
+
+
+def _inact_removed_text(reverify_days):
+    return (
+        "ℹ️ <b>Your Nexora AI account is now unverified</b>\n\n"
+        "We didn't see trading activity on your Exness account after our reminder, "
+        "so your verified access has been paused.\n\n"
+        "━━━━━━━━━━━━━━━━━━━━━\n"
+        "🔁 <b>HOW TO GET BACK IN:</b>\n"
+        "━━━━━━━━━━━━━━━━━━━━━\n\n"
+        "1️⃣ Make sure you have an Exness trading account created with our link: "
+        f"{EXNESS_LINK}\n"
+        f"2️⃣ Place a trade (we need to see a trade within the last {reverify_days} days - "
+        "it can take up to 24 hours to show).\n"
+        "3️⃣ Send your Exness email address here and you'll be verified automatically "
+        "with a fresh Inner Circle invite. 🚀"
+    )
+
+
+async def run_inactivity_cycle(bot, dry=False, report_chat_id=None):
+    cfg = _inact_cfg()
+    group = VERIFY_GROUP_ID
+
+    async def say(text, chat=None):
+        try:
+            await bot.send_message(chat_id=chat or group, text=text, parse_mode=ParseMode.HTML)
+        except Exception as e:
+            print(f"[INACTIVITY] could not post: {type(e).__name__}")
+
+    out_chat = report_chat_id if dry else group
+    if not cfg["enabled"] and not dry:
+        print("[INACTIVITY] disabled (INACTIVITY_ENFORCE=0)")
+        return
+    if not exness_creds_present():
+        await say("⚠️ Inactivity cycle skipped: Exness credentials not set.", out_chat)
+        return
+    try:
+        users = await asyncio.to_thread(_all_verified_users_sync)
+        notices = await asyncio.to_thread(_inact_notices_sync)
+        exempt = await asyncio.to_thread(_inact_exempt_ids_sync)
+        results, rstats, err = await classify_verified_users(users, cfg["days"])
+    except Exception as e:
+        await say(f"⚠️ Inactivity cycle skipped (setup failed: {type(e).__name__}).", out_chat)
+        return
+    if results is None:
+        await say(f"⚠️ Inactivity cycle skipped: couldn't read Exness data ({_esc(str(err))}).", out_chat)
+        return
+    # Safety: don't act on unreliable data.
+    bad = sum(1 for _, c, _, _ in results if c == "unknown")
+    if rstats["rows"] == 0 or (users and bad / max(1, len(users)) > 0.2):
+        await say(f"⚠️ Inactivity cycle skipped: Exness data looks unreliable "
+                  f"({rstats['rows']} report rows, {bad} unchecked users). Nobody was changed.", out_chat)
+        return
+
+    now = datetime.utcnow()
+    to_warn, to_remove, cleared, waiting, new_users = [], [], [], 0, 0
+    for u, cat, detail, last in results:
+        uid = str(u.get("user_id"))
+        if uid in exempt:
+            continue
+        n = notices.get(uid)
+        if cat == "active":
+            if n and n.get("warned_at") and not n.get("removed_at"):
+                cleared.append((u, detail))
+            continue
+        if cat not in ("inactive", "never_traded", "no_rows"):
+            continue
+        v_at = _parse_ts(u.get("verified_at"))
+        if v_at and (now - v_at).days < cfg["new_grace"]:
+            new_users += 1
+            continue
+        warned_at = _parse_ts(n.get("warned_at")) if n else None
+        if n and n.get("removed_at"):
+            continue
+        if not warned_at:
+            to_warn.append((u, cat, detail))
+        elif (now - warned_at).days >= cfg["warn_grace"]:
+            to_remove.append((u, cat, detail))
+        else:
+            waiting += 1
+
+    skipped_removals = False
+    if len(to_remove) > cfg["max_removals"]:
+        skipped_removals = True
+        to_remove_run = []
+    else:
+        to_remove_run = to_remove
+
+    undeliverable = 0
+    warned_n = removed_n = 0
+    if not dry:
+        deadline = (now + timedelta(days=cfg["warn_grace"])).strftime("%d %b %Y")
+        for u, cat, detail in to_warn:
+            uid = str(u.get("user_id"))
+            ok = True
+            try:
+                await bot.send_message(chat_id=int(uid), parse_mode=ParseMode.HTML,
+                                       text=_inact_warning_text(cat, detail, deadline, cfg["days"]))
+            except Exception as e:
+                ok = False
+                undeliverable += 1
+                print(f"[INACTIVITY] warn undeliverable {uid}: {type(e).__name__}")
+            await asyncio.to_thread(
+                _inact_notice_upsert_sync, uid, email=u.get("email"),
+                warned_at=now.isoformat() + "Z", reason=cat, deliverable=ok)
+            warned_n += 1
+            await asyncio.sleep(0.2)
+        for u, cat, detail in to_remove_run:
+            uid = str(u.get("user_id"))
+            if not await asyncio.to_thread(_remove_verified_user_sync, uid):
+                continue
+            await asyncio.to_thread(_inact_notice_upsert_sync, uid, email=u.get("email"),
+                                    removed_at=now.isoformat() + "Z")
+            try:
+                await bot.send_message(chat_id=int(uid), parse_mode=ParseMode.HTML,
+                                       text=_inact_removed_text(cfg["reverify_days"]))
+            except Exception as e:
+                print(f"[INACTIVITY] removal notice undeliverable {uid}: {type(e).__name__}")
+            removed_n += 1
+            await asyncio.sleep(0.2)
+        for u, _detail in cleared:
+            await asyncio.to_thread(_inact_notice_delete_sync, str(u.get("user_id")))
+
+    title = "🧪 INACTIVITY CYCLE - DRY RUN (nothing sent or changed)" if dry else "🔔 INACTIVITY CYCLE"
+    lines = [
+        f"<b>{title}</b>",
+        f"Window {cfg['days']}d · new-user grace {cfg['new_grace']}d · warning grace {cfg['warn_grace']}d",
+        f"👥 Verified checked: {len(users)} · exempt (subscribers/admin): {len(exempt & {str(x.get('user_id')) for x in users})}",
+        f"⚠️ {'Would warn' if dry else 'Warned'}: <b>{len(to_warn) if dry else warned_n}</b>"
+        + (f" ({undeliverable} couldn't be messaged)" if undeliverable and not dry else ""),
+        f"🚫 {'Would move to unverified' if dry else 'Moved to unverified'}: <b>{len(to_remove) if dry else removed_n}</b>",
+        f"✅ Traded since warning (cleared): <b>{len(cleared)}</b>",
+        f"⏳ Still inside warning grace: {waiting} · new users skipped: {new_users}",
+    ]
+    if skipped_removals:
+        lines.append(f"🛑 {len(to_remove)} removals exceeded the safety cap ({cfg['max_removals']}) - "
+                     f"none were done. Review and run /inactivityrun after raising INACTIVITY_MAX_REMOVALS_PER_RUN.")
+    await say("\n".join(lines), out_chat)
+    listed = to_remove if dry else [x for x in to_remove_run]
+    if listed:
+        chunk = ["<b>Moved to unverified:</b>" if not dry else "<b>Would be moved to unverified:</b>"]
+        for u, cat, detail in listed:
+            chunk.append(f"• {_esc(str(u.get('email')))} ({u.get('user_id')}) - {_esc(detail)}")
+            if len(chunk) >= 40:
+                await say("\n".join(chunk), out_chat)
+                chunk = []
+        if chunk:
+            await say("\n".join(chunk), out_chat)
+    print(f"[INACTIVITY] done: warned={warned_n} removed={removed_n} cleared={len(cleared)} dry={dry}")
+
+
+async def inactivity_job(context: ContextTypes.DEFAULT_TYPE):
+    try:
+        await run_inactivity_cycle(context.bot)
+    except Exception as e:
+        print(f"[INACTIVITY] job error: {type(e).__name__}: {e}")
+
+
+async def inactivityrun_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Admin only. /inactivityrun dry  -> preview, nothing sent or changed.
+    /inactivityrun      -> run the real cycle now."""
+    user_id = str(update.message.from_user.id)
+    if not ADMIN_USER_ID or user_id != str(ADMIN_USER_ID):
+        return
+    dry = bool(context.args) and context.args[0].lower() == "dry"
+    await update.message.reply_text(
+        "⏳ Running a DRY RUN (nothing will be sent or changed)..." if dry
+        else "⏳ Running the inactivity cycle now...")
+    t = asyncio.create_task(run_inactivity_cycle(context.bot, dry=dry, report_chat_id=update.message.chat_id))
+    _auto_verify_tasks.add(t)
+    t.add_done_callback(_auto_verify_tasks.discard)
 
 
 async def exnesstest_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -25227,6 +25594,7 @@ def main():
     app.add_handler(CommandHandler("mt5revenue", mt5revenue_command))
     app.add_handler(CommandHandler("exnesstest", exnesstest_command))
     app.add_handler(CommandHandler("inactivereport", inactivereport_command))
+    app.add_handler(CommandHandler("inactivityrun", inactivityrun_command))
     app.add_handler(CommandHandler("testsynth", testsynth_command))
     app.add_handler(CommandHandler("discoversymbols", discoversymbols_command))
     app.add_handler(CommandHandler("testsignal", testsignal_command))
@@ -25314,6 +25682,13 @@ def main():
         name="morning_signal",
         days=EVERY_DAY,
         job_kwargs={"misfire_grace_time": 300}
+    )
+    job_queue.run_daily(
+        inactivity_job,
+        time=parse_time("08:00"),  # 9AM Lagos - warn / move inactive verified users back to unverified
+        name="inactivity_cycle",
+        days=EVERY_DAY,
+        job_kwargs={"misfire_grace_time": 600}
     )
     job_queue.run_daily(
         post_midday_signal,

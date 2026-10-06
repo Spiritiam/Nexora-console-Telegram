@@ -23382,7 +23382,7 @@ async def exness_check_email(email):
                 _exness_post_sync, EXNESS_AFFILIATION_PATH, {"email": email}
             )
             if r is None:
-                return "unknown", err or "request failed"
+                return "unknown", err or "request failed", []
             if r.status_code == 429 and attempt < 3:
                 try:
                     wait = min(30, float(r.headers.get("Retry-After", 2 * (attempt + 1))))
@@ -23394,8 +23394,12 @@ async def exness_check_email(email):
                 body = r.json()
             except Exception:
                 body = None
-            return classify_exness_allocation(r.status_code, body)
-    return "unknown", "throttled by Exness API"
+            verdict, detail = classify_exness_allocation(r.status_code, body)
+            accts = []
+            if isinstance(body, dict):
+                accts = [str(a) for a in (body.get("accounts") or [])]
+            return verdict, detail, accts
+    return "unknown", "throttled by Exness API", []
 
 
 async def _reverify_gate(user_id, email):
@@ -23428,12 +23432,22 @@ async def _reverify_gate(user_id, email):
     return "ok" if rows else "needs_trade"
 
 
+def _fmt_accounts_html(accounts):
+    """First account shown on its own line, any others listed after it."""
+    if not accounts:
+        return ""
+    out = f"🔢 <b>Account:</b> {_esc(accounts[0])}\n"
+    if len(accounts) > 1:
+        out += f"➕ <b>Other accounts:</b> {_esc(', '.join(accounts[1:]))}\n"
+    return out + "\n"
+
+
 async def auto_verify_request(bot, user_id, email, group_msg, username):
     """Runs after the request has been posted to the group. Decides it
     automatically (when enabled) and edits that same group message so
     the outcome stays visible for the admin to recheck."""
     try:
-        verdict, detail = await exness_check_email(email)
+        verdict, detail, accounts = await exness_check_email(email)
         # The request may have been handled by hand, or resubmitted with
         # another email, while the check was running - don't override.
         if pending_verifications.get(user_id) != email:
@@ -23486,7 +23500,7 @@ async def auto_verify_request(bot, user_id, email, group_msg, username):
                 except Exception as e:
                     print(f"[AUTOVERIFY] could not message held user: {type(e).__name__}")
                 await _edit(
-                    "⏳ <b>AUTO-HELD - needs a recent trade</b>\n\n" + head +
+                    "⏳ <b>AUTO-HELD - needs a recent trade</b>\n\n" + head + _fmt_accounts_html(accounts) +
                     f"<i>Returning user (moved to unverified for inactivity). Account is under you "
                     f"but no trade in the last {_inact_cfg()['reverify_days']} days. "
                     f"User told to trade and resubmit · {now}</i>")
@@ -23494,13 +23508,13 @@ async def auto_verify_request(bot, user_id, email, group_msg, username):
             ok = await deliver_approval(bot, user_id, email, require_saved=True)
             if not ok:
                 await _edit(
-                    "⚠️ <b>AUTO-CHECK PASSED, SAVE FAILED</b>\n\n" + head +
+                    "⚠️ <b>AUTO-CHECK PASSED, SAVE FAILED</b>\n\n" + head + _fmt_accounts_html(accounts) +
                     f"<i>{_esc(detail)}. Database save failed - tap Approve to retry.</i>",
                     keep_buttons=True)
                 return
             await asyncio.to_thread(_inact_notice_delete_sync, str(user_id))
             await _edit(
-                "✅ <b>AUTO-APPROVED</b>\n\n" + head +
+                "✅ <b>AUTO-APPROVED</b>\n\n" + head + _fmt_accounts_html(accounts) +
                 f"<i>Matched your Exness partner account: {_esc(detail)}.\n"
                 f"Verified, saved and Inner Circle invite sent · {now}</i>")
         elif verdict == "declined":
@@ -23883,7 +23897,8 @@ def _inact_warning_text(cat, detail, deadline, days):
         f"(create one with our link if you haven't): {EXNESS_LINK}\n"
         "2️⃣ Fund it and place a trade.\n\n"
         f"⏳ <b>Do this by {deadline}.</b> If we don't see trading by then, your "
-        "account goes back to <b>unverified</b>.\n\n"
+        "account goes back to <b>unverified</b> and you'll be removed from the "
+        "<b>Inner Circle</b> channel.\n\n"
         "<i>You can always get back in later: trade, then send your Exness email here to re-verify.</i>"
     )
 
@@ -23892,7 +23907,8 @@ def _inact_removed_text(reverify_days):
     return (
         "ℹ️ <b>Your Nexora AI account is now unverified</b>\n\n"
         "We didn't see trading activity on your Exness account after our reminder, "
-        "so your verified access has been paused.\n\n"
+        "so your verified access has been paused and you've been removed from the "
+        "<b>Inner Circle</b> channel.\n\n"
         "━━━━━━━━━━━━━━━━━━━━━\n"
         "🔁 <b>HOW TO GET BACK IN:</b>\n"
         "━━━━━━━━━━━━━━━━━━━━━\n\n"
@@ -23975,7 +23991,7 @@ async def run_inactivity_cycle(bot, dry=False, report_chat_id=None):
         to_remove_run = to_remove
 
     undeliverable = 0
-    warned_n = removed_n = 0
+    warned_n = removed_n = kicked_n = kick_failed = 0
     if not dry:
         deadline = (now + timedelta(days=cfg["warn_grace"])).strftime("%d %b %Y")
         for u, cat, detail in to_warn:
@@ -23999,6 +24015,15 @@ async def run_inactivity_cycle(bot, dry=False, report_chat_id=None):
                 continue
             await asyncio.to_thread(_inact_notice_upsert_sync, uid, email=u.get("email"),
                                     removed_at=now.isoformat() + "Z")
+            # Also take them out of the Inner Circle channel. Kick = ban +
+            # immediate unban, so they can rejoin later with a fresh invite.
+            try:
+                await bot.ban_chat_member(chat_id=CHANNEL_2_ID, user_id=int(uid))
+                await bot.unban_chat_member(chat_id=CHANNEL_2_ID, user_id=int(uid), only_if_banned=True)
+                kicked_n += 1
+            except Exception as e:
+                kick_failed += 1
+                print(f"[INACTIVITY] channel removal failed {uid}: {type(e).__name__}")
             try:
                 await bot.send_message(chat_id=int(uid), parse_mode=ParseMode.HTML,
                                        text=_inact_removed_text(cfg["reverify_days"]))
@@ -24016,7 +24041,8 @@ async def run_inactivity_cycle(bot, dry=False, report_chat_id=None):
         f"👥 Verified checked: {len(users)} · exempt (subscribers/admin): {len(exempt & {str(x.get('user_id')) for x in users})}",
         f"⚠️ {'Would warn' if dry else 'Warned'}: <b>{len(to_warn) if dry else warned_n}</b>"
         + (f" ({undeliverable} couldn't be messaged)" if undeliverable and not dry else ""),
-        f"🚫 {'Would move to unverified' if dry else 'Moved to unverified'}: <b>{len(to_remove) if dry else removed_n}</b>",
+        f"🚫 {'Would move to unverified + remove from Inner Circle' if dry else 'Moved to unverified'}: <b>{len(to_remove) if dry else removed_n}</b>"
+        + ("" if dry else f" · removed from Inner Circle: {kicked_n}" + (f" ({kick_failed} failed - not in channel or no permission)" if kick_failed else "")),
         f"✅ Traded since warning (cleared): <b>{len(cleared)}</b>",
         f"⏳ Still inside warning grace: {waiting} · new users skipped: {new_users}",
     ]

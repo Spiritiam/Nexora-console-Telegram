@@ -20638,99 +20638,7 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             )
             return
 
-        add_verified_user(target_id, email)
-
-        if target_id in pending_verifications:
-            del pending_verifications[target_id]
-
-        inner_circle_link = None
-        try:
-            invite = await context.bot.create_chat_invite_link(
-                chat_id=CHANNEL_2_ID,
-                member_limit=1,
-                name=f"Verified: {email}"
-            )
-            inner_circle_link = invite.invite_link
-            print(f"[INVITE] ✅ Created invite for {target_id}")
-        except Exception as e:
-            print(f"[INVITE] Could not create invite link: {e}")
-
-        try:
-            if inner_circle_link:
-                await context.bot.send_message(
-                    chat_id=int(target_id),
-                    text=(
-                        "🎉 <b>Congratulations! You're now a verified "
-                        "Nexora AI trader!</b>\n\n"
-                        "✅ <b>Full access unlocked!</b>\n\n"
-                        "You now have <b>unlimited access</b> to:\n\n"
-                        "📊 <b>Live Trading Signals</b> — Real-time "
-                        "signals on Gold, Bitcoin, Oil, Forex and more\n\n"
-                        "📰 <b>News-Driven Calls</b> — Direct BUY/SELL calls "
-                        "on any pair you ask about\n\n"
-                        "📈 <b>Technical Analysis</b> — Professional "
-                        "grade insights powered by AI\n\n"
-                        "🤖 <b>Exness Auto-Trade</b> — Subscribe to auto-trade "
-                        "directly on your own Exness MT5/MT4 account\n\n"
-                        "━━━━━━━━━━━━━━━━━━━━━\n"
-                        "🔐 <b>EXCLUSIVE — INNER CIRCLE ACCESS</b>\n"
-                        "━━━━━━━━━━━━━━━━━━━━━\n\n"
-                        "As a verified trader you now have access to our "
-                        "<b>exclusive Inner Circle channel</b> — premium "
-                        "signals and real-time alerts reserved only for "
-                        "verified Exness traders like you.\n\n"
-                        "👇 <b>Your personal invite link — "
-                        "works once, just for you:</b>"
-                    ),
-                    parse_mode=ParseMode.HTML,
-                    reply_markup=InlineKeyboardMarkup([
-                        [InlineKeyboardButton(
-                            "🔐 Join Inner Circle Now",
-                            url=inner_circle_link
-                        )]
-                    ])
-                )
-            else:
-                await context.bot.send_message(
-                    chat_id=int(target_id),
-                    text=(
-                        "🎉 <b>Congratulations! You're now a verified "
-                        "Nexora AI trader!</b>\n\n"
-                        "✅ <b>Full access unlocked!</b>\n\n"
-                        "You now have <b>unlimited access</b> to:\n\n"
-                        "📊 <b>Live Trading Signals</b> — Real-time "
-                        "signals on Gold, Bitcoin, Oil, Forex and more\n\n"
-                        "📰 <b>News-Driven Calls</b> — Direct BUY/SELL calls "
-                        "on any pair you ask about\n\n"
-                        "📈 <b>Technical Analysis</b> — Professional "
-                        "grade insights powered by AI\n\n"
-                        "🤖 <b>Exness Auto-Trade</b> — Subscribe to auto-trade "
-                        "directly on your own Exness MT5/MT4 account"
-                    ),
-                    parse_mode=ParseMode.HTML,
-                )
-
-            await context.bot.send_message(
-                chat_id=int(target_id),
-                text=(
-                    "━━━━━━━━━━━━━━━━━━━━━\n"
-                    "💼 <i>Welcome to the winning side. "
-                    "Let's get to work!</i> 🔥\n"
-                    "━━━━━━━━━━━━━━━━━━━━━\n\n"
-                    "👇 <b>TAP AN OPTION BELOW TO GET STARTED:</b>\n\n"
-                    "📊 <b>Signal</b> — Get a live trading signal\n\n"
-                    "📰 <b>News</b> — Get a direct call on high-impact news\n\n"
-                    "🔗 <b>Connect Deriv</b> — Link your Deriv account to trade "
-                    "signals directly, manually or fully automatic\n\n"
-                    "🤖 <b>Exness Auto-Trade</b> — Subscribe to auto-trade "
-                    "directly on your own Exness MT5/MT4 account"
-                ),
-                parse_mode=ParseMode.HTML,
-                reply_markup=main_keyboard
-            )
-
-        except Exception as e:
-            print(f"[APPROVE] Could not message user: {e}")
+        await deliver_approval(context.bot, target_id, email)
 
         await query.edit_message_text(
             text=(
@@ -20756,31 +20664,7 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if email and "@" in email and target_id in pending_verifications:
             del pending_verifications[target_id]
 
-        try:
-            await context.bot.send_message(
-                chat_id=int(target_id),
-                text=(
-                    "❌ <b>Verification Failed</b>\n\n"
-                    "Unfortunately, we could not find an Exness account "
-                    "linked to your email that was registered through "
-                    "our official link.\n\n"
-                    "<b>This could mean:</b>\n"
-                    "• You registered on Exness without using our link\n"
-                    "• You used a different email address\n\n"
-                    "━━━━━━━━━━━━━━━━━━━━━\n"
-                    "✅ <b>HOW TO FIX THIS:</b>\n"
-                    "━━━━━━━━━━━━━━━━━━━━━\n\n"
-                    "Click the link below to create a <b>NEW Exness "
-                    "account</b> using our official link. It's completely "
-                    "<b>FREE</b> and takes less than 2 minutes.\n\n"
-                    f"🔗 {EXNESS_LINK}\n\n"
-                    "Once done, come back here and type your new "
-                    "email address to get verified instantly. 🚀"
-                ),
-                parse_mode=ParseMode.HTML
-            )
-        except Exception as e:
-            print(f"[REJECT] Could not message user: {e}")
+        await deliver_rejection(context.bot, target_id)
 
         await query.edit_message_text(
             text=(
@@ -21599,7 +21483,7 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
 
         try:
-            await context.bot.send_message(
+            group_msg = await context.bot.send_message(
                 chat_id=VERIFY_GROUP_ID,
                 text=(
                     f"🔔 <b>NEW VERIFICATION REQUEST</b>\n\n"
@@ -21622,6 +21506,11 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     ]
                 ])
             )
+            if exness_auto_verify_enabled() and exness_creds_present():
+                _t = asyncio.create_task(
+                    auto_verify_request(context.bot, user_id, email, group_msg, username))
+                _auto_verify_tasks.add(_t)
+                _t.add_done_callback(_auto_verify_tasks.discard)
         except Exception as e:
             print(f"[VERIFY] Failed to send to group: {e}")
 
@@ -23237,6 +23126,400 @@ async def purgedigests_command(update: Update, context: ContextTypes.DEFAULT_TYP
         f"48h bot-delete window)."
     )
 
+async def deliver_approval(bot, target_id, email, require_saved=False):
+    """Shared by the manual Approve button AND the Exness auto-verifier:
+    saves the verified user, clears the pending row, creates the one-use
+    Inner Circle invite and messages the user. Returns True if saved."""
+    saved = add_verified_user(target_id, email)
+    if saved is False and require_saved:
+        # Auto-verifier path: never tell a user they're verified (or
+        # touch their pending row) if the database save failed.
+        return False
+
+    if target_id in pending_verifications:
+        del pending_verifications[target_id]
+
+    inner_circle_link = None
+    try:
+        invite = await bot.create_chat_invite_link(
+            chat_id=CHANNEL_2_ID,
+            member_limit=1,
+            name=f"Verified: {email}"
+        )
+        inner_circle_link = invite.invite_link
+        print(f"[INVITE] ✅ Created invite for {target_id}")
+    except Exception as e:
+        print(f"[INVITE] Could not create invite link: {e}")
+
+    try:
+        if inner_circle_link:
+            await bot.send_message(
+                chat_id=int(target_id),
+                text=(
+                    "🎉 <b>Congratulations! You're now a verified "
+                    "Nexora AI trader!</b>\n\n"
+                    "✅ <b>Full access unlocked!</b>\n\n"
+                    "You now have <b>unlimited access</b> to:\n\n"
+                    "📊 <b>Live Trading Signals</b> — Real-time "
+                    "signals on Gold, Bitcoin, Oil, Forex and more\n\n"
+                    "📰 <b>News-Driven Calls</b> — Direct BUY/SELL calls "
+                    "on any pair you ask about\n\n"
+                    "📈 <b>Technical Analysis</b> — Professional "
+                    "grade insights powered by AI\n\n"
+                    "🤖 <b>Exness Auto-Trade</b> — Subscribe to auto-trade "
+                    "directly on your own Exness MT5/MT4 account\n\n"
+                    "━━━━━━━━━━━━━━━━━━━━━\n"
+                    "🔐 <b>EXCLUSIVE — INNER CIRCLE ACCESS</b>\n"
+                    "━━━━━━━━━━━━━━━━━━━━━\n\n"
+                    "As a verified trader you now have access to our "
+                    "<b>exclusive Inner Circle channel</b> — premium "
+                    "signals and real-time alerts reserved only for "
+                    "verified Exness traders like you.\n\n"
+                    "👇 <b>Your personal invite link — "
+                    "works once, just for you:</b>"
+                ),
+                parse_mode=ParseMode.HTML,
+                reply_markup=InlineKeyboardMarkup([
+                    [InlineKeyboardButton(
+                        "🔐 Join Inner Circle Now",
+                        url=inner_circle_link
+                    )]
+                ])
+            )
+        else:
+            await bot.send_message(
+                chat_id=int(target_id),
+                text=(
+                    "🎉 <b>Congratulations! You're now a verified "
+                    "Nexora AI trader!</b>\n\n"
+                    "✅ <b>Full access unlocked!</b>\n\n"
+                    "You now have <b>unlimited access</b> to:\n\n"
+                    "📊 <b>Live Trading Signals</b> — Real-time "
+                    "signals on Gold, Bitcoin, Oil, Forex and more\n\n"
+                    "📰 <b>News-Driven Calls</b> — Direct BUY/SELL calls "
+                    "on any pair you ask about\n\n"
+                    "📈 <b>Technical Analysis</b> — Professional "
+                    "grade insights powered by AI\n\n"
+                    "🤖 <b>Exness Auto-Trade</b> — Subscribe to auto-trade "
+                    "directly on your own Exness MT5/MT4 account"
+                ),
+                parse_mode=ParseMode.HTML,
+            )
+
+        await bot.send_message(
+            chat_id=int(target_id),
+            text=(
+                "━━━━━━━━━━━━━━━━━━━━━\n"
+                "💼 <i>Welcome to the winning side. "
+                "Let's get to work!</i> 🔥\n"
+                "━━━━━━━━━━━━━━━━━━━━━\n\n"
+                "👇 <b>TAP AN OPTION BELOW TO GET STARTED:</b>\n\n"
+                "📊 <b>Signal</b> — Get a live trading signal\n\n"
+                "📰 <b>News</b> — Get a direct call on high-impact news\n\n"
+                "🔗 <b>Connect Deriv</b> — Link your Deriv account to trade "
+                "signals directly, manually or fully automatic\n\n"
+                "🤖 <b>Exness Auto-Trade</b> — Subscribe to auto-trade "
+                "directly on your own Exness MT5/MT4 account"
+            ),
+            parse_mode=ParseMode.HTML,
+            reply_markup=main_keyboard
+        )
+
+    except Exception as e:
+        print(f"[APPROVE] Could not message user: {e}")
+    return True
+
+
+async def deliver_rejection(bot, target_id):
+    """Shared by the manual Reject button AND the Exness auto-verifier."""
+    try:
+        await bot.send_message(
+            chat_id=int(target_id),
+            text=(
+                "❌ <b>Verification Failed</b>\n\n"
+                "Unfortunately, we could not find an Exness account "
+                "linked to your email that was registered through "
+                "our official link.\n\n"
+                "<b>This could mean:</b>\n"
+                "• You registered on Exness without using our link\n"
+                "• You used a different email address\n\n"
+                "━━━━━━━━━━━━━━━━━━━━━\n"
+                "✅ <b>HOW TO FIX THIS:</b>\n"
+                "━━━━━━━━━━━━━━━━━━━━━\n\n"
+                "Click the link below to create a <b>NEW Exness "
+                "account</b> using our official link. It's completely "
+                "<b>FREE</b> and takes less than 2 minutes.\n\n"
+                f"🔗 {EXNESS_LINK}\n\n"
+                "Once done, come back here and type your new "
+                "email address to get verified instantly. 🚀"
+            ),
+            parse_mode=ParseMode.HTML
+        )
+    except Exception as e:
+        print(f"[REJECT] Could not message user: {e}")
+
+
+# ============================================
+# EXNESS PARTNER API - AUTOMATIC VERIFICATION
+# ============================================
+# Checks a submitted email against the admin's own Exness partner
+# account (Partnership API, my.exnessaffiliates.com). Credentials come
+# ONLY from the Railway variables EXNESS_PARTNER_LOGIN and
+# EXNESS_PARTNER_PASSWORD - never logged, never sent to Telegram.
+#
+# Switched by EXNESS_AUTO_VERIFY=1 (default OFF = fully manual, exactly
+# as before). Every request is STILL posted to the verification group;
+# the auto-decision just edits that same message to show
+# AUTO-APPROVED / AUTO-DECLINED, and anything the check cannot decide
+# cleanly is left pending with the normal Approve/Reject buttons.
+from html import escape as _esc
+
+EXNESS_API_BASE = "https://my.exnessaffiliates.com"
+EXNESS_ALLOCATION_PATH = "/api/affiliate/partner/allocation"
+# JSON template for the allocation query; {email} is substituted.
+# Overridable via EXNESS_ALLOC_PARAMS once /exnesstest shows which
+# parameter names the endpoint really takes.
+EXNESS_DEFAULT_ALLOC_PARAMS = {"value": "{email}", "type": "email"}
+
+_exness_token = {"jwt": None}
+_exness_lock = threading.Lock()
+_exness_sem = None          # asyncio.Semaphore, created lazily on the loop
+_auto_verify_tasks = set()  # keep references so tasks aren't GC'd
+
+
+def exness_creds_present():
+    return bool(os.getenv("EXNESS_PARTNER_LOGIN")) and bool(os.getenv("EXNESS_PARTNER_PASSWORD"))
+
+
+def exness_auto_verify_enabled():
+    return os.getenv("EXNESS_AUTO_VERIFY", "0").strip().lower() in ("1", "true", "yes", "on")
+
+
+def _exness_login_sync():
+    """Returns (token, error_text). Never includes credentials."""
+    login = os.getenv("EXNESS_PARTNER_LOGIN")
+    password = os.getenv("EXNESS_PARTNER_PASSWORD")
+    if not login or not password:
+        return None, "EXNESS_PARTNER_LOGIN / EXNESS_PARTNER_PASSWORD not set"
+    try:
+        r = requests.post(
+            f"{EXNESS_API_BASE}/api/v2/auth/",
+            json={"login": login, "password": password},
+            timeout=20,
+        )
+    except Exception as e:
+        return None, f"login request failed: {type(e).__name__}"
+    if r.status_code != 200:
+        hint = ""
+        try:
+            hint = f" ({str(r.json().get('code') or '')[:60]})"
+        except Exception:
+            pass
+        return None, f"login HTTP {r.status_code}{hint}"
+    try:
+        token = r.json().get("token")
+    except Exception:
+        token = None
+    if not token:
+        return None, "login returned no token"
+    return token, None
+
+
+def _exness_get_sync(path, params):
+    """GET with JWT; logs in on demand and once more on a 401.
+    Returns (response_or_None, error_text)."""
+    for attempt in range(2):
+        with _exness_lock:
+            if not _exness_token["jwt"]:
+                tok, err = _exness_login_sync()
+                if not tok:
+                    return None, err
+                _exness_token["jwt"] = tok
+            tok = _exness_token["jwt"]
+        try:
+            r = requests.get(
+                f"{EXNESS_API_BASE}{path}",
+                params=params,
+                headers={"Authorization": f"JWT {tok}"},
+                timeout=20,
+            )
+        except Exception as e:
+            return None, f"request failed: {type(e).__name__}"
+        if r.status_code == 401 and attempt == 0:
+            with _exness_lock:
+                _exness_token["jwt"] = None
+            continue
+        return r, None
+    return None, "unauthorized after re-login"
+
+
+def _exness_alloc_params(email):
+    tpl = EXNESS_DEFAULT_ALLOC_PARAMS
+    raw = os.getenv("EXNESS_ALLOC_PARAMS")
+    if raw:
+        try:
+            tpl = json.loads(raw)
+        except Exception:
+            pass
+    return {k: (v.replace("{email}", email) if isinstance(v, str) else v) for k, v in tpl.items()}
+
+
+def classify_exness_allocation(status, body):
+    """('approved'|'declined'|'unknown', detail). Deliberately
+    conservative: only a clear match approves and only a clear
+    'not found' declines. Anything odd stays for the admin."""
+    if status == 404:
+        return "declined", "no client found for this email under your partner account"
+    if status != 200:
+        return "unknown", f"Exness API HTTP {status}"
+    if isinstance(body, list):
+        body = body[0] if body else {}
+    if not isinstance(body, dict):
+        return "unknown", "unexpected response shape"
+    if body.get("code") and body.get("message") and not body.get("client_uid"):
+        return "unknown", f"API error: {str(body.get('code'))[:40]}"
+    uid = body.get("client_uid")
+    if uid:
+        st = str(body.get("client_status") or "n/a")
+        return "approved", f"client {str(uid)[:12]} · status {st[:30]}"
+    if not body:
+        return "declined", "no client found for this email under your partner account"
+    return "unknown", "response had no client_uid"
+
+
+async def exness_check_email(email):
+    """Async wrapper with a concurrency cap and 429 backoff.
+    Returns (verdict, detail)."""
+    global _exness_sem
+    if _exness_sem is None:
+        _exness_sem = asyncio.Semaphore(2)
+    async with _exness_sem:
+        for attempt in range(4):
+            r, err = await asyncio.to_thread(
+                _exness_get_sync, EXNESS_ALLOCATION_PATH, _exness_alloc_params(email)
+            )
+            if r is None:
+                return "unknown", err or "request failed"
+            if r.status_code == 429 and attempt < 3:
+                try:
+                    wait = min(30, float(r.headers.get("Retry-After", 2 * (attempt + 1))))
+                except Exception:
+                    wait = 2 * (attempt + 1)
+                await asyncio.sleep(wait)
+                continue
+            try:
+                body = r.json()
+            except Exception:
+                body = None
+            return classify_exness_allocation(r.status_code, body)
+    return "unknown", "throttled by Exness API"
+
+
+async def auto_verify_request(bot, user_id, email, group_msg, username):
+    """Runs after the request has been posted to the group. Decides it
+    automatically (when enabled) and edits that same group message so
+    the outcome stays visible for the admin to recheck."""
+    try:
+        verdict, detail = await exness_check_email(email)
+        # The request may have been handled by hand, or resubmitted with
+        # another email, while the check was running - don't override.
+        if pending_verifications.get(user_id) != email:
+            print(f"[AUTOVERIFY] {user_id}: no longer pending, skipping")
+            return
+        now = datetime.utcnow().strftime("%Y-%m-%d %H:%M UTC")
+        head = (
+            f"👤 <b>User:</b> @{_esc(str(username))}\n"
+            f"🆔 <b>ID:</b> {user_id}\n"
+            f"📧 <b>Email:</b> {_esc(email)}\n\n"
+        )
+
+        async def _edit(text, keep_buttons=False):
+            kb = None
+            if keep_buttons:
+                kb = InlineKeyboardMarkup([[
+                    InlineKeyboardButton("✅ Approve", callback_data=f"approve_{user_id}"),
+                    InlineKeyboardButton("❌ Reject", callback_data=f"reject_{user_id}"),
+                ]])
+            try:
+                await bot.edit_message_text(
+                    chat_id=group_msg.chat_id, message_id=group_msg.message_id,
+                    text=text, parse_mode=ParseMode.HTML, reply_markup=kb,
+                )
+            except Exception as e:
+                print(f"[AUTOVERIFY] could not edit group message: {e}")
+
+        if verdict == "approved":
+            ok = await deliver_approval(bot, user_id, email, require_saved=True)
+            if not ok:
+                await _edit(
+                    "⚠️ <b>AUTO-CHECK PASSED, SAVE FAILED</b>\n\n" + head +
+                    f"<i>{_esc(detail)}. Database save failed - tap Approve to retry.</i>",
+                    keep_buttons=True)
+                return
+            await _edit(
+                "✅ <b>AUTO-APPROVED</b>\n\n" + head +
+                f"<i>Matched your Exness partner account: {_esc(detail)}.\n"
+                f"Verified, saved and Inner Circle invite sent · {now}</i>")
+        elif verdict == "declined":
+            if email and "@" in email and user_id in pending_verifications:
+                del pending_verifications[user_id]
+            await deliver_rejection(bot, user_id)
+            await _edit(
+                "❌ <b>AUTO-DECLINED</b>\n\n" + head +
+                f"<i>{_esc(detail)}.\nUser told to register via the official link · {now}</i>")
+        else:
+            print(f"[AUTOVERIFY] {user_id}: undecided ({detail})")
+            await _edit(
+                "🔔 <b>NEW VERIFICATION REQUEST</b>\n\n" + head +
+                f"⚠️ <i>Auto-check couldn't decide ({_esc(detail)}). "
+                f"Please approve or reject manually:</i>",
+                keep_buttons=True)
+    except Exception as e:
+        print(f"[AUTOVERIFY] error for {user_id}: {type(e).__name__}: {e}")
+
+
+async def exnesstest_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Admin-only diagnostic: /exnesstest <email>. Logs in to the Exness
+    partner API, runs the allocation check on that email and shows the
+    raw outcome so the parameter names / response shape can be
+    confirmed before turning EXNESS_AUTO_VERIFY on."""
+    user_id = str(update.message.from_user.id)
+    if not ADMIN_USER_ID or user_id != str(ADMIN_USER_ID):
+        return
+    lines = [
+        f"Credentials set: {'yes' if exness_creds_present() else 'NO'}",
+        f"Auto-verify: {'ON' if exness_auto_verify_enabled() else 'OFF (manual)'}",
+    ]
+    tok, err = await asyncio.to_thread(_exness_login_sync)
+    lines.append("Login: " + ("OK" if tok else f"FAILED - {err}"))
+    if tok:
+        with _exness_lock:
+            _exness_token["jwt"] = tok
+        email = (context.args[0].strip().lower() if context.args else "")
+        if email:
+            variants = [
+                _exness_alloc_params(email),
+                {"value": email},
+                {"email": email},
+                {"client_email": email},
+            ]
+            for params in variants:
+                r, e2 = await asyncio.to_thread(_exness_get_sync, EXNESS_ALLOCATION_PATH, params)
+                keys = ",".join(k for k in params)
+                if r is None:
+                    lines.append(f"params[{keys}] -> {e2}")
+                    continue
+                snippet = (r.text or "")[:300].replace("\n", " ")
+                try:
+                    verdict = classify_exness_allocation(r.status_code, r.json())
+                except Exception:
+                    verdict = ("unknown", "non-JSON")
+                lines.append(f"params[{keys}] -> HTTP {r.status_code} -> {verdict[0]} | {snippet}")
+        else:
+            lines.append("Add an email: /exnesstest someone@example.com")
+    await update.message.reply_text("\n".join(lines)[:3900])
+
+
 async def mt5revenue_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """
     Admin-only report on THIS bot's MT5 Auto-Trade revenue
@@ -24733,6 +25016,7 @@ def main():
     app.add_handler(CommandHandler("registerfallbackimages", registerfallbackimages_command))
     app.add_handler(MessageHandler(filters.PHOTO, broadcast_photo_handler))
     app.add_handler(CommandHandler("mt5revenue", mt5revenue_command))
+    app.add_handler(CommandHandler("exnesstest", exnesstest_command))
     app.add_handler(CommandHandler("testsynth", testsynth_command))
     app.add_handler(CommandHandler("discoversymbols", discoversymbols_command))
     app.add_handler(CommandHandler("testsignal", testsignal_command))

@@ -4184,10 +4184,9 @@ def update_signal_status(signal_id, status, source=None):
         response = requests.patch(url, headers=sb_headers(), json=payload, timeout=10)
         if response.status_code in (200, 204):
             print(f"[SIGNAL LOG] ✅ Signal {signal_id} -> {status}")
-            # Only scheduled signals were ever mirrored to SpiritFX (see
-            # log_signal), so only those have an outcome to sync there.
-            if source == "scheduled":
-                notify_spiritfx("signal.closed", {"id": signal_id, "status": status})
+            # Every logged signal is mirrored on creation (see log_signal),
+            # so every signal's outcome is synced here too.
+            notify_spiritfx("signal.closed", {"id": signal_id, "status": status})
             return True
         else:
             print(

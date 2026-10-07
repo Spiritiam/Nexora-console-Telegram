@@ -3318,6 +3318,209 @@ async def nexora_app_deriv_disconnect_handler(request):
     return _napp_json({"ok": True, "message": "Deriv account disconnected."})
 
 
+# ============================================
+# PUSH NOTIFICATIONS FOR APP USERS (Deriv trades, alerts)
+# ============================================
+# Every Deriv engine tells users things with bot.send_message(chat_id=...).
+# App users have no Telegram chat, so those same messages are turned into
+# push notifications here, in ONE place (a wrapper around the bot's
+# send_message), instead of editing each engine. Real Telegram users are
+# never touched: the wrapper only acts on app (synthetic) ids.
+#
+# Needs one Railway variable to switch on: FIREBASE_SERVICE_ACCOUNT_JSON
+# (the Firebase project's service-account key, raw JSON or base64).
+# Without it, nothing is sent and nothing breaks.
+#
+#   POST /api/nexora/push/register  {token, platform}
+
+_napp_fcm_cache = {"creds": None, "project": None, "loaded": False}
+_napp_push_sent = {}  # synthetic_id -> [timestamps] (cap per hour)
+NAPP_PUSH_PER_HOUR = 30
+
+
+def _napp_fcm_load():
+    if _napp_fcm_cache["loaded"]:
+        return _napp_fcm_cache["creds"], _napp_fcm_cache["project"]
+    _napp_fcm_cache["loaded"] = True
+    raw = os.getenv("FIREBASE_SERVICE_ACCOUNT_JSON", "").strip()
+    if not raw:
+        return None, None
+    try:
+        if not raw.startswith("{"):
+            raw = base64.b64decode(raw).decode()
+        info = json.loads(raw)
+        from google.oauth2 import service_account
+        creds = service_account.Credentials.from_service_account_info(
+            info, scopes=["https://www.googleapis.com/auth/firebase.messaging"]
+        )
+        _napp_fcm_cache["creds"] = creds
+        _napp_fcm_cache["project"] = info.get("project_id")
+        print(f"[PUSH] Firebase credentials loaded for project {info.get('project_id')}")
+    except Exception as e:
+        print(f"[PUSH] Could not load FIREBASE_SERVICE_ACCOUNT_JSON: {type(e).__name__}")
+    return _napp_fcm_cache["creds"], _napp_fcm_cache["project"]
+
+
+def _napp_push_tokens_sync(synth):
+    try:
+        url = f"{SUPABASE_URL}/rest/v1/app_push_tokens?synthetic_id=eq.{synth}&select=fcm_token"
+        rows = requests.get(url, headers=sb_headers(), timeout=10).json()
+        return [r["fcm_token"] for r in rows] if isinstance(rows, list) else []
+    except Exception as e:
+        print(f"[PUSH] token read error: {type(e).__name__}")
+        return []
+
+
+def _napp_push_drop_token_sync(token):
+    try:
+        requests.delete(
+            f"{SUPABASE_URL}/rest/v1/app_push_tokens?fcm_token=eq.{requests.utils.quote(token, safe='')}",
+            headers=sb_headers(), timeout=10)
+    except Exception:
+        pass
+
+
+def _napp_push_send_sync(synth, title, body):
+    creds, project = _napp_fcm_load()
+    if not creds or not project:
+        return
+    now = time.time()
+    sent = [t for t in _napp_push_sent.get(synth, []) if now - t < 3600]
+    if len(sent) >= NAPP_PUSH_PER_HOUR:
+        return
+    tokens = _napp_push_tokens_sync(synth)
+    if not tokens:
+        return
+    try:
+        from google.auth.transport.requests import Request as _GReq
+        if not creds.valid:
+            creds.refresh(_GReq())
+        headers = {"Authorization": f"Bearer {creds.token}", "Content-Type": "application/json"}
+    except Exception as e:
+        print(f"[PUSH] auth refresh failed: {type(e).__name__}")
+        return
+    for tok in tokens:
+        payload = {"message": {
+            "token": tok,
+            "notification": {"title": title[:80], "body": body[:240]},
+            "data": {"type": "nexora_deriv"},
+            "android": {"priority": "HIGH"},
+        }}
+        try:
+            r = requests.post(
+                f"https://fcm.googleapis.com/v1/projects/{project}/messages:send",
+                headers=headers, json=payload, timeout=10)
+            if r.status_code in (404, 410) or (r.status_code == 400 and "INVALID_ARGUMENT" in r.text):
+                _napp_push_drop_token_sync(tok)
+            elif r.status_code != 200:
+                print(f"[PUSH] send failed {r.status_code}: {r.text[:200]}")
+            else:
+                sent.append(now)
+        except Exception as e:
+            print(f"[PUSH] send error: {type(e).__name__}")
+    _napp_push_sent[synth] = sent
+
+
+def _napp_push_split(text):
+    plain = _napp_strip_html(text or "")
+    lines = [ln.strip() for ln in plain.splitlines() if ln.strip()]
+    if not lines:
+        return "Nexora", ""
+    title = re.sub(r"\s+", " ", lines[0])[:70]
+    body = re.sub(r"\s+", " ", " ".join(lines[1:]))[:230]
+    return title, body or title
+
+
+class _AppMsg:
+    """Stand-in for a sent Telegram message, so engine code that reads
+    .message_id / .chat_id after sending keeps working for app users."""
+    def __init__(self, chat_id, text=""):
+        self.message_id = 0
+        self.chat_id = chat_id
+        self.text = text
+
+
+def _napp_install_push_bridge():
+    from telegram.ext import ExtBot
+    if getattr(ExtBot, "_napp_bridge", False):
+        return
+    orig_send = ExtBot.send_message
+    orig_photo = ExtBot.send_photo
+    orig_edit = ExtBot.edit_message_text
+    orig_delete = ExtBot.delete_message
+
+    def _cid(args, kwargs):
+        return kwargs.get("chat_id", args[0] if args else None)
+
+    async def send_message(self, *args, **kwargs):
+        cid = _cid(args, kwargs)
+        if _is_app_synth(cid):
+            text = kwargs.get("text", args[1] if len(args) > 1 else "")
+            title, body = _napp_push_split(text)
+            asyncio.get_running_loop().run_in_executor(
+                None, _napp_push_send_sync, str(int(cid)), title, body)
+            return _AppMsg(cid, text)
+        return await orig_send(self, *args, **kwargs)
+
+    async def send_photo(self, *args, **kwargs):
+        cid = _cid(args, kwargs)
+        if _is_app_synth(cid):
+            cap = kwargs.get("caption", "")
+            title, body = _napp_push_split(cap)
+            asyncio.get_running_loop().run_in_executor(
+                None, _napp_push_send_sync, str(int(cid)), title, body)
+            return _AppMsg(cid, cap)
+        return await orig_photo(self, *args, **kwargs)
+
+    async def edit_message_text(self, *args, **kwargs):
+        if _is_app_synth(kwargs.get("chat_id")):
+            return True
+        return await orig_edit(self, *args, **kwargs)
+
+    async def delete_message(self, *args, **kwargs):
+        if _is_app_synth(kwargs.get("chat_id", args[0] if args else None)):
+            return True
+        return await orig_delete(self, *args, **kwargs)
+
+    ExtBot.send_message = send_message
+    ExtBot.send_photo = send_photo
+    ExtBot.edit_message_text = edit_message_text
+    ExtBot.delete_message = delete_message
+    ExtBot._napp_bridge = True
+    print("[PUSH] App push bridge installed")
+
+
+async def nexora_app_push_register_handler(request):
+    synth, err = await _napp_deriv_auth(request, limit_per_min=20, allow_killed=True)
+    if err:
+        return err
+    try:
+        body = await request.json()
+    except Exception:
+        return _napp_json({"error": "bad_request", "message": "Could not read that."}, 400)
+    token = str((body or {}).get("token", "")).strip()
+    platform = str((body or {}).get("platform", ""))[:20]
+    if not token or len(token) > 4096:
+        return _napp_json({"error": "bad_request", "message": "Missing token."}, 400)
+
+    def _save():
+        headers = dict(sb_headers())
+        headers["Prefer"] = "resolution=merge-duplicates,return=minimal"
+        return requests.post(
+            f"{SUPABASE_URL}/rest/v1/app_push_tokens?on_conflict=fcm_token",
+            headers=headers, timeout=10,
+            json={"fcm_token": token, "synthetic_id": synth, "platform": platform,
+                  "updated_at": datetime.utcnow().isoformat() + "Z"})
+    try:
+        r = await asyncio.to_thread(_save)
+        if r.status_code not in (200, 201, 204):
+            raise RuntimeError(r.status_code)
+    except Exception as e:
+        print(f"[PUSH] register error: {type(e).__name__}")
+        return _napp_json({"error": "server", "message": "Could not save."}, 500)
+    return _napp_json({"ok": True})
+
+
 def run_korapay_webhook_server():
     """
     Runs a small, INDEPENDENT web server in its own background thread
@@ -3340,6 +3543,7 @@ def run_korapay_webhook_server():
     webhook_app.router.add_get("/api/nexora/deriv/status", nexora_app_deriv_status_handler)
     webhook_app.router.add_post("/api/nexora/deriv/config", nexora_app_deriv_config_handler)
     webhook_app.router.add_post("/api/nexora/deriv/disconnect", nexora_app_deriv_disconnect_handler)
+    webhook_app.router.add_post("/api/nexora/push/register", nexora_app_push_register_handler)
     port = int(os.getenv("PORT", 8080))
     print(f"[KORAPAY WEBHOOK] Starting webhook server on port {port}...")
     # handle_signals=False - CONFIRMED REAL CRASH via live logs:
@@ -26235,6 +26439,10 @@ def main():
     load_ml_ev_model()
     load_ml_ev_model_synthetic()
 
+    try:
+        _napp_install_push_bridge()
+    except Exception as _e:
+        print(f"[PUSH] Could not install app push bridge: {type(_e).__name__}: {_e}")
     app = (
         Application.builder()
         .token(TELEGRAM_TOKEN)

@@ -26732,7 +26732,9 @@ async def run_inactivity_cycle(bot, dry=False, report_chat_id=None):
             continue
         if not warned_at:
             to_warn.append((u, cat, detail))
-        elif (now - warned_at).days >= cfg["warn_grace"]:
+        elif (now - warned_at).days >= (
+                # Warnings sent before the 2-day rule went live promised 7 days: honour that.
+                7 if warned_at < datetime(2026, 10, 7, 18, 37) else cfg["warn_grace"]):
             to_remove.append((u, cat, detail))
         else:
             waiting += 1

@@ -12347,7 +12347,10 @@ _BACKUP_OIL_NAMES = ["USOIL", "XTIUSD", "WTI", "CL-OIL"]
 
 def _backup_symbol_candidates(mt5_symbol):
     base = mt5_symbol[:-1] if mt5_symbol.endswith("m") else mt5_symbol
-    names = _BACKUP_OIL_NAMES if base.upper() == "USOIL" else [base]
+    # Exact name first (a backup account on Exness uses the same "...m"
+    # symbols as the primary), then the suffix-less name (MetaQuotes-Demo).
+    names = [mt5_symbol, base] + (_BACKUP_OIL_NAMES if base.upper() == "USOIL" else [])
+    names = list(dict.fromkeys(names))
     now = time.time()
     return [n for n in names if now >= _BACKUP_STATE["bad_symbols"].get(n, 0)]
 

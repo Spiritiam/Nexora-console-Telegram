@@ -2499,7 +2499,7 @@ async def deriv_oauth_callback_handler(request):
     code = params.get("code", "")
 
     if state:
-        user_id, code_verifier, prompt_chat_id, prompt_message_id = resolve_deriv_oauth_state(state)
+        user_id, code_verifier, prompt_chat_id, prompt_message_id = await asyncio.to_thread(resolve_deriv_oauth_state, state)
     else:
         user_id, code_verifier, prompt_chat_id, prompt_message_id = None, None, None, None
     if not user_id or not code_verifier:
@@ -2524,7 +2524,7 @@ async def deriv_oauth_callback_handler(request):
             )
         )
 
-    access_token = exchange_deriv_oauth_code(code, code_verifier)
+    access_token = await asyncio.to_thread(exchange_deriv_oauth_code, code, code_verifier)
     if not access_token:
         return web.Response(
             status=200, content_type="text/html",
@@ -2535,7 +2535,7 @@ async def deriv_oauth_callback_handler(request):
             )
         )
 
-    accounts_data = await deriv_get_options_accounts(access_token)
+    accounts_data = await _napp_run_on_main(deriv_get_options_accounts(access_token), 30)
     accounts_list = None
     if accounts_data:
         accounts_list = accounts_data.get("data")
@@ -2580,7 +2580,8 @@ async def deriv_oauth_callback_handler(request):
             )
         )
 
-    save_pending_deriv_oauth_connection(
+    await asyncio.to_thread(
+        save_pending_deriv_oauth_connection,
         user_id, real_loginid, access_token, real_currency,
         prompt_chat_id, prompt_message_id
     )
@@ -2646,25 +2647,23 @@ def _napp_cfg():
 
 
 def _napp_find_identity(obj, depth=0):
-    """Finds a stable user id (or email) anywhere in the first few
-    levels of spiritfx.org's user_data reply. Returns None if none."""
-    if depth > 3:
+    """Finds a stable user id (or email) in spiritfx.org's user_data
+    reply: first at the top level, then inside up to two nested wrapper objects
+    ("data", "user", "result", "profile"). Never searches lists, so a
+    list of courses/plans can never be mistaken for the user."""
+    if not isinstance(obj, dict):
         return None
-    if isinstance(obj, dict):
-        for key in ("id", "user_id", "uid", "userid", "email"):
-            val = obj.get(key)
-            if isinstance(val, (str, int)) and str(val).strip():
-                return f"{key}:{str(val).strip().lower()}"
-        for val in obj.values():
-            if isinstance(val, (dict, list)):
-                found = _napp_find_identity(val, depth + 1)
+    for key in ("id", "user_id", "uid", "userid", "email"):
+        val = obj.get(key)
+        if isinstance(val, (str, int)) and not isinstance(val, bool) and str(val).strip():
+            return f"{key}:{str(val).strip().lower()}"
+    if depth < 2:
+        for wrap in ("data", "user", "result", "profile"):
+            inner = obj.get(wrap)
+            if isinstance(inner, dict):
+                found = _napp_find_identity(inner, depth + 1)
                 if found:
                     return found
-    elif isinstance(obj, list):
-        for val in obj[:3]:
-            found = _napp_find_identity(val, depth + 1)
-            if found:
-                return found
     return None
 
 
@@ -2726,6 +2725,27 @@ def _napp_usage_get_sync(user_key):
     except Exception as e:
         print(f"[NEXORA APP] usage read error: {type(e).__name__}")
     return 0, 0
+
+
+def _napp_usage_bump_sync(user_key, d_signals, d_chats):
+    """Atomically adds to today's counters and returns (signals, chats),
+    or None if the database could not be reached (callers fail closed)."""
+    try:
+        r = requests.post(
+            f"{SUPABASE_URL}/rest/v1/rpc/app_usage_bump",
+            headers=sb_headers(),
+            json={"p_key": user_key, "p_signals": d_signals, "p_chats": d_chats},
+            timeout=10,
+        )
+        rows = r.json()
+        if r.status_code == 200 and isinstance(rows, list) and rows:
+            return int(rows[0]["signals"]), int(rows[0]["chats"])
+        if r.status_code == 200 and isinstance(rows, dict) and "signals" in rows:
+            return int(rows["signals"]), int(rows["chats"])
+        print(f"[NEXORA APP] usage bump unexpected: {r.status_code} {str(rows)[:150]}")
+    except Exception as e:
+        print(f"[NEXORA APP] usage bump error: {type(e).__name__}")
+    return None
 
 
 def _napp_usage_global_sync():
@@ -2877,21 +2897,27 @@ async def nexora_app_chat_handler(request):
         return _napp_json({"error": "bad_request", "reply": "Type a message first."}, 400)
     history = (body or {}).get("history") or []
 
-    sig_used, chat_used = await asyncio.to_thread(_napp_usage_get_sync, user_key)
     g_sig, g_chat = await asyncio.to_thread(_napp_usage_global_sync)
 
     def _remaining(s, c):
         return {"signals": max(cfg["signals"] - s, 0), "chats": max(cfg["chats"] - c, 0)}
 
-    if chat_used >= cfg["chats"]:
-        return _napp_json({
-            "reply": "You have used all your Nexora messages for today. They reset at midnight UTC.",
-            "cards": [], "remaining": _remaining(sig_used, chat_used), "limit": "chats",
-        })
     if g_chat >= cfg["g_chats"]:
         return _napp_json({
             "reply": "Nexora is very busy right now. Please try again later today.",
-            "cards": [], "remaining": _remaining(sig_used, chat_used), "limit": "global",
+            "cards": [], "remaining": None, "limit": "global",
+        })
+    # Reserve one message atomically BEFORE doing any work, so parallel
+    # requests cannot slip past the daily limit.
+    used = await asyncio.to_thread(_napp_usage_bump_sync, user_key, 0, 1)
+    if used is None:
+        return _napp_json({"error": "server", "reply": "Nexora could not check your limit. Please try again."}, 503)
+    sig_used, chat_used = used
+    if chat_used > cfg["chats"]:
+        await asyncio.to_thread(_napp_usage_bump_sync, user_key, 0, -1)
+        return _napp_json({
+            "reply": "You have used all your Nexora messages for today. They reset at midnight UTC.",
+            "cards": [], "remaining": _remaining(sig_used, cfg["chats"]), "limit": "chats",
         })
 
     intent, pair_key = _napp_classify(message)
@@ -2903,19 +2929,29 @@ async def nexora_app_chat_handler(request):
         suggestions = [f"Signal for {d}" for d in _napp_pair_list()[:6]]
 
     elif intent == "signal":
-        if sig_used >= cfg["signals"]:
-            reply = (f"You have used your {cfg['signals']} signal requests for today. "
-                     "They reset at midnight UTC. You can still ask me questions or check the news.")
-        elif g_sig >= cfg["g_signals"]:
+        reserved = None
+        if g_sig >= cfg["g_signals"]:
             reply = "Signal requests are at capacity right now. Please try again later today."
         else:
+            reserved = await asyncio.to_thread(_napp_usage_bump_sync, user_key, 1, 0)
+            if reserved is None:
+                reply = "Nexora could not check your limit. Please try again."
+            elif reserved[0] > cfg["signals"]:
+                await asyncio.to_thread(_napp_usage_bump_sync, user_key, -1, 0)
+                sig_used = cfg["signals"]
+                reserved = None
+                reply = (f"You have used your {cfg['signals']} signal requests for today. "
+                         "They reset at midnight UTC. You can still ask me questions or check the news.")
+            else:
+                sig_used = reserved[0]
+        if reserved is not None:
             global _napp_signal_sem
             if _napp_signal_sem is None:
                 _napp_signal_sem = asyncio.Semaphore(3)
             try:
                 async with _napp_signal_sem:
-                    image, direction, text, sdata = await asyncio.wait_for(
-                        build_signal_response(message, user_id=None), timeout=100
+                    image, direction, text, sdata = await _napp_run_on_main(
+                        build_signal_response(message, user_id=None), 100
                     )
             except Exception as e:
                 print(f"[NEXORA APP] signal error: {type(e).__name__}: {e}")
@@ -2958,6 +2994,11 @@ async def nexora_app_chat_handler(request):
                 reply = "Here is a setup. Always size your trade to a risk you can afford."
                 suggestions = ["Explain the risk", "Another pair", "Any news for this pair?"]
                 counted_signal = True
+            if not counted_signal:
+                # No signal was delivered, so give the request back.
+                back = await asyncio.to_thread(_napp_usage_bump_sync, user_key, -1, 0)
+                if back:
+                    sig_used = back[0]
 
     elif intent == "news":
         events = await asyncio.to_thread(_napp_news_sync, pair_key)
@@ -2993,12 +3034,9 @@ async def nexora_app_chat_handler(request):
         reply = await _napp_ai_text(prompt) or "I could not answer that right now. Please try again in a moment."
         suggestions = ["Get a signal", "Market news"]
 
-    new_sig = sig_used + (1 if counted_signal else 0)
-    new_chat = chat_used + 1
-    await asyncio.to_thread(_napp_usage_set_sync, user_key, new_sig, new_chat)
     return _napp_json({
         "reply": reply, "cards": cards, "suggestions": suggestions,
-        "remaining": _remaining(new_sig, new_chat),
+        "remaining": _remaining(sig_used, chat_used),
     })
 
 
@@ -3084,6 +3122,8 @@ async def _napp_deriv_auth(request, limit_per_min=20, allow_killed=False):
     if len(hits) >= limit_per_min:
         return None, _napp_json({"error": "slow_down", "message": "Too many requests. Wait a minute."}, 429)
     hits.append(now)
+    if len(_napp_deriv_hits) > 5000:
+        _napp_deriv_hits.clear()
     _napp_deriv_hits[user_key] = hits
     synth = await asyncio.to_thread(_napp_synth_id_sync, user_key)
     if not synth:
@@ -3126,15 +3166,28 @@ def _napp_deriv_recent_trades_sync(synth):
 
 
 def _napp_deriv_has_open_sync(synth):
+    """True if the user has any open Nexora trade or Account Flip stack.
+    Fails CLOSED: any doubt counts as 'open'."""
     try:
-        url = (f"{SUPABASE_URL}/rest/v1/auto_copy_trades"
-               f"?user_id=eq.{synth}&status=eq.OPEN&select=id&limit=1")
-        rows = requests.get(url, headers=sb_headers(), timeout=10).json()
-        if isinstance(rows, list) and rows:
+        r = requests.get(
+            f"{SUPABASE_URL}/rest/v1/auto_copy_trades"
+            f"?user_id=eq.{synth}&status=eq.OPEN&select=id&limit=1",
+            headers=sb_headers(), timeout=10)
+        rows = r.json()
+        if r.status_code != 200 or not isinstance(rows, list):
             return True
+        if rows:
+            return True
+        r2 = requests.get(
+            f"{SUPABASE_URL}/rest/v1/deriv_flip_stacks"
+            f"?user_id=eq.{synth}&status=eq.OPEN&select=id&limit=1",
+            headers=sb_headers(), timeout=10)
+        rows2 = r2.json()
+        if r2.status_code != 200 or not isinstance(rows2, list):
+            return True
+        return bool(rows2)
     except Exception:
-        return True  # fail closed: do not allow disconnect if unsure
-    return bool(get_open_deriv_flip_stack(synth))
+        return True
 
 
 def _napp_deriv_mode_summary(acct):
@@ -3196,7 +3249,7 @@ async def nexora_app_deriv_status_handler(request):
 
     snapshot = None
     try:
-        snapshot = await asyncio.wait_for(deriv_fetch_account_snapshot(acct["api_token"]), timeout=25)
+        snapshot = await _napp_run_on_main(deriv_fetch_account_snapshot(acct["api_token"]), 25)
     except Exception as e:
         print(f"[NEXORA APP] deriv snapshot error: {type(e).__name__}")
     trades = await asyncio.to_thread(_napp_deriv_recent_trades_sync, synth)
@@ -3287,6 +3340,10 @@ async def nexora_app_deriv_config_handler(request):
     else:
         return _napp_json({"error": "bad_request", "message": "Nothing to change."}, 400)
 
+    if mode in ("bot", "flip") and await asyncio.to_thread(_napp_deriv_has_open_sync, synth):
+        return _napp_json({"error": "open_trades",
+                           "message": "You have an open Nexora trade. Wait until it closes before changing the mode, index or stake."}, 409)
+
     ok = await asyncio.to_thread(update_deriv_account_fields, synth, fields)
     if not ok:
         return _napp_json({"error": "server", "message": "Could not save that. Please try again."}, 500)
@@ -3302,9 +3359,12 @@ async def nexora_app_deriv_disconnect_handler(request):
     acct = await asyncio.to_thread(get_deriv_account, synth)
     if not acct:
         return _napp_json({"ok": True, "message": "Already disconnected."})
+    # Stop new trades first, THEN check, so the engine cannot open one
+    # between the check and the delete.
+    await asyncio.to_thread(update_deriv_account_fields, synth, {"deriv_autotrade_enabled": False})
     if await asyncio.to_thread(_napp_deriv_has_open_sync, synth):
         return _napp_json({"error": "open_trades",
-                           "message": "You still have an open Nexora trade. Turn Auto-Trade off and disconnect after it closes."}, 409)
+                           "message": "You still have an open Nexora trade. Auto-Trade is now off. Disconnect after the trade closes."}, 409)
     try:
         r = await asyncio.to_thread(
             lambda: requests.delete(
@@ -3332,6 +3392,21 @@ async def nexora_app_deriv_disconnect_handler(request):
 # Without it, nothing is sent and nothing breaks.
 #
 #   POST /api/nexora/push/register  {token, platform}
+
+async def _napp_run_on_main(coro, timeout):
+    """Runs a coroutine on the bot's MAIN event loop and waits for it from
+    the web-server loop, so slow/blocking work never stalls the payment
+    webhooks. Cancels the work if it times out."""
+    loop = _main_loop
+    if loop is None or not loop.is_running():
+        return await asyncio.wait_for(coro, timeout)
+    fut = asyncio.run_coroutine_threadsafe(coro, loop)
+    try:
+        return await asyncio.wait_for(asyncio.wrap_future(fut), timeout)
+    except BaseException:
+        fut.cancel()
+        raise
+
 
 _napp_fcm_cache = {"creds": None, "project": None, "loaded": False}
 _napp_push_sent = {}  # synthetic_id -> [timestamps] (cap per hour)
@@ -3490,6 +3565,24 @@ def _napp_install_push_bridge():
     print("[PUSH] App push bridge installed")
 
 
+async def nexora_app_push_unregister_handler(request):
+    synth, err = await _napp_deriv_auth(request, limit_per_min=20, allow_killed=True)
+    if err:
+        return err
+    try:
+        body = await request.json()
+    except Exception:
+        return _napp_json({"error": "bad_request", "message": "Could not read that."}, 400)
+    token = str((body or {}).get("token", "")).strip()
+    if token:
+        await asyncio.to_thread(
+            lambda: requests.delete(
+                f"{SUPABASE_URL}/rest/v1/app_push_tokens"
+                f"?fcm_token=eq.{requests.utils.quote(token, safe='')}&synthetic_id=eq.{synth}",
+                headers=sb_headers(), timeout=10))
+    return _napp_json({"ok": True})
+
+
 async def nexora_app_push_register_handler(request):
     synth, err = await _napp_deriv_auth(request, limit_per_min=20, allow_killed=True)
     if err:
@@ -3544,6 +3637,7 @@ def run_korapay_webhook_server():
     webhook_app.router.add_post("/api/nexora/deriv/config", nexora_app_deriv_config_handler)
     webhook_app.router.add_post("/api/nexora/deriv/disconnect", nexora_app_deriv_disconnect_handler)
     webhook_app.router.add_post("/api/nexora/push/register", nexora_app_push_register_handler)
+    webhook_app.router.add_post("/api/nexora/push/unregister", nexora_app_push_unregister_handler)
     port = int(os.getenv("PORT", 8080))
     print(f"[KORAPAY WEBHOOK] Starting webhook server on port {port}...")
     # handle_signals=False - CONFIRMED REAL CRASH via live logs:
@@ -5831,6 +5925,13 @@ def log_auto_copy_failure(user_id, symbol, reason):
 
 def save_deriv_account(user_id, loginid, token, currency, auth_method="manual"):
     try:
+        # One Deriv login must never be linked to two users when an app
+        # user is involved (two engines would trade it twice). Pre-existing
+        # Telegram-only links are left exactly as they were.
+        owner = _deriv_loginid_owner_sync(loginid)
+        if owner and owner != str(user_id) and (_is_app_synth(owner) or _is_app_synth(user_id)):
+            print(f"[DERIV] Refused to link {loginid} to {user_id}: already linked to {owner}")
+            return False
         url = (
             f"{SUPABASE_URL}/rest/v1/deriv_accounts"
             f"?on_conflict=user_id"
@@ -25492,6 +25593,18 @@ def try_claim_catchup_lock(pair_name):
         print(f"[CATCHUP] try_claim_catchup_lock error: {e}")
         return False  # fail safe — if the lock can't be confirmed, don't risk a duplicate
 
+_main_loop = None
+
+
+async def _post_init_capture_loop(app):
+    """Remembers the bot's main event loop (the web server thread hands
+    heavy work to it, exactly where Telegram users' signals already run),
+    then runs the normal startup catch-up."""
+    global _main_loop
+    _main_loop = asyncio.get_running_loop()
+    await catch_up_missed_signals(app)
+
+
 async def catch_up_missed_signals(app):
     # No custom menu button / commands list - left as Telegram's default
     # so the native full-width blue "Start" button shows automatically
@@ -26446,7 +26559,7 @@ def main():
     app = (
         Application.builder()
         .token(TELEGRAM_TOKEN)
-        .post_init(catch_up_missed_signals)
+        .post_init(_post_init_capture_loop)
         .build()
     )
     _app_instance = app

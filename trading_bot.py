@@ -11886,6 +11886,469 @@ def get_price_alphavantage(config):
         return None
 
 # ============================================
+# EXTRA MARKET-DATA FALLBACKS (price + candles)
+# ============================================
+# MetaAPI stays the PRIMARY source for everything. When it fails (account
+# not connected to the broker, 504s, outage), these providers are tried
+# BEFORE the bot gives up, in addition to the existing TwelveData /
+# AlphaVantage / metals.dev / oil paths, which are unchanged:
+#
+#   OANDA practice  - needs OANDA_API_KEY (free practice account); skipped
+#                     silently when the key is not set. FX, gold, silver, oil.
+#   Yahoo Finance   - no key. Price + 1m/5m/1h/4h/1d candles, all pairs/stocks.
+#   Stooq           - no key. Price + DAILY candles only (its intraday
+#                     timestamps are not UTC, so they are not used).
+#   Kraken          - no key. BTC only, real USD pair.
+#   Binance         - no key. BTC only (data-api.binance.vision, works from US IPs).
+#
+# Every provider returns None on ANY problem (never raises), and candles are
+# normalised to the exact shape get_candles_metaapi returns (ISO "...Z" time,
+# float open/high/low/close/volume, oldest -> newest), so nothing downstream
+# needs to know which provider answered. The existing price-vs-candle gap
+# check in build_signal_response (1.5%) still protects against two feeds
+# disagreeing.
+
+OANDA_API_KEY = os.getenv("OANDA_API_KEY")
+OANDA_ENV = (os.getenv("OANDA_ENV") or "practice").strip().lower()
+OANDA_BASE_URL = (
+    "https://api-fxtrade.oanda.com" if OANDA_ENV == "live"
+    else "https://api-fxpractice.oanda.com"
+)
+
+_FALLBACK_HTTP_HEADERS = {
+    "User-Agent": "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0 Safari/537.36",
+    "Accept": "application/json,text/csv,*/*",
+}
+
+# Max age of a quoted price before a free provider's value is refused as stale.
+_FALLBACK_MAX_QUOTE_AGE_SECONDS = 30 * 60
+
+# base symbol (mt5_symbol without the trailing "m") -> provider symbols
+_FALLBACK_SYMBOLS = {
+    "XAUUSD": {"yahoo": "XAUUSD=X", "stooq": "xauusd", "oanda": "XAU_USD"},
+    "XAGUSD": {"yahoo": "XAGUSD=X", "stooq": "xagusd", "oanda": "XAG_USD"},
+    "USOIL":  {"yahoo": "CL=F",     "stooq": "cl.f",   "oanda": "WTICO_USD"},
+    "BTCUSD": {"yahoo": "BTC-USD",  "stooq": "btcusd", "kraken": "XBTUSD", "binance": "BTCUSDT"},
+    "GBPUSD": {"yahoo": "GBPUSD=X", "stooq": "gbpusd", "oanda": "GBP_USD"},
+    "GBPJPY": {"yahoo": "GBPJPY=X", "stooq": "gbpjpy", "oanda": "GBP_JPY"},
+    "EURUSD": {"yahoo": "EURUSD=X", "stooq": "eurusd", "oanda": "EUR_USD"},
+    "USDJPY": {"yahoo": "USDJPY=X", "stooq": "usdjpy", "oanda": "USD_JPY"},
+    "AUDUSD": {"yahoo": "AUDUSD=X", "stooq": "audusd", "oanda": "AUD_USD"},
+    "USDCAD": {"yahoo": "USDCAD=X", "stooq": "usdcad", "oanda": "USD_CAD"},
+    "EURJPY": {"yahoo": "EURJPY=X", "stooq": "eurjpy", "oanda": "EUR_JPY"},
+    "USDCHF": {"yahoo": "USDCHF=X", "stooq": "usdchf", "oanda": "USD_CHF"},
+    "NZDUSD": {"yahoo": "NZDUSD=X", "stooq": "nzdusd", "oanda": "NZD_USD"},
+    "AAPL":  {"yahoo": "AAPL",  "stooq": "aapl.us"},
+    "MSFT":  {"yahoo": "MSFT",  "stooq": "msft.us"},
+    "GOOGL": {"yahoo": "GOOGL", "stooq": "googl.us"},
+    "AMZN":  {"yahoo": "AMZN",  "stooq": "amzn.us"},
+    "NVDA":  {"yahoo": "NVDA",  "stooq": "nvda.us"},
+    "META":  {"yahoo": "META",  "stooq": "meta.us"},
+    "TSLA":  {"yahoo": "TSLA",  "stooq": "tsla.us"},
+}
+
+
+def _fallback_symbols_for(config):
+    """Provider symbol map for a pair config, or {} if it has none (e.g. synthetics)."""
+    mt5 = (config or {}).get("mt5_symbol") or ""
+    base = mt5[:-1] if mt5.endswith("m") else mt5
+    return _FALLBACK_SYMBOLS.get(base.upper(), {})
+
+
+def _fallback_iso(epoch_seconds):
+    return datetime.fromtimestamp(int(epoch_seconds), timezone.utc).strftime("%Y-%m-%dT%H:%M:%S.000Z")
+
+
+def _fallback_candle(epoch_seconds, o, h, l, c, v=0):
+    try:
+        return {
+            "time": _fallback_iso(epoch_seconds),
+            "open": float(o), "high": float(h), "low": float(l), "close": float(c),
+            "volume": float(v or 0),
+        }
+    except (TypeError, ValueError):
+        return None
+
+
+def _aggregate_to_4h(candles_1h):
+    """Builds 4h candles (UTC buckets 00/04/08/12/16/20) from 1h candles, oldest -> newest."""
+    buckets = {}
+    order = []
+    for c in candles_1h:
+        try:
+            dt = datetime.strptime(c["time"][:19], "%Y-%m-%dT%H:%M:%S")
+        except Exception:
+            continue
+        start = dt.replace(hour=(dt.hour // 4) * 4, minute=0, second=0)
+        key = start.strftime("%Y-%m-%dT%H:%M:%S.000Z")
+        if key not in buckets:
+            buckets[key] = {"time": key, "open": c["open"], "high": c["high"],
+                            "low": c["low"], "close": c["close"], "volume": c["volume"]}
+            order.append(key)
+        else:
+            b = buckets[key]
+            b["high"] = max(b["high"], c["high"])
+            b["low"] = min(b["low"], c["low"])
+            b["close"] = c["close"]
+            b["volume"] += c["volume"]
+    return [buckets[k] for k in order]
+
+
+# ---------- Yahoo Finance ----------
+
+_YAHOO_INTERVALS = {"1min": "1m", "5min": "5m", "1h": "60m", "4h": "60m", "1day": "1d"}
+
+
+def _yahoo_chart(symbol, interval, rng):
+    url = f"https://query1.finance.yahoo.com/v8/finance/chart/{symbol}"
+    response = requests.get(
+        url, params={"interval": interval, "range": rng},
+        headers=_FALLBACK_HTTP_HEADERS, timeout=12,
+    )
+    if response.status_code != 200:
+        print(f"[YAHOO] {symbol} {interval} HTTP {response.status_code}")
+        return None
+    result = ((response.json().get("chart") or {}).get("result") or [None])[0]
+    if not result:
+        print(f"[YAHOO] {symbol} {interval}: empty result")
+        return None
+    return result
+
+
+def get_price_yahoo(config):
+    try:
+        symbol = _fallback_symbols_for(config).get("yahoo")
+        if not symbol:
+            return None
+        result = _yahoo_chart(symbol, "1m", "1d")
+        if not result:
+            return None
+        meta = result.get("meta") or {}
+        price = meta.get("regularMarketPrice")
+        quote_time = meta.get("regularMarketTime")
+        if price is None:
+            return None
+        if quote_time and (time.time() - float(quote_time)) > _FALLBACK_MAX_QUOTE_AGE_SECONDS:
+            print(f"[YAHOO] {symbol} quote is {int(time.time() - float(quote_time))}s old - treating as stale")
+            return None
+        return float(price)
+    except Exception as e:
+        print(f"[YAHOO] price error: {e}")
+        return None
+
+
+def get_candles_yahoo(config, interval, outputsize):
+    try:
+        symbol = _fallback_symbols_for(config).get("yahoo")
+        y_interval = _YAHOO_INTERVALS.get(interval)
+        if not symbol or not y_interval:
+            return None
+        if interval == "1min":
+            rng = "5d"
+        elif interval == "5min":
+            rng = "1mo"
+        elif interval == "1h":
+            rng = "1mo" if outputsize <= 400 else "3mo"
+        elif interval == "4h":
+            rng = "3mo" if outputsize > 100 else "1mo"
+        else:
+            rng = "6mo" if outputsize > 60 else "3mo"
+        result = _yahoo_chart(symbol, y_interval, rng)
+        if not result:
+            return None
+        stamps = result.get("timestamp") or []
+        quote = ((result.get("indicators") or {}).get("quote") or [{}])[0]
+        candles = []
+        for i, ts in enumerate(stamps):
+            try:
+                o, h, l, c = quote["open"][i], quote["high"][i], quote["low"][i], quote["close"][i]
+            except (KeyError, IndexError):
+                continue
+            if None in (o, h, l, c):
+                continue
+            candle = _fallback_candle(ts, o, h, l, c, (quote.get("volume") or [0] * len(stamps))[i])
+            if candle:
+                candles.append(candle)
+        if interval == "4h":
+            candles = _aggregate_to_4h(candles)
+        if not candles:
+            return None
+        print(f"[YAHOO] ✅ {symbol} {interval} - {len(candles)} candles")
+        return candles[-outputsize:]
+    except Exception as e:
+        print(f"[YAHOO] candles error: {e}")
+        return None
+
+
+# ---------- OANDA (key-gated) ----------
+
+_OANDA_GRANULARITY = {"1min": "M1", "5min": "M5", "1h": "H1", "4h": "H4", "1day": "D"}
+
+
+def _oanda_candles_raw(instrument, granularity, count):
+    if not OANDA_API_KEY:
+        return None
+    params = {"granularity": granularity, "count": count, "price": "M"}
+    if granularity == "D":
+        params["dailyAlignment"] = 0
+        params["alignmentTimezone"] = "UTC"
+    response = requests.get(
+        f"{OANDA_BASE_URL}/v3/instruments/{instrument}/candles",
+        params=params,
+        headers={"Authorization": f"Bearer {OANDA_API_KEY}", "Accept-Datetime-Format": "RFC3339"},
+        timeout=12,
+    )
+    if response.status_code != 200:
+        print(f"[OANDA] {instrument} {granularity} HTTP {response.status_code}: {response.text[:200]}")
+        return None
+    return response.json().get("candles") or []
+
+
+def get_candles_oanda(config, interval, outputsize):
+    try:
+        instrument = _fallback_symbols_for(config).get("oanda")
+        granularity = _OANDA_GRANULARITY.get(interval)
+        if not OANDA_API_KEY or not instrument or not granularity:
+            return None
+        raw = _oanda_candles_raw(instrument, granularity, min(max(outputsize, 2), 1000))
+        if not raw:
+            return None
+        candles = []
+        for r in raw:
+            mid = r.get("mid") or {}
+            try:
+                t = datetime.strptime(r["time"][:19], "%Y-%m-%dT%H:%M:%S")
+            except Exception:
+                continue
+            candle = _fallback_candle(
+                (t - datetime(1970, 1, 1)).total_seconds(),
+                mid.get("o"), mid.get("h"), mid.get("l"), mid.get("c"), r.get("volume", 0),
+            )
+            if candle:
+                candles.append(candle)
+        if not candles:
+            return None
+        print(f"[OANDA] ✅ {instrument} {interval} - {len(candles)} candles")
+        return candles[-outputsize:]
+    except Exception as e:
+        print(f"[OANDA] candles error: {e}")
+        return None
+
+
+def get_price_oanda(config):
+    try:
+        instrument = _fallback_symbols_for(config).get("oanda")
+        if not OANDA_API_KEY or not instrument:
+            return None
+        raw = _oanda_candles_raw(instrument, "M1", 2)
+        if not raw:
+            return None
+        close = (raw[-1].get("mid") or {}).get("c")
+        return float(close) if close is not None else None
+    except Exception as e:
+        print(f"[OANDA] price error: {e}")
+        return None
+
+
+# ---------- Stooq (price + daily only) ----------
+
+def _stooq_rows(url):
+    response = requests.get(url, headers=_FALLBACK_HTTP_HEADERS, timeout=12)
+    if response.status_code != 200:
+        print(f"[STOOQ] HTTP {response.status_code} for {url}")
+        return None
+    text = response.text.strip()
+    lines = text.splitlines()
+    if len(lines) < 2 or "," not in lines[0] or "<" in lines[0]:
+        print(f"[STOOQ] unexpected response: {text[:120]}")
+        return None
+    header = [h.strip().lower() for h in lines[0].split(",")]
+    rows = []
+    for line in lines[1:]:
+        parts = [p.strip() for p in line.split(",")]
+        if len(parts) == len(header):
+            rows.append(dict(zip(header, parts)))
+    return rows
+
+
+def get_price_stooq(config):
+    try:
+        symbol = _fallback_symbols_for(config).get("stooq")
+        if not symbol:
+            return None
+        rows = _stooq_rows(f"https://stooq.com/q/l/?s={symbol}&f=sd2t2c&h&e=csv")
+        if not rows:
+            return None
+        close = rows[0].get("close")
+        if not close or close.upper() == "N/D":
+            return None
+        return float(close)
+    except Exception as e:
+        print(f"[STOOQ] price error: {e}")
+        return None
+
+
+def get_candles_stooq(config, interval, outputsize):
+    try:
+        symbol = _fallback_symbols_for(config).get("stooq")
+        if interval != "1day" or not symbol:
+            return None
+        rows = _stooq_rows(f"https://stooq.com/q/d/l/?s={symbol}&i=d")
+        if not rows:
+            return None
+        candles = []
+        for r in rows:
+            try:
+                t = datetime.strptime(r["date"], "%Y-%m-%d")
+            except Exception:
+                continue
+            candle = _fallback_candle(
+                (t - datetime(1970, 1, 1)).total_seconds(),
+                r.get("open"), r.get("high"), r.get("low"), r.get("close"), r.get("volume") or 0,
+            )
+            if candle:
+                candles.append(candle)
+        if not candles:
+            return None
+        print(f"[STOOQ] ✅ {symbol} daily - {len(candles)} candles")
+        return candles[-outputsize:]
+    except Exception as e:
+        print(f"[STOOQ] candles error: {e}")
+        return None
+
+
+# ---------- Kraken + Binance (BTC only) ----------
+
+_KRAKEN_INTERVALS = {"1min": 1, "5min": 5, "1h": 60, "4h": 240, "1day": 1440}
+_BINANCE_INTERVALS = {"1min": "1m", "5min": "5m", "1h": "1h", "4h": "4h", "1day": "1d"}
+
+
+def get_price_kraken(config):
+    try:
+        pair = _fallback_symbols_for(config).get("kraken")
+        if not pair:
+            return None
+        response = requests.get("https://api.kraken.com/0/public/Ticker",
+                                params={"pair": pair}, headers=_FALLBACK_HTTP_HEADERS, timeout=10)
+        result = response.json().get("result") or {}
+        if not result:
+            return None
+        return float(next(iter(result.values()))["c"][0])
+    except Exception as e:
+        print(f"[KRAKEN] price error: {e}")
+        return None
+
+
+def get_candles_kraken(config, interval, outputsize):
+    try:
+        pair = _fallback_symbols_for(config).get("kraken")
+        minutes = _KRAKEN_INTERVALS.get(interval)
+        if not pair or not minutes:
+            return None
+        response = requests.get("https://api.kraken.com/0/public/OHLC",
+                                params={"pair": pair, "interval": minutes},
+                                headers=_FALLBACK_HTTP_HEADERS, timeout=12)
+        result = response.json().get("result") or {}
+        rows = next((v for k, v in result.items() if k != "last"), None)
+        if not rows:
+            return None
+        candles = [c for c in (
+            _fallback_candle(r[0], r[1], r[2], r[3], r[4], r[6]) for r in rows
+        ) if c]
+        if not candles:
+            return None
+        print(f"[KRAKEN] ✅ {pair} {interval} - {len(candles)} candles")
+        return candles[-outputsize:]
+    except Exception as e:
+        print(f"[KRAKEN] candles error: {e}")
+        return None
+
+
+def get_price_binance(config):
+    try:
+        symbol = _fallback_symbols_for(config).get("binance")
+        if not symbol:
+            return None
+        response = requests.get("https://data-api.binance.vision/api/v3/ticker/price",
+                                params={"symbol": symbol}, headers=_FALLBACK_HTTP_HEADERS, timeout=10)
+        return float(response.json()["price"])
+    except Exception as e:
+        print(f"[BINANCE] price error: {e}")
+        return None
+
+
+def get_candles_binance(config, interval, outputsize):
+    try:
+        symbol = _fallback_symbols_for(config).get("binance")
+        b_interval = _BINANCE_INTERVALS.get(interval)
+        if not symbol or not b_interval:
+            return None
+        response = requests.get("https://data-api.binance.vision/api/v3/klines",
+                                params={"symbol": symbol, "interval": b_interval,
+                                        "limit": min(max(outputsize, 2), 1000)},
+                                headers=_FALLBACK_HTTP_HEADERS, timeout=12)
+        rows = response.json()
+        if not isinstance(rows, list) or not rows:
+            return None
+        candles = [c for c in (
+            _fallback_candle(r[0] / 1000.0, r[1], r[2], r[3], r[4], r[5]) for r in rows
+        ) if c]
+        if not candles:
+            return None
+        print(f"[BINANCE] ✅ {symbol} {interval} - {len(candles)} candles")
+        return candles[-outputsize:]
+    except Exception as e:
+        print(f"[BINANCE] candles error: {e}")
+        return None
+
+
+_FALLBACK_PRICE_FUNCS = {
+    "oanda": get_price_oanda, "yahoo": get_price_yahoo, "stooq": get_price_stooq,
+    "kraken": get_price_kraken, "binance": get_price_binance,
+}
+_FALLBACK_CANDLE_FUNCS = {
+    "oanda": get_candles_oanda, "yahoo": get_candles_yahoo, "stooq": get_candles_stooq,
+    "kraken": get_candles_kraken, "binance": get_candles_binance,
+}
+
+
+def get_price_fallbacks(config, providers=("oanda", "yahoo", "stooq", "kraken", "binance")):
+    """First live price any extra provider can give. Returns (price, provider) or (None, None)."""
+    for name in providers:
+        price = _FALLBACK_PRICE_FUNCS[name](config)
+        if price is not None and price > 0:
+            print(f"[PRICE] ✅ fallback provider '{name}' answered: {price}")
+            return price, name
+    return None, None
+
+
+def get_candles_fallbacks(config, interval, outputsize, providers=("oanda", "yahoo", "stooq", "kraken", "binance")):
+    """First candle set any extra provider can give. Returns candles or None."""
+    for name in providers:
+        candles = _FALLBACK_CANDLE_FUNCS[name](config, interval, outputsize)
+        if candles:
+            return candles
+    return None
+
+
+def _run_fallback_selftest():
+    """One-shot startup check: logs whether each extra provider answers right now (EUR/USD, BTC/USD)."""
+    try:
+        for label, cfg in (("EURUSD", {"mt5_symbol": "EURUSDm"}), ("BTCUSD", {"mt5_symbol": "BTCUSDm"})):
+            for name, fn in _FALLBACK_PRICE_FUNCS.items():
+                if name in ("kraken", "binance") and label != "BTCUSD":
+                    continue
+                if name == "oanda" and not OANDA_API_KEY:
+                    print(f"[FALLBACK SELFTEST] {label} oanda: skipped (OANDA_API_KEY not set)")
+                    continue
+                print(f"[FALLBACK SELFTEST] {label} {name} price: {fn(cfg)}")
+            c = get_candles_yahoo(cfg, "1h", 5)
+            print(f"[FALLBACK SELFTEST] {label} yahoo 1h candles: {len(c) if c else 0}")
+    except Exception as e:
+        print(f"[FALLBACK SELFTEST] error: {e}")
+
+
+# ============================================
 # LIVE PRICE — COMBINED
 # ============================================
 
@@ -11999,11 +12462,18 @@ def get_live_price(symbol="XAU/USD", config=None, source_tracker=None):
         if price:
             if _is_fallback_price_stale(symbol, price):
                 print(f"[PRICE] ⚠️ metals.dev returned the SAME price ({price}) as the last genuinely-fresh call, {_FALLBACK_STALENESS_SECONDS}s+ ago for {symbol} - treating as stale, not trusting it as live.")
-                return None
+            else:
+                if source_tracker is not None:
+                    source_tracker["source"] = "metals_api"
+                return price
+        else:
+            print("[PRICE] metals.dev failed for silver")
+        # Extra fallbacks (OANDA / Yahoo / Stooq) before giving up.
+        price, provider = get_price_fallbacks(config)
+        if price is not None:
             if source_tracker is not None:
-                source_tracker["source"] = "metals_api"
+                source_tracker["source"] = provider
             return price
-        print("[PRICE] metals.dev failed for silver")
         return None
 
     if config and config.get("use_oil_api"):
@@ -12011,12 +12481,29 @@ def get_live_price(symbol="XAU/USD", config=None, source_tracker=None):
         if price:
             if _is_fallback_price_stale(symbol, price):
                 print(f"[PRICE] ⚠️ Oil API returned the SAME price ({price}) as the last genuinely-fresh call, {_FALLBACK_STALENESS_SECONDS}s+ ago for {symbol} - treating as stale, not trusting it as live.")
-                return None
+            else:
+                if source_tracker is not None:
+                    source_tracker["source"] = "oil_api"
+                return price
+        else:
+            print("[PRICE] All oil APIs failed")
+        # Extra fallbacks (OANDA / Yahoo / Stooq) before giving up.
+        price, provider = get_price_fallbacks(config)
+        if price is not None:
             if source_tracker is not None:
-                source_tracker["source"] = "oil_api"
+                source_tracker["source"] = provider
             return price
-        print("[PRICE] All oil APIs failed")
         return None
+
+    # MetaAPI is down for this pair: try the keyless/real-broker feeds
+    # (OANDA if configured, then Yahoo) before spending TwelveData's
+    # tiny rate-limited quota.
+    if config and config.get("mt5_symbol"):
+        price, provider = get_price_fallbacks(config, providers=("oanda", "yahoo"))
+        if price is not None:
+            if source_tracker is not None:
+                source_tracker["source"] = provider
+            return price
 
     price = get_price_twelvedata(symbol)
     if price is not None:
@@ -12034,7 +12521,12 @@ def get_live_price(symbol="XAU/USD", config=None, source_tracker=None):
             if source_tracker is not None:
                 source_tracker["source"] = "alphavantage"
             return price
-    print(f"[PRICE] Both APIs failed for {symbol}")
+        price, provider = get_price_fallbacks(config, providers=("stooq", "kraken", "binance"))
+        if price is not None:
+            if source_tracker is not None:
+                source_tracker["source"] = provider
+            return price
+    print(f"[PRICE] All price sources failed for {symbol}")
     return None
 
 # ============================================
@@ -12058,6 +12550,12 @@ def get_price_history_1h(symbol, config=None):
         values = data.get("values", [])
         if len(values) >= 2:
             return float(values[1]["close"])
+        # TwelveData gave nothing (rate limit etc.) - use the extra
+        # providers' 1h candles: previous completed candle's close.
+        if config:
+            fb = get_candles_fallbacks(config, "1h", 3, providers=("oanda", "yahoo", "kraken", "binance"))
+            if fb and len(fb) >= 2:
+                return float(fb[-2]["close"])
         return None
     except Exception as e:
         print(f"[HISTORY] Error fetching 1h history for {symbol}: {e}")
@@ -12667,7 +13165,11 @@ def get_cached_candles(pair_key, config, interval, outputsize=60, force_fresh=Fa
         if candles:
             candle_cache[cache_key] = {"candles": candles, "timestamp": now}
             return candles
-        print(f"[CANDLES] MetaAPI failed for {pair_key} ({interval}) - falling back to TwelveData")
+        print(f"[CANDLES] MetaAPI failed for {pair_key} ({interval}) - falling back to OANDA/Yahoo, then TwelveData")
+        candles = get_candles_fallbacks(config, interval, outputsize, providers=("oanda", "yahoo"))
+        if candles:
+            candle_cache[cache_key] = {"candles": candles, "timestamp": now}
+            return candles
 
     candidates = get_candle_symbol_candidates(config)
     for symbol in candidates:
@@ -12675,6 +13177,13 @@ def get_cached_candles(pair_key, config, interval, outputsize=60, force_fresh=Fa
         if candles:
             candle_cache[cache_key] = {"candles": candles, "timestamp": now}
             return candles
+
+    # Last resort: every remaining extra provider (non-MetaAPI pairs also
+    # get OANDA/Yahoo here, since TwelveData was their first choice).
+    candles = get_candles_fallbacks(config, interval, outputsize, providers=("oanda", "yahoo", "stooq", "kraken", "binance"))
+    if candles:
+        candle_cache[cache_key] = {"candles": candles, "timestamp": now}
+        return candles
 
     print(f"[CANDLES] All symbol candidates failed for {pair_key} ({interval}, outputsize={outputsize}): tried {candidates}")
     return None
@@ -28170,6 +28679,8 @@ def main():
     # requesting every update type here forces Telegram to reset that
     # filter on every single startup, regardless of what any external
     # caller set it to before.
+    # One-shot startup check of the extra market-data fallbacks (logs only).
+    threading.Thread(target=_run_fallback_selftest, daemon=True).start()
     app.run_polling(drop_pending_updates=True, allowed_updates=Update.ALL_TYPES)
 
 

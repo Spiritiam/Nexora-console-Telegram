@@ -11923,6 +11923,21 @@ _FALLBACK_HTTP_HEADERS = {
 # Max age of a quoted price before a free provider's value is refused as stale.
 _FALLBACK_MAX_QUOTE_AGE_SECONDS = 30 * 60
 
+# A provider that answers 429/403/404 (blocked or rate-limited from this
+# server's IP) is skipped for a while instead of being hit on every call.
+_FALLBACK_COOLDOWN_SECONDS = 10 * 60
+_FALLBACK_COOLDOWN_UNTIL = {}
+
+
+def _fallback_cooldown_start(provider, status_code):
+    if status_code in (403, 404, 429):
+        _FALLBACK_COOLDOWN_UNTIL[provider] = time.time() + _FALLBACK_COOLDOWN_SECONDS
+        print(f"[{provider.upper()}] HTTP {status_code} - pausing this provider for {_FALLBACK_COOLDOWN_SECONDS // 60} min")
+
+
+def _fallback_on_cooldown(provider):
+    return time.time() < _FALLBACK_COOLDOWN_UNTIL.get(provider, 0)
+
 # base symbol (mt5_symbol without the trailing "m") -> provider symbols
 _FALLBACK_SYMBOLS = {
     "XAUUSD": {"yahoo": "XAUUSD=X", "stooq": "xauusd", "oanda": "XAU_USD"},
@@ -12000,19 +12015,24 @@ _YAHOO_INTERVALS = {"1min": "1m", "5min": "5m", "1h": "60m", "4h": "60m", "1day"
 
 
 def _yahoo_chart(symbol, interval, rng):
-    url = f"https://query1.finance.yahoo.com/v8/finance/chart/{symbol}"
-    response = requests.get(
-        url, params={"interval": interval, "range": rng},
-        headers=_FALLBACK_HTTP_HEADERS, timeout=12,
-    )
-    if response.status_code != 200:
-        print(f"[YAHOO] {symbol} {interval} HTTP {response.status_code}")
-        return None
-    result = ((response.json().get("chart") or {}).get("result") or [None])[0]
-    if not result:
-        print(f"[YAHOO] {symbol} {interval}: empty result")
-        return None
-    return result
+    last_status = None
+    for host in ("query1.finance.yahoo.com", "query2.finance.yahoo.com"):
+        response = requests.get(
+            f"https://{host}/v8/finance/chart/{symbol}",
+            params={"interval": interval, "range": rng},
+            headers=_FALLBACK_HTTP_HEADERS, timeout=12,
+        )
+        last_status = response.status_code
+        if response.status_code != 200:
+            print(f"[YAHOO] {symbol} {interval} HTTP {response.status_code} ({host})")
+            continue
+        result = ((response.json().get("chart") or {}).get("result") or [None])[0]
+        if not result:
+            print(f"[YAHOO] {symbol} {interval}: empty result")
+            return None
+        return result
+    _fallback_cooldown_start("yahoo", last_status)
+    return None
 
 
 def get_price_yahoo(config):
@@ -12156,6 +12176,7 @@ def _stooq_rows(url):
     response = requests.get(url, headers=_FALLBACK_HTTP_HEADERS, timeout=12)
     if response.status_code != 200:
         print(f"[STOOQ] HTTP {response.status_code} for {url}")
+        _fallback_cooldown_start("stooq", response.status_code)
         return None
     text = response.text.strip()
     lines = text.splitlines()
@@ -12315,6 +12336,8 @@ _FALLBACK_CANDLE_FUNCS = {
 def get_price_fallbacks(config, providers=("oanda", "yahoo", "stooq", "kraken", "binance")):
     """First live price any extra provider can give. Returns (price, provider) or (None, None)."""
     for name in providers:
+        if _fallback_on_cooldown(name):
+            continue
         price = _FALLBACK_PRICE_FUNCS[name](config)
         if price is not None and price > 0:
             print(f"[PRICE] ✅ fallback provider '{name}' answered: {price}")
@@ -12325,6 +12348,8 @@ def get_price_fallbacks(config, providers=("oanda", "yahoo", "stooq", "kraken", 
 def get_candles_fallbacks(config, interval, outputsize, providers=("oanda", "yahoo", "stooq", "kraken", "binance")):
     """First candle set any extra provider can give. Returns candles or None."""
     for name in providers:
+        if _fallback_on_cooldown(name):
+            continue
         candles = _FALLBACK_CANDLE_FUNCS[name](config, interval, outputsize)
         if candles:
             return candles

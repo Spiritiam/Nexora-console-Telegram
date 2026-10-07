@@ -12338,7 +12338,6 @@ METAAPI_BACKUP_ACCOUNT_ID = os.getenv("METAAPI_BACKUP_ACCOUNT_ID")
 _BACKUP_PRICE_HOSTS = (
     "https://mt-client-api-v1.london.agiliumtrade.ai",
     "https://mt-client-api-v1.new-york.agiliumtrade.ai",
-    "https://mt-client-api-v1.singapore.agiliumtrade.ai",
 )
 _BACKUP_STATE = {"price_host": None, "bad_symbols": {}}
 _BACKUP_BAD_SYMBOL_SECONDS = 600

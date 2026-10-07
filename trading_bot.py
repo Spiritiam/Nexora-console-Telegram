@@ -12334,86 +12334,94 @@ def get_candles_binance(config, interval, outputsize):
 # prices, so this is a backup, never the first choice. Symbol names on it
 # have no broker suffix ("EURUSD", not "EURUSDm"). Returns None on any problem.
 
-METAAPI_BACKUP_ACCOUNT_ID = os.getenv("METAAPI_BACKUP_ACCOUNT_ID")
+METAAPI_BACKUP_ACCOUNT_ID = os.getenv("METAAPI_BACKUP_ACCOUNT_ID")  # one id, or several separated by commas (tried in order)
 _BACKUP_PRICE_HOSTS = (
     "https://mt-client-api-v1.london.agiliumtrade.ai",
     "https://mt-client-api-v1.new-york.agiliumtrade.ai",
 )
-_BACKUP_STATE = {"price_host": None, "bad_symbols": {}}
+_BACKUP_STATE = {"price_host": {}, "bad_symbols": {}}
 _BACKUP_BAD_SYMBOL_SECONDS = 600
 _BACKUP_OIL_NAMES = ["USOIL", "XTIUSD", "WTI", "CL-OIL"]
 
 
-def _backup_symbol_candidates(mt5_symbol):
+def _backup_account_ids():
+    return [a.strip() for a in (METAAPI_BACKUP_ACCOUNT_ID or "").split(",") if a.strip()]
+
+
+def _backup_symbol_candidates(account_id, mt5_symbol):
     base = mt5_symbol[:-1] if mt5_symbol.endswith("m") else mt5_symbol
     # Exact name first (a backup account on Exness uses the same "...m"
     # symbols as the primary), then the suffix-less name (MetaQuotes-Demo).
     names = [mt5_symbol, base] + (_BACKUP_OIL_NAMES if base.upper() == "USOIL" else [])
     names = list(dict.fromkeys(names))
     now = time.time()
-    return [n for n in names if now >= _BACKUP_STATE["bad_symbols"].get(n, 0)]
+    return [n for n in names if now >= _BACKUP_STATE["bad_symbols"].get((account_id, n), 0)]
 
 
-def _backup_mark_bad_symbol(name):
-    _BACKUP_STATE["bad_symbols"][name] = time.time() + _BACKUP_BAD_SYMBOL_SECONDS
+def _backup_mark_bad_symbol(account_id, name):
+    _BACKUP_STATE["bad_symbols"][(account_id, name)] = time.time() + _BACKUP_BAD_SYMBOL_SECONDS
 
 
-def get_price_metaapi_backup(mt5_symbol):
-    if not METAAPI_TOKEN or not METAAPI_BACKUP_ACCOUNT_ID or not mt5_symbol:
-        return None
+def _backup_price_one(account_id, mt5_symbol):
     headers = {"auth-token": METAAPI_TOKEN, "Accept": "application/json"}
-    hosts = [_BACKUP_STATE["price_host"]] if _BACKUP_STATE["price_host"] else list(_BACKUP_PRICE_HOSTS)
-    for name in _backup_symbol_candidates(mt5_symbol):
+    known = _BACKUP_STATE["price_host"].get(account_id)
+    hosts = [known] if known else list(_BACKUP_PRICE_HOSTS)
+    for name in _backup_symbol_candidates(account_id, mt5_symbol):
         for host in hosts:
             try:
                 response = requests.get(
-                    f"{host}/users/current/accounts/{METAAPI_BACKUP_ACCOUNT_ID}/symbols/{name}/current-price",
-                    headers=headers, timeout=20,
+                    f"{host}/users/current/accounts/{account_id}/symbols/{name}/current-price",
+                    headers=headers, timeout=12,
                 )
             except Exception as e:
-                print(f"[METAAPI BACKUP] price {name} error on {host}: {e}")
+                print(f"[METAAPI BACKUP] {account_id[:8]} price {name} error on {host}: {e}")
                 continue
             if response.status_code == 200:
                 data = response.json()
                 bid, ask = data.get("bid"), data.get("ask")
                 if bid is not None and ask is not None:
-                    _BACKUP_STATE["price_host"] = host
-                    print(f"[METAAPI BACKUP] ✅ price {name}: {(bid + ask) / 2}")
+                    _BACKUP_STATE["price_host"][account_id] = host
+                    print(f"[METAAPI BACKUP] ✅ {account_id[:8]} price {name}: {(bid + ask) / 2}")
                     return (bid + ask) / 2
                 continue
             if response.status_code == 404:
-                print(f"[METAAPI BACKUP] symbol {name} not found on backup account - skipping it for 10 min")
-                _backup_mark_bad_symbol(name)
+                print(f"[METAAPI BACKUP] {account_id[:8]} symbol {name} not found - skipping it for 10 min")
+                _backup_mark_bad_symbol(account_id, name)
                 break
-            print(f"[METAAPI BACKUP] price {name} HTTP {response.status_code} on {host}: {response.text[:150]}")
+            print(f"[METAAPI BACKUP] {account_id[:8]} price {name} HTTP {response.status_code} on {host}: {response.text[:150]}")
     return None
 
 
-def get_candles_metaapi_backup(mt5_symbol, interval, outputsize):
-    if not METAAPI_TOKEN or not METAAPI_BACKUP_ACCOUNT_ID or not mt5_symbol:
+def get_price_metaapi_backup(mt5_symbol):
+    if not METAAPI_TOKEN or not mt5_symbol:
         return None
-    timeframe = {"1h": "1h", "4h": "4h", "1day": "1d"}.get(interval)
-    if not timeframe:
-        return None
+    for account_id in _backup_account_ids():
+        price = _backup_price_one(account_id, mt5_symbol)
+        if price is not None:
+            return price
+    return None
+
+
+def _backup_candles_one(account_id, mt5_symbol, timeframe, outputsize):
     headers = {"auth-token": METAAPI_TOKEN, "Accept": "application/json"}
-    for name in _backup_symbol_candidates(mt5_symbol):
+    for name in _backup_symbol_candidates(account_id, mt5_symbol):
         try:
             response = requests.get(
                 f"https://mt-market-data-client-api-v1.new-york.agiliumtrade.ai"
-                f"/users/current/accounts/{METAAPI_BACKUP_ACCOUNT_ID}"
+                f"/users/current/accounts/{account_id}"
                 f"/historical-market-data/symbols/{name}/timeframes/{timeframe}/candles"
                 f"?limit={min(outputsize, 1000)}",
                 headers=headers, timeout=20,
             )
         except Exception as e:
-            print(f"[METAAPI BACKUP] candles {name} {timeframe} error: {e}")
+            print(f"[METAAPI BACKUP] {account_id[:8]} candles {name} {timeframe} error: {e}")
             continue
         if response.status_code == 404:
-            print(f"[METAAPI BACKUP] symbol {name} not found on backup account - skipping it for 10 min")
-            _backup_mark_bad_symbol(name)
+            print(f"[METAAPI BACKUP] {account_id[:8]} symbol {name} not found - skipping it for 10 min")
+            _backup_mark_bad_symbol(account_id, name)
             continue
         if response.status_code != 200:
-            print(f"[METAAPI BACKUP] candles {name} {timeframe} HTTP {response.status_code}: {response.text[:150]}")
+            print(f"[METAAPI BACKUP] {account_id[:8]} candles {name} {timeframe} HTTP {response.status_code}: {response.text[:150]}")
             continue
         try:
             candles = [{
@@ -12423,11 +12431,24 @@ def get_candles_metaapi_backup(mt5_symbol, interval, outputsize):
                 "volume": float(c.get("tickVolume") or 0),
             } for c in response.json()]
         except Exception as e:
-            print(f"[METAAPI BACKUP] candles {name} parse error: {e}")
+            print(f"[METAAPI BACKUP] {account_id[:8]} candles {name} parse error: {e}")
             continue
         if candles:
-            print(f"[METAAPI BACKUP] ✅ candles {name} {timeframe} - {len(candles)}")
+            print(f"[METAAPI BACKUP] ✅ {account_id[:8]} candles {name} {timeframe} - {len(candles)}")
             return candles[-outputsize:]
+    return None
+
+
+def get_candles_metaapi_backup(mt5_symbol, interval, outputsize):
+    if not METAAPI_TOKEN or not mt5_symbol:
+        return None
+    timeframe = {"1h": "1h", "4h": "4h", "1day": "1d"}.get(interval)
+    if not timeframe:
+        return None
+    for account_id in _backup_account_ids():
+        candles = _backup_candles_one(account_id, mt5_symbol, timeframe, outputsize)
+        if candles:
+            return candles
     return None
 
 
@@ -12467,11 +12488,12 @@ def get_candles_fallbacks(config, interval, outputsize, providers=("oanda", "yah
 def _run_fallback_selftest():
     """One-shot startup check: logs whether each extra provider answers right now (EUR/USD, BTC/USD)."""
     try:
-        if METAAPI_BACKUP_ACCOUNT_ID:
-            for sym in ("EURUSDm", "XAUUSDm", "BTCUSDm", "USOILm"):
-                print(f"[FALLBACK SELFTEST] backup MetaAPI account {sym} price: {get_price_metaapi_backup(sym)}")
-            c = get_candles_metaapi_backup("EURUSDm", "1h", 5)
-            print(f"[FALLBACK SELFTEST] backup MetaAPI account EURUSD 1h candles: {len(c) if c else 0}")
+        if _backup_account_ids():
+            for acct in _backup_account_ids():
+                for sym in ("EURUSDm", "XAUUSDm", "BTCUSDm", "USOILm"):
+                    print(f"[FALLBACK SELFTEST] backup account {acct[:8]} {sym} price: {_backup_price_one(acct, sym)}")
+                c = _backup_candles_one(acct, "EURUSDm", "1h", 5)
+                print(f"[FALLBACK SELFTEST] backup account {acct[:8]} EURUSD 1h candles: {len(c) if c else 0}")
         else:
             print("[FALLBACK SELFTEST] backup MetaAPI account: skipped (METAAPI_BACKUP_ACCOUNT_ID not set)")
         for label, cfg in (("EURUSD", {"mt5_symbol": "EURUSDm"}), ("BTCUSD", {"mt5_symbol": "BTCUSDm"}),

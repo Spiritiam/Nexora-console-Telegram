@@ -12341,7 +12341,7 @@ _BACKUP_PRICE_HOSTS = (
     "https://mt-client-api-v1.singapore.agiliumtrade.ai",
 )
 _BACKUP_STATE = {"price_host": None, "bad_symbols": {}}
-_BACKUP_BAD_SYMBOL_SECONDS = 3600
+_BACKUP_BAD_SYMBOL_SECONDS = 600
 _BACKUP_OIL_NAMES = ["USOIL", "XTIUSD", "WTI", "CL-OIL"]
 
 
@@ -12369,7 +12369,7 @@ def get_price_metaapi_backup(mt5_symbol):
             try:
                 response = requests.get(
                     f"{host}/users/current/accounts/{METAAPI_BACKUP_ACCOUNT_ID}/symbols/{name}/current-price",
-                    headers=headers, timeout=8,
+                    headers=headers, timeout=20,
                 )
             except Exception as e:
                 print(f"[METAAPI BACKUP] price {name} error on {host}: {e}")
@@ -12383,7 +12383,7 @@ def get_price_metaapi_backup(mt5_symbol):
                     return (bid + ask) / 2
                 continue
             if response.status_code == 404:
-                print(f"[METAAPI BACKUP] symbol {name} not found on backup account - skipping it for 1h")
+                print(f"[METAAPI BACKUP] symbol {name} not found on backup account - skipping it for 10 min")
                 _backup_mark_bad_symbol(name)
                 break
             print(f"[METAAPI BACKUP] price {name} HTTP {response.status_code} on {host}: {response.text[:150]}")
@@ -12410,7 +12410,7 @@ def get_candles_metaapi_backup(mt5_symbol, interval, outputsize):
             print(f"[METAAPI BACKUP] candles {name} {timeframe} error: {e}")
             continue
         if response.status_code == 404:
-            print(f"[METAAPI BACKUP] symbol {name} not found on backup account - skipping it for 1h")
+            print(f"[METAAPI BACKUP] symbol {name} not found on backup account - skipping it for 10 min")
             _backup_mark_bad_symbol(name)
             continue
         if response.status_code != 200:

@@ -11935,8 +11935,10 @@ def _fallback_cooldown_start(provider, status_code):
         print(f"[{provider.upper()}] HTTP {status_code} - pausing this provider for {_FALLBACK_COOLDOWN_SECONDS // 60} min")
 
 
-def _fallback_on_cooldown(provider):
-    return time.time() < _FALLBACK_COOLDOWN_UNTIL.get(provider, 0)
+def _fallback_on_cooldown(provider, kind):
+    """kind is "price" or "candles" - a provider can be throttled for one and fine for the other."""
+    now = time.time()
+    return now < _FALLBACK_COOLDOWN_UNTIL.get(provider, 0) or now < _FALLBACK_COOLDOWN_UNTIL.get(f"{provider}_{kind}", 0)
 
 # base symbol (mt5_symbol without the trailing "m") -> provider symbols
 _FALLBACK_SYMBOLS = {
@@ -12031,7 +12033,7 @@ def _yahoo_chart(symbol, interval, rng):
             print(f"[YAHOO] {symbol} {interval}: empty result")
             return None
         return result
-    _fallback_cooldown_start("yahoo", last_status)
+    _fallback_cooldown_start("yahoo_price" if interval == "1m" else "yahoo_candles", last_status)
     return None
 
 
@@ -12336,7 +12338,7 @@ _FALLBACK_CANDLE_FUNCS = {
 def get_price_fallbacks(config, providers=("oanda", "yahoo", "stooq", "kraken", "binance")):
     """First live price any extra provider can give. Returns (price, provider) or (None, None)."""
     for name in providers:
-        if _fallback_on_cooldown(name):
+        if _fallback_on_cooldown(name, "price"):
             continue
         price = _FALLBACK_PRICE_FUNCS[name](config)
         if price is not None and price > 0:
@@ -12348,7 +12350,7 @@ def get_price_fallbacks(config, providers=("oanda", "yahoo", "stooq", "kraken", 
 def get_candles_fallbacks(config, interval, outputsize, providers=("oanda", "yahoo", "stooq", "kraken", "binance")):
     """First candle set any extra provider can give. Returns candles or None."""
     for name in providers:
-        if _fallback_on_cooldown(name):
+        if _fallback_on_cooldown(name, "candles"):
             continue
         candles = _FALLBACK_CANDLE_FUNCS[name](config, interval, outputsize)
         if candles:

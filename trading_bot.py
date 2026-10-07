@@ -7139,6 +7139,16 @@ def set_low_balance_notified(user_id, notified):
         print(f"[DERIV] set_low_balance_notified error: {e}")
 
 
+
+def _user_unreachable(err):
+    """True when Telegram says this user can never receive our messages
+    (they blocked the bot / deleted the account / chat gone). Retrying
+    every scan only burns Telegram's rate limit, so callers mark the
+    alert as 'done' instead of retrying."""
+    t = str(err).lower()
+    return ("blocked by the user" in t or "user is deactivated" in t
+            or "chat not found" in t or "bot can't initiate" in t)
+
 def should_send_low_balance_notification(account):
     """
     THE ACTUAL FIX, per explicit instruction: max once per calendar
@@ -10193,6 +10203,8 @@ async def run_auto_copy_scan(context: ContextTypes.DEFAULT_TYPE):
                         set_token_invalid_notified(user_id, True)
                     except Exception as notify_err:
                         print(f"[AUTO-COPY SCAN] Couldn't notify {user_id} about dead token: {notify_err}")
+                        if _user_unreachable(notify_err):
+                            set_token_invalid_notified(user_id, True)  # stop retrying every scan
                 continue
 
             # Token is working again - clear the flag so a FUTURE
@@ -10440,6 +10452,8 @@ async def run_deriv_autotrade_bot_scan(context: ContextTypes.DEFAULT_TYPE):
                             set_low_balance_notified(user_id, True)
                         except Exception as e:
                             print(f"[DERIV BOT SCAN] Couldn't send low-balance alert to {user_id}: {e}")
+                            if _user_unreachable(e):
+                                set_low_balance_notified(user_id, True)  # stop retrying every scan
                     continue  # insufficient balance - skip this round rather than trade a smaller size than chosen
 
                 if account.get("low_balance_notified"):
@@ -10544,6 +10558,8 @@ async def run_deriv_flip_entry_scan(context: ContextTypes.DEFAULT_TYPE):
                             set_low_balance_notified(user_id, True)
                         except Exception as e:
                             print(f"[DERIV FLIP] Couldn't send low-balance alert to {user_id}: {e}")
+                            if _user_unreachable(e):
+                                set_low_balance_notified(user_id, True)  # stop retrying every scan
                     continue
                 if account.get("low_balance_notified"):
                     set_low_balance_notified(user_id, False)

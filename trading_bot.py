@@ -28032,25 +28032,10 @@ def main():
         job_kwargs={"misfire_grace_time": 300}
     )
 
-    # Daily signal report - weekdays only (Mon-Fri) at 20:00 UTC (9PM
-    # Lagos), per explicit instruction - both weekend days now
-    # excluded. Saturday only ever has the single evening BTCUSD slot
-    # (often still running at post time, as confirmed live), and
-    # Sunday has no scheduled signals at all - both were consistently
-    # near-empty or literally "No scheduled signals today" every
-    # single week. Both now fold entirely into Sunday's weekly report
-    # instead of their own thin/empty same-day posts. NOTE: PTB v20+
-    # uses cron-style day indexing for run_daily's `days` param
-    # (0=Sunday...6=Saturday), NOT Python's datetime.weekday()
-    # convention - days=(1,2,3,4,5) is Monday through Friday,
-    # correctly excluding both Sunday (0) and Saturday (6).
-    job_queue.run_daily(
-        post_daily_report,
-        time=parse_time("20:00"),
-        name="daily_report",
-        days=(1, 2, 3, 4, 5),
-        job_kwargs={"misfire_grace_time": 300}
-    )
+    # Daily signal report - DISABLED per explicit instruction. Only the
+    # weekly report (Sunday 23:00 UTC) is posted now. post_daily_report
+    # is kept in the file but no longer scheduled; to bring it back,
+    # re-add a job_queue.run_daily(post_daily_report, ...) here.
 
     # Self-serve reminder - REDUCED to 1x weekly (Wednesday, 2PM WAT /
     # 13:00 UTC), per explicit instruction after a review of everything

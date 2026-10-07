@@ -12049,6 +12049,7 @@ def get_price_yahoo(config):
         price = meta.get("regularMarketPrice")
         quote_time = meta.get("regularMarketTime")
         if price is None:
+            print(f"[YAHOO] {symbol}: response had no regularMarketPrice (meta keys: {list(meta.keys())[:8]})")
             return None
         if quote_time and (time.time() - float(quote_time)) > _FALLBACK_MAX_QUOTE_AGE_SECONDS:
             print(f"[YAHOO] {symbol} quote is {int(time.time() - float(quote_time))}s old - treating as stale")
@@ -12361,7 +12362,8 @@ def get_candles_fallbacks(config, interval, outputsize, providers=("oanda", "yah
 def _run_fallback_selftest():
     """One-shot startup check: logs whether each extra provider answers right now (EUR/USD, BTC/USD)."""
     try:
-        for label, cfg in (("EURUSD", {"mt5_symbol": "EURUSDm"}), ("BTCUSD", {"mt5_symbol": "BTCUSDm"})):
+        for label, cfg in (("EURUSD", {"mt5_symbol": "EURUSDm"}), ("BTCUSD", {"mt5_symbol": "BTCUSDm"}),
+                           ("XAUUSD", {"mt5_symbol": "XAUUSDm"}), ("USOIL", {"mt5_symbol": "USOILm"})):
             for name, fn in _FALLBACK_PRICE_FUNCS.items():
                 if name in ("kraken", "binance") and label != "BTCUSD":
                     continue

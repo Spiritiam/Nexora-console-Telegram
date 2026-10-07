@@ -12341,6 +12341,7 @@ _BACKUP_PRICE_HOSTS = (
 )
 _BACKUP_STATE = {"price_host": {}, "bad_symbols": {}}
 _BACKUP_BAD_SYMBOL_SECONDS = 600
+_BACKUP_MAX_QUOTE_AGE_SECONDS = 10 * 60  # a backup quote older than this is refused as stale
 _BACKUP_OIL_NAMES = ["USOIL", "XTIUSD", "WTI", "CL-OIL"]
 
 
@@ -12381,7 +12382,17 @@ def _backup_price_one(account_id, mt5_symbol):
                 bid, ask = data.get("bid"), data.get("ask")
                 if bid is not None and ask is not None:
                     _BACKUP_STATE["price_host"][account_id] = host
-                    print(f"[METAAPI BACKUP] ✅ {account_id[:8]} price {name}: {(bid + ask) / 2}")
+                    quote_time = data.get("time")
+                    age = None
+                    try:
+                        qt = datetime.fromisoformat(str(quote_time).replace("Z", "+00:00"))
+                        age = (datetime.now(timezone.utc) - qt).total_seconds()
+                    except Exception:
+                        pass
+                    if age is not None and age > _BACKUP_MAX_QUOTE_AGE_SECONDS:
+                        print(f"[METAAPI BACKUP] {account_id[:8]} price {name}: quote is {int(age)}s old ({quote_time}) - refusing stale price")
+                        continue
+                    print(f"[METAAPI BACKUP] ✅ {account_id[:8]} price {name}: {(bid + ask) / 2} (quote age {int(age) if age is not None else '?'}s)")
                     return (bid + ask) / 2
                 continue
             if response.status_code == 404:

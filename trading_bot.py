@@ -26250,6 +26250,22 @@ async def auto_verify_request(bot, user_id, email, group_msg, username):
                     keep_buttons=True)
                 return
             await asyncio.to_thread(_inact_notice_delete_sync, str(user_id))
+            if not accounts:
+                # Approved on affiliation alone, but no trading account yet:
+                # tell the user plainly what they need to do to keep access.
+                try:
+                    await bot.send_message(
+                        chat_id=int(user_id), parse_mode=ParseMode.HTML,
+                        text=(
+                            "📌 <b>One important thing</b>\n\n"
+                            "You're verified, but we don't see an <b>Exness trading account</b> "
+                            "under our link yet.\n\n"
+                            f"To keep your access, create one with our link, fund it and place a trade "
+                            f"within <b>{_inact_cfg()['days']} days</b>:\n{EXNESS_LINK}\n\n"
+                            "If we don't see trading by then, we'll send a reminder, and access "
+                            f"is removed {_inact_cfg()['warn_grace']} days after that."))
+                except Exception as e:
+                    print(f"[AUTOVERIFY] could not send no-account note: {type(e).__name__}")
             await _edit(
                 "✅ <b>AUTO-APPROVED</b>\n\n" + head + _fmt_accounts_html(accounts) +
                 f"<i>Matched your Exness partner account: {_esc(detail)}.\n"
@@ -26541,9 +26557,9 @@ def _inact_cfg():
             return default
     return {
         "enabled": os.getenv("INACTIVITY_ENFORCE", "1").strip().lower() in ("1", "true", "yes", "on"),
-        "days": _i("INACTIVITY_DAYS", 30),
-        "new_grace": _i("INACTIVITY_NEW_USER_GRACE_DAYS", 14),
-        "warn_grace": _i("INACTIVITY_GRACE_AFTER_WARNING_DAYS", 7),
+        "days": _i("INACTIVITY_DAYS", 7),
+        "new_grace": _i("INACTIVITY_NEW_USER_GRACE_DAYS", 7),
+        "warn_grace": _i("INACTIVITY_GRACE_AFTER_WARNING_DAYS", 2),
         "reverify_days": _i("REVERIFY_TRADE_DAYS", 14),
         "max_removals": _i("INACTIVITY_MAX_REMOVALS_PER_RUN", 120),
     }
@@ -26652,7 +26668,7 @@ def _inact_removed_text(reverify_days):
         "━━━━━━━━━━━━━━━━━━━━━\n\n"
         "1️⃣ Make sure you have an Exness trading account created with our link: "
         f"{EXNESS_LINK}\n"
-        f"2️⃣ Place a trade (we need to see a trade within the last {reverify_days} days - "
+        f"2️⃣ Fund it and place a trade (we need to see a trade within the last {reverify_days} days - "
         "it can take up to 24 hours to show).\n"
         "3️⃣ Send your Exness email address here and you'll be verified automatically "
         "with a fresh Inner Circle invite. 🚀"

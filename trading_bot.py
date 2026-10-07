@@ -2507,7 +2507,7 @@ async def deriv_oauth_callback_handler(request):
             status=400, content_type="text/html",
             text=render_deriv_oauth_page(
                 "This login link has expired or was already used.",
-                "Go back to Telegram and tap Connect Deriv again.",
+                "Go back to Telegram or the SpiritFX Academy app and start the Deriv connection again.",
                 kind="warning",
             )
         )
@@ -2519,7 +2519,7 @@ async def deriv_oauth_callback_handler(request):
             status=200, content_type="text/html",
             text=render_deriv_oauth_page(
                 "Login didn't complete.",
-                f"{error}<br>Go back to Telegram and try again.",
+                f"{error}<br>Go back to Telegram or the SpiritFX Academy app and try again.",
                 kind="error",
             )
         )
@@ -2530,7 +2530,7 @@ async def deriv_oauth_callback_handler(request):
             status=200, content_type="text/html",
             text=render_deriv_oauth_page(
                 "Something went wrong finishing the login.",
-                "Go back to Telegram and try again, or paste an API token instead.",
+                "Go back to Telegram or the SpiritFX Academy app and try again.",
                 kind="error",
             )
         )
@@ -2559,9 +2559,23 @@ async def deriv_oauth_callback_handler(request):
             status=200, content_type="text/html",
             text=render_deriv_oauth_page(
                 "No real Deriv account found.",
-                "Only demo accounts were found on this login. Go back to Telegram, and "
+                "Only demo accounts were found on this login. Go back to Telegram or the app, and "
                 "either paste a real-account API token manually, or log in with an "
                 "account that has a real Deriv account too.",
+                kind="warning",
+            )
+        )
+
+    # One Deriv login must only ever be linked to ONE user, otherwise
+    # two engines (e.g. Telegram + the app) would trade it twice.
+    owner = await asyncio.to_thread(_deriv_loginid_owner_sync, real_loginid)
+    if owner and owner != str(user_id):
+        where = "the SpiritFX Academy app" if _is_app_synth(owner) else "Nexora on Telegram"
+        return web.Response(
+            status=200, content_type="text/html",
+            text=render_deriv_oauth_page(
+                "This Deriv account is already connected.",
+                f"It is linked through {where}. Disconnect it there first, then connect it here.",
                 kind="warning",
             )
         )
@@ -2575,7 +2589,7 @@ async def deriv_oauth_callback_handler(request):
         status=200, content_type="text/html",
         text=render_deriv_oauth_page(
             "Deriv account connected!",
-            "Go back to Telegram - you'll get a confirmation message there in a few seconds.",
+            ("Go back to the SpiritFX Academy app - it will show your account in a few seconds." if _is_app_synth(user_id) else "Go back to Telegram - you'll get a confirmation message there in a few seconds."),
             kind="success",
         )
     )
@@ -2997,6 +3011,313 @@ async def nexora_app_chart_handler(request):
                         headers={"Cache-Control": "private, max-age=1800"})
 
 
+# ============================================
+# DERIV INSIDE THE SPIRITFX ACADEMY APP
+# ============================================
+# App users are not Telegram users, but every Deriv engine in this bot
+# identifies a user by one id. So each app user is given a stable
+# "synthetic" numeric id far above any real Telegram id (>= 9e12) and
+# is stored in deriv_accounts exactly like a Telegram user. The engines
+# then trade for them with NO changes; their Telegram messages simply
+# fail harmlessly (every engine already wraps them in try/except).
+#
+#   POST /api/nexora/deriv/oauth-start   -> {url} (Deriv login page)
+#   GET  /api/nexora/deriv/status        -> connection, balance, mode, trades
+#   POST /api/nexora/deriv/config        -> set bot / account flip / on / off
+#   POST /api/nexora/deriv/disconnect    -> unlink the Deriv account
+#
+# Kill switch: NEXORA_APP_DERIV=0 (blocks new connections and changes).
+
+APP_SYNTH_MIN = 9_000_000_000_000
+_napp_deriv_hits = {}  # user_key -> [timestamps] for light rate limiting
+
+
+def _is_app_synth(user_id):
+    try:
+        return int(str(user_id)) >= APP_SYNTH_MIN
+    except Exception:
+        return False
+
+
+def _napp_synth_id_sync(user_key):
+    try:
+        r = requests.post(
+            f"{SUPABASE_URL}/rest/v1/rpc/app_synthetic_id",
+            headers=sb_headers(), json={"p_key": user_key}, timeout=10,
+        )
+        if r.status_code == 200:
+            return str(int(r.json()))
+        print(f"[NEXORA APP] synthetic id failed: {r.status_code} {r.text[:200]}")
+    except Exception as e:
+        print(f"[NEXORA APP] synthetic id error: {type(e).__name__}")
+    return None
+
+
+def _napp_deriv_killed():
+    return os.getenv("NEXORA_APP_DERIV", "1") == "0"
+
+
+def _deriv_loginid_owner_sync(loginid):
+    """Which user_id (if any) already has this Deriv login linked."""
+    try:
+        url = (f"{SUPABASE_URL}/rest/v1/deriv_accounts"
+               f"?deriv_loginid=eq.{requests.utils.quote(str(loginid), safe='')}&select=user_id&limit=1")
+        rows = requests.get(url, headers=sb_headers(), timeout=10).json()
+        if isinstance(rows, list) and rows:
+            return str(rows[0].get("user_id"))
+    except Exception as e:
+        print(f"[DERIV] loginid owner lookup error: {type(e).__name__}")
+    return None
+
+
+async def _napp_deriv_auth(request, limit_per_min=20, allow_killed=False):
+    """Returns (synthetic_id, None) or (None, error_response)."""
+    if _napp_deriv_killed() and not allow_killed:
+        return None, _napp_json({"error": "unavailable", "message": "Deriv in the app is switched off right now."}, 503)
+    auth = request.headers.get("Authorization", "")
+    token = auth[7:].strip() if auth.lower().startswith("bearer ") else ""
+    user_key = await asyncio.to_thread(_napp_validate_token_sync, token)
+    if not user_key:
+        return None, _napp_json({"error": "auth", "message": "Please log in again."}, 401)
+    now = time.time()
+    hits = [t for t in _napp_deriv_hits.get(user_key, []) if now - t < 60]
+    if len(hits) >= limit_per_min:
+        return None, _napp_json({"error": "slow_down", "message": "Too many requests. Wait a minute."}, 429)
+    hits.append(now)
+    _napp_deriv_hits[user_key] = hits
+    synth = await asyncio.to_thread(_napp_synth_id_sync, user_key)
+    if not synth:
+        return None, _napp_json({"error": "server", "message": "Could not set up your account. Try again."}, 500)
+    return synth, None
+
+
+def _napp_clean_label(label):
+    return re.sub(r"[^\x20-\x7E]", "", label or "").strip()
+
+
+def _napp_deriv_options():
+    return {
+        "bots": [
+            {"key": k, "label": _napp_clean_label(v["label"]), "description": v["description"]}
+            for k, v in DERIV_AUTOTRADE_BOTS.items()
+        ],
+        "pairs": [
+            {"key": p, "display": SYNTHETIC_CONFIG[p]["display"]}
+            for p in DERIV_AUTOTRADE_PAIRS
+        ],
+        "stakes": [dict(t) for t in STAKE_TIERS],
+        "flip_stake_min": 1,
+        "flip_stake_max": 100,
+    }
+
+
+def _napp_deriv_recent_trades_sync(synth):
+    try:
+        url = (
+            f"{SUPABASE_URL}/rest/v1/auto_copy_trades?user_id=eq.{synth}"
+            f"&select=symbol,direction,stake,status,profit,placed_at,closed_at"
+            f"&order=placed_at.desc&limit=10"
+        )
+        rows = requests.get(url, headers=sb_headers(), timeout=10).json()
+        return rows if isinstance(rows, list) else []
+    except Exception as e:
+        print(f"[NEXORA APP] trades read error: {type(e).__name__}")
+        return []
+
+
+def _napp_deriv_has_open_sync(synth):
+    try:
+        url = (f"{SUPABASE_URL}/rest/v1/auto_copy_trades"
+               f"?user_id=eq.{synth}&status=eq.OPEN&select=id&limit=1")
+        rows = requests.get(url, headers=sb_headers(), timeout=10).json()
+        if isinstance(rows, list) and rows:
+            return True
+    except Exception:
+        return True  # fail closed: do not allow disconnect if unsure
+    return bool(get_open_deriv_flip_stack(synth))
+
+
+def _napp_deriv_mode_summary(acct):
+    choice = acct.get("deriv_bot_choice")
+    pair = acct.get("deriv_pair_choice")
+    pair_disp = SYNTHETIC_CONFIG.get(pair, {}).get("display") if pair else None
+    out = {
+        "enabled": bool(acct.get("deriv_autotrade_enabled")),
+        "mode": None, "pair": pair, "pair_display": pair_disp,
+    }
+    if choice in DERIV_AUTOTRADE_BOTS:
+        out.update({
+            "mode": "bot", "bot": choice,
+            "bot_label": _napp_clean_label(DERIV_AUTOTRADE_BOTS[choice]["label"]),
+            "stake": acct.get("deriv_bot_stake"),
+            "risk": acct.get("deriv_bot_risk"), "win": acct.get("deriv_bot_win"),
+        })
+    elif choice == "account_flip":
+        out.update({
+            "mode": "flip", "bot_label": "Account Flip",
+            "stake": acct.get("deriv_flip_base_stake"),
+            "step": acct.get("deriv_flip_step"),
+            "max_layers": acct.get("deriv_flip_max_layers"),
+            "trigger": acct.get("deriv_flip_trigger_amount"),
+            "trail": acct.get("deriv_flip_trail_amount"),
+        })
+    return out
+
+
+async def nexora_app_deriv_oauth_start_handler(request):
+    synth, err = await _napp_deriv_auth(request, limit_per_min=20)
+    if err:
+        return err
+    if not (DERIV_OAUTH_APP_ID and DERIV_OAUTH_REDIRECT_URL):
+        return _napp_json({"error": "unavailable", "message": "Deriv login is not set up yet."}, 503)
+    verifier, challenge = generate_pkce_pair()
+    state = await asyncio.to_thread(create_deriv_oauth_state, synth, verifier)
+    if not state:
+        return _napp_json({"error": "server", "message": "Could not start the Deriv login. Try again."}, 500)
+    url = (
+        "https://auth.deriv.com/oauth2/auth"
+        f"?response_type=code&client_id={DERIV_OAUTH_APP_ID}"
+        f"&redirect_uri={requests.utils.quote(DERIV_OAUTH_REDIRECT_URL, safe='')}"
+        "&scope=trade+account_manage"
+        f"&state={state}"
+        f"&code_challenge={challenge}&code_challenge_method=S256"
+    )
+    return _napp_json({"url": url})
+
+
+async def nexora_app_deriv_status_handler(request):
+    synth, err = await _napp_deriv_auth(request)
+    if err:
+        return err
+    acct = await asyncio.to_thread(get_deriv_account, synth)
+    options = _napp_deriv_options()
+    if not acct or not acct.get("api_token"):
+        return _napp_json({"connected": False, "options": options})
+
+    snapshot = None
+    try:
+        snapshot = await asyncio.wait_for(deriv_fetch_account_snapshot(acct["api_token"]), timeout=25)
+    except Exception as e:
+        print(f"[NEXORA APP] deriv snapshot error: {type(e).__name__}")
+    trades = await asyncio.to_thread(_napp_deriv_recent_trades_sync, synth)
+    return _napp_json({
+        "connected": True,
+        "reachable": bool(snapshot),
+        "loginid": acct.get("deriv_loginid"),
+        "currency": acct.get("currency"),
+        "balance": snapshot.get("balance") if snapshot else None,
+        "open_positions": len(snapshot.get("open_contracts") or []) if snapshot else None,
+        "autotrade": _napp_deriv_mode_summary(acct),
+        "trades": trades,
+        "options": options,
+    })
+
+
+async def nexora_app_deriv_config_handler(request):
+    synth, err = await _napp_deriv_auth(request, limit_per_min=20, allow_killed=True)
+    if err:
+        return err
+    try:
+        body = await request.json()
+    except Exception:
+        return _napp_json({"error": "bad_request", "message": "Could not read that."}, 400)
+    if not isinstance(body, dict):
+        return _napp_json({"error": "bad_request", "message": "Could not read that."}, 400)
+
+    acct = await asyncio.to_thread(get_deriv_account, synth)
+    if not acct or not acct.get("api_token"):
+        return _napp_json({"error": "not_connected", "message": "Connect your Deriv account first."}, 400)
+
+    action = body.get("action")
+    mode = body.get("mode")
+    # Kill switch: everything except turning OFF is blocked, so a user
+    # can always stop trading.
+    if _napp_deriv_killed() and action != "off":
+        return _napp_json({"error": "unavailable", "message": "Deriv in the app is switched off right now."}, 503)
+    fields = None
+    done_text = ""
+
+    if action == "off":
+        fields = {"deriv_autotrade_enabled": False}
+        done_text = "Auto-Trade turned off. Your settings are kept."
+    elif action == "on":
+        choice = acct.get("deriv_bot_choice")
+        if choice not in DERIV_AUTOTRADE_BOTS and choice != "account_flip":
+            return _napp_json({"error": "not_configured", "message": "Pick a mode first."}, 400)
+        fields = {"deriv_autotrade_enabled": True}
+        done_text = "Auto-Trade turned on with your saved settings."
+    elif mode == "bot":
+        bot_key = body.get("bot")
+        pair_key = body.get("pair")
+        try:
+            stake = float(body.get("stake"))
+        except Exception:
+            stake = None
+        tier = next((t for t in STAKE_TIERS if stake is not None and t["stake"] == stake), None)
+        if bot_key not in DERIV_AUTOTRADE_BOTS or pair_key not in DERIV_AUTOTRADE_PAIRS or not tier:
+            return _napp_json({"error": "bad_request", "message": "Pick a bot, an index and a stake."}, 400)
+        fields = {
+            "deriv_bot_choice": bot_key, "deriv_pair_choice": pair_key,
+            "deriv_autotrade_enabled": True,
+            "deriv_bot_stake": tier["stake"], "deriv_bot_risk": tier["risk"], "deriv_bot_win": tier["win"],
+        }
+        done_text = f"{_napp_clean_label(DERIV_AUTOTRADE_BOTS[bot_key]['label'])} is on."
+    elif mode == "flip":
+        pair_key = body.get("pair")
+        try:
+            base = float(body.get("base_stake"))
+        except Exception:
+            base = None
+        if body.get("accept") is not True:
+            return _napp_json({"error": "bad_request", "message": "You must accept the Account Flip warning."}, 400)
+        if pair_key not in DERIV_AUTOTRADE_PAIRS or base is None or not (1 <= base <= 100):
+            return _napp_json({"error": "bad_request", "message": "Pick an index and a starting stake between 1 and 100."}, 400)
+        d = get_deriv_flip_defaults(base)
+        fields = {
+            "deriv_bot_choice": "account_flip", "deriv_pair_choice": pair_key,
+            "deriv_autotrade_enabled": True,
+            "deriv_flip_base_stake": base, "deriv_flip_step": d["flip_step"],
+            "deriv_flip_max_stake": d["flip_max_stake"],
+            "deriv_flip_trigger_amount": d["flip_trigger_amount"],
+            "deriv_flip_max_layers": d["flip_max_layers"],
+            "deriv_flip_trail_amount": d["flip_trail_amount"],
+            "deriv_flip_disclaimer_accepted": True,
+        }
+        done_text = "Account Flip is on."
+    else:
+        return _napp_json({"error": "bad_request", "message": "Nothing to change."}, 400)
+
+    ok = await asyncio.to_thread(update_deriv_account_fields, synth, fields)
+    if not ok:
+        return _napp_json({"error": "server", "message": "Could not save that. Please try again."}, 500)
+    fresh = await asyncio.to_thread(get_deriv_account, synth)
+    return _napp_json({"ok": True, "message": done_text,
+                       "autotrade": _napp_deriv_mode_summary(fresh or acct)})
+
+
+async def nexora_app_deriv_disconnect_handler(request):
+    synth, err = await _napp_deriv_auth(request, limit_per_min=20)
+    if err:
+        return err
+    acct = await asyncio.to_thread(get_deriv_account, synth)
+    if not acct:
+        return _napp_json({"ok": True, "message": "Already disconnected."})
+    if await asyncio.to_thread(_napp_deriv_has_open_sync, synth):
+        return _napp_json({"error": "open_trades",
+                           "message": "You still have an open Nexora trade. Turn Auto-Trade off and disconnect after it closes."}, 409)
+    try:
+        r = await asyncio.to_thread(
+            lambda: requests.delete(
+                f"{SUPABASE_URL}/rest/v1/deriv_accounts?user_id=eq.{synth}",
+                headers=sb_headers(), timeout=10))
+        if r.status_code not in (200, 204):
+            raise RuntimeError(r.status_code)
+    except Exception as e:
+        print(f"[NEXORA APP] deriv disconnect error: {type(e).__name__}")
+        return _napp_json({"error": "server", "message": "Could not disconnect. Please try again."}, 500)
+    return _napp_json({"ok": True, "message": "Deriv account disconnected."})
+
+
 def run_korapay_webhook_server():
     """
     Runs a small, INDEPENDENT web server in its own background thread
@@ -3015,6 +3336,10 @@ def run_korapay_webhook_server():
     webhook_app.router.add_get("/deriv-oauth-callback", deriv_oauth_callback_handler)
     webhook_app.router.add_post("/api/nexora/chat", nexora_app_chat_handler)
     webhook_app.router.add_get("/api/nexora/chart/{cid}", nexora_app_chart_handler)
+    webhook_app.router.add_post("/api/nexora/deriv/oauth-start", nexora_app_deriv_oauth_start_handler)
+    webhook_app.router.add_get("/api/nexora/deriv/status", nexora_app_deriv_status_handler)
+    webhook_app.router.add_post("/api/nexora/deriv/config", nexora_app_deriv_config_handler)
+    webhook_app.router.add_post("/api/nexora/deriv/disconnect", nexora_app_deriv_disconnect_handler)
     port = int(os.getenv("PORT", 8080))
     print(f"[KORAPAY WEBHOOK] Starting webhook server on port {port}...")
     # handle_signals=False - CONFIRMED REAL CRASH via live logs:
@@ -3386,6 +3711,11 @@ async def process_pending_deriv_oauth_connections(context: ContextTypes.DEFAULT_
         try:
             saved = save_deriv_account(user_id, loginid, token, currency, auth_method="oauth")
             mark_deriv_oauth_connection_processed(row_id)
+            if _is_app_synth(user_id):
+                # App user: no Telegram chat to message. The app shows
+                # the connection by polling its status endpoint.
+                print(f"[DERIV OAUTH] App user {user_id} connected: {loginid} (saved={saved})")
+                continue
             if saved:
                 # Clean up the "Login with Deriv" prompt now that it's
                 # done its job - per explicit instruction, leaving a

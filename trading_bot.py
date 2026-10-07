@@ -12381,6 +12381,101 @@ def _run_fallback_selftest():
 # LIVE PRICE — COMBINED
 # ============================================
 
+# ============================================
+# METAAPI SELF-HEAL (admin market-data account only)
+# ============================================
+# If live prices from the bot's MetaAPI account keep failing with
+# gateway/timeout errors (the "terminal shows connected but the API says
+# not connected to broker" state), ask MetaAPI to redeploy that ONE
+# account - the same action as the dashboard's Redeploy button - then
+# tell the admin on Telegram. Safety limits: only after an unbroken
+# outage of 15+ minutes with recent failures, at most once per hour, and
+# the outage clock restarts after each attempt. Open positions are not
+# touched (a redeploy only restarts MetaAPI's cloud terminal).
+
+_METAAPI_SELFHEAL = {"first_failure": None, "last_failure": None, "last_redeploy": 0.0}
+METAAPI_SELFHEAL_MIN_OUTAGE_SECONDS = 15 * 60
+METAAPI_SELFHEAL_RECENT_FAILURE_SECONDS = 10 * 60
+METAAPI_SELFHEAL_COOLDOWN_SECONDS = 60 * 60
+
+
+def _selfheal_note_price_ok():
+    _METAAPI_SELFHEAL["first_failure"] = None
+    _METAAPI_SELFHEAL["last_failure"] = None
+
+
+def _selfheal_note_price_failure():
+    now = time.time()
+    if _METAAPI_SELFHEAL["first_failure"] is None:
+        _METAAPI_SELFHEAL["first_failure"] = now
+    _METAAPI_SELFHEAL["last_failure"] = now
+
+
+def _metaapi_redeploy_admin_account():
+    """POSTs MetaAPI's redeploy for the bot's own account. Returns (ok, detail)."""
+    try:
+        response = requests.post(
+            f"https://mt-provisioning-api-v1.agiliumtrade.agiliumtrade.ai"
+            f"/users/current/accounts/{METAAPI_ACCOUNT_ID}/redeploy",
+            headers={"auth-token": METAAPI_TOKEN},
+            timeout=30,
+        )
+        if response.status_code in (200, 204):
+            return True, f"HTTP {response.status_code}"
+        return False, f"HTTP {response.status_code}: {response.text[:200]}"
+    except Exception as e:
+        return False, f"error: {e}"
+
+
+def _selfheal_should_redeploy(now=None):
+    now = now or time.time()
+    st = _METAAPI_SELFHEAL
+    if not METAAPI_TOKEN or not METAAPI_ACCOUNT_ID:
+        return False
+    if st["first_failure"] is None or st["last_failure"] is None:
+        return False
+    if now - st["last_failure"] > METAAPI_SELFHEAL_RECENT_FAILURE_SECONDS:
+        return False  # no fresh evidence (bot idle between scans)
+    if st["last_failure"] - st["first_failure"] < METAAPI_SELFHEAL_MIN_OUTAGE_SECONDS:
+        return False
+    if now - st["last_redeploy"] < METAAPI_SELFHEAL_COOLDOWN_SECONDS:
+        return False
+    return True
+
+
+async def metaapi_selfheal_job(context: ContextTypes.DEFAULT_TYPE):
+    if not _selfheal_should_redeploy():
+        return
+    st = _METAAPI_SELFHEAL
+    outage_minutes = int((st["last_failure"] - st["first_failure"]) / 60)
+    st["last_redeploy"] = time.time()
+    st["first_failure"] = None  # outage clock restarts after this attempt
+    st["last_failure"] = None
+    ok, detail = await asyncio.to_thread(_metaapi_redeploy_admin_account)
+    print(f"[METAAPI SELFHEAL] redeploy requested after {outage_minutes} min of failures: ok={ok} ({detail})")
+    if not ADMIN_USER_ID:
+        return
+    try:
+        await context.bot.send_message(
+            chat_id=int(ADMIN_USER_ID),
+            text=(
+                f"🔧 <b>MetaAPI live prices have been failing for {outage_minutes}+ minutes.</b>\n\n"
+                + (
+                    "I asked MetaAPI to redeploy the bot's data account (same as the dashboard Redeploy button). "
+                    "It usually takes 1-2 minutes to reconnect."
+                    if ok else
+                    f"I tried to redeploy the bot's data account but MetaAPI refused: {detail}\n"
+                    "Please check app.metaapi.cloud."
+                )
+                + "\n\n<i>The bot is using its backup price sources meanwhile. "
+                  "Next automatic attempt: not before 1 hour from now.</i>"
+            ),
+            parse_mode=ParseMode.HTML,
+        )
+    except Exception as e:
+        print(f"[METAAPI SELFHEAL] couldn't notify admin: {e}")
+
+
 def get_price_metaapi(mt5_symbol):
     """
     Live bid/ask price straight from the connected MT5 account -
@@ -12413,6 +12508,7 @@ def get_price_metaapi(mt5_symbol):
             bid, ask = data.get("bid"), data.get("ask")
             if bid is not None and ask is not None:
                 record_metaapi_candles_success()
+                _selfheal_note_price_ok()
                 return (bid + ask) / 2
             print(f"[METAAPI PRICE] {mt5_symbol} response missing bid/ask: {data}")
             return None
@@ -12421,9 +12517,13 @@ def get_price_metaapi(mt5_symbol):
             record_metaapi_candles_failure()
             return None
         print(f"[METAAPI PRICE] {mt5_symbol} failed {response.status_code}: {response.text[:300]}")
+        if response.status_code in (500, 502, 503, 504):
+            _selfheal_note_price_failure()
         return None
     except Exception as e:
         print(f"[METAAPI PRICE] {mt5_symbol} error: {e}")
+        if isinstance(e, requests.exceptions.Timeout):
+            _selfheal_note_price_failure()
         return None
 
 
@@ -28248,6 +28348,15 @@ def main():
             days=days,
             job_kwargs={"misfire_grace_time": 300}
         )
+
+    # MetaAPI self-heal - every 5 min, redeploys the bot's own data account
+    # if live prices have been failing for 15+ minutes (max once per hour).
+    job_queue.run_repeating(
+        metaapi_selfheal_job,
+        interval=300,
+        first=180,
+        name="metaapi_selfheal"
+    )
 
     # TP/SL monitor - checks every OPEN logged signal every 15 minutes
     job_queue.run_repeating(

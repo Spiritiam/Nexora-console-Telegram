@@ -12326,6 +12326,109 @@ def get_candles_binance(config, interval, outputsize):
         return None
 
 
+# ---------- Second MetaAPI account (backup data feed) ----------
+# A second, independent MetaAPI account (same METAAPI_TOKEN) used ONLY when
+# the primary account's live price / candles fail. Set METAAPI_BACKUP_ACCOUNT_ID
+# in Railway to enable; nothing happens while it is unset. Its broker feed
+# (MetaQuotes-Demo) is close to, but not identical with, the primary's Exness
+# prices, so this is a backup, never the first choice. Symbol names on it
+# have no broker suffix ("EURUSD", not "EURUSDm"). Returns None on any problem.
+
+METAAPI_BACKUP_ACCOUNT_ID = os.getenv("METAAPI_BACKUP_ACCOUNT_ID")
+_BACKUP_PRICE_HOSTS = (
+    "https://mt-client-api-v1.london.agiliumtrade.ai",
+    "https://mt-client-api-v1.new-york.agiliumtrade.ai",
+    "https://mt-client-api-v1.singapore.agiliumtrade.ai",
+)
+_BACKUP_STATE = {"price_host": None, "bad_symbols": {}}
+_BACKUP_BAD_SYMBOL_SECONDS = 3600
+_BACKUP_OIL_NAMES = ["USOIL", "XTIUSD", "WTI", "CL-OIL"]
+
+
+def _backup_symbol_candidates(mt5_symbol):
+    base = mt5_symbol[:-1] if mt5_symbol.endswith("m") else mt5_symbol
+    names = _BACKUP_OIL_NAMES if base.upper() == "USOIL" else [base]
+    now = time.time()
+    return [n for n in names if now >= _BACKUP_STATE["bad_symbols"].get(n, 0)]
+
+
+def _backup_mark_bad_symbol(name):
+    _BACKUP_STATE["bad_symbols"][name] = time.time() + _BACKUP_BAD_SYMBOL_SECONDS
+
+
+def get_price_metaapi_backup(mt5_symbol):
+    if not METAAPI_TOKEN or not METAAPI_BACKUP_ACCOUNT_ID or not mt5_symbol:
+        return None
+    headers = {"auth-token": METAAPI_TOKEN, "Accept": "application/json"}
+    hosts = [_BACKUP_STATE["price_host"]] if _BACKUP_STATE["price_host"] else list(_BACKUP_PRICE_HOSTS)
+    for name in _backup_symbol_candidates(mt5_symbol):
+        for host in hosts:
+            try:
+                response = requests.get(
+                    f"{host}/users/current/accounts/{METAAPI_BACKUP_ACCOUNT_ID}/symbols/{name}/current-price",
+                    headers=headers, timeout=8,
+                )
+            except Exception as e:
+                print(f"[METAAPI BACKUP] price {name} error on {host}: {e}")
+                continue
+            if response.status_code == 200:
+                data = response.json()
+                bid, ask = data.get("bid"), data.get("ask")
+                if bid is not None and ask is not None:
+                    _BACKUP_STATE["price_host"] = host
+                    print(f"[METAAPI BACKUP] ✅ price {name}: {(bid + ask) / 2}")
+                    return (bid + ask) / 2
+                continue
+            if response.status_code == 404:
+                print(f"[METAAPI BACKUP] symbol {name} not found on backup account - skipping it for 1h")
+                _backup_mark_bad_symbol(name)
+                break
+            print(f"[METAAPI BACKUP] price {name} HTTP {response.status_code} on {host}: {response.text[:150]}")
+    return None
+
+
+def get_candles_metaapi_backup(mt5_symbol, interval, outputsize):
+    if not METAAPI_TOKEN or not METAAPI_BACKUP_ACCOUNT_ID or not mt5_symbol:
+        return None
+    timeframe = {"1h": "1h", "4h": "4h", "1day": "1d"}.get(interval)
+    if not timeframe:
+        return None
+    headers = {"auth-token": METAAPI_TOKEN, "Accept": "application/json"}
+    for name in _backup_symbol_candidates(mt5_symbol):
+        try:
+            response = requests.get(
+                f"https://mt-market-data-client-api-v1.new-york.agiliumtrade.ai"
+                f"/users/current/accounts/{METAAPI_BACKUP_ACCOUNT_ID}"
+                f"/historical-market-data/symbols/{name}/timeframes/{timeframe}/candles"
+                f"?limit={min(outputsize, 1000)}",
+                headers=headers, timeout=20,
+            )
+        except Exception as e:
+            print(f"[METAAPI BACKUP] candles {name} {timeframe} error: {e}")
+            continue
+        if response.status_code == 404:
+            print(f"[METAAPI BACKUP] symbol {name} not found on backup account - skipping it for 1h")
+            _backup_mark_bad_symbol(name)
+            continue
+        if response.status_code != 200:
+            print(f"[METAAPI BACKUP] candles {name} {timeframe} HTTP {response.status_code}: {response.text[:150]}")
+            continue
+        try:
+            candles = [{
+                "time": c.get("time"),
+                "open": float(c["open"]), "high": float(c["high"]),
+                "low": float(c["low"]), "close": float(c["close"]),
+                "volume": float(c.get("tickVolume") or 0),
+            } for c in response.json()]
+        except Exception as e:
+            print(f"[METAAPI BACKUP] candles {name} parse error: {e}")
+            continue
+        if candles:
+            print(f"[METAAPI BACKUP] ✅ candles {name} {timeframe} - {len(candles)}")
+            return candles[-outputsize:]
+    return None
+
+
 _FALLBACK_PRICE_FUNCS = {
     "oanda": get_price_oanda, "yahoo": get_price_yahoo, "stooq": get_price_stooq,
     "kraken": get_price_kraken, "binance": get_price_binance,
@@ -12362,6 +12465,13 @@ def get_candles_fallbacks(config, interval, outputsize, providers=("oanda", "yah
 def _run_fallback_selftest():
     """One-shot startup check: logs whether each extra provider answers right now (EUR/USD, BTC/USD)."""
     try:
+        if METAAPI_BACKUP_ACCOUNT_ID:
+            for sym in ("EURUSDm", "XAUUSDm", "BTCUSDm", "USOILm"):
+                print(f"[FALLBACK SELFTEST] backup MetaAPI account {sym} price: {get_price_metaapi_backup(sym)}")
+            c = get_candles_metaapi_backup("EURUSDm", "1h", 5)
+            print(f"[FALLBACK SELFTEST] backup MetaAPI account EURUSD 1h candles: {len(c) if c else 0}")
+        else:
+            print("[FALLBACK SELFTEST] backup MetaAPI account: skipped (METAAPI_BACKUP_ACCOUNT_ID not set)")
         for label, cfg in (("EURUSD", {"mt5_symbol": "EURUSDm"}), ("BTCUSD", {"mt5_symbol": "BTCUSDm"}),
                            ("XAUUSD", {"mt5_symbol": "XAUUSDm"}), ("USOIL", {"mt5_symbol": "USOILm"})):
             for name, fn in _FALLBACK_PRICE_FUNCS.items():
@@ -12585,6 +12695,11 @@ def get_live_price(symbol="XAU/USD", config=None, source_tracker=None):
                 source_tracker["source"] = "metaapi"
             return price
         print(f"[PRICE] MetaAPI failed for {symbol} - falling back to existing sources")
+        price = get_price_metaapi_backup(config["mt5_symbol"])
+        if price is not None:
+            if source_tracker is not None:
+                source_tracker["source"] = "metaapi_backup"
+            return price
 
     if config and config.get("use_metals_api"):
         price = get_silver_price()
@@ -13294,7 +13409,11 @@ def get_cached_candles(pair_key, config, interval, outputsize=60, force_fresh=Fa
         if candles:
             candle_cache[cache_key] = {"candles": candles, "timestamp": now}
             return candles
-        print(f"[CANDLES] MetaAPI failed for {pair_key} ({interval}) - falling back to OANDA/Yahoo, then TwelveData")
+        print(f"[CANDLES] MetaAPI failed for {pair_key} ({interval}) - falling back to backup account, OANDA/Yahoo, then TwelveData")
+        candles = get_candles_metaapi_backup(config["mt5_symbol"], interval, outputsize)
+        if candles:
+            candle_cache[cache_key] = {"candles": candles, "timestamp": now}
+            return candles
         candles = get_candles_fallbacks(config, interval, outputsize, providers=("oanda", "yahoo"))
         if candles:
             candle_cache[cache_key] = {"candles": candles, "timestamp": now}

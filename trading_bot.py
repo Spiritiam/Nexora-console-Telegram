@@ -28360,7 +28360,10 @@ def main():
 
         if ADMIN_USER_ID and not is_routine_handover_conflict and not is_harmless_no_op_edit:
             try:
-                signature = f"{type(error).__name__}:{str(error)[:200]}"
+                # Strip digits so "Retry in 222 seconds" / "Retry in 221 seconds"
+                # count as the SAME error (otherwise a countdown defeats the
+                # 15-minute silence and floods the admin with alerts).
+                signature = f"{type(error).__name__}:{re.sub(r'[0-9]+', '#', str(error))[:200]}"
                 now = datetime.now(timezone.utc)
                 last_sent = _error_alert_last_sent.get(signature)
                 if last_sent is None or (now - last_sent).total_seconds() > 900:

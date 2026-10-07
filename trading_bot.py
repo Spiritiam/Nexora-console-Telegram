@@ -1216,6 +1216,49 @@ async def has_client_open_mt5_position(metaapi_account_id, mt5_symbol):
         return False
 
 
+# Optional per-user SL/TP override (set from the Nexora app). Distances are
+# in standard market pips (forex 0.0001, JPY pairs 0.01, gold 0.1, silver and
+# oil 0.01, BTC 1.0). Accounts without an override (everyone on Telegram) are
+# left exactly as before - the signal's own SL/TP is used.
+SLTP_OVERRIDE_PIP_SIZE = {
+    "xauusd": 0.1, "btcusd": 1.0, "xagusd": 0.01, "usoil": 0.01,
+    "eurusd": 0.0001, "gbpusd": 0.0001, "audusd": 0.0001, "usdcad": 0.0001,
+    "nzdusd": 0.0001, "usdchf": 0.0001,
+    "usdjpy": 0.01, "gbpjpy": 0.01, "eurjpy": 0.01,
+}
+
+
+def apply_sltp_override(account, pair_key, direction, entry_price, stop_loss, take_profit):
+    """Returns (stop_loss, take_profit), replaced by the user's fixed pip
+    distances when they set them. Any doubt -> the signal's own values."""
+    try:
+        sl_pips = account.get("sl_override_pips")
+        tp_pips = account.get("tp_override_pips")
+        if not sl_pips and not tp_pips:
+            return stop_loss, take_profit
+        pip = SLTP_OVERRIDE_PIP_SIZE.get(pair_key)
+        if not pip or not entry_price or direction not in ("BUY", "SELL"):
+            return stop_loss, take_profit
+        decimals = PAIR_CONFIG.get(pair_key, {}).get("decimals", 5)
+        sign = 1 if direction == "BUY" else -1
+        sl, tp = stop_loss, take_profit
+        for kind, pips in (("sl", sl_pips), ("tp", tp_pips)):
+            if not pips:
+                continue
+            dist = float(pips) * pip
+            if not (entry_price * 0.0002 <= dist <= entry_price * 0.2):
+                print(f"[MT5 AUTOTRADE] SL/TP override {kind}={pips} pips looks off for {pair_key} - using the signal's value")
+                continue
+            if kind == "sl":
+                sl = round(entry_price - sign * dist, decimals)
+            else:
+                tp = round(entry_price + sign * dist, decimals)
+        return sl, tp
+    except Exception as e:
+        print(f"[MT5 AUTOTRADE] SL/TP override error: {type(e).__name__}")
+        return stop_loss, take_profit
+
+
 def compute_lot_size(account, entry_price, stop_loss):
     """
     Returns a lot size for this trade based on the account's own
@@ -1837,15 +1880,18 @@ async def run_mt5_autotrade_bot_scan(context: ContextTypes.DEFAULT_TYPE):
                 if await has_client_open_mt5_position(metaapi_account_id, resolved_symbol):
                     continue
 
+                acct_sl, acct_tp = apply_sltp_override(
+                    account, pair_key, direction, entry_price, stop_loss, take_profit)
+
                 if account.get("risk_mode") == "percent":
                     balance = await get_client_mt5_balance(metaapi_account_id)
                     account["_live_balance"] = balance
 
-                volume = compute_lot_size(account, entry_price, stop_loss)
+                volume = compute_lot_size(account, entry_price, acct_sl)
 
                 order_id = await place_client_mt5_trade(
                     metaapi_account_id, resolved_symbol, direction,
-                    volume, stop_loss, take_profit,
+                    volume, acct_sl, acct_tp,
                     # Short, per explicit instruction - MT5's native
                     # comment field has a real, strict length limit
                     # (commonly ~31 chars). signal_marker alone can run
@@ -1865,7 +1911,7 @@ async def run_mt5_autotrade_bot_scan(context: ContextTypes.DEFAULT_TYPE):
                             chat_id=int(user_id),
                             text=(
                                 f"🤖 <b>{bot_info['label']} — {direction} {pair_config['display']}</b>\n\n"
-                                f"Entry: {entry_price:.4f} | SL: {stop_loss:.4f} | TP: {take_profit:.4f}\n"
+                                f"Entry: {entry_price:.4f} | SL: {acct_sl:.4f} | TP: {acct_tp:.4f}\n"
                                 f"Volume: {volume} lots"
                             ),
                             parse_mode=ParseMode.HTML
@@ -1947,16 +1993,19 @@ async def run_mt5_autotrade_follow_channel_scan(context: ContextTypes.DEFAULT_TY
                 print(f"[MT5 AUTOTRADE FOLLOW] Signal {signal_id} ({pair_name}) missing required fields - entry={entry_price} sl={stop_loss} tp={take_profit} dir={direction}, skipping")
                 continue
 
+            acct_sl, acct_tp = apply_sltp_override(
+                account, pair_key, direction, entry_price, stop_loss, take_profit)
+
             if account.get("risk_mode") == "percent":
                 balance = await get_client_mt5_balance(metaapi_account_id)
                 account["_live_balance"] = balance
 
-            volume = compute_lot_size(account, entry_price, stop_loss)
+            volume = compute_lot_size(account, entry_price, acct_sl)
             print(f"[MT5 AUTOTRADE FOLLOW] Attempting to copy signal {signal_id} ({pair_name} {direction}) for user {user_id}, volume={volume}, symbol={resolved_symbol}")
 
             order_id = await place_client_mt5_trade(
                 metaapi_account_id, resolved_symbol, direction,
-                volume, stop_loss, take_profit,
+                volume, acct_sl, acct_tp,
                 # signal_id is a real Supabase auto-incrementing ID
                 # (short, numeric) - safe within MT5's comment length
                 # limit, and a genuinely meaningful identifier here
@@ -1976,7 +2025,7 @@ async def run_mt5_autotrade_follow_channel_scan(context: ContextTypes.DEFAULT_TY
                         text=(
                             f"<b>{mode_header}</b>\n\n"
                             f"{direction} {pair_config['display']}\n"
-                            f"Entry: {entry_price} | SL: {stop_loss} | TP: {take_profit}\n"
+                            f"Entry: {entry_price} | SL: {acct_sl} | TP: {acct_tp}\n"
                             f"Volume: {volume} lots"
                         ),
                         parse_mode=ParseMode.HTML
@@ -3379,6 +3428,620 @@ async def nexora_app_deriv_disconnect_handler(request):
 
 
 # ============================================
+# EXNESS AUTO-TRADE FOR APP USERS
+# ============================================
+# The same Exness Auto-Trade engine Telegram users have (same strategies,
+# same subscription, same verified-client rule), run for app users through
+# their synthetic id. Nothing in the trading engines changes for Telegram.
+#
+#   GET  /api/nexora/exness/status    -> everything the app screen needs
+#   POST /api/nexora/exness/verify    {email}                 Exness client check
+#   POST /api/nexora/exness/pay       {method: card|crypto}   -> {url}
+#   POST /api/nexora/exness/connect   {account_number, password, server, name, replace?}
+#   POST /api/nexora/exness/config    {action: strategy|size|sltp|pause|resume, ...}
+#
+# Kill switch: NEXORA_APP_EXNESS=0 (blocks everything except pausing).
+
+_napp_exness_jobs = {}         # synth -> {state, message, ts}
+_napp_exness_hits = {}         # (kind, synth) -> [timestamps]
+
+NAPP_EXNESS_LOT_MIN, NAPP_EXNESS_LOT_MAX = 0.01, 10.0
+NAPP_EXNESS_RISK_MIN, NAPP_EXNESS_RISK_MAX = 0.1, 10.0
+NAPP_EXNESS_FLIP_MIN, NAPP_EXNESS_FLIP_MAX = 0.01, 2.0
+NAPP_EXNESS_PIPS_MIN, NAPP_EXNESS_PIPS_MAX = 1.0, 10000.0
+
+
+def _napp_exness_killed():
+    return os.getenv("NEXORA_APP_EXNESS", "1") == "0"
+
+
+def _napp_exness_limited(kind, synth, per_hour):
+    now = time.time()
+    key = (kind, synth)
+    hits = [t for t in _napp_exness_hits.get(key, []) if now - t < 3600]
+    if len(hits) >= per_hour:
+        _napp_exness_hits[key] = hits
+        return True
+    hits.append(now)
+    if len(_napp_exness_hits) > 5000:
+        _napp_exness_hits.clear()
+    _napp_exness_hits[key] = hits
+    return False
+
+
+def _napp_exness_row_sync(synth):
+    """(row_or_None, ok). ok=False means the database could not be read -
+    callers that gate money or access treat that as 'do nothing'."""
+    try:
+        r = requests.get(
+            f"{SUPABASE_URL}/rest/v1/mt5_auto_trade_accounts?user_id=eq.{synth}&select=*",
+            headers=sb_headers(), timeout=10)
+        rows = r.json()
+        if r.status_code != 200 or not isinstance(rows, list):
+            return None, False
+        return (rows[0] if rows else None), True
+    except Exception as e:
+        print(f"[NEXORA EXNESS] row read error: {type(e).__name__}")
+        return None, False
+
+
+def _napp_exness_verified_sync(synth):
+    """(verified, email, ok) read straight from verified_users."""
+    try:
+        r = requests.get(
+            f"{SUPABASE_URL}/rest/v1/verified_users?user_id=eq.{synth}&select=email",
+            headers=sb_headers(), timeout=10)
+        rows = r.json()
+        if r.status_code != 200 or not isinstance(rows, list):
+            return False, None, False
+        if rows and rows[0].get("email") and "@" in rows[0]["email"]:
+            return True, rows[0]["email"], True
+        return False, None, True
+    except Exception:
+        return False, None, False
+
+
+def _napp_exness_flip_open_sync(synth):
+    """True if an Account Flip stack is open. Fails CLOSED (any doubt = open)."""
+    try:
+        r = requests.get(
+            f"{SUPABASE_URL}/rest/v1/mt5_flip_stacks?user_id=eq.{synth}&status=eq.OPEN&select=id&limit=1",
+            headers=sb_headers(), timeout=10)
+        rows = r.json()
+        if r.status_code != 200 or not isinstance(rows, list):
+            return True
+        return bool(rows)
+    except Exception:
+        return True
+
+
+def _napp_exness_email_owner_sync(email):
+    """(owner_user_id_or_None, ok) - who already has this email verified."""
+    try:
+        r = requests.get(
+            f"{SUPABASE_URL}/rest/v1/verified_users",
+            params={"email": f"ilike.{email}", "select": "user_id", "limit": "1"},
+            headers=sb_headers(), timeout=10)
+        rows = r.json()
+        if r.status_code != 200 or not isinstance(rows, list):
+            return None, False
+        return (str(rows[0]["user_id"]) if rows else None), True
+    except Exception:
+        return None, False
+
+
+def _napp_exness_account_owner_sync(number, synth):
+    """(other_user_id_or_None, ok) - who else has this trading account linked."""
+    try:
+        r = requests.get(
+            f"{SUPABASE_URL}/rest/v1/mt5_auto_trade_accounts",
+            params={"account_number": f"eq.{number}", "user_id": f"neq.{synth}",
+                    "select": "user_id", "limit": "1"},
+            headers=sb_headers(), timeout=10)
+        rows = r.json()
+        if r.status_code != 200 or not isinstance(rows, list):
+            return None, False
+        return (str(rows[0]["user_id"]) if rows else None), True
+    except Exception:
+        return None, False
+
+
+def _napp_exness_expiry(row):
+    """Naive UTC expiry datetime of the subscription, or None."""
+    try:
+        raw = (row or {}).get("subscription_expires_at")
+        if not raw:
+            return None
+        return datetime.fromisoformat(raw.replace("Z", "+00:00")).replace(tzinfo=None)
+    except Exception:
+        return None
+
+
+def _napp_exness_mask_email(email):
+    try:
+        name, dom = email.split("@", 1)
+        return (name[:1] + "***@" + dom) if name else email
+    except Exception:
+        return None
+
+
+def _napp_exness_mask_number(number):
+    s = str(number or "")
+    return ("••••" + s[-4:]) if len(s) >= 4 else None
+
+
+def _napp_exness_options():
+    return {
+        "bots": [
+            {"key": k, "label": _napp_clean_label(v["label"]), "description": v["description"]}
+            for k, v in MT5_AUTOTRADE_BOTS.items()
+        ],
+        "pairs": [
+            {"key": p, "display": _napp_clean_label(PAIR_CONFIG[p]["display"]),
+             "pip": SLTP_OVERRIDE_PIP_SIZE.get(p)}
+            for p in MT5_AUTOTRADE_PAIRS
+        ],
+        "price": {"ngn": MT5_AUTOTRADE_MONTHLY_FEE, "usd": MT5_AUTOTRADE_MONTHLY_FEE_USD,
+                  "days": MT5_SUBSCRIPTION_DAYS},
+        "limits": {
+            "lot_min": NAPP_EXNESS_LOT_MIN, "lot_max": NAPP_EXNESS_LOT_MAX,
+            "risk_min": NAPP_EXNESS_RISK_MIN, "risk_max": NAPP_EXNESS_RISK_MAX,
+            "flip_min": NAPP_EXNESS_FLIP_MIN, "flip_max": NAPP_EXNESS_FLIP_MAX,
+            "pips_min": NAPP_EXNESS_PIPS_MIN, "pips_max": NAPP_EXNESS_PIPS_MAX,
+        },
+    }
+
+
+def _napp_exness_settings(row):
+    if not row or not row.get("bot_choice"):
+        return {"configured": False}
+    return {
+        "configured": True,
+        "bot_choice": row.get("bot_choice"),
+        "pair": row.get("pair_choice"),
+        "risk_mode": row.get("risk_mode") or "lot",
+        "lot_size": row.get("lot_size"),
+        "risk_percent": row.get("risk_percent"),
+        "flip_base_lot": row.get("flip_base_lot"),
+        "paused": bool(row.get("trading_paused")),
+        "sl_pips": row.get("sl_override_pips"),
+        "tp_pips": row.get("tp_override_pips"),
+    }
+
+
+def _napp_exness_prune_jobs():
+    now = time.time()
+    for k in [k for k, v in _napp_exness_jobs.items()
+              if v.get("state") != "connecting" and now - v.get("ts", 0) > 3600]:
+        _napp_exness_jobs.pop(k, None)
+
+
+async def _napp_exness_push(synth, text):
+    try:
+        if _app_instance:
+            await _app_instance.bot.send_message(chat_id=int(synth), text=text, parse_mode=ParseMode.HTML)
+    except Exception as e:
+        print(f"[NEXORA EXNESS] push failed: {type(e).__name__}")
+
+
+async def nexora_app_exness_status_handler(request):
+    synth, err = await _napp_deriv_auth(request, limit_per_min=40, allow_killed=True)
+    if err:
+        return err
+    _napp_exness_prune_jobs()
+    options = _napp_exness_options()
+    verified, email, vok = await asyncio.to_thread(_napp_exness_verified_sync, synth)
+    row, rok = await asyncio.to_thread(_napp_exness_row_sync, synth)
+    if not vok or not rok:
+        return _napp_json({"error": "server", "message": "Could not load your Exness status. Try again."}, 503)
+
+    now = datetime.utcnow()
+    expiry = _napp_exness_expiry(row)
+    active_sub = bool(expiry and now < expiry)
+    connected = bool(row and row.get("metaapi_account_id"))
+    job = _napp_exness_jobs.get(synth) or {"state": "idle", "message": ""}
+
+    balance, reachable = None, None
+    if connected and active_sub:
+        try:
+            balance = await _napp_run_on_main(get_client_mt5_balance(row["metaapi_account_id"]), 25)
+            reachable = balance is not None
+        except Exception as e:
+            print(f"[NEXORA EXNESS] balance error: {type(e).__name__}")
+            reachable = False
+
+    flip_open = None
+    if row and row.get("bot_choice") == "account_flip" and connected:
+        flip_open = await asyncio.to_thread(_napp_exness_flip_open_sync, synth)
+
+    return _napp_json({
+        "enabled": not _napp_exness_killed(),
+        "verified": verified,
+        "email": _napp_exness_mask_email(email) if email else None,
+        "subscription": {
+            "active": active_sub,
+            "days_left": max(0, (expiry - now).days) if active_sub else 0,
+            "expires_at": (expiry.isoformat() + "Z") if expiry else None,
+        },
+        "account": {
+            "connected": connected and active_sub,
+            "number": _napp_exness_mask_number(row.get("account_number")) if row else None,
+            "server": row.get("server") if row else None,
+            "name": row.get("account_name") if row else None,
+            "balance": balance,
+            "reachable": reachable,
+        },
+        "connect": {"state": job.get("state"), "message": job.get("message")},
+        "settings": _napp_exness_settings(row),
+        "flip_open": flip_open,
+        "options": options,
+    })
+
+
+async def _napp_exness_body(request):
+    try:
+        body = await request.json()
+    except Exception:
+        return None
+    return body if isinstance(body, dict) else None
+
+
+async def nexora_app_exness_verify_handler(request):
+    synth, err = await _napp_deriv_auth(request, limit_per_min=20, allow_killed=True)
+    if err:
+        return err
+    if _napp_exness_killed():
+        return _napp_json({"error": "unavailable", "message": "Exness in the app is switched off right now."}, 503)
+    body = await _napp_exness_body(request)
+    if body is None:
+        return _napp_json({"error": "bad_request", "message": "Could not read that."}, 400)
+    email = str(body.get("email", "")).strip().lower()
+    if not re.fullmatch(r"[^@\s]{1,64}@[^@\s]+\.[^@\s]{2,}", email) or len(email) > 120:
+        return _napp_json({"error": "bad_request", "message": "Enter the email you used to register on Exness."}, 400)
+
+    verified, _, vok = await asyncio.to_thread(_napp_exness_verified_sync, synth)
+    if not vok:
+        return _napp_json({"error": "server", "message": "Could not check right now. Try again."}, 503)
+    if verified:
+        return _napp_json({"verified": True, "message": "You're already verified."})
+    if _napp_exness_limited("verify", synth, 6):
+        return _napp_json({"error": "slow_down", "message": "Too many attempts. Try again in an hour."}, 429)
+
+    owner, ook = await asyncio.to_thread(_napp_exness_email_owner_sync, email)
+    if not ook:
+        return _napp_json({"error": "server", "message": "Could not check right now. Try again."}, 503)
+    if owner and owner != synth:
+        return _napp_json({
+            "verified": False, "result": "taken",
+            "message": "That email is already verified on another Nexora account (for example through Telegram)."}, 409)
+
+    try:
+        verdict, detail, _accts = await _napp_run_on_main(exness_check_email(email), 70)
+    except Exception as e:
+        print(f"[NEXORA EXNESS] verify error: {type(e).__name__}")
+        verdict = "unknown"
+    if verdict == "approved":
+        ok = await asyncio.to_thread(add_verified_user, synth, email)
+        if not ok:
+            return _napp_json({"error": "server", "message": "Verified, but saving failed. Try again."}, 503)
+        print(f"[NEXORA EXNESS] verified app user {synth}")
+        return _napp_json({"verified": True, "message": "Verified. You're an Exness client under SpiritFX."})
+    if verdict == "declined":
+        return _napp_json({
+            "verified": False, "result": "declined",
+            "message": "That email is not an Exness client under SpiritFX's link. Register through the official link, then check again."})
+    return _napp_json({
+        "verified": False, "result": "unknown",
+        "message": "We couldn't check right now. Please try again in a few minutes."}, 503)
+
+
+async def nexora_app_exness_pay_handler(request):
+    synth, err = await _napp_deriv_auth(request, limit_per_min=20, allow_killed=True)
+    if err:
+        return err
+    if _napp_exness_killed():
+        return _napp_json({"error": "unavailable", "message": "Exness in the app is switched off right now."}, 503)
+    body = await _napp_exness_body(request)
+    if body is None:
+        return _napp_json({"error": "bad_request", "message": "Could not read that."}, 400)
+    method = body.get("method")
+    if method not in ("card", "crypto"):
+        return _napp_json({"error": "bad_request", "message": "Choose card or crypto."}, 400)
+
+    verified, email, vok = await asyncio.to_thread(_napp_exness_verified_sync, synth)
+    row, rok = await asyncio.to_thread(_napp_exness_row_sync, synth)
+    if not vok or not rok:
+        return _napp_json({"error": "server", "message": "Could not check right now. Try again."}, 503)
+    if not verified:
+        return _napp_json({"error": "not_verified", "message": "Verify your Exness account first."}, 403)
+    expiry = _napp_exness_expiry(row)
+    if expiry and datetime.utcnow() < expiry:
+        return _napp_json({"error": "already_active", "message": "Your subscription is already active."}, 409)
+    if _napp_exness_limited("pay", synth, 8):
+        return _napp_json({"error": "slow_down", "message": "Too many attempts. Try again later."}, 429)
+
+    ts = int(time.time())
+    try:
+        if method == "card":
+            reference = f"MT5AUTO-{synth}-{ts}"
+            url = await _napp_run_on_main(korapay_initialize_charge(synth, email, reference), 25)
+            if url:
+                await asyncio.to_thread(log_korapay_transaction, reference, synth,
+                                        MT5_AUTOTRADE_MONTHLY_FEE, MT5_AUTOTRADE_CURRENCY)
+        else:
+            order_id = f"MT5AUTO-{synth}-{ts}"
+            url = await _napp_run_on_main(nowpayments_initialize_payment(synth, order_id), 25)
+            if url:
+                await asyncio.to_thread(log_nowpayments_transaction, order_id, synth,
+                                        MT5_AUTOTRADE_MONTHLY_FEE_USD, "usd")
+    except Exception as e:
+        print(f"[NEXORA EXNESS] pay error: {type(e).__name__}")
+        url = None
+    if not url:
+        return _napp_json({"error": "payment", "message": "Couldn't start the payment right now. Try again shortly, or try the other payment option."}, 502)
+    return _napp_json({"url": url})
+
+
+async def _napp_exness_connect_job(synth, number, password, server, name, replace_old_id):
+    job = {"state": "connecting", "message": "Connecting your Exness account. This can take a couple of minutes.",
+           "ts": time.time()}
+    _napp_exness_jobs[synth] = job
+    pending_id = None
+    try:
+        enc = encrypt_credential(password)
+        pending_id = await asyncio.to_thread(log_pending_mt5_provisioning, synth, number, enc, server, name)
+
+        async def _prog(n):
+            job["message"] = (f"Still connecting. Your broker's settings are taking longer than usual "
+                              f"(attempt {n}/3). This is normal.")
+
+        account_id, error = await provision_mt5_account(
+            number, password, server, account_name=name, progress_callback=_prog)
+        if error:
+            await asyncio.to_thread(resolve_pending_mt5_provisioning, pending_id, "failed")
+            _napp_exness_jobs[synth] = {"state": "failed", "message": clean_mt5_provision_error(error),
+                                        "ts": time.time()}
+            return
+        try:
+            await asyncio.to_thread(upsert_mt5_autotrade_account, synth, {
+                "account_number": number, "encrypted_password": enc, "server": server,
+                "account_name": name, "metaapi_account_id": account_id, "is_active": True,
+            })
+        except Exception as e:
+            # Left 'in_progress' on purpose: the recovery job finishes it.
+            print(f"[NEXORA EXNESS] connect save failed for {synth}: {type(e).__name__}")
+            _napp_exness_jobs[synth] = {
+                "state": "failed",
+                "message": "Your account connected but saving failed. It will finish automatically in a few minutes.",
+                "ts": time.time()}
+            return
+        await asyncio.to_thread(resolve_pending_mt5_provisioning, pending_id, "success")
+        if replace_old_id and replace_old_id != account_id:
+            asyncio.create_task(deprovision_mt5_account(replace_old_id))
+
+        async def _warm():
+            for _ in range(3):
+                if await get_client_mt5_connection(account_id) is not None:
+                    return
+                await asyncio.sleep(65)
+        asyncio.create_task(_warm())
+        _napp_exness_jobs[synth] = {"state": "done", "message": "Connected.", "ts": time.time()}
+        await _napp_exness_push(synth, "<b>Exness account connected</b>\nAuto-Trade is ready with your saved settings.")
+    except Exception as e:
+        print(f"[NEXORA EXNESS] connect job error for {synth}: {type(e).__name__}")
+        _napp_exness_jobs[synth] = {"state": "failed",
+                                    "message": "Something went wrong on our end. Please try again.",
+                                    "ts": time.time()}
+        if pending_id:
+            await asyncio.to_thread(resolve_pending_mt5_provisioning, pending_id, "failed")
+
+
+async def nexora_app_exness_connect_handler(request):
+    synth, err = await _napp_deriv_auth(request, limit_per_min=20, allow_killed=True)
+    if err:
+        return err
+    if _napp_exness_killed():
+        return _napp_json({"error": "unavailable", "message": "Exness in the app is switched off right now."}, 503)
+    body = await _napp_exness_body(request)
+    if body is None:
+        return _napp_json({"error": "bad_request", "message": "Could not read that."}, 400)
+
+    number = str(body.get("account_number", "")).strip()
+    password = str(body.get("password", ""))
+    server = str(body.get("server", "")).strip()
+    name = _napp_clean_label(str(body.get("name", ""))).strip()[:40]
+    replace = bool(body.get("replace"))
+    if not re.fullmatch(r"\d{4,12}", number):
+        return _napp_json({"error": "bad_request", "message": "Enter your Exness account number (digits only)."}, 400)
+    if not password or len(password) > 128 or "\n" in password or "\r" in password:
+        return _napp_json({"error": "bad_request", "message": "Enter your trading password."}, 400)
+    if not re.fullmatch(r"[A-Za-z0-9._\- ]{2,60}", server):
+        return _napp_json({"error": "bad_request", "message": "Enter your server name, for example Exness-Real4."}, 400)
+    if not name:
+        return _napp_json({"error": "bad_request", "message": "Give the account a nickname."}, 400)
+
+    verified, _, vok = await asyncio.to_thread(_napp_exness_verified_sync, synth)
+    row, rok = await asyncio.to_thread(_napp_exness_row_sync, synth)
+    if not vok or not rok:
+        return _napp_json({"error": "server", "message": "Could not check right now. Try again."}, 503)
+    if not verified:
+        return _napp_json({"error": "not_verified", "message": "Verify your Exness account first."}, 403)
+    expiry = _napp_exness_expiry(row)
+    if not (expiry and datetime.utcnow() < expiry):
+        return _napp_json({"error": "no_subscription", "message": "Start your subscription first."}, 402)
+
+    old_id = (row or {}).get("metaapi_account_id")
+    if old_id and not replace:
+        return _napp_json({"error": "already_connected", "message": "An account is already connected."}, 409)
+    if old_id and str(row.get("account_number")) == number and (row.get("server") or "") == server:
+        return _napp_json({"error": "already_connected", "message": "That account is already connected."}, 409)
+    if old_id and row.get("bot_choice") == "account_flip":
+        if await asyncio.to_thread(_napp_exness_flip_open_sync, synth):
+            return _napp_json({"error": "flip_open", "message":
+                               "An Account Flip trade is still open. Let it close before changing accounts."}, 409)
+    if (_napp_exness_jobs.get(synth) or {}).get("state") == "connecting":
+        return _napp_json({"error": "busy", "message": "Already connecting. Please wait."}, 409)
+
+    other, ook = await asyncio.to_thread(_napp_exness_account_owner_sync, number, synth)
+    if not ook:
+        return _napp_json({"error": "server", "message": "Could not check right now. Try again."}, 503)
+    if other:
+        return _napp_json({"error": "account_taken", "message":
+                           "That trading account is already linked to another Nexora user."}, 409)
+    if _napp_exness_limited("connect", synth, 10):
+        return _napp_json({"error": "slow_down", "message": "Too many attempts. Try again later."}, 429)
+
+    loop = _main_loop
+    if loop is None or not loop.is_running():
+        return _napp_json({"error": "server", "message": "The service is starting up. Try again in a minute."}, 503)
+    _napp_exness_jobs[synth] = {"state": "connecting", "message": "Starting...", "ts": time.time()}
+    asyncio.run_coroutine_threadsafe(
+        _napp_exness_connect_job(synth, number, password, server, name, old_id if replace else None), loop)
+    return _napp_json({"state": "connecting"})
+
+
+def _napp_exness_num(body, key, lo, hi, decimals=2):
+    try:
+        v = float(body.get(key))
+    except Exception:
+        return None
+    if not (lo <= v <= hi) or v != v:
+        return None
+    return round(v, decimals)
+
+
+async def nexora_app_exness_config_handler(request):
+    synth, err = await _napp_deriv_auth(request, limit_per_min=20, allow_killed=True)
+    if err:
+        return err
+    body = await _napp_exness_body(request)
+    if body is None:
+        return _napp_json({"error": "bad_request", "message": "Could not read that."}, 400)
+    action = body.get("action")
+    if _napp_exness_killed() and action != "pause":
+        return _napp_json({"error": "unavailable", "message": "Exness in the app is switched off right now."}, 503)
+
+    verified, _, vok = await asyncio.to_thread(_napp_exness_verified_sync, synth)
+    row, rok = await asyncio.to_thread(_napp_exness_row_sync, synth)
+    if not vok or not rok:
+        return _napp_json({"error": "server", "message": "Could not check right now. Try again."}, 503)
+    if not verified:
+        return _napp_json({"error": "not_verified", "message": "Verify your Exness account first."}, 403)
+
+    fields, done = None, ""
+    bad = lambda m: _napp_json({"error": "bad_request", "message": m}, 400)
+
+    if action in ("pause", "resume"):
+        if not row:
+            return bad("Set up Auto-Trade first.")
+        fields = {"trading_paused": action == "pause"}
+        done = ("Auto-Trade paused. No new trades will open; trades already open are left alone."
+                if action == "pause" else "Auto-Trade resumed.")
+
+    elif action in ("strategy", "size"):
+        cur_flip = bool(row and row.get("bot_choice") == "account_flip")
+        # Changing anything while an Account Flip stack is open would
+        # change how that live stack is managed - wait until it closes.
+        if cur_flip and row and row.get("metaapi_account_id"):
+            if await asyncio.to_thread(_napp_exness_flip_open_sync, synth):
+                return _napp_json({"error": "flip_open", "message":
+                                   "Your Account Flip trade is still open. You can change this once it closes."}, 409)
+
+        def _sizing(existing_ok=True):
+            """Lot or risk % for the non-flip modes. Anything not sent
+            keeps the saved value (or a safe default)."""
+            rm = body.get("risk_mode")
+            if rm is None:
+                rm = row.get("risk_mode") if (existing_ok and row and row.get("risk_mode") in ("lot", "percent")) else "lot"
+            if rm == "lot":
+                if "lot_size" in body:
+                    lot = _napp_exness_num(body, "lot_size", NAPP_EXNESS_LOT_MIN, NAPP_EXNESS_LOT_MAX)
+                else:
+                    lot = float((row or {}).get("lot_size") or 0.01)
+                return None if lot is None else {"risk_mode": "lot", "lot_size": lot}
+            if rm == "percent":
+                if "risk_percent" in body:
+                    rp = _napp_exness_num(body, "risk_percent", NAPP_EXNESS_RISK_MIN, NAPP_EXNESS_RISK_MAX)
+                else:
+                    rp = float((row or {}).get("risk_percent") or 1.0)
+                return None if rp is None else {"risk_mode": "percent", "risk_percent": rp}
+            return None
+
+        if action == "size":
+            if cur_flip:
+                base = _napp_exness_num(body, "flip_base_lot", NAPP_EXNESS_FLIP_MIN, NAPP_EXNESS_FLIP_MAX)
+                if base is None:
+                    return bad(f"Starting lot must be {NAPP_EXNESS_FLIP_MIN} to {NAPP_EXNESS_FLIP_MAX}.")
+                d = get_account_flip_defaults(row.get("pair_choice"), base)
+                fields = {"flip_base_lot": base, **d}
+                done = "Starting lot updated."
+            else:
+                if not row or not row.get("bot_choice"):
+                    return bad("Pick how Auto-Trade should trade first.")
+                fields = _sizing()
+                if not fields:
+                    return bad(f"Lot size must be {NAPP_EXNESS_LOT_MIN} to {NAPP_EXNESS_LOT_MAX}, "
+                               f"risk {NAPP_EXNESS_RISK_MIN}% to {NAPP_EXNESS_RISK_MAX}%.")
+                done = "Trade size updated. It applies to the next trade."
+        else:
+            mode = body.get("mode")
+            pair = body.get("pair")
+            if mode in ("follow_channel", "copy_channel"):
+                sz = _sizing(existing_ok=not cur_flip)
+                if not sz:
+                    return bad("Set a valid lot size or risk %.")
+                fields = {"bot_choice": mode, "pair_choice": None, **sz}
+            elif mode == "bot":
+                bot_key = body.get("bot")
+                if bot_key not in MT5_AUTOTRADE_BOTS or pair not in MT5_AUTOTRADE_PAIRS:
+                    return bad("Pick a bot and a pair.")
+                sz = _sizing(existing_ok=not cur_flip)
+                if not sz:
+                    return bad("Set a valid lot size or risk %.")
+                fields = {"bot_choice": bot_key, "pair_choice": pair, **sz}
+            elif mode == "account_flip":
+                if pair not in MT5_AUTOTRADE_PAIRS:
+                    return bad("Pick the pair Account Flip should trade.")
+                if body.get("accepted") is not True:
+                    return bad("Please accept the Account Flip risk notice.")
+                base = _napp_exness_num(body, "flip_base_lot", NAPP_EXNESS_FLIP_MIN, NAPP_EXNESS_FLIP_MAX)
+                if base is None:
+                    return bad(f"Starting lot must be {NAPP_EXNESS_FLIP_MIN} to {NAPP_EXNESS_FLIP_MAX}.")
+                d = get_account_flip_defaults(pair, base)
+                fields = {"bot_choice": "account_flip", "pair_choice": pair, "risk_mode": "account_flip",
+                          "flip_base_lot": base, "flip_disclaimer_accepted": True, **d}
+            else:
+                return bad("Pick a mode.")
+            done = "Mode updated."
+
+    elif action == "sltp":
+        fields = {}
+        for key, col in (("sl_pips", "sl_override_pips"), ("tp_pips", "tp_override_pips")):
+            if key not in body:
+                continue
+            if body.get(key) is None:
+                fields[col] = None
+                continue
+            v = _napp_exness_num(body, key, NAPP_EXNESS_PIPS_MIN, NAPP_EXNESS_PIPS_MAX, 1)
+            if v is None:
+                return bad(f"Pips must be {NAPP_EXNESS_PIPS_MIN:g} to {NAPP_EXNESS_PIPS_MAX:g}, or empty to use Nexora's own.")
+            fields[col] = v
+        if not fields:
+            return bad("Nothing to change.")
+        done = "Stop loss / take profit saved. It applies to the next trade."
+    else:
+        return bad("Unknown action.")
+
+    try:
+        await asyncio.to_thread(upsert_mt5_autotrade_account, synth, fields)
+    except Exception as e:
+        print(f"[NEXORA EXNESS] config save error: {type(e).__name__}")
+        return _napp_json({"error": "server", "message": "Could not save. Try again."}, 500)
+    new_row, _ = await asyncio.to_thread(_napp_exness_row_sync, synth)
+    return _napp_json({"ok": True, "message": done, "settings": _napp_exness_settings(new_row)})
+
+
+# ============================================
 # PUSH NOTIFICATIONS FOR APP USERS (Deriv trades, alerts)
 # ============================================
 # Every Deriv engine tells users things with bot.send_message(chat_id=...).
@@ -3636,6 +4299,11 @@ def run_korapay_webhook_server():
     webhook_app.router.add_get("/api/nexora/deriv/status", nexora_app_deriv_status_handler)
     webhook_app.router.add_post("/api/nexora/deriv/config", nexora_app_deriv_config_handler)
     webhook_app.router.add_post("/api/nexora/deriv/disconnect", nexora_app_deriv_disconnect_handler)
+    webhook_app.router.add_get("/api/nexora/exness/status", nexora_app_exness_status_handler)
+    webhook_app.router.add_post("/api/nexora/exness/verify", nexora_app_exness_verify_handler)
+    webhook_app.router.add_post("/api/nexora/exness/pay", nexora_app_exness_pay_handler)
+    webhook_app.router.add_post("/api/nexora/exness/connect", nexora_app_exness_connect_handler)
+    webhook_app.router.add_post("/api/nexora/exness/config", nexora_app_exness_config_handler)
     webhook_app.router.add_post("/api/nexora/push/register", nexora_app_push_register_handler)
     webhook_app.router.add_post("/api/nexora/push/unregister", nexora_app_push_unregister_handler)
     port = int(os.getenv("PORT", 8080))
@@ -3753,6 +4421,11 @@ async def check_mt5_autotrade_expiry(context: ContextTypes.DEFAULT_TYPE):
                 await deprovision_mt5_account(metaapi_account_id)
             upsert_mt5_autotrade_account(user_id, {"is_active": False, "metaapi_account_id": None})
             print(f"[MT5 AUTOTRADE EXPIRY] ⏸️ Deactivated and deprovisioned expired subscription for {user_id}")
+            if _is_app_synth(user_id):
+                await bot.send_message(chat_id=int(user_id), parse_mode=ParseMode.HTML, text=(
+                    "<b>Your Exness Auto-Trade subscription has expired</b>\n"
+                    "Auto-trading is paused. Renew in the app within 90 days and your same account reconnects automatically."))
+                continue
             await bot.send_message(
                 chat_id=int(user_id),
                 text=(
@@ -3843,6 +4516,11 @@ async def try_auto_reprovision_on_resubscribe(user_id, account, bot):
 
         upsert_mt5_autotrade_account(user_id, {"metaapi_account_id": account_id, "is_active": True})
         print(f"[MT5 AUTOTRADE] ✅ Auto-reconnected {user_id} on resubscribe using saved credentials.")
+        if _is_app_synth(user_id):
+            await bot.send_message(chat_id=int(user_id), parse_mode=ParseMode.HTML, text=(
+                "<b>Payment confirmed. You're reconnected</b>\n"
+                f"Exness Auto-Trade is active for {MT5_SUBSCRIPTION_DAYS} more days with your saved account."))
+            return True
         await bot.send_message(
             chat_id=int(user_id),
             text=(
@@ -3884,6 +4562,21 @@ async def process_confirmed_korapay_payments(context: ContextTypes.DEFAULT_TYPE)
             upsert_mt5_autotrade_account(user_id, {"subscription_expires_at": expires_at})
             mark_korapay_transaction_processed(reference)
             print(f"[MT5 AUTOTRADE] ✅ Subscription activated for {user_id} until {expires_at}")
+
+            if _is_app_synth(user_id):
+                # App user: no Telegram prompts. Reconnect from saved details
+                # if they have them, otherwise the app asks for the account.
+                if account and account.get("metaapi_account_id"):
+                    await bot.send_message(chat_id=int(user_id), parse_mode=ParseMode.HTML, text=(
+                        "<b>Payment confirmed</b>\n"
+                        f"Exness Auto-Trade is active for {MT5_SUBSCRIPTION_DAYS} more days."))
+                elif await try_auto_reprovision_on_resubscribe(user_id, account, bot):
+                    pass
+                else:
+                    await bot.send_message(chat_id=int(user_id), parse_mode=ParseMode.HTML, text=(
+                        "<b>Payment confirmed</b>\n"
+                        "Open the app to connect your Exness account."))
+                continue
 
             if account and account.get("metaapi_account_id"):
                 await bot.send_message(
@@ -3943,6 +4636,21 @@ async def process_confirmed_nowpayments_payments(context: ContextTypes.DEFAULT_T
             upsert_mt5_autotrade_account(user_id, {"subscription_expires_at": expires_at})
             mark_nowpayments_transaction_processed(order_id)
             print(f"[MT5 AUTOTRADE] ✅ Subscription activated for {user_id} until {expires_at} (paid via crypto)")
+
+            if _is_app_synth(user_id):
+                # App user: no Telegram prompts. Reconnect from saved details
+                # if they have them, otherwise the app asks for the account.
+                if account and account.get("metaapi_account_id"):
+                    await bot.send_message(chat_id=int(user_id), parse_mode=ParseMode.HTML, text=(
+                        "<b>Payment confirmed</b>\n"
+                        f"Exness Auto-Trade is active for {MT5_SUBSCRIPTION_DAYS} more days."))
+                elif await try_auto_reprovision_on_resubscribe(user_id, account, bot):
+                    pass
+                else:
+                    await bot.send_message(chat_id=int(user_id), parse_mode=ParseMode.HTML, text=(
+                        "<b>Payment confirmed</b>\n"
+                        "Open the app to connect your Exness account."))
+                continue
 
             if account and account.get("metaapi_account_id"):
                 await bot.send_message(
@@ -23806,7 +24514,8 @@ async def get_all_known_user_ids():
     except Exception as e:
         print(f"[BROADCAST] Failed to fetch verified_users: {e}")
 
-    return user_ids
+    # App users get no Telegram broadcasts.
+    return {u for u in user_ids if not _is_app_synth(u)}
 
 async def _run_broadcast(bot, message_text, admin_chat_id, button_label=None, destination="exness", photo_file_ids=None):
     user_ids = await get_all_known_user_ids()
@@ -24700,7 +25409,8 @@ def _all_verified_users_sync():
         batch = r.json()
         users += batch
         if len(batch) < 1000:
-            return users
+            # App users are outside the Telegram inactivity cycle and report.
+            return [u for u in users if not _is_app_synth(u.get("user_id"))]
         offset += 1000
 
 

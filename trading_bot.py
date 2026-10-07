@@ -3430,6 +3430,83 @@ async def nexora_app_deriv_disconnect_handler(request):
     return _napp_json({"ok": True, "message": "Deriv account disconnected."})
 
 
+# ----------------------------------------------------------------------
+# SIGNAL CHART FOR THE APP: tap a signal card, see the chart picture
+#   GET /api/nexora/signal-chart?pair=XAUUSD&type=BUY&entry=..&sl=..&tp=..
+# Same chart the Telegram signals use (candles + Entry/SL/TP lines).
+# ----------------------------------------------------------------------
+_napp_sigchart_cache = {}  # key -> (expires_ts, png)
+
+
+def _napp_pair_key(pair):
+    p = re.sub(r"[^A-Za-z]", "", str(pair or "")).upper()
+    for k, v in PAIR_CONFIG.items():
+        if v.get("pair_name") == p:
+            return k
+    return None
+
+
+def _napp_float(v):
+    try:
+        f = float(str(v).replace(",", ""))
+        return f if f == f and f > 0 else None
+    except Exception:
+        return None
+
+
+async def _napp_build_signal_chart(pair_key, direction, entry, sl, tp):
+    config = PAIR_CONFIG[pair_key]
+    candles = await asyncio.to_thread(get_cached_candles, pair_key, config, "1h", outputsize=210)
+    if not candles or len(candles) < 30:
+        return None
+    os.makedirs(CHART_OUTPUT_DIR, exist_ok=True)
+    path = os.path.join(CHART_OUTPUT_DIR, f"app_{pair_key}_{secrets.token_hex(6)}.png")
+    ok = await asyncio.to_thread(
+        generate_signal_chart, config["display"], "Nexora", direction, candles, entry, sl, tp, path,
+        70, False)
+    if not ok or not os.path.exists(path):
+        return None
+    try:
+        with open(path, "rb") as fh:
+            return fh.read()
+    finally:
+        try:
+            os.remove(path)
+        except Exception:
+            pass
+
+
+async def nexora_app_signal_chart_handler(request):
+    synth, err = await _napp_deriv_auth(request, limit_per_min=30, allow_killed=True)
+    if err:
+        return err
+    q = request.query
+    pair_key = _napp_pair_key(q.get("pair"))
+    direction = str(q.get("type", "")).upper()
+    entry, sl, tp = _napp_float(q.get("entry")), _napp_float(q.get("sl")), _napp_float(q.get("tp"))
+    if not pair_key or direction not in ("BUY", "SELL") or not (entry and sl and tp):
+        return _napp_json({"error": "bad_request", "message": "No chart for this signal."}, 400)
+    key = f"{pair_key}|{direction}|{entry}|{sl}|{tp}"
+    now = time.time()
+    hit = _napp_sigchart_cache.get(key)
+    png = hit[1] if hit and hit[0] > now else None
+    if png is None:
+        try:
+            png = await _napp_run_on_main(
+                _napp_build_signal_chart(pair_key, direction, entry, sl, tp), 45)
+        except Exception as e:
+            print(f"[NEXORA APP] signal chart error: {type(e).__name__}")
+            png = None
+        if not png:
+            return _napp_json({"error": "unavailable", "message": "Chart is not available right now."}, 503)
+        for k in [k for k, v in _napp_sigchart_cache.items() if v[0] < now]:
+            _napp_sigchart_cache.pop(k, None)
+        if len(_napp_sigchart_cache) < 100:
+            _napp_sigchart_cache[key] = (now + 120, png)
+    return web.Response(body=png, content_type="image/png",
+                        headers={"Cache-Control": "private, max-age=60"})
+
+
 # ============================================
 # EXNESS AUTO-TRADE FOR APP USERS
 # ============================================
@@ -4371,6 +4448,7 @@ def run_korapay_webhook_server():
     webhook_app.router.add_post("/api/nexora/exness/pay", nexora_app_exness_pay_handler)
     webhook_app.router.add_post("/api/nexora/exness/connect", nexora_app_exness_connect_handler)
     webhook_app.router.add_post("/api/nexora/exness/config", nexora_app_exness_config_handler)
+    webhook_app.router.add_get("/api/nexora/signal-chart", nexora_app_signal_chart_handler)
     webhook_app.router.add_post("/api/nexora/push/register", nexora_app_push_register_handler)
     webhook_app.router.add_post("/api/nexora/push/unregister", nexora_app_push_unregister_handler)
     port = int(os.getenv("PORT", 8080))
@@ -16351,7 +16429,7 @@ def generate_daily_line_chart(display_name, direction, daily_history, save_path,
         return False
 
 
-def generate_signal_chart(display_name, strategy_name, direction, candles, entry, sl, tp, save_path, display_window=70):
+def generate_signal_chart(display_name, strategy_name, direction, candles, entry, sl, tp, save_path, display_window=70, anchor_live=True):
     """
     Generates one chart PNG for a signal. candles = the SAME candle
     list the winning strategy actually used (h1_candles for most
@@ -16402,7 +16480,7 @@ def generate_signal_chart(display_name, strategy_name, direction, candles, entry
         # breaking EVERY chart, for every pair, the moment this first
         # shipped. Fixed by giving it a real "now" timestamp, so it's
         # indistinguishable in type from every other candle.
-        if entry and candles:
+        if anchor_live and entry and candles:
             # FIX: per explicit instruction, after a real 8AM XAUUSD
             # chart (signal 5562) showed no visible candle at the
             # Entry level: this live point used to be open=high=low=

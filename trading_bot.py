@@ -3439,10 +3439,23 @@ _napp_sigchart_cache = {}  # key -> (expires_ts, png)
 
 
 def _napp_pair_key(pair):
-    p = re.sub(r"[^A-Za-z]", "", str(pair or "")).upper()
+    """Resolve whatever name the signal list uses to a chart source: the same
+    matching manual search uses, so every pair a signal can be for works."""
+    raw = str(pair or "")
+    letters = re.sub(r"[^A-Za-z]", "", raw).upper()
     for k, v in PAIR_CONFIG.items():
-        if v.get("pair_name") == p:
+        if v.get("pair_name") == letters:
             return k
+    for cand in (raw, re.sub(r"[^A-Za-z0-9 ]", "", raw), letters.lower()):
+        try:
+            k = match_pair_key(cand)
+        except Exception:
+            k = None
+        if k in PAIR_CONFIG:
+            return k
+    m = re.search(r"(?:volatility|vol|r)[\s_]*(10|25|50|75|100)\b", raw, re.I)
+    if m and f"r{m.group(1)}" in SYNTHETIC_CONFIG:
+        return f"r{m.group(1)}"
     return None
 
 
@@ -3455,8 +3468,13 @@ def _napp_float(v):
 
 
 async def _napp_build_signal_chart(pair_key, direction, entry, sl, tp):
-    config = PAIR_CONFIG[pair_key]
-    candles = await asyncio.to_thread(get_cached_candles, pair_key, config, "1h", outputsize=210)
+    if pair_key in SYNTHETIC_CONFIG:
+        config = {"display": SYNTHETIC_CONFIG[pair_key]["display"]}
+        candles = await get_cached_synthetic_candles(
+            pair_key, SYNTHETIC_CONFIG[pair_key]["symbol"], "1h", 3600, 210)
+    else:
+        config = PAIR_CONFIG[pair_key]
+        candles = await asyncio.to_thread(get_cached_candles, pair_key, config, "1h", outputsize=210)
     if not candles or len(candles) < 30:
         return None
     os.makedirs(CHART_OUTPUT_DIR, exist_ok=True)

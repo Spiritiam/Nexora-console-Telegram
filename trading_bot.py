@@ -5959,8 +5959,73 @@ async def place_and_link_mt5_trade(signal_id, signal_data):
     order_id back onto its signal_log row. Runs as a background task
     so channel posting never waits on MT5 execution.
     """
+    _PERSONAL_COPY_LAST_FAILURE["reason"] = None
     order_id = await place_mt5_trade(signal_data, signal_id=signal_id)
     attach_mt5_order_id(signal_id, order_id)
+    if not order_id:
+        await handle_personal_copy_failure(signal_id, signal_data)
+
+
+# Filled in by place_mt5_trade whenever the admin's own copy fails, so the
+# caller above can tell the admin WHY (and decide whether a redeploy helps).
+_PERSONAL_COPY_LAST_FAILURE = {"reason": None}
+
+
+def _personal_copy_looks_disconnected(reason):
+    t = (reason or "").lower()
+    return ("not connected to broker" in t or "504" in t or "timed out" in t
+            or "timeouterror" in t or "502" in t or "503" in t)
+
+
+async def handle_personal_copy_failure(signal_id, signal_data):
+    """
+    The admin's own MT5 copy did not go through. Tell the admin right away
+    (it used to be silent) and, if the failure looks like MetaAPI losing its
+    broker connection, ask MetaAPI to redeploy the account - same action and
+    same once-per-hour limit as the price self-heal. The trade is NOT retried
+    automatically: by then the signal's price is stale and a late entry
+    would not match the signal.
+    """
+    import html as _html
+    reason = _PERSONAL_COPY_LAST_FAILURE.get("reason") or "unknown reason"
+    redeploy_note = ""
+    if _personal_copy_looks_disconnected(reason):
+        st = _METAAPI_SELFHEAL
+        if time.time() - st["last_redeploy"] >= METAAPI_SELFHEAL_COOLDOWN_SECONDS:
+            st["last_redeploy"] = time.time()
+            st["first_failure"] = None
+            st["last_failure"] = None
+            ok, detail = await asyncio.to_thread(_metaapi_redeploy_admin_account)
+            print(f"[METAAPI SELFHEAL] redeploy requested after failed personal copy: ok={ok} ({detail})")
+            redeploy_note = (
+                "\n\n🔧 MetaAPI looks disconnected from the broker, so I asked it to redeploy your account "
+                "(same as the dashboard Redeploy button). It usually reconnects in 1-2 minutes."
+                if ok else
+                f"\n\n🔧 MetaAPI looks disconnected, but my redeploy request was refused: {detail}. "
+                "Please press Redeploy at app.metaapi.cloud."
+            )
+        else:
+            redeploy_note = (
+                "\n\n🔧 MetaAPI looks disconnected. A redeploy was already requested within the last hour, "
+                "so I did not send another. If it stays down, press Redeploy at app.metaapi.cloud."
+            )
+    if not ADMIN_USER_ID or not _app_instance:
+        return
+    try:
+        await _app_instance.bot.send_message(
+            chat_id=int(ADMIN_USER_ID),
+            text=(
+                f"⚠️ <b>Your MT5 did NOT take this signal.</b>\n\n"
+                f"Signal: <code>{signal_data.get('mt5_symbol')} {signal_data.get('direction')}</code> "
+                f"(#{signal_id})\n"
+                f"Reason: {_html.escape(str(reason)[:300])}"
+                f"{redeploy_note}\n\n"
+                f"<i>The trade is not retried automatically because the signal price is no longer current.</i>"
+            ),
+            parse_mode=ParseMode.HTML,
+        )
+    except Exception as e:
+        print(f"[MT5 PERSONAL COPY] Couldn't notify admin of failed copy: {e}")
 
 async def _delete_message_job(context: ContextTypes.DEFAULT_TYPE):
     """No longer used - process_due_auto_deletes performs deletions directly now. Kept as a no-op stub only if something external still references it."""
@@ -20732,6 +20797,7 @@ async def place_mt5_trade(signal_data, signal_id=None):
             except requests.exceptions.RequestException as network_exc:
                 if attempt == max_attempts:
                     print(f"[MT5 PERSONAL COPY] ❌ Network error on final attempt {attempt}/{max_attempts}: {network_exc}")
+                    _PERSONAL_COPY_LAST_FAILURE["reason"] = f"Network error talking to MetaAPI (timed out): {str(network_exc)[:150]}"
                     return None
                 # FIX: CONFIRMED REAL BUG, caught live via a direct
                 # report - a real duplicate position happened because
@@ -20840,6 +20906,7 @@ async def place_mt5_trade(signal_data, signal_id=None):
                 # diagnostic to read a raw repr() dump.
                 broker_reason = result.get("message") or result.get("stringCode") or "unknown reason"
                 print(f"[MT5 PERSONAL COPY] ⚠️ Trade REJECTED by broker: {broker_reason} (full response: {result!r})")
+                _PERSONAL_COPY_LAST_FAILURE["reason"] = f"Broker rejected the order: {broker_reason}"
                 return None
             print(f"[MT5 PERSONAL COPY] ✅ Trade placed — Order ID: {order_id}")
             return order_id
@@ -20851,9 +20918,16 @@ async def place_mt5_trade(signal_data, signal_id=None):
             # bare number. Logging the full body now so a future
             # failure is actually diagnosable instead of another guess.
             print(f"[MT5 PERSONAL COPY] ❌ Trade failed after {max_attempts} attempt(s): {response.status_code} | {response.text}")
+            if response.status_code in transient_statuses:
+                _PERSONAL_COPY_LAST_FAILURE["reason"] = (
+                    f"MetaAPI error {response.status_code}: account not connected to the broker (timed out)"
+                )
+            else:
+                _PERSONAL_COPY_LAST_FAILURE["reason"] = f"MetaAPI error {response.status_code}: {response.text[:150]}"
             return None
     except Exception as e:
         print(f"[MT5 PERSONAL COPY] ❌ Exception: {e}")
+        _PERSONAL_COPY_LAST_FAILURE["reason"] = f"Unexpected error: {str(e)[:150]}"
         return None
 
 # ============================================

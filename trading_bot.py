@@ -199,7 +199,7 @@ def maybe_invert_direction(direction):
 #   conservative_structure  support_resistance_bounce   + supertrend (was ict_smc/strategy_unicorn_model - removed per explicit instruction, the most subjective/discretionary strategy in the whole bank)
 #
 # "strategy_functions" (plural) replaces the old single
-# "strategy_function". "timeframe": "1min" for Aggressive, "5min" for
+# "strategy_function". "timeframe": now "1h" for ALL bots (the hourly timeframe the ML model was trained on) - was "1min" for Aggressive, "5min" for
 # Conservative (down from the old 1h/4h) - per explicit instruction.
 MT5_AUTOTRADE_BOTS = {
     "aggressive_scalper": {
@@ -216,7 +216,7 @@ MT5_AUTOTRADE_BOTS = {
             "strategy_ema_ribbon", "strategy_rate_of_change", "strategy_cci_breakout",
             "strategy_williams_r", "strategy_heikin_ashi_trend",
         ],
-        "timeframe": "1min",
+        "timeframe": "1h",
         "description": "Fast, frequent entries on short-term pullbacks.",
     },
     "aggressive_breakout": {
@@ -229,7 +229,7 @@ MT5_AUTOTRADE_BOTS = {
             "strategy_ema_ribbon", "strategy_rate_of_change", "strategy_cci_breakout",
             "strategy_williams_r", "strategy_heikin_ashi_trend",
         ],
-        "timeframe": "1min",
+        "timeframe": "1h",
         "description": "Fires on sharp volatility expansions.",
     },
     "conservative_trend": {
@@ -242,7 +242,7 @@ MT5_AUTOTRADE_BOTS = {
             "strategy_ema_ribbon", "strategy_rate_of_change", "strategy_cci_breakout",
             "strategy_williams_r", "strategy_heikin_ashi_trend",
         ],
-        "timeframe": "5min",
+        "timeframe": "1h",
         "description": "Slower, higher-conviction trend-following entries.",
     },
     "conservative_structure": {
@@ -255,7 +255,7 @@ MT5_AUTOTRADE_BOTS = {
             "strategy_ema_ribbon", "strategy_rate_of_change", "strategy_cci_breakout",
             "strategy_williams_r", "strategy_heikin_ashi_trend",
         ],
-        "timeframe": "5min",
+        "timeframe": "1h",
         "description": "Patient, level-based support/resistance entries.",
     },
 }
@@ -1866,7 +1866,7 @@ async def run_mt5_autotrade_bot_scan(context: ContextTypes.DEFAULT_TYPE):
                 stop_loss = entry_price + atr * 1.5
                 take_profit = entry_price - atr * 3.0
 
-            signal_marker = f"{bot_key}_{pair_key}_{int(time.time() // 300)}"  # 5-min bucket
+            signal_marker = f"{bot_key}_{pair_key}_{int(time.time() // 3600)}"  # 1-hour bucket (matches the 1h candles the decision is made on)
 
             for account in subscribers:
                 user_id = account["user_id"]
@@ -2311,6 +2311,22 @@ async def _xc_enter_one(context, account, pair_key, sig, entry, sl, stop_dist):
             log_mt5_autotrade_order, user_id, acct_id, order_id, pair_config["display"], sig["direction"]
         )
         print(f"[XC] ✅ {sig['direction']} {resolved} user={user_id} vol={volume} entry~{entry} sl={sl} z={sig['z']:.2f} corr={sig['corr']:.2f}")
+        if count == 0:
+            # Only the FIRST trade of the day is announced - no per-trade spam after that.
+            try:
+                await context.bot.send_message(
+                    chat_id=int(user_id),
+                    text=(
+                        f"🐆 <b>Aggressive Scalper is trading today</b>\n\n"
+                        f"First trade: {sig['direction']} {pair_config['display']} — {volume} lots, "
+                        f"trailing stop on.\n"
+                        f"It may place several more trades today (up to {XC_CFG['max_trades_per_day']}). "
+                        f"I won't message you for each one — your results come in the daily summary."
+                    ),
+                    parse_mode=ParseMode.HTML,
+                )
+            except Exception as e:
+                print(f"[XC] Couldn't notify {user_id}: {e}")
     except Exception as e:
         print(f"[XC] ❌ entry error for {user_id}: {e}")
 
@@ -2689,7 +2705,7 @@ async def run_account_flip_entry_scan(context: ContextTypes.DEFAULT_TYPE):
         if not pair_config:
             continue
         try:
-            candles = await asyncio.to_thread(get_cached_candles, pair_key, pair_config, "15min", outputsize=210)
+            candles = await asyncio.to_thread(get_cached_candles, pair_key, pair_config, "1h", outputsize=210)
             if not candles or len(candles) < 5:
                 continue
 
@@ -2736,7 +2752,7 @@ async def run_account_flip_entry_scan(context: ContextTypes.DEFAULT_TYPE):
             else:
                 stop_loss = max(invalidation + buffer_dist, entry_price + pair_config["pip_size"] * 0.5)
 
-            signal_marker = f"accountflip_{pair_key}_{int(time.time() // 300)}"
+            signal_marker = f"accountflip_{pair_key}_{int(time.time() // 3600)}"
 
             for account in subscribers:
                 user_id = account["user_id"]

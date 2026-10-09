@@ -2315,6 +2315,9 @@ async def run_xc_scalper_tick(context: ContextTypes.DEFAULT_TYPE):
             return
         subs = await _xc_get_subscribers()
         if not subs:
+            if time.time() - _XC["last_log_at"] > 1800:
+                _XC["last_log_at"] = time.time()
+                print("[XC] idle - no active Aggressive Scalper / XAUUSD subscribers (sampler running)")
             return
         xsym = PAIR_CONFIG["xauusd"]["mt5_symbol"]
         csym = PAIR_CONFIG["usdchf"]["mt5_symbol"]

@@ -262,7 +262,8 @@ MT5_AUTOTRADE_BOTS = {
 
 # Curated subset of PAIR_CONFIG for bot trading - not all 12 pairs,
 # to keep the choice simple and recognizable.
-MT5_AUTOTRADE_PAIRS = ["xauusd", "gbpjpy", "btcusd", "eurusd", "gbpusd", "usdjpy"]
+# Only the high-volatility instruments people actually trade: gold, bitcoin, oil, silver.
+MT5_AUTOTRADE_PAIRS = ["xauusd", "btcusd", "usoil", "xagusd"]
 
 # Deriv's mirror of MT5_AUTOTRADE_BOTS. IMPORTANT DIFFERENCE, stated
 # plainly rather than glossed over: synthetic indices already run
@@ -2167,7 +2168,7 @@ async def _xc_get_subscribers():
     if isinstance(accts, list):
         _XC["subs"] = [
             a for a in accts
-            if a.get("bot_choice") == "aggressive_scalper" and a.get("pair_choice") == "xauusd"
+            if a.get("bot_choice") in ("aggressive_scalper", "account_flip") and a.get("pair_choice") == "xauusd"
             and a.get("metaapi_account_id")
         ]
         _XC["subs_at"] = time.time()
@@ -2281,20 +2282,55 @@ async def _xc_enter_one(context, account, sig, entry, sl, stop_dist):
             log_mt5_autotrade_order, user_id, acct_id, order_id, pair_config["display"], sig["direction"]
         )
         print(f"[XC] ✅ {sig['direction']} {resolved} user={user_id} vol={volume} entry~{entry:.2f} sl={sl:.2f} z={sig['z']:.2f} corr={sig['corr']:.2f}")
+    except Exception as e:
+        print(f"[XC] ❌ entry error for {user_id}: {e}")
+
+
+async def _xc_flip_enter_one(context, account, sig, entry, sl):
+    """Account Flip + XAUUSD: the divergence signal opens the FIRST layer of a
+    new flip stack. Layering and the stack trailing stop are handled, exactly as
+    before, by manage_account_flip_stacks."""
+    user_id = str(account["user_id"])
+    acct_id = account["metaapi_account_id"]
+    try:
+        if account.get("trading_paused"):
+            return
+        if await asyncio.to_thread(get_open_flip_stack, user_id):
+            return
+        pair_config = PAIR_CONFIG["xauusd"]
+        symbol_map = await get_client_symbol_map(account)
+        resolved = resolve_trade_symbol(symbol_map, pair_config)
+        positions = await _xc_get_positions(acct_id, resolved)
+        if positions is None or positions:
+            return  # unverifiable, or something already open on gold - sit out
+        base_lot = float(account.get("flip_base_lot") or 0.01)
+        order_id = await place_client_mt5_trade(
+            acct_id, resolved, sig["direction"], base_lot, sl, None,
+            trade_comment=f"NexoraAI-Flip-{int(time.time())}",
+        )
+        if not order_id:
+            return
+        await asyncio.to_thread(
+            create_flip_stack, user_id, acct_id, "xauusd", resolved, sig["direction"], entry, sl
+        )
+        print(f"[XC] ✅ FLIP {sig['direction']} {resolved} user={user_id} lot={base_lot} entry~{entry:.2f} sl={sl:.2f} z={sig['z']:.2f}")
         try:
             await context.bot.send_message(
                 chat_id=int(user_id),
                 text=(
-                    f"🐆 <b>Aggressive Scalper — {sig['direction']} {pair_config['display']}</b>\n\n"
-                    f"Entry ≈ {entry:.2f} | Stop: {sl:.2f} | Trailing stop: on\n"
-                    f"Volume: {volume} lots"
+                    f"🚀 <b>Account Flip — {sig['direction']} {pair_config['display']}</b>\n\n"
+                    f"Signal: gold lagging the dollar (USDCHF) move\n"
+                    f"Entry ≈ {entry:.2f} | SL: {sl:.2f}\n"
+                    f"Volume: {base_lot} lots (layer 1)\n\n"
+                    f"No take-profit set - this position rides on a trailing "
+                    f"stop across the whole stack as layers get added."
                 ),
                 parse_mode=ParseMode.HTML,
             )
         except Exception as e:
-            print(f"[XC] Couldn't notify {user_id}: {e}")
+            print(f"[XC] Couldn't notify {user_id} of flip entry: {e}")
     except Exception as e:
-        print(f"[XC] ❌ entry error for {user_id}: {e}")
+        print(f"[XC] ❌ flip entry error for {user_id}: {e}")
 
 
 async def _xc_enter_all(context, subs, sig, entry, sl, stop_dist):
@@ -2302,7 +2338,10 @@ async def _xc_enter_all(context, subs, sig, entry, sl, stop_dist):
 
     async def one(a):
         async with sem:
-            await _xc_enter_one(context, a, sig, entry, sl, stop_dist)
+            if a.get("bot_choice") == "account_flip":
+                await _xc_flip_enter_one(context, a, sig, entry, sl)
+            else:
+                await _xc_enter_one(context, a, sig, entry, sl, stop_dist)
 
     await asyncio.gather(*(one(a) for a in subs), return_exceptions=True)
 
@@ -2317,7 +2356,7 @@ async def run_xc_scalper_tick(context: ContextTypes.DEFAULT_TYPE):
         if not subs:
             if time.time() - _XC["last_log_at"] > 1800:
                 _XC["last_log_at"] = time.time()
-                print("[XC] idle - no active Aggressive Scalper / XAUUSD subscribers (sampler running)")
+                print("[XC] idle - no active Aggressive Scalper / Account Flip XAUUSD subscribers (sampler running)")
             return
         xsym = PAIR_CONFIG["xauusd"]["mt5_symbol"]
         csym = PAIR_CONFIG["usdchf"]["mt5_symbol"]
@@ -2439,7 +2478,11 @@ async def manage_xc_positions(context: ContextTypes.DEFAULT_TYPE):
             return
         _XC["tick_n"] += 1
         discover = _XC["tick_n"] % 10 == 0
-        targets = [a for a in subs if discover or str(a["user_id"]) in _XC["open_users"]]
+        targets = [
+            a for a in subs
+            if a.get("bot_choice") == "aggressive_scalper"
+            and (discover or str(a["user_id"]) in _XC["open_users"])
+        ]
         if not targets:
             return
         sem = asyncio.Semaphore(6)
@@ -2597,6 +2640,8 @@ async def run_account_flip_entry_scan(context: ContextTypes.DEFAULT_TYPE):
         combos.setdefault(account["pair_choice"], []).append(account)
 
     for pair_key, subscribers in combos.items():
+        if pair_key == "xauusd":
+            continue  # gold entries come from the XAU/USDCHF divergence signal (run_xc_scalper_tick)
         pair_config = PAIR_CONFIG.get(pair_key)
         if not pair_config:
             continue

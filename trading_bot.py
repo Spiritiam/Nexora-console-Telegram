@@ -1754,8 +1754,8 @@ async def run_mt5_autotrade_bot_scan(context: ContextTypes.DEFAULT_TYPE):
         combos.setdefault(key, []).append(account)
 
     for (bot_key, pair_key), subscribers in combos.items():
-        if bot_key == "aggressive_scalper" and pair_key == "xauusd":
-            continue  # handled by the dedicated XAUUSD x USDCHF divergence scalper (run_xc_scalper_tick)
+        if bot_key == "aggressive_scalper" and pair_key in XC_PAIRS:
+            continue  # handled by the dedicated metals x USDCHF divergence scalper (run_xc_scalper_tick)
         bot_info = MT5_AUTOTRADE_BOTS.get(bot_key)
         pair_config = PAIR_CONFIG.get(pair_key)
         if not bot_info or not pair_config:
@@ -2098,22 +2098,47 @@ def xc_trail_target(direction, entry, current, cur_sl, stop_dist, cfg=None):
     return target
 
 
-# ---- live runtime for the XAUUSD x USDCHF scalper ----------------------
+# ---- live runtime for the metals x USDCHF divergence scalper ------------
 
 from collections import deque as _xc_deque
 
+# Per-instrument settings layered over XC_CFG. Silver's spread is much wider
+# relative to its price than gold's, so its spread cap and stop distances are
+# wider too. "contract" = ounces per 1.00 lot, used for percent-risk sizing.
+XC_PAIRS = {
+    "xauusd": {"cfg": {}, "contract": 100.0},
+    "xagusd": {
+        "cfg": {"sl_min_frac": 0.0012, "sl_max_frac": 0.0030, "max_spread_frac": 0.0006},
+        "contract": 5000.0,
+    },
+}
+
+
+def xc_cfg_for(pair_key):
+    cfg = dict(XC_CFG)
+    cfg.update(XC_PAIRS.get(pair_key, {}).get("cfg", {}))
+    return cfg
+
+
 _XC = {
-    "samples": _xc_deque(maxlen=1200),   # ~100 minutes at 5s
+    "pairs": {},          # pair_key -> {"samples": deque, "armed": bool, "last_signal_at": float}
     "subs": [], "subs_at": 0.0,
-    "last_signal_at": 0.0, "armed": True,
-    "open_users": set(),
+    "open_users": set(),  # (user_id, pair_key) known to hold a scalper trade
     "daily": {},          # user_id -> [utc_date, count]
-    "cap_notified": set(),  # (user_id, utc_date) already told about the cap in the log
+    "cap_notified": set(),
     "pos_stop": {},       # position id -> initial stop distance
     "tick_n": 0,
     "tasks": set(),
     "last_log_at": 0.0,
 }
+
+
+def _xc_state(pair_key):
+    st = _XC["pairs"].get(pair_key)
+    if st is None:
+        st = {"samples": _xc_deque(maxlen=1200), "armed": True, "last_signal_at": 0.0}
+        _XC["pairs"][pair_key] = st
+    return st
 
 
 def _xc_market_closed(now=None):
@@ -2168,7 +2193,8 @@ async def _xc_get_subscribers():
     if isinstance(accts, list):
         _XC["subs"] = [
             a for a in accts
-            if a.get("bot_choice") in ("aggressive_scalper", "account_flip") and a.get("pair_choice") == "xauusd"
+            if a.get("bot_choice") in ("aggressive_scalper", "account_flip")
+            and a.get("pair_choice") in XC_PAIRS
             and a.get("metaapi_account_id")
         ]
         _XC["subs_at"] = time.time()
@@ -2240,7 +2266,9 @@ def _xc_trade_action_sync(metaapi_account_id, payload):
         return False, f"error: {e}"
 
 
-async def _xc_enter_one(context, account, sig, entry, sl, stop_dist):
+async def _xc_enter_one(context, account, pair_key, sig, entry, sl, stop_dist):
+    """Aggressive Scalper entry. Deliberately sends the user NO message per trade
+    (these are frequent); results appear in the daily summary."""
     user_id = str(account["user_id"])
     acct_id = account["metaapi_account_id"]
     try:
@@ -2253,21 +2281,22 @@ async def _xc_enter_one(context, account, sig, entry, sl, stop_dist):
                 _XC["cap_notified"].add((user_id, today))
                 print(f"[XC] {user_id} reached the {XC_CFG['max_trades_per_day']}-trade daily cap")
             return
-        pair_config = PAIR_CONFIG["xauusd"]
+        pair_config = PAIR_CONFIG[pair_key]
         symbol_map = await get_client_symbol_map(account)
         resolved = resolve_trade_symbol(symbol_map, pair_config)
         positions = await _xc_get_positions(acct_id, resolved)
         if positions is None:
             return  # could not verify - do not risk a stacked trade
         if positions:
-            _XC["open_users"].add(user_id)
+            _XC["open_users"].add((user_id, pair_key))
             return
         if account.get("risk_mode") == "percent":
             balance = await get_client_mt5_balance(acct_id)
             if not balance:
                 return
             risk_amount = float(balance) * float(account.get("risk_percent", 1.0)) / 100.0
-            volume = round(max(0.01, min(risk_amount / (stop_dist * 100.0), 10.0)), 2)  # gold: 100 oz per lot
+            contract = XC_PAIRS[pair_key]["contract"]
+            volume = round(max(0.01, min(risk_amount / (stop_dist * contract), 10.0)), 2)
         else:
             volume = float(account.get("lot_size", 0.01))
         order_id = await place_client_mt5_trade(
@@ -2276,20 +2305,20 @@ async def _xc_enter_one(context, account, sig, entry, sl, stop_dist):
         )
         if not order_id:
             return
-        _XC["open_users"].add(user_id)
+        _XC["open_users"].add((user_id, pair_key))
         _XC["daily"][user_id] = [today, count + 1]
         await asyncio.to_thread(
             log_mt5_autotrade_order, user_id, acct_id, order_id, pair_config["display"], sig["direction"]
         )
-        print(f"[XC] ✅ {sig['direction']} {resolved} user={user_id} vol={volume} entry~{entry:.2f} sl={sl:.2f} z={sig['z']:.2f} corr={sig['corr']:.2f}")
+        print(f"[XC] ✅ {sig['direction']} {resolved} user={user_id} vol={volume} entry~{entry} sl={sl} z={sig['z']:.2f} corr={sig['corr']:.2f}")
     except Exception as e:
         print(f"[XC] ❌ entry error for {user_id}: {e}")
 
 
-async def _xc_flip_enter_one(context, account, sig, entry, sl):
-    """Account Flip + XAUUSD: the divergence signal opens the FIRST layer of a
-    new flip stack. Layering and the stack trailing stop are handled, exactly as
-    before, by manage_account_flip_stacks."""
+async def _xc_flip_enter_one(context, account, pair_key, sig, entry, sl):
+    """Account Flip: the divergence signal opens the FIRST layer of a new flip
+    stack. Layering and the stack trailing stop are handled, exactly as before,
+    by manage_account_flip_stacks."""
     user_id = str(account["user_id"])
     acct_id = account["metaapi_account_id"]
     try:
@@ -2297,12 +2326,12 @@ async def _xc_flip_enter_one(context, account, sig, entry, sl):
             return
         if await asyncio.to_thread(get_open_flip_stack, user_id):
             return
-        pair_config = PAIR_CONFIG["xauusd"]
+        pair_config = PAIR_CONFIG[pair_key]
         symbol_map = await get_client_symbol_map(account)
         resolved = resolve_trade_symbol(symbol_map, pair_config)
         positions = await _xc_get_positions(acct_id, resolved)
         if positions is None or positions:
-            return  # unverifiable, or something already open on gold - sit out
+            return  # unverifiable, or something already open on this metal - sit out
         base_lot = float(account.get("flip_base_lot") or 0.01)
         order_id = await place_client_mt5_trade(
             acct_id, resolved, sig["direction"], base_lot, sl, None,
@@ -2311,16 +2340,16 @@ async def _xc_flip_enter_one(context, account, sig, entry, sl):
         if not order_id:
             return
         await asyncio.to_thread(
-            create_flip_stack, user_id, acct_id, "xauusd", resolved, sig["direction"], entry, sl
+            create_flip_stack, user_id, acct_id, pair_key, resolved, sig["direction"], entry, sl
         )
-        print(f"[XC] ✅ FLIP {sig['direction']} {resolved} user={user_id} lot={base_lot} entry~{entry:.2f} sl={sl:.2f} z={sig['z']:.2f}")
+        print(f"[XC] ✅ FLIP {sig['direction']} {resolved} user={user_id} lot={base_lot} entry~{entry} sl={sl} z={sig['z']:.2f}")
         try:
             await context.bot.send_message(
                 chat_id=int(user_id),
                 text=(
                     f"🚀 <b>Account Flip — {sig['direction']} {pair_config['display']}</b>\n\n"
-                    f"Signal: gold lagging the dollar (USDCHF) move\n"
-                    f"Entry ≈ {entry:.2f} | SL: {sl:.2f}\n"
+                    f"Signal: metal lagging the dollar (USDCHF) move\n"
+                    f"Entry ≈ {entry} | SL: {sl}\n"
                     f"Volume: {base_lot} lots (layer 1)\n\n"
                     f"No take-profit set - this position rides on a trailing "
                     f"stop across the whole stack as layers get added."
@@ -2333,22 +2362,66 @@ async def _xc_flip_enter_one(context, account, sig, entry, sl):
         print(f"[XC] ❌ flip entry error for {user_id}: {e}")
 
 
-async def _xc_enter_all(context, subs, sig, entry, sl, stop_dist):
+async def _xc_enter_all(context, subs, pair_key, sig, entry, sl, stop_dist):
     sem = asyncio.Semaphore(6)
 
     async def one(a):
         async with sem:
             if a.get("bot_choice") == "account_flip":
-                await _xc_flip_enter_one(context, a, sig, entry, sl)
+                await _xc_flip_enter_one(context, a, pair_key, sig, entry, sl)
             else:
-                await _xc_enter_one(context, a, sig, entry, sl, stop_dist)
+                await _xc_enter_one(context, a, pair_key, sig, entry, sl, stop_dist)
 
     await asyncio.gather(*(one(a) for a in subs), return_exceptions=True)
 
 
+async def _xc_process_pair(context, pair_key, mq, cq, now, subs):
+    cfg = xc_cfg_for(pair_key)
+    st = _xc_state(pair_key)
+    mid = (mq[0] + mq[1]) / 2.0
+    chf_mid = (cq[0] + cq[1]) / 2.0
+    st["samples"].append((now, mid, chf_mid))
+    samples = list(st["samples"])
+
+    sig = xc_signal(samples, cfg)
+    if not st["armed"]:
+        zc = xc_current_z(samples, cfg)
+        if zc is not None and zc < cfg["z_rearm"]:
+            st["armed"] = True
+    if not sig:
+        if now - _XC["last_log_at"] > 900:
+            _XC["last_log_at"] = now
+            print(f"[XC] watching {pair_key} - {len(samples)} samples, {len(subs)} subscriber(s), no divergence")
+        return
+    if not st["armed"] or now - st["last_signal_at"] < cfg["signal_cooldown_s"]:
+        return
+    spread_frac = (mq[1] - mq[0]) / mid
+    if spread_frac > cfg["max_spread_frac"]:
+        print(f"[XC] {pair_key} {sig['direction']} skipped - spread {spread_frac * 100:.3f}% too wide")
+        return
+
+    st["armed"] = False
+    st["last_signal_at"] = now
+    decimals = PAIR_CONFIG[pair_key]["decimals"]
+    stop_dist, _, _ = xc_risk(mid, sig["sigma_win"], cfg)
+    if sig["direction"] == "BUY":
+        entry = mq[1]
+        sl = round(entry - stop_dist, decimals)
+    else:
+        entry = mq[0]
+        sl = round(entry + stop_dist, decimals)
+    print(
+        f"[XC] 🔔 {sig['direction']} {pair_key} z={sig['z']:.2f} beta={sig['beta']:.2f} "
+        f"corr={sig['corr']:.2f} entry~{entry} stop_dist={stop_dist:.4f}"
+    )
+    task = asyncio.create_task(_xc_enter_all(context, list(subs), pair_key, sig, entry, sl, stop_dist))
+    _XC["tasks"].add(task)
+    task.add_done_callback(_XC["tasks"].discard)
+
+
 async def run_xc_scalper_tick(context: ContextTypes.DEFAULT_TYPE):
-    """Every 5s: sample gold + USDCHF, look for a divergence, enter for every
-    Aggressive Scalper / XAUUSD subscriber that is flat and under the daily cap."""
+    """Every 5s: sample each metal that has subscribers plus USDCHF, look for a
+    divergence, enter for every subscriber of that metal that is flat."""
     try:
         if _xc_market_closed():
             return
@@ -2356,55 +2429,22 @@ async def run_xc_scalper_tick(context: ContextTypes.DEFAULT_TYPE):
         if not subs:
             if time.time() - _XC["last_log_at"] > 1800:
                 _XC["last_log_at"] = time.time()
-                print("[XC] idle - no active Aggressive Scalper / Account Flip XAUUSD subscribers (sampler running)")
+                print("[XC] idle - no active XAUUSD / XAGUSD Aggressive Scalper or Account Flip subscribers (sampler running)")
             return
-        xsym = PAIR_CONFIG["xauusd"]["mt5_symbol"]
+        active = sorted({a["pair_choice"] for a in subs})
         csym = PAIR_CONFIG["usdchf"]["mt5_symbol"]
-        gq, cq = await asyncio.gather(
-            asyncio.to_thread(_xc_fetch_quote, xsym),
+        quotes = await asyncio.gather(
             asyncio.to_thread(_xc_fetch_quote, csym),
+            *[asyncio.to_thread(_xc_fetch_quote, PAIR_CONFIG[pk]["mt5_symbol"]) for pk in active],
         )
-        if not gq or not cq:
+        cq = quotes[0]
+        if not cq:
             return
-        gold_mid = (gq[0] + gq[1]) / 2.0
-        chf_mid = (cq[0] + cq[1]) / 2.0
         now = time.time()
-        _XC["samples"].append((now, gold_mid, chf_mid))
-        samples = list(_XC["samples"])
-
-        sig = xc_signal(samples)
-        if not _XC["armed"]:
-            zc = xc_current_z(samples)
-            if zc is not None and zc < XC_CFG["z_rearm"]:
-                _XC["armed"] = True
-        if not sig:
-            if now - _XC["last_log_at"] > 900:
-                _XC["last_log_at"] = now
-                print(f"[XC] watching - {len(samples)} samples, {len(subs)} subscriber(s), no divergence")
-            return
-        if not _XC["armed"] or now - _XC["last_signal_at"] < XC_CFG["signal_cooldown_s"]:
-            return
-        spread_frac = (gq[1] - gq[0]) / gold_mid
-        if spread_frac > XC_CFG["max_spread_frac"]:
-            print(f"[XC] signal {sig['direction']} skipped - gold spread {spread_frac * 100:.3f}% too wide")
-            return
-
-        _XC["armed"] = False
-        _XC["last_signal_at"] = now
-        stop_dist, _, _ = xc_risk(gold_mid, sig["sigma_win"])
-        if sig["direction"] == "BUY":
-            entry = gq[1]
-            sl = round(entry - stop_dist, 2)
-        else:
-            entry = gq[0]
-            sl = round(entry + stop_dist, 2)
-        print(
-            f"[XC] 🔔 {sig['direction']} XAUUSD z={sig['z']:.2f} beta={sig['beta']:.2f} "
-            f"corr={sig['corr']:.2f} entry~{entry:.2f} stop_dist={stop_dist:.2f}"
-        )
-        task = asyncio.create_task(_xc_enter_all(context, list(subs), sig, entry, sl, stop_dist))
-        _XC["tasks"].add(task)
-        task.add_done_callback(_XC["tasks"].discard)
+        for pk, mq in zip(active, quotes[1:]):
+            if not mq:
+                continue
+            await _xc_process_pair(context, pk, mq, cq, now, [a for a in subs if a["pair_choice"] == pk])
     except Exception as e:
         print(f"[XC] ❌ tick error: {type(e).__name__}: {e}")
 
@@ -2412,18 +2452,21 @@ async def run_xc_scalper_tick(context: ContextTypes.DEFAULT_TYPE):
 async def _xc_manage_one(context, account):
     user_id = str(account["user_id"])
     acct_id = account["metaapi_account_id"]
+    pair_key = account["pair_choice"]
     try:
-        pair_config = PAIR_CONFIG["xauusd"]
+        cfg = xc_cfg_for(pair_key)
+        pair_config = PAIR_CONFIG[pair_key]
         symbol_map = await get_client_symbol_map(account)
         resolved = resolve_trade_symbol(symbol_map, pair_config)
         positions = await _xc_get_positions(acct_id, resolved)
         if positions is None:
             return
         mine = [p for p in positions if str(p.get("comment") or "").startswith("NexoraXC")]
+        key = (user_id, pair_key)
         if not mine:
-            _XC["open_users"].discard(user_id)
+            _XC["open_users"].discard(key)
             return
-        _XC["open_users"].add(user_id)
+        _XC["open_users"].add(key)
         for p in mine:
             pid = str(p.get("id"))
             direction = "BUY" if "BUY" in str(p.get("type", "")).upper() else "SELL"
@@ -2438,18 +2481,18 @@ async def _xc_manage_one(context, account):
                 if sl and ((direction == "BUY" and sl < entry) or (direction == "SELL" and sl > entry)):
                     stop_dist = abs(entry - sl)
                 else:
-                    stop_dist = entry * XC_CFG["sl_min_frac"] * 1.4  # restart mid-trail: sensible default
+                    stop_dist = entry * cfg["sl_min_frac"] * 1.4  # restart mid-trail: sensible default
                 _XC["pos_stop"][pid] = stop_dist
                 if len(_XC["pos_stop"]) > 500:
                     _XC["pos_stop"].pop(next(iter(_XC["pos_stop"])))
-            new_sl = xc_trail_target(direction, entry, cur, sl, stop_dist)
+            new_sl = xc_trail_target(direction, entry, cur, sl, stop_dist, cfg)
             if new_sl is not None:
                 new_sl = round(new_sl, pair_config["decimals"])
                 payload = {"actionType": "POSITION_MODIFY", "positionId": pid, "stopLoss": new_sl}
                 if p.get("takeProfit"):
                     payload["takeProfit"] = p["takeProfit"]
                 ok, detail = await asyncio.to_thread(_xc_trade_action_sync, acct_id, payload)
-                print(f"[XC] trail {direction} user={user_id} sl {sl} -> {new_sl} ok={ok} {'' if ok else detail}")
+                print(f"[XC] trail {pair_key} {direction} user={user_id} sl {sl} -> {new_sl} ok={ok} {'' if ok else detail}")
                 continue
             # time stop: still at initial risk (trail never started) after max_hold_s
             trail_started = sl is not None and ((direction == "BUY" and sl >= entry) or (direction == "SELL" and sl <= entry))
@@ -2460,11 +2503,11 @@ async def _xc_manage_one(context, account):
                     held = (datetime.now(t_open.tzinfo) - t_open).total_seconds()
                 except Exception:
                     held = 0
-                if held > XC_CFG["max_hold_s"]:
+                if held > cfg["max_hold_s"]:
                     ok, detail = await asyncio.to_thread(
                         _xc_trade_action_sync, acct_id, {"actionType": "POSITION_CLOSE_ID", "positionId": pid}
                     )
-                    print(f"[XC] time-stop close {direction} user={user_id} held={held:.0f}s ok={ok} {'' if ok else detail}")
+                    print(f"[XC] time-stop close {pair_key} {direction} user={user_id} held={held:.0f}s ok={ok} {'' if ok else detail}")
     except Exception as e:
         print(f"[XC] ❌ manage error for {user_id}: {e}")
 
@@ -2481,7 +2524,7 @@ async def manage_xc_positions(context: ContextTypes.DEFAULT_TYPE):
         targets = [
             a for a in subs
             if a.get("bot_choice") == "aggressive_scalper"
-            and (discover or str(a["user_id"]) in _XC["open_users"])
+            and (discover or (str(a["user_id"]), a["pair_choice"]) in _XC["open_users"])
         ]
         if not targets:
             return
@@ -2640,8 +2683,8 @@ async def run_account_flip_entry_scan(context: ContextTypes.DEFAULT_TYPE):
         combos.setdefault(account["pair_choice"], []).append(account)
 
     for pair_key, subscribers in combos.items():
-        if pair_key == "xauusd":
-            continue  # gold entries come from the XAU/USDCHF divergence signal (run_xc_scalper_tick)
+        if pair_key in XC_PAIRS:
+            continue  # gold/silver entries come from the metals x USDCHF divergence signal (run_xc_scalper_tick)
         pair_config = PAIR_CONFIG.get(pair_key)
         if not pair_config:
             continue

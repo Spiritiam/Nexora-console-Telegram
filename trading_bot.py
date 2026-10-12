@@ -6834,17 +6834,38 @@ def update_signal_status(signal_id, status, source=None):
         return False
 
 def get_signals_since(start_dt):
+    """
+    Returns scheduled (or legacy NULL-source) signals since start_dt.
+    FIX: Supabase REST caps a response at 1000 rows. Thousands of manual
+    signals per week used to fill that cap, so the weekly/daily reports
+    only saw a handful of the real scheduled signals. The source filter
+    is now applied in the query itself and results are paged.
+    """
+    rows = []
     try:
         start_str = start_dt.isoformat()
-        url = (
-            f"{SUPABASE_URL}/rest/v1/signal_log"
-            f"?posted_at=gte.{start_str}&select=*"
-        )
-        response = requests.get(url, headers=sb_headers(), timeout=10)
-        return response.json()
+        page = 1000
+        offset = 0
+        while True:
+            url = (
+                f"{SUPABASE_URL}/rest/v1/signal_log"
+                f"?posted_at=gte.{start_str}&select=*"
+                f"&or=(source.eq.scheduled,source.is.null)"
+                f"&order=posted_at.asc&limit={page}&offset={offset}"
+            )
+            response = requests.get(url, headers=sb_headers(), timeout=15)
+            batch = response.json()
+            if not isinstance(batch, list):
+                print(f"[SIGNAL LOG] get_signals_since unexpected response: {str(batch)[:200]}")
+                break
+            rows.extend(batch)
+            if len(batch) < page:
+                break
+            offset += page
+        return rows
     except Exception as e:
         print(f"[SIGNAL LOG] get_signals_since error: {e}")
-        return []
+        return rows
 
 # ============================================
 # DERIV ACCOUNT LINKING (NEW) — PHASE 1
@@ -21271,6 +21292,22 @@ async def check_for_matching_recent_position(metaapi_account_id, mt5_symbol, com
         return "CHECK_FAILED"
 
 
+async def _late_confirm_position(metaapi_account_id, mt5_symbol, comment, since_dt, waits=(4, 8, 12)):
+    """
+    A trade request that timed out (504 / network error) may still execute
+    on the broker a few seconds later. Before declaring a failure, poll the
+    open positions a few more times for this exact symbol + comment.
+    Returns the position dict if found, else None. Never places an order.
+    """
+    for w in waits:
+        await asyncio.sleep(w)
+        res = await check_for_matching_recent_position(metaapi_account_id, mt5_symbol, comment, since_dt)
+        if res and res != "CHECK_FAILED":
+            print(f"[MT5] ✅ Late confirmation: position {res.get('id')} found after the request had timed out.")
+            return res
+    return None
+
+
 async def place_mt5_trade(signal_data, signal_id=None):
     if not METAAPI_TOKEN or not METAAPI_ACCOUNT_ID:
         print("[MT5] MetaAPI credentials not set.")
@@ -21430,6 +21467,9 @@ async def place_mt5_trade(signal_data, signal_id=None):
             except requests.exceptions.RequestException as network_exc:
                 if attempt == max_attempts:
                     print(f"[MT5 PERSONAL COPY] ❌ Network error on final attempt {attempt}/{max_attempts}: {network_exc}")
+                    late = await _late_confirm_position(METAAPI_ACCOUNT_ID, mt5_symbol, trade_comment, attempt_started_at)
+                    if late:
+                        return late.get("id", "unknown")
                     _PERSONAL_COPY_LAST_FAILURE["reason"] = f"Network error talking to MetaAPI (timed out): {str(network_exc)[:150]}"
                     return None
                 # FIX: CONFIRMED REAL BUG, caught live via a direct
@@ -21449,6 +21489,9 @@ async def place_mt5_trade(signal_data, signal_id=None):
                 )
                 if check_result == "CHECK_FAILED":
                     print(f"[MT5] ⚠️ Idempotency check itself failed after a network error - stopping rather than risk a duplicate order.")
+                    late = await _late_confirm_position(METAAPI_ACCOUNT_ID, mt5_symbol, trade_comment, attempt_started_at)
+                    if late:
+                        return late.get("id", "unknown")
                     return None
                 if check_result:
                     idempotent_match = check_result
@@ -21512,6 +21555,12 @@ async def place_mt5_trade(signal_data, signal_id=None):
             return order_id
 
         response = last_response
+        if response is not None and response.status_code not in (200, 201) and response.status_code in transient_statuses:
+            late = await _late_confirm_position(METAAPI_ACCOUNT_ID, mt5_symbol, trade_comment, attempt_started_at)
+            if late:
+                order_id = late.get("id", "unknown")
+                print(f"[MT5 PERSONAL COPY] ✅ Trade confirmed late - Position ID: {order_id}")
+                return order_id
         if response.status_code in [200, 201]:
             result = response.json()
             order_id = result.get("orderId", "unknown")

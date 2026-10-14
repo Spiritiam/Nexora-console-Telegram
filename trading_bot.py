@@ -52,7 +52,7 @@ from telegram.ext import (
 )
 
 from telegram.constants import ParseMode
-from telegram.error import TimedOut, Conflict as TelegramConflictError, BadRequest
+from telegram.error import TimedOut, NetworkError as TelegramNetworkError, Conflict as TelegramConflictError, BadRequest
 
 # ============================================
 # ENV VARIABLES
@@ -29040,6 +29040,7 @@ def main():
     _app_instance = app
 
     _error_alert_last_sent = {}  # error signature -> last alert datetime, for rate-limiting
+    _transport_blip_times = []  # recent polling-connection blips, to tell a one-off drop from a real outage
 
     async def global_error_handler(update, context):
         # FIX: CONFIRMED REAL BUG, per explicit report of the bot being
@@ -29130,7 +29131,30 @@ def main():
             and "message is not modified" in str(error).lower()
         )
 
-        if ADMIN_USER_ID and not is_routine_handover_conflict and not is_harmless_no_op_edit:
+        # FIX: per explicit report - "Nexora AI error: NetworkError
+        # httpx.ReadError" / "TimedOut" arrived 3 times in one morning
+        # while everything (signals, MT5 copies) was working normally.
+        # Confirmed from Railway logs: these are python-telegram-bot's
+        # own getUpdates long-poll connection to Telegram being dropped
+        # (update is None = raised by the polling loop itself, not by
+        # any handler or send). PTB retries that connection on its own
+        # and the bot never stops working, so paging a person about each
+        # one is a false alarm. Logged as before, never DMed for a
+        # one-off. A REAL outage still alerts: 5+ blips inside 10
+        # minutes means Telegram is genuinely not being reached.
+        is_polling_transport_blip = (
+            update is None
+            and isinstance(error, (TelegramNetworkError, TimedOut))
+        )
+        if is_polling_transport_blip:
+            _now_ts = time.time()
+            _transport_blip_times.append(_now_ts)
+            _transport_blip_times[:] = [t for t in _transport_blip_times if _now_ts - t <= 600]
+            if len(_transport_blip_times) >= 5:
+                is_polling_transport_blip = False  # sustained: let the normal alert fire (rate-limited)
+                _transport_blip_times.clear()
+
+        if ADMIN_USER_ID and not is_routine_handover_conflict and not is_harmless_no_op_edit and not is_polling_transport_blip:
             try:
                 # Strip digits so "Retry in 222 seconds" / "Retry in 221 seconds"
                 # count as the SAME error (otherwise a countdown defeats the

@@ -6594,6 +6594,25 @@ async def place_and_link_mt5_trade(signal_id, signal_data):
     """
     _PERSONAL_COPY_LAST_FAILURE["reason"] = None
     order_id = await place_mt5_trade(signal_data, signal_id=signal_id)
+    if not order_id and signal_id:
+        # An order whose confirmation timed out can still land on the broker
+        # a minute or two later (seen live: #12348 filled ~27s after the
+        # alert). Unless the broker explicitly rejected it, keep looking for
+        # this signal's own position for ~2.5 more minutes before alarming.
+        reason = (_PERSONAL_COPY_LAST_FAILURE.get("reason") or "").lower()
+        explicit_rejection = bool(reason) and not _personal_copy_looks_disconnected(reason)
+        mt5_symbol = signal_data.get("mt5_symbol")
+        if mt5_symbol and not explicit_rejection:
+            since_dt = datetime.utcnow() - timedelta(minutes=15)
+            for _ in range(15):
+                await asyncio.sleep(10)
+                res = await check_for_matching_recent_position(
+                    METAAPI_ACCOUNT_ID, mt5_symbol, f"NexoraAI #{signal_id}", since_dt
+                )
+                if res and res != "CHECK_FAILED":
+                    order_id = res.get("id", "unknown")
+                    print(f"[MT5 PERSONAL COPY] ✅ Signal {signal_id} filled late - position {order_id}; no failure alert sent.")
+                    break
     attach_mt5_order_id(signal_id, order_id)
     if not order_id:
         await handle_personal_copy_failure(signal_id, signal_data)

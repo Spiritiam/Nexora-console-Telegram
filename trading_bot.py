@@ -20562,30 +20562,22 @@ async def check_upcoming_high_impact_news(context: ContextTypes.DEFAULT_TYPE):
     # the rest show their name and time only, with no directional
     # read at all, so nobody sees 4 different "directions" for one
     # single market-moving moment.
-    event_bias_results = []  # (event, direction_or_None, reason_or_None)
-    for _, event in group:
-        _, is_headliner, _ = get_cluster_and_headliner(event, all_today_events)
-        if is_headliner:
-            direction, reason = await generate_pre_release_bias(event)
-        else:
-            direction, reason = None, None
-        event_bias_results.append((event, direction, reason))
+    # Per explicit instruction: the alert is now a short, time-ordered list
+    # (name, currency, time) - no per-event AI commentary. The bias is still
+    # one tap away on each headliner's button.
+    event_bias_results = [
+        (event, None, None)
+        for _, event in sorted(group, key=lambda g: g[1].get("event_dt_utc", ""))
+    ]
 
     def _format_event_bias_line(event, direction, reason, offset_minutes, tz_label):
         flag = flag_by_currency.get(event["currency"], "🌍")
         time_str = f"{format_local_time(event.get('event_dt_utc', ''), offset_minutes)} {tz_label}"
-        header_line = f"{flag} <b>{event['title']}</b> ({event['currency']}) — {time_str}"
-        if direction and reason:
-            lean_emoji = "🟢" if direction == "BULLISH" else "🔴"
-            return f"{header_line}\n{lean_emoji} {reason}"
-        # AI call failed for this one event - still show it with its
-        # real time, just without a bias line, rather than dropping
-        # it from the alert entirely.
-        return header_line
+        return f"{flag} <b>{event['title']}</b> ({event['currency']}) — {time_str}"
 
     channel_alert_text = (
         f"⏰ <b>{header}</b>\n\n"
-        + "\n\n".join(
+        + "\n".join(
             _format_event_bias_line(event, direction, reason, DEFAULT_UTC_OFFSET_MINUTES, "GMT+1")
             for event, direction, reason in event_bias_results
         )
@@ -20618,7 +20610,7 @@ async def check_upcoming_high_impact_news(context: ContextTypes.DEFAULT_TYPE):
             tz_label = format_gmt_label(offset_minutes)
             personal_alert_text = (
                 f"⏰ <b>{header}</b>\n\n"
-                + "\n\n".join(
+                + "\n".join(
                     _format_event_bias_line(event, direction, reason, offset_minutes, tz_label)
                     for event, direction, reason in event_bias_results
                 )

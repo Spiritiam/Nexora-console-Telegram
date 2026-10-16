@@ -19047,12 +19047,22 @@ async def build_signal_response(question, user_id=None, retry_mismatch=False):
     # narrative can't run.
     narrative = reason
 
+    # Pip distances shown next to SL/TP1/TP2, same pip convention as the
+    # reports (gold $0.10, BTC $9.918, others from pip_value). Skipped for
+    # stocks, where "pips" has no meaning.
+    sl_pips_txt = tp1_pips_txt = tp2_pips_txt = ""
+    _pip_unit = None if matched_key in STOCK_TICKERS else (REPORT_PIP_UNIT.get(pair_name) or config.get("pip_value"))
+    if _pip_unit:
+        sl_pips_txt = f" ({int(round(pip_size * sl_multiplier / _pip_unit))} pips)"
+        tp1_pips_txt = f" ({int(round(pip_size * tp1_multiplier / _pip_unit))} pips)"
+        tp2_pips_txt = f" ({int(round(pip_size * tp_multiplier / _pip_unit))} pips)"
+
     response = (
         f"{signal_emoji} <b>{strength} {direction} {display}</b>\n\n"
         f"{narrative}\n\n"
         f"<b>Entry Price:</b> {entry_price}\n"
-        f"<b>SL:</b> {stop_loss}\n"
-        f"<b>TP1:</b> {take_profit_1} | <b>TP2:</b> {take_profit}\n\n"
+        f"<b>SL:</b> {stop_loss}{sl_pips_txt}\n"
+        f"<b>TP1:</b> {take_profit_1}{tp1_pips_txt} || <b>TP2:</b> {take_profit}{tp2_pips_txt}\n\n"
         f"<b>Confidence:</b> {confidence}%\n"
         f"<b>Session:</b> {session}\n\n"
     )

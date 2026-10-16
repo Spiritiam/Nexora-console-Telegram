@@ -1237,7 +1237,7 @@ def apply_sltp_override(account, pair_key, direction, entry_price, stop_loss, ta
 
     DISABLED by default (SLTP_OVERRIDE_ENABLED=1 turns it back on): every
     copier now follows the signal's own SL / TP1 / TP2 exactly."""
-    if os.getenv("SLTP_OVERRIDE_ENABLED", "0") != "1":
+    if os.getenv("SLTP_OVERRIDE_ENABLED", "0") != "1" and not _is_prop_id(account.get("user_id")):
         return stop_loss, take_profit
     try:
         sl_pips = account.get("sl_override_pips")
@@ -4141,6 +4141,34 @@ def _is_app_synth(user_id):
         return False
 
 
+# Prop Firm Auto-Trade lives in its own mt5_auto_trade_accounts row so an app
+# user can have an Exness account AND a prop firm account at the same time.
+# That row's user_id is the app user's id + PROP_OFFSET: still an "app" id
+# (>= APP_SYNTH_MIN), so every engine, payment job and expiry job treats it
+# like any other app subscriber, and pushes are routed back to the real user.
+PROP_OFFSET = 10_000_000_000_000
+
+
+def _prop_id(synth):
+    return str(int(synth) + PROP_OFFSET)
+
+
+def _is_prop_id(user_id):
+    try:
+        return int(str(user_id)) >= PROP_OFFSET
+    except Exception:
+        return False
+
+
+def _real_synth(cid):
+    n = int(cid)
+    return n - PROP_OFFSET if n >= PROP_OFFSET else n
+
+
+def _autotrade_label(user_id):
+    return "Prop Firm Auto-Trade" if _is_prop_id(user_id) else "Exness Auto-Trade"
+
+
 def _napp_synth_id_sync(user_key):
     try:
         r = requests.post(
@@ -4974,7 +5002,7 @@ async def _napp_exness_connect_job(synth, number, password, server, name, replac
                 await asyncio.sleep(65)
         _napp_exness_spawn(_warm())
         _napp_exness_jobs[synth] = {"state": "done", "message": "Connected.", "ts": time.time()}
-        await _napp_exness_push(synth, "<b>Exness account connected</b>\nAuto-Trade is ready with your saved settings.")
+        await _napp_exness_push(synth, f"<b>{'Prop firm' if _is_prop_id(synth) else 'Exness'} account connected</b>\nAuto-Trade is ready with your saved settings.")
     except Exception as e:
         print(f"[NEXORA EXNESS] connect job error for {synth}: {type(e).__name__}")
         _napp_exness_jobs[synth] = {"state": "failed",
@@ -5220,6 +5248,246 @@ async def nexora_app_exness_config_handler(request):
     return _napp_json({"ok": True, "message": done, "settings": _napp_exness_settings(new_row)})
 
 
+
+# ---------------------------------------------------------------- PROP FIRM
+# Prop Firm Auto-Trade for the app: MT5 only, same subscription and engines as
+# Exness but no Exness email verification, and simple settings (bot, pair, lot
+# size, stop loss, take profit). One row per app user in mt5_auto_trade_accounts
+# under user_id = _prop_id(synth).
+
+async def _napp_prop_email(request, synth):
+    auth = request.headers.get("Authorization", "")
+    token = auth[7:].strip() if auth.lower().startswith("bearer ") else ""
+    ident = await asyncio.to_thread(_napp_validate_token_sync, token)
+    if ident and ident.startswith("email:") and "@" in ident:
+        return ident[6:]
+    return f"app{synth}@spiritfx.org"
+
+
+def _napp_prop_settings(row):
+    st = _napp_exness_settings(row)
+    if st.get("bot_choice") == "account_flip":
+        return {"configured": False}
+    return st
+
+
+async def nexora_app_prop_status_handler(request):
+    synth, err = await _napp_deriv_auth(request, limit_per_min=40, allow_killed=True)
+    if err:
+        return err
+    _napp_exness_prune_jobs()
+    pid = _prop_id(synth)
+    row, rok = await asyncio.to_thread(_napp_exness_row_sync, pid)
+    if not rok:
+        return _napp_json({"error": "server", "message": "Could not load your status. Try again."}, 503)
+    now = datetime.utcnow()
+    expiry = _napp_exness_expiry(row)
+    active_sub = bool(expiry and now < expiry)
+    connected = bool(row and row.get("metaapi_account_id"))
+    job = _napp_exness_jobs.get(pid) or {"state": "idle", "message": ""}
+    balance, reachable = None, None
+    if connected and active_sub:
+        try:
+            balance = await _napp_run_on_main(get_client_mt5_balance(row["metaapi_account_id"]), 25)
+            reachable = balance is not None
+        except Exception as e:
+            print(f"[NEXORA PROP] balance error: {type(e).__name__}")
+            reachable = False
+    opts = _napp_exness_options()
+    opts["bots"] = [b for b in opts["bots"]]
+    return _napp_json({
+        "enabled": not _napp_exness_killed(),
+        "subscription": {
+            "active": active_sub,
+            "days_left": max(0, (expiry - now).days) if active_sub else 0,
+            "expires_at": (expiry.isoformat() + "Z") if expiry else None,
+        },
+        "account": {
+            "connected": connected and active_sub,
+            "number": _napp_exness_mask_number(row.get("account_number")) if row else None,
+            "server": row.get("server") if row else None,
+            "name": row.get("account_name") if row else None,
+            "balance": balance,
+            "reachable": reachable,
+        },
+        "connect": {"state": job.get("state"), "message": job.get("message")},
+        "settings": _napp_prop_settings(row),
+        "options": opts,
+    })
+
+
+async def nexora_app_prop_pay_handler(request):
+    synth, err = await _napp_deriv_auth(request, limit_per_min=20, allow_killed=True)
+    if err:
+        return err
+    if _napp_exness_killed():
+        return _napp_json({"error": "unavailable", "message": "Auto-Trade in the app is switched off right now."}, 503)
+    body = await _napp_exness_body(request)
+    if body is None:
+        return _napp_json({"error": "bad_request", "message": "Could not read that."}, 400)
+    method = body.get("method")
+    if method not in ("card", "crypto"):
+        return _napp_json({"error": "bad_request", "message": "Choose card or crypto."}, 400)
+    pid = _prop_id(synth)
+    row, rok = await asyncio.to_thread(_napp_exness_row_sync, pid)
+    if not rok:
+        return _napp_json({"error": "server", "message": "Could not check right now. Try again."}, 503)
+    expiry = _napp_exness_expiry(row)
+    if expiry and datetime.utcnow() < expiry:
+        return _napp_json({"error": "already_active", "message": "Your subscription is already active."}, 409)
+    if _napp_exness_limited("pay", pid, 8):
+        return _napp_json({"error": "slow_down", "message": "Too many attempts. Try again later."}, 429)
+    email = await _napp_prop_email(request, synth)
+
+    ts = int(time.time())
+    ref = f"MT5AUTO-{pid}-{ts}"
+    if method == "card":
+        table, row_ = "korapay_transactions", {
+            "reference": ref, "user_id": pid, "amount": MT5_AUTOTRADE_MONTHLY_FEE,
+            "currency": MT5_AUTOTRADE_CURRENCY, "status": "pending"}
+    else:
+        table, row_ = "nowpayments_transactions", {
+            "order_id": ref, "user_id": pid, "amount": MT5_AUTOTRADE_MONTHLY_FEE_USD,
+            "currency": "usd", "status": "pending"}
+
+    def _log_pending():
+        r = requests.post(f"{SUPABASE_URL}/rest/v1/{table}", headers=sb_headers(), json=row_, timeout=10)
+        return r.status_code in (200, 201, 204)
+    try:
+        logged_ok = await asyncio.to_thread(_log_pending)
+    except Exception:
+        logged_ok = False
+    if not logged_ok:
+        return _napp_json({"error": "server", "message": "Couldn't start the payment right now. Try again shortly."}, 503)
+    try:
+        if method == "card":
+            url = await _napp_run_on_main(korapay_initialize_charge(pid, email, ref), 25)
+        else:
+            url = await _napp_run_on_main(nowpayments_initialize_payment(pid, ref), 25)
+    except Exception as e:
+        print(f"[NEXORA PROP] pay error: {type(e).__name__}")
+        url = None
+    if not url:
+        return _napp_json({"error": "payment", "message": "Couldn't start the payment right now. Try again shortly, or try the other payment option."}, 502)
+    return _napp_json({"url": url})
+
+
+async def nexora_app_prop_connect_handler(request):
+    synth, err = await _napp_deriv_auth(request, limit_per_min=20, allow_killed=True)
+    if err:
+        return err
+    if _napp_exness_killed():
+        return _napp_json({"error": "unavailable", "message": "Auto-Trade in the app is switched off right now."}, 503)
+    body = await _napp_exness_body(request)
+    if body is None:
+        return _napp_json({"error": "bad_request", "message": "Could not read that."}, 400)
+    number = str(body.get("account_number", "")).strip()
+    password = str(body.get("password", ""))
+    server = str(body.get("server", "")).strip()
+    name = _napp_clean_label(str(body.get("name", ""))).strip()[:40]
+    replace = bool(body.get("replace"))
+    if not re.fullmatch(r"\d{4,12}", number):
+        return _napp_json({"error": "bad_request", "message": "Enter your MT5 account number (digits only)."}, 400)
+    if not password or len(password) > 128 or "\n" in password or "\r" in password:
+        return _napp_json({"error": "bad_request", "message": "Enter your MT5 trading password."}, 400)
+    if not re.fullmatch(r"[A-Za-z0-9._\- ]{2,60}", server):
+        return _napp_json({"error": "bad_request", "message": "Enter your MT5 server name exactly as your prop firm gave it."}, 400)
+    if not name:
+        return _napp_json({"error": "bad_request", "message": "Give the account a nickname."}, 400)
+
+    pid = _prop_id(synth)
+    row, rok = await asyncio.to_thread(_napp_exness_row_sync, pid)
+    if not rok:
+        return _napp_json({"error": "server", "message": "Could not check right now. Try again."}, 503)
+    expiry = _napp_exness_expiry(row)
+    if not (expiry and datetime.utcnow() < expiry):
+        return _napp_json({"error": "no_subscription", "message": "Start your subscription first."}, 402)
+    if (_napp_exness_jobs.get(pid) or {}).get("state") == "connecting":
+        return _napp_json({"error": "busy", "message": "Already connecting. Please wait."}, 409)
+    old_id = (row or {}).get("metaapi_account_id")
+    if old_id and not replace:
+        return _napp_json({"error": "already_connected", "message": "An account is already connected."}, 409)
+    if old_id and str(row.get("account_number")) == number and (row.get("server") or "") == server:
+        return _napp_json({"error": "already_connected", "message": "That account is already connected."}, 409)
+    other, ook = await asyncio.to_thread(_napp_exness_account_owner_sync, number, pid)
+    if not ook:
+        return _napp_json({"error": "server", "message": "Could not check right now. Try again."}, 503)
+    if other:
+        return _napp_json({"error": "account_taken", "message":
+                           "That trading account is already linked to another Nexora user."}, 409)
+    if _napp_exness_limited("connect", pid, 10):
+        return _napp_json({"error": "slow_down", "message": "Too many attempts. Try again later."}, 429)
+    loop = _main_loop
+    if loop is None or not loop.is_running():
+        return _napp_json({"error": "server", "message": "The service is starting up. Try again in a minute."}, 503)
+    _napp_exness_jobs[pid] = {"state": "connecting", "message": "Starting...", "ts": time.time()}
+    fut = asyncio.run_coroutine_threadsafe(
+        _napp_exness_connect_job(pid, number, password, server, name, old_id if replace else None), loop)
+    _napp_exness_futs.add(fut)
+    fut.add_done_callback(_napp_exness_futs.discard)
+    return _napp_json({"state": "connecting"})
+
+
+async def nexora_app_prop_config_handler(request):
+    synth, err = await _napp_deriv_auth(request, limit_per_min=20, allow_killed=True)
+    if err:
+        return err
+    body = await _napp_exness_body(request)
+    if body is None:
+        return _napp_json({"error": "bad_request", "message": "Could not read that."}, 400)
+    action = body.get("action")
+    if _napp_exness_killed() and action != "pause":
+        return _napp_json({"error": "unavailable", "message": "Auto-Trade in the app is switched off right now."}, 503)
+    pid = _prop_id(synth)
+    row, rok = await asyncio.to_thread(_napp_exness_row_sync, pid)
+    if not rok:
+        return _napp_json({"error": "server", "message": "Could not check right now. Try again."}, 503)
+    bad = lambda m: _napp_json({"error": "bad_request", "message": m}, 400)
+    if not row or not row.get("metaapi_account_id"):
+        return bad("Connect your prop firm account first.")
+
+    fields, done = None, ""
+    if action in ("pause", "resume"):
+        fields = {"trading_paused": action == "pause"}
+        done = ("Auto-Trade is off. No new trades will open; trades already open are left alone."
+                if action == "pause" else "Auto-Trade is on.")
+    elif action == "save":
+        # One simple save: how to trade + lot size + optional stop loss / take profit.
+        mode = body.get("mode")
+        lot = _napp_exness_num(body, "lot_size", NAPP_EXNESS_LOT_MIN, NAPP_EXNESS_LOT_MAX)
+        if lot is None:
+            return bad(f"Lot size must be {NAPP_EXNESS_LOT_MIN} to {NAPP_EXNESS_LOT_MAX}.")
+        fields = {"risk_mode": "lot", "lot_size": lot}
+        if mode == "bot":
+            bot_key, pair = body.get("bot"), body.get("pair")
+            if bot_key not in MT5_AUTOTRADE_BOTS or pair not in MT5_AUTOTRADE_PAIRS:
+                return bad("Pick a bot and a pair.")
+            fields.update({"bot_choice": bot_key, "pair_choice": pair})
+        elif mode in ("follow_channel", "copy_channel"):
+            fields.update({"bot_choice": mode, "pair_choice": None})
+        else:
+            return bad("Pick how Nexora should trade.")
+        for key, col in (("sl_pips", "sl_override_pips"), ("tp_pips", "tp_override_pips")):
+            if body.get(key) in (None, "", 0):
+                fields[col] = None
+                continue
+            v = _napp_exness_num(body, key, NAPP_EXNESS_PIPS_MIN, NAPP_EXNESS_PIPS_MAX, 1)
+            if v is None:
+                return bad(f"Stop loss and take profit must be {NAPP_EXNESS_PIPS_MIN:g} to {NAPP_EXNESS_PIPS_MAX:g} pips, or empty to use Nexora's own.")
+            fields[col] = v
+        done = "Saved. It applies to the next trade."
+    else:
+        return bad("Unknown action.")
+
+    try:
+        await asyncio.to_thread(upsert_mt5_autotrade_account, pid, fields)
+    except Exception as e:
+        print(f"[NEXORA PROP] config save error: {type(e).__name__}")
+        return _napp_json({"error": "server", "message": "Could not save. Try again."}, 500)
+    new_row, _ = await asyncio.to_thread(_napp_exness_row_sync, pid)
+    return _napp_json({"ok": True, "message": done, "settings": _napp_prop_settings(new_row)})
+
+
 # ============================================
 # PUSH NOTIFICATIONS FOR APP USERS (Deriv trades, alerts)
 # ============================================
@@ -5375,7 +5643,7 @@ def _napp_install_push_bridge():
             text = kwargs.get("text", args[1] if len(args) > 1 else "")
             title, body = _napp_push_split(text)
             asyncio.get_running_loop().run_in_executor(
-                None, _napp_push_send_sync, str(int(cid)), title, body)
+                None, _napp_push_send_sync, str(_real_synth(cid)), title, body)
             return _AppMsg(cid, text)
         return await orig_send(self, *args, **kwargs)
 
@@ -5385,7 +5653,7 @@ def _napp_install_push_bridge():
             cap = kwargs.get("caption", "")
             title, body = _napp_push_split(cap)
             asyncio.get_running_loop().run_in_executor(
-                None, _napp_push_send_sync, str(int(cid)), title, body)
+                None, _napp_push_send_sync, str(_real_synth(cid)), title, body)
             return _AppMsg(cid, cap)
         return await orig_photo(self, *args, **kwargs)
 
@@ -5483,6 +5751,10 @@ def run_korapay_webhook_server():
     webhook_app.router.add_post("/api/nexora/exness/pay", nexora_app_exness_pay_handler)
     webhook_app.router.add_post("/api/nexora/exness/connect", nexora_app_exness_connect_handler)
     webhook_app.router.add_post("/api/nexora/exness/config", nexora_app_exness_config_handler)
+    webhook_app.router.add_get("/api/nexora/prop/status", nexora_app_prop_status_handler)
+    webhook_app.router.add_post("/api/nexora/prop/pay", nexora_app_prop_pay_handler)
+    webhook_app.router.add_post("/api/nexora/prop/connect", nexora_app_prop_connect_handler)
+    webhook_app.router.add_post("/api/nexora/prop/config", nexora_app_prop_config_handler)
     webhook_app.router.add_get("/api/nexora/signal-chart", nexora_app_signal_chart_handler)
     webhook_app.router.add_post("/api/nexora/push/register", nexora_app_push_register_handler)
     webhook_app.router.add_post("/api/nexora/push/unregister", nexora_app_push_unregister_handler)
@@ -5754,7 +6026,7 @@ async def process_confirmed_korapay_payments(context: ContextTypes.DEFAULT_TYPE)
                 if account and account.get("metaapi_account_id"):
                     await bot.send_message(chat_id=int(user_id), parse_mode=ParseMode.HTML, text=(
                         "<b>Payment confirmed</b>\n"
-                        f"Exness Auto-Trade is active for {MT5_SUBSCRIPTION_DAYS} more days."))
+                        f"{_autotrade_label(user_id)} is active for {MT5_SUBSCRIPTION_DAYS} more days."))
                 else:
                     _claim = {"state": "connecting", "message": "Reconnecting your saved account...", "ts": time.time()}
                     _napp_exness_jobs[str(user_id)] = _claim
@@ -5765,7 +6037,7 @@ async def process_confirmed_korapay_payments(context: ContextTypes.DEFAULT_TYPE)
                     if not _re_ok:
                         await bot.send_message(chat_id=int(user_id), parse_mode=ParseMode.HTML, text=(
                             "<b>Payment confirmed</b>\n"
-                            "Open the app to connect your Exness account."))
+                            f"Open the app to connect your {'trading' if _is_prop_id(user_id) else 'Exness'} account."))
                 continue
 
             if account and account.get("metaapi_account_id"):
@@ -5838,7 +6110,7 @@ async def process_confirmed_nowpayments_payments(context: ContextTypes.DEFAULT_T
                 if account and account.get("metaapi_account_id"):
                     await bot.send_message(chat_id=int(user_id), parse_mode=ParseMode.HTML, text=(
                         "<b>Payment confirmed</b>\n"
-                        f"Exness Auto-Trade is active for {MT5_SUBSCRIPTION_DAYS} more days."))
+                        f"{_autotrade_label(user_id)} is active for {MT5_SUBSCRIPTION_DAYS} more days."))
                 else:
                     _claim = {"state": "connecting", "message": "Reconnecting your saved account...", "ts": time.time()}
                     _napp_exness_jobs[str(user_id)] = _claim
@@ -5849,7 +6121,7 @@ async def process_confirmed_nowpayments_payments(context: ContextTypes.DEFAULT_T
                     if not _re_ok:
                         await bot.send_message(chat_id=int(user_id), parse_mode=ParseMode.HTML, text=(
                             "<b>Payment confirmed</b>\n"
-                            "Open the app to connect your Exness account."))
+                            f"Open the app to connect your {'trading' if _is_prop_id(user_id) else 'Exness'} account."))
                 continue
 
             if account and account.get("metaapi_account_id"):

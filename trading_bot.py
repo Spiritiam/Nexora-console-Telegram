@@ -23579,7 +23579,10 @@ async def handle_buttons(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 sent_unreachable = await update.message.reply_text(
                     reconnect_text,
                     parse_mode=ParseMode.HTML,
-                    reply_markup=reconnect_markup or main_keyboard
+                    reply_markup=InlineKeyboardMarkup(
+                        (list(reconnect_markup.inline_keyboard) if reconnect_markup else [])
+                        + [[InlineKeyboardButton("🔌 Disconnect Deriv Account", callback_data="derivdisc_ask")]]
+                    )
                 )
                 if reconnect_markup and oauth_state:
                     update_deriv_oauth_state_message_id(oauth_state, sent_unreachable.chat_id, sent_unreachable.message_id)
@@ -24619,9 +24622,8 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if data == "derivdisc_ask":
         await query.message.edit_text(
             "🔌 <b>Disconnect your Deriv account?</b>\n\n"
-            "Auto-Trade will stop and the link to this bot will be removed. "
-            "You can then connect the same account in the SpiritFX Academy app "
-            "(or reconnect it here later).",
+            "Auto-Trade will stop and your account will be unlinked from this bot. "
+            "You can reconnect it here any time.",
             parse_mode=ParseMode.HTML,
             reply_markup=InlineKeyboardMarkup([
                 [InlineKeyboardButton("✅ Yes, disconnect", callback_data="derivdisc_yes")],
@@ -24663,8 +24665,7 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         user_modes.pop(user_id, None)
         await query.message.edit_text(
             "✅ <b>Deriv account disconnected.</b>\n\n"
-            "You can connect it in the SpiritFX Academy app now, "
-            "or tap 🔗 Connect Deriv here to link it again.",
+            "Tap 🔗 Connect Deriv any time to link an account again.",
             parse_mode=ParseMode.HTML
         )
         return

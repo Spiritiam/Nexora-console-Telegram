@@ -6438,6 +6438,10 @@ def log_signal(signal_data, source="scheduled"):
             "entry_price": signal_data["entry_price"],
             "stop_loss": signal_data["stop_loss"],
             "take_profit": signal_data["take_profit"],
+            # TP1 (halfway to TP2). Added Oct 2026; column is nullable so
+            # older rows and any signal without TP1 are unaffected. The
+            # SpiritFX app webhook below deliberately does NOT send it.
+            "tp1": signal_data.get("tp1"),
             "posted_at": datetime.utcnow().isoformat(),
             "status": "OPEN",
             # Per-strategy performance tracking - see signal_data's own
@@ -17586,14 +17590,26 @@ def get_sl_tp_multipliers(pair_key, entry_price=None):
             tp_mult = (entry_price * 0.03) / 0.1
             return sl_mult, tp_mult
         return 20, 40  # fallback only - genuine entry_price unavailable
+    # Oct 2026, per explicit instruction after channel feedback that the
+    # SL was too wide (TP unchanged or kept standard): XAUUSD SL 100 / TP2
+    # 300 pips (1:3); XAGUSD and USOIL SL 50 / TP2 150 pips (1:3). Everything
+    # else is unchanged. The returned TP is TP2 (the "main" TP the trade is
+    # placed with); TP1 is always half of it - see get_tp1_multiplier.
     if pair_key == "xauusd":
-        return 3.0, 6.0
+        return 2.0, 6.0
     elif pair_key in ("gbpusd", "eurusd", "audusd", "usdcad", "usdjpy", "usdchf", "nzdusd"):
         return 1.8, 3.6
     elif pair_key in ("usoil", "xagusd"):
-        return 4.2, 8.4
+        return 3.0, 9.0
     else:
         return 3, 6
+
+
+def get_tp1_multiplier(pair_key, entry_price=None):
+    """TP1 sits exactly halfway to TP2 for every pair (gold 150/300,
+    BTC 50/100, silver+oil 75/150, forex 30/60, GBPJPY 50/100)."""
+    _, tp2_mult = get_sl_tp_multipliers(pair_key, entry_price)
+    return tp2_mult / 2.0
 
 
 def predict_direction_via_ml(pair_key, current_price, h1_candles, current_time, min_candles=100):
@@ -17798,7 +17814,7 @@ def _chart_fmt_price(value, all_values):
     return f"{value:.5f}" if ref < 10 else f"{value:.2f}"
 
 
-def _chart_finish(fig, ax, x, times, candles, entry, sl, tp, title, save_path, sub_ax=None):
+def _chart_finish(fig, ax, x, times, candles, entry, sl, tp, title, save_path, sub_ax=None, tp1=None):
     # Per explicit instruction - filled, colored label backgrounds
     # instead of a uniform dark box for all three, so each level
     # actually stands out and is instantly distinguishable at a
@@ -17815,12 +17831,12 @@ def _chart_finish(fig, ax, x, times, candles, entry, sl, tp, title, save_path, s
 
     all_lows = [c["low"] for c in candles]
     all_highs = [c["high"] for c in candles]
-    level_values = [v for v in (entry, sl, tp) if v is not None]
+    level_values = [v for v in (entry, sl, tp1, tp) if v is not None]
     all_price_values = all_lows + all_highs + level_values
 
     full_range = max(all_price_values) - min(all_price_values)
     min_gap = full_range * 0.035
-    points = sorted([(v, name) for v, name in [(entry, "entry"), (sl, "sl"), (tp, "tp")] if v is not None])
+    points = sorted([(v, name) for v, name in [(entry, "entry"), (sl, "sl"), (tp1, "tp1"), (tp, "tp")] if v is not None])
     adjusted = {name: v for v, name in points}
     for i in range(1, len(points)):
         prev_v, prev_name = points[i - 1]
@@ -17836,9 +17852,13 @@ def _chart_finish(fig, ax, x, times, candles, entry, sl, tp, title, save_path, s
     if sl is not None:
         ax.axhline(sl, color=sl_color, linewidth=1.4, linestyle="--", zorder=1)
         ax.text(x_right, adjusted["sl"], f" SL {_chart_fmt_price(sl, all_price_values)} ", color="#0f1115", fontsize=9, fontweight="bold", va="center", bbox=sl_box, zorder=5)
+    if tp1 is not None:
+        ax.axhline(tp1, color=tp_color, linewidth=1.2, linestyle=":", zorder=1)
+        ax.text(x_right, adjusted["tp1"], f" TP1 {_chart_fmt_price(tp1, all_price_values)} ", color="#0f1115", fontsize=9, fontweight="bold", va="center", bbox=tp_box, zorder=5)
     if tp is not None:
         ax.axhline(tp, color=tp_color, linewidth=1.4, linestyle="--", zorder=1)
-        ax.text(x_right, adjusted["tp"], f" TP {_chart_fmt_price(tp, all_price_values)} ", color="#0f1115", fontsize=9, fontweight="bold", va="center", bbox=tp_box, zorder=5)
+        tp_label = "TP2" if tp1 is not None else "TP"
+        ax.text(x_right, adjusted["tp"], f" {tp_label} {_chart_fmt_price(tp, all_price_values)} ", color="#0f1115", fontsize=9, fontweight="bold", va="center", bbox=tp_box, zorder=5)
 
     xlim_left = x[0] - (x[-1] - x[0]) * 0.02 if len(x) > 1 else x[0] - 1
     xlim_right = x_right + (x[-1] - x[0]) * 0.12 if len(x) > 1 else x_right + 2
@@ -17993,7 +18013,7 @@ def generate_daily_line_chart(display_name, direction, daily_history, save_path,
         return False
 
 
-def generate_signal_chart(display_name, strategy_name, direction, candles, entry, sl, tp, save_path, display_window=70, anchor_live=True):
+def generate_signal_chart(display_name, strategy_name, direction, candles, entry, sl, tp, save_path, display_window=70, anchor_live=True, tp1=None):
     """
     Generates one chart PNG for a signal. candles = the SAME candle
     list the winning strategy actually used (h1_candles for most
@@ -18320,7 +18340,7 @@ def generate_signal_chart(display_name, strategy_name, direction, candles, entry
             sub_ax.fill_between(x, 0, 25, color="#22c55e", alpha=0.06, zorder=0)
             sub_ax.set_ylim(0, 100)
 
-        _chart_finish(fig, ax, x, times, candles, entry, sl, tp, title_suffix, save_path, sub_ax=sub_ax)
+        _chart_finish(fig, ax, x, times, candles, entry, sl, tp, title_suffix, save_path, sub_ax=sub_ax, tp1=tp1)
         return True
     except Exception as e:
         print(f"[CHART] Failed to generate chart for {display_name}/{strategy_name}: {e}")
@@ -18909,17 +18929,20 @@ async def build_signal_response(question, user_id=None, retry_mismatch=False):
     # 3.0 = $15), not 0.3. Verified: 3.0/6.0 -> $15/$30 price move ->
     # $150/$300 P&L at 0.1 lot, exactly matching the real target.
     sl_multiplier, tp_multiplier = get_sl_tp_multipliers(matched_key, live_price)
+    tp1_multiplier = get_tp1_multiplier(matched_key, live_price)
 
     if direction == "BUY":
         entry_price = round(live_price, decimals)
         stop_loss = round(live_price - (pip_size * sl_multiplier), decimals)
         take_profit = round(live_price + (pip_size * tp_multiplier), decimals)
+        take_profit_1 = round(live_price + (pip_size * tp1_multiplier), decimals)
         signal_emoji = "🟢"
         fallback_image_file_id = BUY_IMAGE_FILE_ID
     else:
         entry_price = round(live_price, decimals)
         stop_loss = round(live_price + (pip_size * sl_multiplier), decimals)
         take_profit = round(live_price - (pip_size * tp_multiplier), decimals)
+        take_profit_1 = round(live_price - (pip_size * tp1_multiplier), decimals)
         signal_emoji = "🔴"
         fallback_image_file_id = SELL_IMAGE_FILE_ID
 
@@ -18975,6 +18998,7 @@ async def build_signal_response(question, user_id=None, retry_mismatch=False):
             generate_signal_chart,
             display, chart_strategy_name, direction, h1_candles,
             entry_price, stop_loss, take_profit, chart_path,
+            70, True, take_profit_1,
         )
         if not chart_ok:
             # RETRY: per explicit instruction, after a real
@@ -18998,6 +19022,7 @@ async def build_signal_response(question, user_id=None, retry_mismatch=False):
                     generate_signal_chart,
                     display, chart_strategy_name, direction, retry_candles,
                     entry_price, stop_loss, take_profit, chart_path,
+                    70, True, take_profit_1,
                 )
         if chart_ok:
             image_file_id = chart_path
@@ -19026,7 +19051,8 @@ async def build_signal_response(question, user_id=None, retry_mismatch=False):
         f"{signal_emoji} <b>{strength} {direction} {display}</b>\n\n"
         f"{narrative}\n\n"
         f"<b>Entry Price:</b> {entry_price}\n"
-        f"<b>SL:</b> {stop_loss} | <b>TP:</b> {take_profit}\n\n"
+        f"<b>SL:</b> {stop_loss}\n"
+        f"<b>TP1:</b> {take_profit_1} | <b>TP2:</b> {take_profit}\n\n"
         f"<b>Confidence:</b> {confidence}%\n"
         f"<b>Session:</b> {session}\n\n"
     )
@@ -19042,6 +19068,7 @@ async def build_signal_response(question, user_id=None, retry_mismatch=False):
         "entry_price": entry_price,
         "stop_loss": stop_loss,
         "take_profit": take_profit,
+        "tp1": take_profit_1,
         "config": config,
         # Added for per-strategy performance tracking - joined against
         # this signal's eventual TP_HIT/SL_HIT status (already tracked
@@ -19078,7 +19105,7 @@ async def build_signal_response(question, user_id=None, retry_mismatch=False):
     print(
         f"[SIGNAL] ✅ {pair_name} | "
         f"{direction} @ {entry_price} | "
-        f"TP: {take_profit} | SL: {stop_loss} | "
+        f"TP1: {take_profit_1} | TP2: {take_profit} | SL: {stop_loss} | "
         f"SMC used: {used_smc} | AI layer used: {used_ai_layer}"
     )
 
@@ -28710,14 +28737,40 @@ SCHEDULED_DAILY_PAIRS = ("XAUUSD", "XAGUSD", "USOIL", "BTCUSD")
 # pip_size, pip_value, and multiplier bucket, so their pip distances
 # are identical too - not a copy-paste mistake).
 SCHEDULED_PAIR_PIPS = {
-    "XAUUSD": (150, 300),
+    # Oct 2026 values (fallback only - reports now read each signal's own
+    # stored prices via signal_pips, so older signals keep their old pips).
+    "XAUUSD": (100, 300),
     "EURUSD": (30, 60),
     "GBPUSD": (30, 60),
     "GBPJPY": (50, 100),
-    "BTCUSD": (49.59, 99.18),
-    "XAGUSD": (70.014, 140.028),
-    "USOIL": (70.014, 140.028),
+    "BTCUSD": (50, 100),
+    "XAGUSD": (50, 150),
+    "USOIL": (50, 150),
 }
+
+# Price distance that counts as one "pip" in reports, per pair. Gold: $0.10,
+# BTC: $9.918 (= 165.3 * 3 / 50, so SL shows as exactly 50 and TP2 as 100),
+# silver/oil: $0.01, EURUSD/GBPUSD: 0.0001, GBPJPY: 0.01.
+REPORT_PIP_UNIT = {
+    "XAUUSD": 0.1, "BTCUSD": 9.918, "XAGUSD": 0.01, "USOIL": 0.01,
+    "EURUSD": 0.0001, "GBPUSD": 0.0001, "GBPJPY": 0.01,
+}
+
+def signal_pips(sig):
+    """(sl_pips, tp_pips) for ONE logged signal, from its own stored entry/
+    stop_loss/take_profit. This is what keeps a week that mixes old-width
+    and new-width signals reporting correctly (e.g. gold SL 150 before the
+    Oct 2026 change, 100 after). Falls back to the per-pair table if the
+    row's prices are missing."""
+    pair = sig.get("pair_name")
+    unit = REPORT_PIP_UNIT.get(pair)
+    try:
+        entry = float(sig["entry_price"]); sl = float(sig["stop_loss"]); tp = float(sig["take_profit"])
+        if unit:
+            return float(round(abs(entry - sl) / unit)), float(round(abs(tp - entry) / unit))
+    except Exception:
+        pass
+    return SCHEDULED_PAIR_PIPS.get(pair, (0, 0))
 
 def get_week_start():
     now = datetime.utcnow()
@@ -28819,7 +28872,7 @@ async def post_weekly_report(context: ContextTypes.DEFAULT_TYPE):
         # lookup specifically because GBPJPY's real USD value depends
         # on the JPY rate at close time - pips have no such ambiguity).
         if pair_name in SCHEDULED_PAIR_PIPS:
-            sl_pips, tp_pips = SCHEDULED_PAIR_PIPS[pair_name]
+            sl_pips, tp_pips = signal_pips(sig)
             if status == "TP_HIT":
                 total_pips_won += tp_pips
             elif status == "SL_HIT":
@@ -28972,7 +29025,7 @@ async def post_daily_report(context: ContextTypes.DEFAULT_TYPE):
         pair_name = sig.get("pair_name")
         status = sig.get("status")
         direction = sig.get("direction", "")
-        sl_pips, tp_pips = SCHEDULED_PAIR_PIPS.get(pair_name, (0, 0))
+        sl_pips, tp_pips = signal_pips(sig)
 
         if status == "TP_HIT":
             total_pips_won += tp_pips

@@ -3458,7 +3458,7 @@ async def nowpayments_webhook_handler(request):
     return web.Response(status=200, text="ok")
 
 
-def render_deriv_oauth_page(heading, message, kind="info", emoji=None):
+def render_deriv_oauth_page(heading, message, kind="info", emoji=None, app=False):
     """
     Shared styled page for every deriv_oauth_callback_handler response
     below - added after real user confusion (tiny, unstyled system-
@@ -3479,6 +3479,10 @@ def render_deriv_oauth_page(heading, message, kind="info", emoji=None):
     color = colors.get(kind, colors["info"])
     icon = emoji or icons.get(kind, icons["info"])
     telegram_url = f"https://t.me/{BOT_USERNAME}"
+    # App-origin users go back to the SpiritFX app via its custom URL scheme,
+    # with no Telegram wording at all.
+    back_url = "spiritfxacademy://deriv-connected" if app else telegram_url
+    back_label = "↩ Back to the app" if app else "↩ Back to Telegram"
 
     return f"""<!DOCTYPE html>
 <html>
@@ -3527,7 +3531,7 @@ def render_deriv_oauth_page(heading, message, kind="info", emoji=None):
     <div class="bar"></div>
     <h1>{heading}</h1>
     <p>{message}</p>
-    <a class="btn" href="{telegram_url}">↩ Back to Telegram</a>
+    <a class="btn" href="{back_url}">{back_label}</a>
   </div>
   <script>
     // Auto-redirect on the success page specifically, after a short
@@ -3535,7 +3539,7 @@ def render_deriv_oauth_page(heading, message, kind="info", emoji=None):
     // vanishing instantly - the button above still covers every case
     // where a browser blocks the auto-redirect (Safari sometimes
     // does), so nobody gets stuck either way.
-    {"setTimeout(function(){ window.location.href = '" + telegram_url + "'; }, 1800);" if kind == "success" else ""}
+    {"setTimeout(function(){ window.location.href = '" + back_url + "'; }, 1800);" if kind == "success" else ""}
   </script>
 </body>
 </html>"""
@@ -3567,7 +3571,7 @@ async def deriv_oauth_callback_handler(request):
             status=400, content_type="text/html",
             text=render_deriv_oauth_page(
                 "This login link has expired or was already used.",
-                "Go back to Telegram or the SpiritFX Academy app and start the Deriv connection again.",
+                "Go back to the app (or Telegram) and start the Deriv connection again.",
                 kind="warning",
             )
         )
@@ -3579,8 +3583,8 @@ async def deriv_oauth_callback_handler(request):
             status=200, content_type="text/html",
             text=render_deriv_oauth_page(
                 "Login didn't complete.",
-                f"{error}<br>Go back to Telegram or the SpiritFX Academy app and try again.",
-                kind="error",
+                (f"{error}<br>Go back to the app and try again." if _is_app_synth(user_id) else f"{error}<br>Go back to Telegram and try again."),
+                kind="error", app=_is_app_synth(user_id),
             )
         )
 
@@ -3590,8 +3594,8 @@ async def deriv_oauth_callback_handler(request):
             status=200, content_type="text/html",
             text=render_deriv_oauth_page(
                 "Something went wrong finishing the login.",
-                "Go back to Telegram or the SpiritFX Academy app and try again.",
-                kind="error",
+                ("Go back to the app and try again." if _is_app_synth(user_id) else "Go back to Telegram and try again."),
+                kind="error", app=_is_app_synth(user_id),
             )
         )
 
@@ -3619,10 +3623,10 @@ async def deriv_oauth_callback_handler(request):
             status=200, content_type="text/html",
             text=render_deriv_oauth_page(
                 "No real Deriv account found.",
-                "Only demo accounts were found on this login. Go back to Telegram or the app, and "
-                "either paste a real-account API token manually, or log in with an "
-                "account that has a real Deriv account too.",
-                kind="warning",
+                "Only demo accounts were found on this login. Go back and "
+                "log in with an account that has a real Deriv account"
+                + ("." if _is_app_synth(user_id) else ", or paste a real-account API token manually."),
+                kind="warning", app=_is_app_synth(user_id),
             )
         )
 
@@ -3636,7 +3640,7 @@ async def deriv_oauth_callback_handler(request):
             text=render_deriv_oauth_page(
                 "This Deriv account is already connected.",
                 f"It is linked through {where}. Disconnect it there first, then connect it here.",
-                kind="warning",
+                kind="warning", app=_is_app_synth(user_id),
             )
         )
 
@@ -3650,8 +3654,8 @@ async def deriv_oauth_callback_handler(request):
         status=200, content_type="text/html",
         text=render_deriv_oauth_page(
             "Deriv account connected!",
-            ("Go back to the SpiritFX Academy app - it will show your account in a few seconds." if _is_app_synth(user_id) else "Go back to Telegram - you'll get a confirmation message there in a few seconds."),
-            kind="success",
+            ("Returning you to the app - it will show your account in a few seconds." if _is_app_synth(user_id) else "Go back to Telegram - you'll get a confirmation message there in a few seconds."),
+            kind="success", app=_is_app_synth(user_id),
         )
     )
 
@@ -4829,7 +4833,10 @@ async def nexora_app_exness_verify_handler(request):
     if owner and owner != synth:
         return _napp_json({
             "verified": False, "result": "taken",
-            "message": "That email is already verified on another Nexora account (for example through Telegram)."}, 409)
+            "message": ("This email is not verified for auto-trading. It isn't linked to SpiritFX's Exness link, "
+                        "or it's already in use on another Nexora account. To enable auto-trading, use the email of an "
+                        "Exness account you created through our link, or create a new Exness account through our link "
+                        "(or change your IB to SpiritFX in your Exness account), then verify again.")}, 409)
 
     try:
         verdict, detail, _accts = await _napp_run_on_main(exness_check_email(email), 70)
@@ -4845,7 +4852,9 @@ async def nexora_app_exness_verify_handler(request):
     if verdict == "declined":
         return _napp_json({
             "verified": False, "result": "declined",
-            "message": "That email is not an Exness client under SpiritFX's link. Register through the official link, then check again."})
+            "message": ("This email is not verified. It isn't an Exness client under SpiritFX's link. To enable auto-trading, "
+                        "create an Exness account through our link (or change your IB to SpiritFX in your Exness account), "
+                        "then verify again.")})
     return _napp_json({
         "verified": False, "result": "unknown",
         "message": "We couldn't check right now. Please try again in a few minutes."}, 503)

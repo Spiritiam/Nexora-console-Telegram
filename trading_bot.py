@@ -216,8 +216,8 @@ MT5_AUTOTRADE_BOTS = {
             "strategy_ema_ribbon", "strategy_rate_of_change", "strategy_cci_breakout",
             "strategy_williams_r", "strategy_heikin_ashi_trend",
         ],
-        "timeframe": "1h",
-        "description": "Fast, frequent entries on short-term pullbacks.",
+        "timeframe": "1min",
+        "description": "Fast 1-minute entries on pullbacks. Adds to winning trades and trails its stop.",
     },
     "aggressive_breakout": {
         "label": "⚡ Aggressive Breakout",
@@ -229,8 +229,8 @@ MT5_AUTOTRADE_BOTS = {
             "strategy_ema_ribbon", "strategy_rate_of_change", "strategy_cci_breakout",
             "strategy_williams_r", "strategy_heikin_ashi_trend",
         ],
-        "timeframe": "1h",
-        "description": "Fires on sharp volatility expansions.",
+        "timeframe": "1min",
+        "description": "Fires on 1-minute breakouts. Scales in up to 3 entries and trails its stop.",
     },
     "conservative_trend": {
         "label": "🛡️ Conservative Trend",
@@ -242,8 +242,8 @@ MT5_AUTOTRADE_BOTS = {
             "strategy_ema_ribbon", "strategy_rate_of_change", "strategy_cci_breakout",
             "strategy_williams_r", "strategy_heikin_ashi_trend",
         ],
-        "timeframe": "1h",
-        "description": "Slower, higher-conviction trend-following entries.",
+        "timeframe": "15min",
+        "description": "15-minute trend-following entries with a fixed stop loss and take profit.",
     },
     "conservative_structure": {
         "label": "🏛️ Conservative Structure",
@@ -255,8 +255,8 @@ MT5_AUTOTRADE_BOTS = {
             "strategy_ema_ribbon", "strategy_rate_of_change", "strategy_cci_breakout",
             "strategy_williams_r", "strategy_heikin_ashi_trend",
         ],
-        "timeframe": "1h",
-        "description": "Patient, level-based support/resistance entries.",
+        "timeframe": "15min",
+        "description": "15-minute squeeze and structure entries with a fixed stop loss and take profit.",
     },
 }
 
@@ -1232,7 +1232,12 @@ SLTP_OVERRIDE_PIP_SIZE = {
 
 def apply_sltp_override(account, pair_key, direction, entry_price, stop_loss, take_profit):
     """Returns (stop_loss, take_profit), replaced by the user's fixed pip
-    distances when they set them. Any doubt -> the signal's own values."""
+    distances when they set them. Any doubt -> the signal's own values.
+
+    DISABLED by default (SLTP_OVERRIDE_ENABLED=1 turns it back on): every
+    copier now follows the signal's own SL / TP1 / TP2 exactly."""
+    if os.getenv("SLTP_OVERRIDE_ENABLED", "0") != "1":
+        return stop_loss, take_profit
     try:
         sl_pips = account.get("sl_override_pips")
         tp_pips = account.get("tp_override_pips")
@@ -1756,6 +1761,8 @@ async def run_mt5_autotrade_bot_scan(context: ContextTypes.DEFAULT_TYPE):
     for (bot_key, pair_key), subscribers in combos.items():
         if bot_key == "aggressive_scalper" and pair_key in XC_PAIRS:
             continue  # handled by the dedicated metals x USDCHF divergence scalper (run_xc_scalper_tick)
+        if bot_key in ("aggressive_scalper", "aggressive_breakout"):
+            continue  # handled by the aggressive engine (run_aggressive_entry_scan)
         bot_info = MT5_AUTOTRADE_BOTS.get(bot_key)
         pair_config = PAIR_CONFIG.get(pair_key)
         if not bot_info or not pair_config:
@@ -1856,7 +1863,12 @@ async def run_mt5_autotrade_bot_scan(context: ContextTypes.DEFAULT_TYPE):
             direction = maybe_invert_direction(direction)
 
             entry_price = primary_candles[-1]["close"]
-            atr = _accum_zone_atr(primary_candles, 14) if len(primary_candles) > 15 else None
+            # Decision runs on 15-minute candles, but the stop/target distances
+            # still come from the HOURLY ATR so they stay a sensible size.
+            atr_candles = await asyncio.to_thread(get_cached_candles, pair_key, pair_config, "1h", outputsize=60)
+            if not atr_candles or len(atr_candles) <= 15:
+                atr_candles = primary_candles
+            atr = _accum_zone_atr(atr_candles, 14) if len(atr_candles) > 15 else None
             if not atr:
                 continue
             if direction == "BUY":
@@ -1866,7 +1878,7 @@ async def run_mt5_autotrade_bot_scan(context: ContextTypes.DEFAULT_TYPE):
                 stop_loss = entry_price + atr * 1.5
                 take_profit = entry_price - atr * 3.0
 
-            signal_marker = f"{bot_key}_{pair_key}_{int(time.time() // 3600)}"  # 1-hour bucket (matches the 1h candles the decision is made on)
+            signal_marker = f"{bot_key}_{pair_key}_{int(time.time() // 900)}"  # 15-minute bucket (matches the 15m candles the decision is made on)
 
             for account in subscribers:
                 user_id = account["user_id"]
@@ -2553,6 +2565,329 @@ async def manage_xc_positions(context: ContextTypes.DEFAULT_TYPE):
         await asyncio.gather(*(one(a) for a in targets), return_exceptions=True)
     except Exception as e:
         print(f"[XC] ❌ manager error: {type(e).__name__}: {e}")
+
+
+# ============================================
+# AGGRESSIVE ENGINE: Aggressive Scalper (BTC, oil) and Aggressive Breakout
+# (gold, silver, BTC, oil). Gold/silver Aggressive Scalper stays on the
+# USDCHF divergence scalper above.
+#   - 1-minute candles, ML model decides the direction
+#   - a bot-specific trigger must agree with the ML direction:
+#       Scalper : EMA pullback or MACD cross
+#       Breakout: 10-candle breakout or ATR volatility expansion
+#   - entry has a stop loss and NO take profit; a trailing stop does the exit
+#   - up to AGG_CFG["max_entries"] entries per trade: another entry is only added
+#     once every open entry already has its stop at/after break-even AND price
+#     has moved another stop-distance in favour. The added entry takes the
+#     protected (trailed) stop, so it adds little risk.
+#   - one running trade per account and pair at a time, 5 min cool-down after
+#     it ends, daily entry cap
+# Trade comments start with "NexoraAG" so the manager finds them again.
+# ============================================
+AGG_CFG = {
+    "atr_mult": 2.0,
+    "trail_activate_frac": 0.5,
+    "trail_dist_frac": 0.5,
+    "max_hold_s": 600,
+    "max_entries": 3,
+    "add_move_frac": 1.0,
+    "cooldown_s": 300,
+    "max_entries_per_day": 40,
+}
+AGG_PAIR_CFG = {
+    "xauusd": {"sl_min": 0.0005, "sl_max": 0.0015, "max_spread": 0.0002},
+    "xagusd": {"sl_min": 0.0012, "sl_max": 0.0030, "max_spread": 0.0006},
+    "btcusd": {"sl_min": 0.0008, "sl_max": 0.0025, "max_spread": 0.0006},
+    "usoil":  {"sl_min": 0.0015, "sl_max": 0.0040, "max_spread": 0.0012},
+}
+AGG_CORE = {
+    "aggressive_scalper": ("strategy_ema_pullback_scalper", "strategy_momentum_macd"),
+    "aggressive_breakout": ("strategy_volatility_breakout_scalper", "strategy_atr_volatility_breakout"),
+}
+_AG = {
+    "subs": [], "subs_at": 0.0, "open": set(), "pos_stop": {}, "cool": {}, "daily": {},
+    "tick_n": 0, "last_add": {},
+}
+
+
+def _ag_trail_cfg():
+    c = dict(XC_CFG)
+    c["trail_activate_frac"] = AGG_CFG["trail_activate_frac"]
+    c["trail_dist_frac"] = AGG_CFG["trail_dist_frac"]
+    return c
+
+
+async def _ag_get_subscribers():
+    if time.time() - _AG["subs_at"] < 60:
+        return _AG["subs"]
+    accts = await asyncio.to_thread(get_all_active_mt5_autotrade_accounts)
+    if isinstance(accts, list):
+        _AG["subs"] = [
+            a for a in accts
+            if a.get("bot_choice") in AGG_CORE
+            and a.get("pair_choice") in AGG_PAIR_CFG
+            and a.get("metaapi_account_id")
+            and not (a.get("bot_choice") == "aggressive_scalper" and a.get("pair_choice") in XC_PAIRS)
+        ]
+        _AG["subs_at"] = time.time()
+    return _AG["subs"]
+
+
+def _ag_daily_count(user_id):
+    today = datetime.utcnow().strftime("%Y-%m-%d")
+    rec = _AG["daily"].get(user_id)
+    return rec[1] if rec and rec[0] == today else 0
+
+
+def _ag_daily_add(user_id, n=1):
+    today = datetime.utcnow().strftime("%Y-%m-%d")
+    rec = _AG["daily"].get(user_id)
+    _AG["daily"][user_id] = [today, (rec[1] if rec and rec[0] == today else 0) + n]
+
+
+def _ag_stop_distance(pair_key, price, atr):
+    pc = AGG_PAIR_CFG[pair_key]
+    return max(price * pc["sl_min"], min(price * pc["sl_max"], atr * AGG_CFG["atr_mult"]))
+
+
+async def run_aggressive_entry_scan(context: ContextTypes.DEFAULT_TYPE):
+    """Every 60s. One ML + trigger check per (bot, pair) in use, then enter for
+    every subscriber of that combination that is flat."""
+    try:
+        subs = await _ag_get_subscribers()
+        if not subs:
+            return
+        combos = {}
+        for a in subs:
+            combos.setdefault((a["bot_choice"], a["pair_choice"]), []).append(a)
+        for (bot_key, pair_key), accounts in combos.items():
+            if pair_key != "btcusd" and _xc_market_closed():
+                continue
+            pair_config = PAIR_CONFIG.get(pair_key)
+            bot_info = MT5_AUTOTRADE_BOTS.get(bot_key)
+            if not pair_config or not bot_info:
+                continue
+            m1 = await asyncio.to_thread(get_cached_candles, pair_key, pair_config, "1min", outputsize=210)
+            if not m1 or len(m1) < 100:
+                continue
+            h4 = await asyncio.to_thread(get_cached_candles, pair_key, pair_config, "4h", outputsize=60)
+            daily = await asyncio.to_thread(get_cached_candles, pair_key, pair_config, "1day", outputsize=10)
+            fns = [globals().get(n) for n in bot_info["strategy_functions"]]
+            fns = [f for f in fns if f]
+            ml = await asyncio.to_thread(run_ml_driven_decision, pair_key, pair_config, m1, h4, daily, strategy_fns=fns)
+            if not ml:
+                continue
+            direction = ml[0]
+            trig = None
+            for n in AGG_CORE[bot_key]:
+                fn = globals().get(n)
+                if not fn:
+                    continue
+                try:
+                    v = fn(pair_key, pair_config, m1, h4, daily)
+                except Exception:
+                    v = None
+                if v and v.get("direction") == direction:
+                    trig = v.get("strategy_name") or n
+                    break
+            if not trig:
+                continue
+            atr = _accum_zone_atr(m1, 14) if len(m1) > 15 else None
+            if not atr:
+                continue
+            decimals = pair_config["decimals"]
+            print(f"[AGG] {bot_key}/{pair_key} {direction} trigger={trig} ML-agree, {len(accounts)} account(s)")
+            sem = asyncio.Semaphore(6)
+
+            async def one(acc):
+                async with sem:
+                    await _ag_enter_one(context, acc, bot_key, pair_key, pair_config, direction, atr, decimals)
+
+            await asyncio.gather(*(one(a) for a in accounts), return_exceptions=True)
+    except Exception as e:
+        print(f"[AGG] ❌ entry scan error: {type(e).__name__}: {e}")
+
+
+async def _ag_enter_one(context, account, bot_key, pair_key, pair_config, direction, atr, decimals):
+    user_id = str(account["user_id"])
+    acct_id = account["metaapi_account_id"]
+    try:
+        if account.get("trading_paused"):
+            return
+        if time.time() < _AG["cool"].get((user_id, pair_key), 0):
+            return
+        if _ag_daily_count(user_id) >= AGG_CFG["max_entries_per_day"]:
+            return
+        symbol_map = await get_client_symbol_map(account)
+        resolved = resolve_trade_symbol(symbol_map, pair_config)
+        positions = await _xc_get_positions(acct_id, resolved)
+        if positions is None:
+            return
+        if positions:
+            _AG["open"].add((user_id, pair_key))
+            return
+        quote = await asyncio.to_thread(_xc_fetch_quote, resolved)
+        if not quote:
+            return
+        bid, ask = quote
+        mid = (bid + ask) / 2.0
+        if (ask - bid) / mid > AGG_PAIR_CFG[pair_key]["max_spread"]:
+            return
+        stop_dist = _ag_stop_distance(pair_key, mid, atr)
+        if direction == "BUY":
+            entry, sl = ask, round(ask - stop_dist, decimals)
+        else:
+            entry, sl = bid, round(bid + stop_dist, decimals)
+        if account.get("risk_mode") == "percent":
+            account["_live_balance"] = await get_client_mt5_balance(acct_id)
+        volume = compute_lot_size(account, entry, sl)
+        order_id = await place_client_mt5_trade(
+            acct_id, resolved, direction, volume, sl, None,
+            trade_comment=f"NexoraAG-{int(time.time())}",
+        )
+        if not order_id:
+            return
+        _AG["open"].add((user_id, pair_key))
+        _AG["pos_stop"][str(order_id)] = stop_dist
+        _AG["last_add"][(user_id, pair_key)] = time.time()
+        first_today = _ag_daily_count(user_id) == 0
+        _ag_daily_add(user_id)
+        print(f"[AGG] ✅ {bot_key} {direction} {resolved} user={user_id} vol={volume} entry~{entry} sl={sl}")
+        if first_today:
+            try:
+                label = MT5_AUTOTRADE_BOTS[bot_key]["label"]
+                await context.bot.send_message(
+                    chat_id=int(user_id),
+                    text=(
+                        f"{label} is trading today\n\n"
+                        f"First trade: {direction} {pair_config['display']} — {volume} lots, trailing stop on.\n"
+                        f"It can add up to {AGG_CFG['max_entries'] - 1} more entries while the move continues, "
+                        f"but only after the earlier entries are protected. I won't message you for each one."
+                    ),
+                )
+            except Exception as e:
+                print(f"[AGG] Couldn't notify {user_id}: {type(e).__name__}")
+    except Exception as e:
+        print(f"[AGG] ❌ entry error for {user_id}: {type(e).__name__}: {e}")
+
+
+async def _ag_manage_one(context, account):
+    user_id = str(account["user_id"])
+    acct_id = account["metaapi_account_id"]
+    pair_key = account["pair_choice"]
+    try:
+        pair_config = PAIR_CONFIG[pair_key]
+        decimals = pair_config["decimals"]
+        symbol_map = await get_client_symbol_map(account)
+        resolved = resolve_trade_symbol(symbol_map, pair_config)
+        positions = await _xc_get_positions(acct_id, resolved)
+        if positions is None:
+            return
+        mine = [p for p in positions if str(p.get("comment") or "").startswith("NexoraAG")]
+        key = (user_id, pair_key)
+        if not mine:
+            if key in _AG["open"]:
+                _AG["cool"][key] = time.time() + AGG_CFG["cooldown_s"]
+            _AG["open"].discard(key)
+            return
+        _AG["open"].add(key)
+        cfg = _ag_trail_cfg()
+        protected = []   # positions whose stop is already at/after break-even
+        rows = []
+        for p in mine:
+            pid = str(p.get("id"))
+            direction = "BUY" if "BUY" in str(p.get("type", "")).upper() else "SELL"
+            entry = float(p.get("openPrice") or 0)
+            cur = float(p.get("currentPrice") or 0)
+            sl = float(p["stopLoss"]) if p.get("stopLoss") else None
+            if not entry or not cur:
+                continue
+            stop_dist = _AG["pos_stop"].get(pid)
+            if stop_dist is None:
+                if sl and ((direction == "BUY" and sl < entry) or (direction == "SELL" and sl > entry)):
+                    stop_dist = abs(entry - sl)
+                else:
+                    stop_dist = entry * AGG_PAIR_CFG[pair_key]["sl_min"] * 1.4
+                _AG["pos_stop"][pid] = stop_dist
+                if len(_AG["pos_stop"]) > 800:
+                    _AG["pos_stop"].pop(next(iter(_AG["pos_stop"])))
+            trail_started = sl is not None and ((direction == "BUY" and sl >= entry) or (direction == "SELL" and sl <= entry))
+            if trail_started:
+                protected.append(pid)
+            rows.append((p, pid, direction, entry, cur, sl, stop_dist, trail_started))
+            new_sl = xc_trail_target(direction, entry, cur, sl, stop_dist, cfg)
+            if new_sl is not None:
+                new_sl = round(new_sl, decimals)
+                payload = {"actionType": "POSITION_MODIFY", "positionId": pid, "stopLoss": new_sl}
+                if p.get("takeProfit"):
+                    payload["takeProfit"] = p["takeProfit"]
+                ok, detail = await asyncio.to_thread(_xc_trade_action_sync, acct_id, payload)
+                print(f"[AGG] trail {pair_key} {direction} user={user_id} sl {sl} -> {new_sl} ok={ok} {'' if ok else detail}")
+                continue
+            opened = p.get("time")
+            if opened and not trail_started:
+                try:
+                    t_open = datetime.fromisoformat(str(opened).replace("Z", "+00:00"))
+                    held = (datetime.now(t_open.tzinfo) - t_open).total_seconds()
+                except Exception:
+                    held = 0
+                if held > AGG_CFG["max_hold_s"]:
+                    ok, detail = await asyncio.to_thread(
+                        _xc_trade_action_sync, acct_id, {"actionType": "POSITION_CLOSE_ID", "positionId": pid})
+                    print(f"[AGG] time-stop close {pair_key} user={user_id} held={held:.0f}s ok={ok} {'' if ok else detail}")
+
+        # add another entry once every open entry is protected and price moved on
+        if (rows and len(rows) < AGG_CFG["max_entries"] and len(protected) == len(rows)
+                and not account.get("trading_paused")
+                and _ag_daily_count(user_id) < AGG_CFG["max_entries_per_day"]
+                and time.time() - _AG["last_add"].get(key, 0) > 30):
+            direction = rows[0][2]
+            last_entry = max((r[3] for r in rows), default=None) if direction == "BUY" else min((r[3] for r in rows), default=None)
+            cur = rows[0][4]
+            stop_dist = rows[0][6]
+            moved = (cur - last_entry) if direction == "BUY" else (last_entry - cur)
+            if moved >= stop_dist * AGG_CFG["add_move_frac"]:
+                sls = [r[5] for r in rows if r[5]]
+                best_sl = max(sls) if direction == "BUY" else min(sls)
+                gap = abs(cur - best_sl)
+                if gap < stop_dist * 0.3:  # too close to price for the broker: use a normal half stop
+                    best_sl = cur - stop_dist * 0.5 if direction == "BUY" else cur + stop_dist * 0.5
+                new_sl = round(best_sl, decimals)
+                volume = float(rows[0][0].get("volume") or account.get("lot_size") or 0.01)
+                _AG["last_add"][key] = time.time()
+                order_id = await place_client_mt5_trade(
+                    acct_id, resolved, direction, volume, new_sl, None,
+                    trade_comment=f"NexoraAG-{int(time.time())}",
+                )
+                if order_id:
+                    _AG["pos_stop"][str(order_id)] = stop_dist
+                    _ag_daily_add(user_id)
+                    print(f"[AGG] ➕ added entry {len(rows) + 1}/{AGG_CFG['max_entries']} {pair_key} {direction} user={user_id} sl={new_sl}")
+    except Exception as e:
+        print(f"[AGG] ❌ manage error for {user_id}: {type(e).__name__}: {e}")
+
+
+async def manage_aggressive_positions(context: ContextTypes.DEFAULT_TYPE):
+    """Every 5s: trailing stops, time stop and add-on entries. Every 12th run it
+    also re-discovers running trades (covers restarts)."""
+    try:
+        subs = _AG["subs"]
+        if not subs:
+            return
+        _AG["tick_n"] += 1
+        discover = _AG["tick_n"] % 12 == 0
+        targets = [a for a in subs if discover or (str(a["user_id"]), a["pair_choice"]) in _AG["open"]]
+        if not targets:
+            return
+        sem = asyncio.Semaphore(6)
+
+        async def one(a):
+            async with sem:
+                await _ag_manage_one(context, a)
+
+        await asyncio.gather(*(one(a) for a in targets), return_exceptions=True)
+    except Exception as e:
+        print(f"[AGG] ❌ manager error: {type(e).__name__}: {e}")
 
 
 async def run_mt5_autotrade_follow_channel_scan(context: ContextTypes.DEFAULT_TYPE):
@@ -13297,7 +13632,7 @@ def _backup_candles_one(account_id, mt5_symbol, timeframe, outputsize):
 def get_candles_metaapi_backup(mt5_symbol, interval, outputsize):
     if not METAAPI_TOKEN or not mt5_symbol:
         return None
-    timeframe = {"1h": "1h", "4h": "4h", "1day": "1d"}.get(interval)
+    timeframe = {"1min": "1m", "5min": "5m", "15min": "15m", "1h": "1h", "4h": "4h", "1day": "1d"}.get(interval)
     if not timeframe:
         return None
     for account_id in _backup_account_ids():
@@ -13749,6 +14084,7 @@ def get_cached_price_data(pair_key, symbol, config, source_tracker=None, force_f
 CANDLE_CACHE_SECONDS = {
     "1min": 60,     # matches the actual candle length - no point caching longer than one candle's real duration
     "5min": 300,
+    "15min": 900,
     "1h": 3600,
     "4h": 14400,
     "1day": 21600,  # 6h - previous day's high/low doesn't change intraday, no need to refetch often
@@ -13861,7 +14197,7 @@ def get_candles_metaapi(mt5_symbol, interval, outputsize):
         record_metaapi_candles_failure()
         return None
 
-    timeframe_map = {"1h": "1h", "4h": "4h", "1day": "1d"}
+    timeframe_map = {"1min": "1m", "5min": "5m", "15min": "15m", "1h": "1h", "4h": "4h", "1day": "1d"}
     mt5_timeframe = timeframe_map.get(interval)
     if not mt5_timeframe:
         print(f"[METAAPI CANDLES] No mapping for internal timeframe '{interval}'")
@@ -29937,6 +30273,8 @@ def main():
         first=45,
         name="client_be_manager"
     )
+    job_queue.run_repeating(run_aggressive_entry_scan, interval=60, first=50, name="aggressive_entry_scan")
+    job_queue.run_repeating(manage_aggressive_positions, interval=5, first=55, name="aggressive_manager")
 
     # TP/SL monitor - checks every OPEN logged signal every 15 minutes
     job_queue.run_repeating(

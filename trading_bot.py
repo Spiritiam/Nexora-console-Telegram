@@ -48,6 +48,7 @@ from telegram.ext import (
     MessageHandler,
     CallbackQueryHandler,
     ContextTypes,
+    TypeHandler,
     filters,
 )
 
@@ -23015,6 +23016,77 @@ async def send_verification_gate(update, reason_intro=None):
 # START COMMAND
 # ============================================
 
+# ============================================
+# KEEP EVERY USER'S BOTTOM MENU CURRENT
+# Telegram stores the bottom button menu on the user's device and only changes
+# it when the bot sends a message carrying the new menu. Anyone who was away
+# during a menu change would keep the old buttons. This runs before every
+# other handler: the first time a user interacts after the menu changed, the
+# current menu is sent to them (one short line), then remembered per user.
+# The version is a fingerprint of the buttons themselves, so adding or
+# renaming a button refreshes everyone automatically - nothing to bump.
+# ============================================
+_KB_SEEN = {}
+
+
+def _kb_fingerprint():
+    import hashlib as _h
+    labels = "|".join(",".join(str(getattr(b, "text", b)) for b in row) for row in main_keyboard.keyboard)
+    return _h.md5(labels.encode("utf-8")).hexdigest()[:12]
+
+
+def _kb_load_sync(user_id):
+    """Stored fingerprint, "" when the user has none, None when the lookup failed."""
+    try:
+        r = requests.get(f"{SUPABASE_URL}/rest/v1/keyboard_refresh?user_id=eq.{user_id}&select=kb_hash&limit=1",
+                         headers=sb_headers(), timeout=8)
+        rows = r.json()
+        if r.status_code != 200 or not isinstance(rows, list):
+            return None
+        return rows[0]["kb_hash"] if rows else ""
+    except Exception:
+        return None
+
+
+def _kb_save_sync(user_id, fp):
+    try:
+        h = dict(sb_headers())
+        h["Prefer"] = "resolution=merge-duplicates,return=minimal"
+        requests.post(f"{SUPABASE_URL}/rest/v1/keyboard_refresh?on_conflict=user_id", headers=h,
+                      json={"user_id": str(user_id), "kb_hash": fp, "updated_at": datetime.utcnow().isoformat()},
+                      timeout=8)
+    except Exception:
+        pass
+
+
+async def refresh_menu_if_stale(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    try:
+        chat = update.effective_chat
+        user = update.effective_user
+        if not chat or not user or chat.type != "private" or user.is_bot:
+            return
+        uid = str(user.id)
+        fp = _kb_fingerprint()
+        if _KB_SEEN.get(uid) == fp:
+            return
+        text = (update.message.text or "") if update.message else ""
+        if text.startswith("/start"):
+            _KB_SEEN[uid] = fp   # /start already sends the current menu
+            await asyncio.to_thread(_kb_save_sync, uid, fp)
+            return
+        stored = await asyncio.to_thread(_kb_load_sync, uid)
+        if stored is None:
+            return               # lookup failed: do nothing rather than risk repeating
+        if stored == fp:
+            _KB_SEEN[uid] = fp
+            return
+        await context.bot.send_message(chat_id=chat.id, text="🔄 Menu refreshed.", reply_markup=main_keyboard)
+        _KB_SEEN[uid] = fp
+        await asyncio.to_thread(_kb_save_sync, uid, fp)
+    except Exception as e:
+        print(f"[MENU REFRESH] {type(e).__name__}: {str(e)[:100]}")
+
+
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     user_id = str(update.message.from_user.id)
@@ -30150,6 +30222,7 @@ def main():
 
     app.add_error_handler(global_error_handler)
 
+    app.add_handler(TypeHandler(Update, refresh_menu_if_stale), group=-1)
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("broadcast", broadcast_command))
     app.add_handler(CommandHandler("broadcastchannels", broadcastchannels_command))

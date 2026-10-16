@@ -6590,14 +6590,44 @@ def attach_mt5_order_id(signal_id, order_id):
     except Exception as e:
         print(f"[SIGNAL LOG] attach_mt5_order_id error: {e}")
 
+# TP1/TP2 split for the personal account (Oct 2026): a 0.1-lot signal is
+# placed as two half-size positions, one with TP at TP1 and one with TP at
+# TP2, both sharing the same SL. When the TP1 leg closes in profit, the
+# TP2 leg's SL is moved to just past entry (see manage_break_even).
+# Set TP_SPLIT_ENABLED=0 on Railway to go back to one 0.1-lot trade.
+PERSONAL_LOT = 0.1
+TP_SPLIT_ENABLED = os.getenv("TP_SPLIT_ENABLED", "1") != "0"
+
+
+def attach_second_leg(signal_id, order_id_2):
+    """Stores the TP2 leg's position id on the signal row."""
+    try:
+        url = f"{SUPABASE_URL}/rest/v1/signal_log?id=eq.{signal_id}"
+        r = requests.patch(url, headers=sb_headers(), json={"mt5_order_id_2": str(order_id_2), "be_done": False}, timeout=10)
+        if r.status_code not in (200, 204):
+            print(f"[SIGNAL LOG] ❌ Failed to store TP2 leg {order_id_2} for signal {signal_id}: {r.status_code} {r.text}")
+    except Exception as e:
+        print(f"[SIGNAL LOG] attach_second_leg error: {e}")
+
+
 async def place_and_link_mt5_trade(signal_id, signal_data):
     """
-    Places the MT5 trade exactly once, then links the resulting
+    Places the MT5 trade(s) exactly once, then links the resulting
     order_id back onto its signal_log row. Runs as a background task
     so channel posting never waits on MT5 execution.
+    With the split on, the signal is linked to the TP1 leg (its close
+    decides TP or SL for the signal / app); the TP2 leg is tracked
+    separately for the break-even move.
     """
     _PERSONAL_COPY_LAST_FAILURE["reason"] = None
-    order_id = await place_mt5_trade(signal_data, signal_id=signal_id)
+    split = bool(TP_SPLIT_ENABLED and signal_id and signal_data.get("tp1") is not None and PERSONAL_LOT >= 0.02)
+    half = round(PERSONAL_LOT / 2, 2)
+    if split:
+        order_id = await place_mt5_trade(signal_data, signal_id=signal_id, leg="TP1", volume=half)
+        first_comment = f"NexoraAI #{signal_id} TP1"
+    else:
+        order_id = await place_mt5_trade(signal_data, signal_id=signal_id)
+        first_comment = f"NexoraAI #{signal_id}"
     if not order_id and signal_id:
         # An order whose confirmation timed out can still land on the broker
         # a minute or two later (seen live: #12348 filled ~27s after the
@@ -6611,13 +6641,30 @@ async def place_and_link_mt5_trade(signal_id, signal_data):
             for _ in range(15):
                 await asyncio.sleep(10)
                 res = await check_for_matching_recent_position(
-                    METAAPI_ACCOUNT_ID, mt5_symbol, f"NexoraAI #{signal_id}", since_dt
+                    METAAPI_ACCOUNT_ID, mt5_symbol, first_comment, since_dt
                 )
                 if res and res != "CHECK_FAILED":
                     order_id = res.get("id", "unknown")
                     print(f"[MT5 PERSONAL COPY] ✅ Signal {signal_id} filled late - position {order_id}; no failure alert sent.")
                     break
+    second_id = None
+    if split and order_id:
+        second_id = await place_mt5_trade(signal_data, signal_id=signal_id, leg="TP2", volume=half)
+        if not second_id and ADMIN_USER_ID and _app_instance:
+            try:
+                await _app_instance.bot.send_message(
+                    chat_id=int(ADMIN_USER_ID),
+                    text=(
+                        f"⚠️ Signal #{signal_id}: the TP1 half of your trade is open, but the TP2 half did not place. "
+                        f"The open half still has its SL and TP1."
+                    ),
+                )
+            except Exception as e:
+                print(f"[MT5 PERSONAL COPY] Couldn't notify admin about missing TP2 leg: {e}")
     attach_mt5_order_id(signal_id, order_id)
+    if split and order_id and second_id:
+        attach_second_leg(signal_id, second_id)
+        _BE_PENDING[str(signal_id)] = {"stage": "wait", "a": str(order_id), "b": str(second_id), "tries": 0, "tp2": signal_data.get("take_profit")}
     if not order_id:
         await handle_personal_copy_failure(signal_id, signal_data)
 
@@ -21356,10 +21403,21 @@ async def _late_confirm_position(metaapi_account_id, mt5_symbol, comment, since_
     return None
 
 
-async def place_mt5_trade(signal_data, signal_id=None):
+async def place_mt5_trade(signal_data, signal_id=None, leg=None, volume=0.1):
+    """
+    Places ONE market position on the personal MT5 account.
+    leg=None  -> the classic single 0.1-lot trade with TP2 (unchanged).
+    leg="TP1" -> half-size leg whose take profit is TP1.
+    leg="TP2" -> half-size leg whose take profit is TP2.
+    Each leg gets its own order comment ("NexoraAI #123 TP1"), so the
+    duplicate-order safety check can never mix the two legs up.
+    """
     if not METAAPI_TOKEN or not METAAPI_ACCOUNT_ID:
         print("[MT5] MetaAPI credentials not set.")
         return None
+    if leg == "TP1":
+        signal_data = dict(signal_data)
+        signal_data["take_profit"] = signal_data["tp1"]
     try:
         headers = {
             "auth-token": METAAPI_TOKEN,
@@ -21381,6 +21439,8 @@ async def place_mt5_trade(signal_data, signal_id=None):
         # (keeps this function callable exactly as before from
         # anywhere that doesn't have one).
         trade_comment = f"NexoraAI #{signal_id}" if signal_id else "NexoraAI Signal"
+        if leg and signal_id:
+            trade_comment += f" {leg}"
 
         # FIX: CONFIRMED REAL BUG, caught via a direct live report - a
         # USOIL signal quoted entry 90.42 (built right after the live
@@ -21441,7 +21501,7 @@ async def place_mt5_trade(signal_data, signal_id=None):
 
         payload = {
             "symbol": mt5_symbol,
-            "volume": 0.1,
+            "volume": volume,
             "actionType": order_type,
             "stopLoss": stop_loss,
             "takeProfit": take_profit,
@@ -21659,6 +21719,216 @@ async def place_mt5_trade(signal_data, signal_id=None):
         print(f"[MT5 PERSONAL COPY] ❌ Exception: {e}")
         _PERSONAL_COPY_LAST_FAILURE["reason"] = f"Unexpected error: {str(e)[:150]}"
         return None
+
+# ============================================
+# BREAK-EVEN MANAGER FOR THE TP1/TP2 SPLIT (personal account)
+# Watches the signals whose trade was placed as two half-size legs.
+# stage "wait":  TP1 leg still open. When it disappears while the TP2
+#                leg is still open AND in profit, TP1 was hit -> move the
+#                TP2 leg's SL to just past entry (5% of the SL distance, to
+#                cover the spread).
+# stage "final": SL already moved. When the TP2 leg closes, record whether
+#                the signal ended as "TP1" (back to break-even), "TP2", or
+#                "SL", for the reports.
+# All state also lives in signal_log (be_done / tp_detail), so a restart
+# simply reloads whatever is still unfinished.
+# ============================================
+_BE_PENDING = {}
+_BE_STATE = {"loaded": False}
+BE_BUFFER_FRACTION = 0.05
+
+
+def _decimals_of(x):
+    t = str(x)
+    return len(t.split(".")[-1]) if "." in t else 0
+
+
+def _load_be_pending_sync():
+    try:
+        since = (datetime.utcnow() - timedelta(days=14)).isoformat()
+        url = (
+            f"{SUPABASE_URL}/rest/v1/signal_log"
+            f"?mt5_order_id_2=not.is.null&tp_detail=is.null&posted_at=gte.{since}"
+            f"&select=id,mt5_order_id,mt5_order_id_2,be_done,take_profit&limit=100"
+        )
+        r = requests.get(url, headers=sb_headers(), timeout=15)
+        rows = r.json()
+        if not isinstance(rows, list):
+            return False
+        for row in rows:
+            sid = str(row["id"])
+            if sid in _BE_PENDING or not row.get("mt5_order_id") or not row.get("mt5_order_id_2"):
+                continue
+            _BE_PENDING[sid] = {
+                "stage": "final" if row.get("be_done") else "wait",
+                "a": str(row["mt5_order_id"]), "b": str(row["mt5_order_id_2"]),
+                "tries": 0, "tp2": row.get("take_profit"),
+            }
+        print(f"[BREAK-EVEN] loaded {len(rows)} unfinished split signal(s).")
+        return True
+    except Exception as e:
+        print(f"[BREAK-EVEN] load error: {e}")
+        return False
+
+
+def _patch_signal_sync(signal_id, fields):
+    try:
+        url = f"{SUPABASE_URL}/rest/v1/signal_log?id=eq.{signal_id}"
+        r = requests.patch(url, headers=sb_headers(), json=fields, timeout=10)
+        if r.status_code not in (200, 204):
+            print(f"[BREAK-EVEN] ❌ could not update signal {signal_id}: {r.status_code} {r.text}")
+    except Exception as e:
+        print(f"[BREAK-EVEN] update error for {signal_id}: {e}")
+
+
+async def _fetch_open_positions():
+    try:
+        url = f"https://mt-client-api-v1.london.agiliumtrade.ai/users/current/accounts/{METAAPI_ACCOUNT_ID}/positions"
+        r = await asyncio.to_thread(requests.get, url, headers={"auth-token": METAAPI_TOKEN, "Accept": "application/json"}, timeout=8)
+        if r.status_code != 200:
+            return None
+        data = r.json()
+        return data if isinstance(data, list) else None
+    except Exception:
+        return None
+
+
+async def _metaapi_trade_action(payload):
+    """Returns (ok, detail) for a MetaAPI trade action (modify / close)."""
+    try:
+        url = f"https://mt-client-api-v1.london.agiliumtrade.ai/users/current/accounts/{METAAPI_ACCOUNT_ID}/trade"
+        r = await asyncio.to_thread(
+            requests.post, url, headers={"auth-token": METAAPI_TOKEN, "Content-Type": "application/json"}, json=payload, timeout=10
+        )
+        body = {}
+        try:
+            body = r.json()
+        except Exception:
+            pass
+        code = str(body.get("stringCode") or "")
+        ok = r.status_code in (200, 201) and code in ("TRADE_RETCODE_DONE", "ERR_NO_ERROR", "TRADE_RETCODE_PLACED", "")
+        if ok and not code and body.get("numericCode") not in (None, 10009, 0):
+            ok = False
+        return ok, (code or str(r.status_code)) + " " + str(body.get("message") or r.text[:120])
+    except Exception as e:
+        return False, f"error: {e}"
+
+
+async def _be_admin_note(text):
+    if ADMIN_USER_ID and _app_instance:
+        try:
+            await _app_instance.bot.send_message(chat_id=int(ADMIN_USER_ID), text=text)
+        except Exception as e:
+            print(f"[BREAK-EVEN] could not DM admin: {e}")
+
+
+async def _be_classify_and_store(sid, info):
+    """Once both legs are closed: record how the signal really ended."""
+    oa, pa = await get_mt5_trade_outcome(info["a"])
+    ob, pb = await get_mt5_trade_outcome(info["b"])
+    if oa != "CLOSED" or ob != "CLOSED" or pa is None or pb is None:
+        info["tries"] = info.get("tries", 0) + 1
+        if info["tries"] > 60:  # ~10 minutes of failed lookups: stop retrying, reports fall back to TP1
+            _BE_PENDING.pop(sid, None)
+        return
+    if pa > 0:
+        detail = "TP2" if pb > pa else "TP1"
+    else:
+        detail = "SL"
+    await asyncio.to_thread(_patch_signal_sync, sid, {"tp_detail": detail, "be_done": True})
+    _BE_PENDING.pop(sid, None)
+    print(f"[BREAK-EVEN] signal {sid} finished as {detail} (TP1 leg {pa:+.2f}, TP2 leg {pb:+.2f}).")
+
+
+async def manage_break_even(context: ContextTypes.DEFAULT_TYPE):
+    if not METAAPI_TOKEN or not METAAPI_ACCOUNT_ID:
+        return
+    if not _BE_STATE["loaded"]:
+        _BE_STATE["loaded"] = await asyncio.to_thread(_load_be_pending_sync)
+    if not _BE_PENDING:
+        return
+    positions = await _fetch_open_positions()
+    if positions is None:
+        return
+    by_id = {str(p.get("id")): p for p in positions if isinstance(p, dict)}
+
+    for sid, info in list(_BE_PENDING.items()):
+        a_open = info["a"] in by_id
+        b_pos = by_id.get(info["b"])
+
+        if info["stage"] == "final":
+            if not b_pos:
+                await _be_classify_and_store(sid, info)
+            continue
+
+        # stage "wait"
+        if a_open:
+            continue
+        if not b_pos:
+            # Both legs are gone: stopped out together (or closed by hand).
+            await _be_classify_and_store(sid, info)
+            continue
+        try:
+            open_p = float(b_pos.get("openPrice"))
+            cur_p = float(b_pos.get("currentPrice"))
+        except Exception:
+            continue
+        is_buy = "BUY" in str(b_pos.get("type", "")).upper()
+        in_profit = cur_p > open_p if is_buy else cur_p < open_p
+        if not in_profit:
+            # TP1 leg gone but TP2 leg not in profit: the shared SL is being
+            # hit right now. Give it a couple of sweeps, then stop watching.
+            info["tries"] = info.get("tries", 0) + 1
+            if info["tries"] >= 3:
+                oa, pa = await get_mt5_trade_outcome(info["a"])
+                if oa == "CLOSED" and pa is not None:
+                    if pa > 0:
+                        # TP1 was hit but price already fell back to entry before
+                        # the stop could be moved: exit the TP2 half now.
+                        ok2, d2 = await _metaapi_trade_action({"actionType": "POSITION_CLOSE_ID", "positionId": info["b"]})
+                        print(f"[BREAK-EVEN] signal {sid}: TP1 hit, price back at entry, closed TP2 leg: ok={ok2} ({d2})")
+                        if ok2:
+                            await _be_admin_note(f"🔒 Signal #{sid}: TP1 hit, but price was back at entry, so the TP2 half was closed at about break-even.")
+                    info["stage"] = "final"; info["tries"] = 0
+                    await asyncio.to_thread(_patch_signal_sync, sid, {"be_done": True})
+            continue
+
+        sl_b = b_pos.get("stopLoss")
+        try:
+            sl_b = float(sl_b) if sl_b else None
+        except Exception:
+            sl_b = None
+        dist = abs(open_p - sl_b) if sl_b else 0.0
+        decimals = max(_decimals_of(b_pos.get("openPrice")), _decimals_of(sl_b) if sl_b else 0, 2)
+        be_price = round(open_p + dist * BE_BUFFER_FRACTION if is_buy else open_p - dist * BE_BUFFER_FRACTION, decimals)
+        tp_keep = b_pos.get("takeProfit") or info.get("tp2")
+        payload = {"actionType": "POSITION_MODIFY", "positionId": info["b"], "stopLoss": be_price}
+        if tp_keep:
+            payload["takeProfit"] = tp_keep
+        ok, detail = await _metaapi_trade_action(payload)
+        if ok:
+            info["stage"] = "final"; info["tries"] = 0
+            await asyncio.to_thread(_patch_signal_sync, sid, {"be_done": True})
+            print(f"[BREAK-EVEN] signal {sid}: TP1 hit, TP2 leg {info['b']} stop moved to {be_price}.")
+            await _be_admin_note(f"🔒 Signal #{sid}: TP1 hit. The TP2 half now has its stop at break-even ({be_price}).")
+            continue
+        info["tries"] = info.get("tries", 0) + 1
+        print(f"[BREAK-EVEN] signal {sid}: stop move failed ({detail}), try {info['tries']}")
+        beyond_be = cur_p <= be_price if is_buy else cur_p >= be_price
+        if beyond_be:
+            # Price already fell back to entry: exit the second half now.
+            ok2, d2 = await _metaapi_trade_action({"actionType": "POSITION_CLOSE_ID", "positionId": info["b"]})
+            print(f"[BREAK-EVEN] signal {sid}: price already back at entry, closed TP2 leg: ok={ok2} ({d2})")
+            if ok2:
+                info["stage"] = "final"; info["tries"] = 0
+                await asyncio.to_thread(_patch_signal_sync, sid, {"be_done": True})
+                await _be_admin_note(f"🔒 Signal #{sid}: TP1 hit, but price was already back at entry, so the TP2 half was closed at about break-even.")
+                continue
+        if info["tries"] == 6:
+            await _be_admin_note(
+                f"⚠️ Signal #{sid}: TP1 hit, but I could not move the stop on the TP2 half ({detail[:120]}). Please check it on MT5."
+            )
+
 
 # ============================================
 # METAAPI — CHECK REAL TRADE OUTCOME (NEW)
@@ -28766,6 +29036,21 @@ REPORT_PIP_UNIT = {
     "EURUSD": 0.0001, "GBPUSD": 0.0001, "GBPJPY": 0.01,
 }
 
+def signal_win_pips(sig):
+    """Pips credited when a signal is TP_HIT. Plain signals: the full TP.
+    Split (TP1/TP2) signals: TP1 pips, unless the TP2 leg is known to have
+    reached TP2 (tp_detail == 'TP2')."""
+    sl_pips, tp_pips = signal_pips(sig)
+    if sig.get("mt5_order_id_2") and sig.get("tp1") is not None and sig.get("tp_detail") != "TP2":
+        unit = REPORT_PIP_UNIT.get(sig.get("pair_name"))
+        try:
+            if unit:
+                return float(round(abs(float(sig["tp1"]) - float(sig["entry_price"])) / unit))
+        except Exception:
+            pass
+    return tp_pips
+
+
 def signal_pips(sig):
     """(sl_pips, tp_pips) for ONE logged signal, from its own stored entry/
     stop_loss/take_profit. This is what keeps a week that mixes old-width
@@ -28884,6 +29169,7 @@ async def post_weekly_report(context: ContextTypes.DEFAULT_TYPE):
         if pair_name in SCHEDULED_PAIR_PIPS:
             sl_pips, tp_pips = signal_pips(sig)
             if status == "TP_HIT":
+                tp_pips = signal_win_pips(sig)
                 total_pips_won += tp_pips
             elif status == "SL_HIT":
                 total_pips_lost += sl_pips
@@ -28898,6 +29184,12 @@ async def post_weekly_report(context: ContextTypes.DEFAULT_TYPE):
         if outcome != "CLOSED" or profit is None:
             missing_pnl_count += 1
             continue
+        # Split trades: add the second (TP2) half's closed profit too.
+        order_id_2 = sig.get("mt5_order_id_2")
+        if order_id_2:
+            outcome2, profit2 = await get_mt5_trade_outcome(order_id_2)
+            if outcome2 == "CLOSED" and profit2 is not None:
+                profit += profit2
         total_profit_usd += profit
         if pair_name in per_pair_pnl:
             per_pair_pnl[pair_name] += profit
@@ -29038,6 +29330,7 @@ async def post_daily_report(context: ContextTypes.DEFAULT_TYPE):
         sl_pips, tp_pips = signal_pips(sig)
 
         if status == "TP_HIT":
+            tp_pips = signal_win_pips(sig)
             total_pips_won += tp_pips
             line_items.append(f"✅ {pair_name} {direction} +{tp_pips:.0f} pips")
         elif status == "SL_HIT":
@@ -29418,6 +29711,15 @@ def main():
         interval=300,
         first=180,
         name="metaapi_selfheal"
+    )
+
+    # Break-even manager for TP1/TP2 split trades (personal account): cheap
+    # in-memory check every 10s, only calls MetaAPI while a split trade is open.
+    job_queue.run_repeating(
+        manage_break_even,
+        interval=10,
+        first=40,
+        name="be_manager"
     )
 
     # TP/SL monitor - checks every OPEN logged signal every 15 minutes

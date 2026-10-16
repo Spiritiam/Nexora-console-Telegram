@@ -2634,17 +2634,48 @@ async def run_mt5_autotrade_follow_channel_scan(context: ContextTypes.DEFAULT_TY
                 account["_live_balance"] = balance
 
             volume = compute_lot_size(account, entry_price, acct_sl)
-            print(f"[MT5 AUTOTRADE FOLLOW] Attempting to copy signal {signal_id} ({pair_name} {direction}) for user {user_id}, volume={volume}, symbol={resolved_symbol}")
 
-            order_id = await place_client_mt5_trade(
-                metaapi_account_id, resolved_symbol, direction,
-                volume, acct_sl, acct_tp,
-                # signal_id is a real Supabase auto-incrementing ID
-                # (short, numeric) - safe within MT5's comment length
-                # limit, and a genuinely meaningful identifier here
-                # since this call copies an actual logged signal.
-                trade_comment=f"NexoraAI-{signal_id}"
-            )
+            # TP1/TP2 handling (same rules for Copy Channel Signal and Full
+            # Signal Coverage). Accounts with their own custom TP keep it.
+            tp1 = signal.get("tp1")
+            has_custom_tp = (acct_tp != take_profit)
+            plan = "legacy"
+            if tp1 and not has_custom_tp and CLIENT_TP_SPLIT_ENABLED:
+                try:
+                    tp1 = float(tp1)
+                    plan = "single_tp1" if volume < 0.02 else "split"
+                except Exception:
+                    plan = "legacy"
+            print(f"[MT5 AUTOTRADE FOLLOW] Attempting to copy signal {signal_id} ({pair_name} {direction}) for user {user_id}, volume={volume}, symbol={resolved_symbol}, plan={plan}")
+
+            split_ids = None
+            if plan == "split":
+                leg_b = max(0.01, (int(round(volume * 100)) // 2) / 100)
+                leg_a = round(volume - leg_b, 2)
+                order_id = await place_client_mt5_trade(
+                    metaapi_account_id, resolved_symbol, direction,
+                    leg_a, acct_sl, tp1, trade_comment=f"NexoraAI-{signal_id}-T1")
+                if order_id:
+                    order_b = await place_client_mt5_trade(
+                        metaapi_account_id, resolved_symbol, direction,
+                        leg_b, acct_sl, acct_tp, trade_comment=f"NexoraAI-{signal_id}-T2")
+                    if order_b:
+                        split_ids = (str(order_id), str(order_b))
+                        await asyncio.to_thread(
+                            _register_client_split, user_id, metaapi_account_id, signal_id,
+                            str(order_id), str(order_b), acct_tp, direction)
+                    else:
+                        print(f"[MT5 AUTOTRADE FOLLOW] ⚠️ TP2 leg failed for signal {signal_id}, user {user_id} - first leg stays open with TP1.")
+            else:
+                order_id = await place_client_mt5_trade(
+                    metaapi_account_id, resolved_symbol, direction,
+                    volume, acct_sl, (tp1 if plan == "single_tp1" else acct_tp),
+                    # signal_id is a real Supabase auto-incrementing ID
+                    # (short, numeric) - safe within MT5's comment length
+                    # limit, and a genuinely meaningful identifier here
+                    # since this call copies an actual logged signal.
+                    trade_comment=f"NexoraAI-{signal_id}"
+                )
             MT5_AUTOTRADE_COPIED_SIGNALS.add(copy_key)
             if order_id:
                 log_mt5_autotrade_order(user_id, metaapi_account_id, order_id, pair_config["display"], direction)
@@ -2652,13 +2683,21 @@ async def run_mt5_autotrade_follow_channel_scan(context: ContextTypes.DEFAULT_TY
                     "📻 Copy Channel Signal — Trade Opened" if account.get("bot_choice") == "copy_channel"
                     else "📡 Full Signal Coverage — Trade Opened"
                 )
+                if plan == "split" and split_ids:
+                    tp_txt = f"TP1: {tp1} (half) | TP2: {acct_tp} (half)\nAfter TP1, your stop moves to break-even."
+                elif plan == "split":
+                    tp_txt = f"TP: {tp1}"
+                elif plan == "single_tp1":
+                    tp_txt = f"TP: {tp1}"
+                else:
+                    tp_txt = f"TP: {acct_tp}"
                 try:
                     await context.bot.send_message(
                         chat_id=int(user_id),
                         text=(
                             f"<b>{mode_header}</b>\n\n"
                             f"{direction} {pair_config['display']}\n"
-                            f"Entry: {entry_price} | SL: {acct_sl} | TP: {acct_tp}"
+                            f"Entry: {entry_price} | SL: {acct_sl}\n{tp_txt}"
                             f"{' (your SL/TP)' if (acct_sl, acct_tp) != (stop_loss, take_profit) else ''}\n"
                             f"Volume: {volume} lots"
                         ),
@@ -19109,7 +19148,8 @@ async def build_signal_response(question, user_id=None, retry_mismatch=False):
         f"{narrative}\n\n"
         f"<b>Entry Price:</b> {entry_price}\n"
         f"<b>SL:</b> {stop_loss}{sl_pips_txt}\n"
-        f"<b>TP1:</b> {take_profit_1}{tp1_pips_txt} || <b>TP2:</b> {take_profit}{tp2_pips_txt}\n\n"
+        f"<b>TP1:</b> {take_profit_1}{tp1_pips_txt}\n"
+        f"<b>TP2:</b> {take_profit}{tp2_pips_txt}\n\n"
         f"<b>Confidence:</b> {confidence}%\n"
         f"<b>Session:</b> {session}\n\n"
     )
@@ -21781,9 +21821,9 @@ def _patch_signal_sync(signal_id, fields):
         print(f"[BREAK-EVEN] update error for {signal_id}: {e}")
 
 
-async def _fetch_open_positions():
+async def _fetch_open_positions(account_id=None):
     try:
-        url = f"https://mt-client-api-v1.london.agiliumtrade.ai/users/current/accounts/{METAAPI_ACCOUNT_ID}/positions"
+        url = f"https://mt-client-api-v1.london.agiliumtrade.ai/users/current/accounts/{account_id or METAAPI_ACCOUNT_ID}/positions"
         r = await asyncio.to_thread(requests.get, url, headers={"auth-token": METAAPI_TOKEN, "Accept": "application/json"}, timeout=8)
         if r.status_code != 200:
             return None
@@ -21793,10 +21833,10 @@ async def _fetch_open_positions():
         return None
 
 
-async def _metaapi_trade_action(payload):
+async def _metaapi_trade_action(payload, account_id=None):
     """Returns (ok, detail) for a MetaAPI trade action (modify / close)."""
     try:
-        url = f"https://mt-client-api-v1.london.agiliumtrade.ai/users/current/accounts/{METAAPI_ACCOUNT_ID}/trade"
+        url = f"https://mt-client-api-v1.london.agiliumtrade.ai/users/current/accounts/{account_id or METAAPI_ACCOUNT_ID}/trade"
         r = await asyncio.to_thread(
             requests.post, url, headers={"auth-token": METAAPI_TOKEN, "Content-Type": "application/json"}, json=payload, timeout=10
         )
@@ -21928,6 +21968,176 @@ async def manage_break_even(context: ContextTypes.DEFAULT_TYPE):
             await _be_admin_note(
                 f"⚠️ Signal #{sid}: TP1 hit, but I could not move the stop on the TP2 half ({detail[:120]}). Please check it on MT5."
             )
+
+
+# ============================================
+# TP1/TP2 SPLIT FOR COPY-TRADING ACCOUNTS
+# Rules (all copy modes that follow Nexora channel signals):
+#   lot 0.01        -> single trade, TP = TP1 (always, permanent)
+#   lot 0.02+       -> two legs: first leg TP1, second leg TP2, same SL
+# When the TP1 leg closes in profit while the TP2 leg is still open, the TP2
+# leg's stop moves to just past entry (5% of the SL distance).
+# CLIENT_TP_SPLIT_ENABLED=0 on Railway turns all of this off (old behaviour).
+# ============================================
+CLIENT_TP_SPLIT_ENABLED = os.getenv("CLIENT_TP_SPLIT_ENABLED", "1") != "0"
+_CBE_PENDING = {}   # order_a -> info
+_CBE_STATE = {"loaded": False}
+
+
+def _register_client_split(user_id, acct_id, signal_id, order_a, order_b, tp2, direction):
+    _CBE_PENDING[order_a] = {
+        "user": str(user_id), "acct": acct_id, "sig": signal_id, "a": order_a, "b": order_b,
+        "tp2": tp2, "tries": 0, "fails": 0,
+    }
+    try:
+        r = requests.post(f"{SUPABASE_URL}/rest/v1/mt5_split_trades", headers=sb_headers(), json={
+            "user_id": str(user_id), "metaapi_account_id": acct_id, "signal_id": str(signal_id),
+            "order_a": order_a, "order_b": order_b, "tp2": tp2, "direction": direction, "be_done": False,
+        }, timeout=10)
+        if r.status_code not in (200, 201):
+            print(f"[CLIENT BREAK-EVEN] ❌ could not save split record: {r.status_code} {r.text[:150]}")
+    except Exception as e:
+        print(f"[CLIENT BREAK-EVEN] save error: {type(e).__name__}")
+
+
+def _cbe_load_sync():
+    try:
+        since = (datetime.utcnow() - timedelta(days=14)).isoformat()
+        url = (f"{SUPABASE_URL}/rest/v1/mt5_split_trades?be_done=eq.false&created_at=gte.{since}"
+               f"&select=user_id,metaapi_account_id,signal_id,order_a,order_b,tp2&limit=500")
+        rows = requests.get(url, headers=sb_headers(), timeout=15).json()
+        if not isinstance(rows, list):
+            return False
+        for row in rows:
+            a = str(row["order_a"])
+            if a not in _CBE_PENDING:
+                _CBE_PENDING[a] = {"user": str(row["user_id"]), "acct": row["metaapi_account_id"],
+                                   "sig": row.get("signal_id"), "a": a, "b": str(row["order_b"]),
+                                   "tp2": row.get("tp2"), "tries": 0, "fails": 0}
+        print(f"[CLIENT BREAK-EVEN] loaded {len(rows)} unfinished split trade(s).")
+        return True
+    except Exception as e:
+        print(f"[CLIENT BREAK-EVEN] load error: {type(e).__name__}")
+        return False
+
+
+def _cbe_finish_sync(order_a):
+    try:
+        requests.patch(f"{SUPABASE_URL}/rest/v1/mt5_split_trades?order_a=eq.{order_a}",
+                       headers=sb_headers(), json={"be_done": True}, timeout=10)
+    except Exception as e:
+        print(f"[CLIENT BREAK-EVEN] finish update error: {type(e).__name__}")
+
+
+def _cbe_leg_profit_sync(acct_id, position_id):
+    """Total profit of a CLOSED position from deal history, or None if unknown."""
+    try:
+        r = requests.get(
+            f"https://mt-client-api-v1.london.agiliumtrade.ai/users/current/accounts/{acct_id}"
+            f"/history-deals/position/{position_id}",
+            headers={"auth-token": METAAPI_TOKEN, "Accept": "application/json"}, timeout=10)
+        if r.status_code != 200:
+            return None
+        data = r.json()
+        deals = data.get("deals", []) if isinstance(data, dict) else data
+        out = [d for d in deals if isinstance(d, dict) and "OUT" in str(d.get("entryType", "")).upper()]
+        if not out:
+            return None
+        return sum(float(d.get("profit") or 0) + float(d.get("commission") or 0) + float(d.get("swap") or 0) for d in out)
+    except Exception:
+        return None
+
+
+async def _cbe_process_account(context, acct_id, infos):
+    positions = await _fetch_open_positions(acct_id)
+    if positions is None:
+        return
+    by_id = {str(p.get("id")): p for p in positions if isinstance(p, dict)}
+    for info in infos:
+        a, b = info["a"], info["b"]
+        b_pos = by_id.get(b)
+        if a in by_id:
+            continue  # TP1 leg still running
+        if not b_pos:
+            # both legs gone (stopped out together or closed by hand): nothing left to manage
+            _CBE_PENDING.pop(a, None)
+            await asyncio.to_thread(_cbe_finish_sync, a)
+            continue
+        try:
+            open_p = float(b_pos.get("openPrice")); cur_p = float(b_pos.get("currentPrice"))
+        except Exception:
+            continue
+        is_buy = "BUY" in str(b_pos.get("type", "")).upper()
+        in_profit = cur_p > open_p if is_buy else cur_p < open_p
+        if not in_profit:
+            info["tries"] += 1
+            if info["tries"] >= 3:
+                pa = await asyncio.to_thread(_cbe_leg_profit_sync, acct_id, a)
+                if pa is not None:
+                    if pa > 0:
+                        ok2, _d2 = await _metaapi_trade_action({"actionType": "POSITION_CLOSE_ID", "positionId": b}, acct_id)
+                        print(f"[CLIENT BREAK-EVEN] signal {info['sig']}: TP1 hit, price back at entry, closed TP2 leg: ok={ok2}")
+                    _CBE_PENDING.pop(a, None)
+                    await asyncio.to_thread(_cbe_finish_sync, a)
+            continue
+        sl_b = b_pos.get("stopLoss")
+        try:
+            sl_b = float(sl_b) if sl_b else None
+        except Exception:
+            sl_b = None
+        dist = abs(open_p - sl_b) if sl_b else 0.0
+        decimals = max(_decimals_of(b_pos.get("openPrice")), _decimals_of(sl_b) if sl_b else 0, 2)
+        be_price = round(open_p + dist * BE_BUFFER_FRACTION if is_buy else open_p - dist * BE_BUFFER_FRACTION, decimals)
+        tp_keep = b_pos.get("takeProfit") or info.get("tp2")
+        payload = {"actionType": "POSITION_MODIFY", "positionId": b, "stopLoss": be_price}
+        if tp_keep:
+            payload["takeProfit"] = tp_keep
+        ok, detail = await _metaapi_trade_action(payload, acct_id)
+        if ok:
+            _CBE_PENDING.pop(a, None)
+            await asyncio.to_thread(_cbe_finish_sync, a)
+            print(f"[CLIENT BREAK-EVEN] signal {info['sig']}: TP1 hit, TP2 leg stop moved to break-even.")
+            try:
+                await context.bot.send_message(
+                    chat_id=int(info["user"]),
+                    text=f"🔒 TP1 hit on signal #{info['sig']}. The second half of your trade now has its stop at break-even ({be_price}).")
+            except Exception as e:
+                print(f"[CLIENT BREAK-EVEN] could not notify user: {type(e).__name__}")
+            continue
+        info["fails"] += 1
+        print(f"[CLIENT BREAK-EVEN] signal {info['sig']}: stop move failed ({detail[:100]}), try {info['fails']}")
+        beyond_be = cur_p <= be_price if is_buy else cur_p >= be_price
+        if beyond_be:
+            ok2, _d2 = await _metaapi_trade_action({"actionType": "POSITION_CLOSE_ID", "positionId": b}, acct_id)
+            if ok2:
+                _CBE_PENDING.pop(a, None)
+                await asyncio.to_thread(_cbe_finish_sync, a)
+                continue
+        if info["fails"] >= 30:  # ~5 minutes of failures: give up, leave the trade as is
+            _CBE_PENDING.pop(a, None)
+            await _be_admin_note(f"⚠️ Copier break-even for signal #{info['sig']} failed repeatedly ({detail[:100]}). One account's second leg keeps its original stop.")
+
+
+async def manage_client_break_even(context: ContextTypes.DEFAULT_TYPE):
+    if not METAAPI_TOKEN:
+        return
+    if not _CBE_STATE["loaded"]:
+        _CBE_STATE["loaded"] = await asyncio.to_thread(_cbe_load_sync)
+    if not _CBE_PENDING:
+        return
+    by_acct = {}
+    for info in list(_CBE_PENDING.values()):
+        by_acct.setdefault(info["acct"], []).append(info)
+    sem = asyncio.Semaphore(6)
+
+    async def one(acct_id, infos):
+        async with sem:
+            try:
+                await _cbe_process_account(context, acct_id, infos)
+            except Exception as e:
+                print(f"[CLIENT BREAK-EVEN] error: {type(e).__name__}")
+
+    await asyncio.gather(*(one(k, v) for k, v in by_acct.items()))
 
 
 # ============================================
@@ -29720,6 +29930,12 @@ def main():
         interval=10,
         first=40,
         name="be_manager"
+    )
+    job_queue.run_repeating(
+        manage_client_break_even,
+        interval=10,
+        first=45,
+        name="client_be_manager"
     )
 
     # TP/SL monitor - checks every OPEN logged signal every 15 minutes

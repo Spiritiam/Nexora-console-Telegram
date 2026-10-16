@@ -23557,7 +23557,10 @@ async def handle_buttons(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 )
                 await update.message.reply_text(
                     "Want to change or set up trading?",
-                    reply_markup=InlineKeyboardMarkup([[manage_button], [toggle_button]])
+                    reply_markup=InlineKeyboardMarkup([
+                        [manage_button], [toggle_button],
+                        [InlineKeyboardButton("🔌 Disconnect Deriv Account", callback_data="derivdisc_ask")],
+                    ])
                 )
             else:
                 reconnect_markup, oauth_state = await build_deriv_login_button(user_id)
@@ -24610,6 +24613,59 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             "a trailing stop across the whole stack. Higher risk.",
             parse_mode=ParseMode.HTML,
             reply_markup=InlineKeyboardMarkup(buttons)
+        )
+        return
+
+    if data == "derivdisc_ask":
+        await query.message.edit_text(
+            "🔌 <b>Disconnect your Deriv account?</b>\n\n"
+            "Auto-Trade will stop and the link to this bot will be removed. "
+            "You can then connect the same account in the SpiritFX Academy app "
+            "(or reconnect it here later).",
+            parse_mode=ParseMode.HTML,
+            reply_markup=InlineKeyboardMarkup([
+                [InlineKeyboardButton("✅ Yes, disconnect", callback_data="derivdisc_yes")],
+                [InlineKeyboardButton("Cancel", callback_data="derivdisc_no")],
+            ])
+        )
+        return
+
+    if data == "derivdisc_no":
+        await query.message.edit_text("Okay, your Deriv account stays connected.")
+        return
+
+    if data == "derivdisc_yes":
+        user_id = str(query.from_user.id)
+        acct = await asyncio.to_thread(get_deriv_account, user_id)
+        if not acct:
+            await query.message.edit_text("Your Deriv account is already disconnected.")
+            return
+        # Stop new trades first, THEN check, so the engine can't open one in between.
+        await asyncio.to_thread(update_deriv_account_fields, user_id, {"deriv_autotrade_enabled": False})
+        if await asyncio.to_thread(_napp_deriv_has_open_sync, user_id):
+            await query.message.edit_text(
+                "⏳ <b>You still have an open Nexora trade.</b>\n\n"
+                "Auto-Trade is now off. Disconnect after the trade closes.",
+                parse_mode=ParseMode.HTML
+            )
+            return
+        try:
+            r = await asyncio.to_thread(
+                lambda: requests.delete(
+                    f"{SUPABASE_URL}/rest/v1/deriv_accounts?user_id=eq.{user_id}",
+                    headers=sb_headers(), timeout=10))
+            if r.status_code not in (200, 204):
+                raise RuntimeError(r.status_code)
+        except Exception as e:
+            print(f"[DERIV DISCONNECT] error: {type(e).__name__}")
+            await query.message.edit_text("⚠️ Couldn't disconnect right now. Please try again in a moment.")
+            return
+        user_modes.pop(user_id, None)
+        await query.message.edit_text(
+            "✅ <b>Deriv account disconnected.</b>\n\n"
+            "You can connect it in the SpiritFX Academy app now, "
+            "or tap 🔗 Connect Deriv here to link it again.",
+            parse_mode=ParseMode.HTML
         )
         return
 

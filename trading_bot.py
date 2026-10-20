@@ -4772,16 +4772,115 @@ async def _napp_exness_push(synth, text):
         print(f"[NEXORA EXNESS] push failed: {type(e).__name__}")
 
 
+NAPP_EXNESS_UNLINKS_PER_MONTH = 3
+_napp_exness_cancelled = set()   # synth ids whose in-progress connect must be discarded
+
+
+def _napp_exness_mask_email2(email):
+    """fe***@gmail.com"""
+    try:
+        name, dom = email.split("@", 1)
+        return (name[:2] + "***@" + dom) if name else email
+    except Exception:
+        return None
+
+
+def _napp_exness_unlinks_used_sync(synth):
+    """(unlinks this calendar month (UTC), ok) - counted from exness_unlink_log."""
+    try:
+        now = datetime.utcnow()
+        start = datetime(now.year, now.month, 1).isoformat() + "Z"
+        r = requests.get(
+            f"{SUPABASE_URL}/rest/v1/exness_unlink_log",
+            params={"user_id": f"eq.{synth}", "created_at": f"gte.{start}", "select": "id"},
+            headers=sb_headers(), timeout=10)
+        rows = r.json()
+        if r.status_code != 200 or not isinstance(rows, list):
+            return 0, False
+        return len(rows), True
+    except Exception:
+        return 0, False
+
+
+async def _napp_remove_metaapi_checked(metaapi_account_id):
+    """True if the MetaAPI account is gone (or was already gone), False if the
+    removal failed and should be retried."""
+    try:
+        api = MetaApi(token=METAAPI_TOKEN)
+        try:
+            account = await api.metatrader_account_api.get_account(account_id=metaapi_account_id)
+        except Exception as e:
+            if "not found" in str(e).lower() or "NotFound" in type(e).__name__:
+                return True
+            raise
+        await account.remove()
+        return True
+    except Exception as e:
+        print(f"[EXNESS UNLINK] MetaAPI removal failed for {metaapi_account_id}: {type(e).__name__}: {str(e)[:150]}")
+        return False
+    finally:
+        _reset_client_mt5_connection(metaapi_account_id)
+
+
+def _napp_unlink_mark_removed_sync(log_id):
+    try:
+        requests.patch(f"{SUPABASE_URL}/rest/v1/exness_unlink_log?id=eq.{log_id}",
+                       headers=sb_headers(), json={"metaapi_removed": True}, timeout=10)
+    except Exception as e:
+        print(f"[EXNESS UNLINK] couldn't mark log {log_id} removed: {type(e).__name__}")
+
+
+async def _napp_unlink_retry_removal(log_id, metaapi_account_id):
+    for delay in (60, 300, 1800):
+        await asyncio.sleep(delay)
+        if await _napp_remove_metaapi_checked(metaapi_account_id):
+            await asyncio.to_thread(_napp_unlink_mark_removed_sync, log_id)
+            print(f"[EXNESS UNLINK] MetaAPI account {metaapi_account_id} removed on retry")
+            return
+
+
+async def retry_exness_unlink_removals(context: ContextTypes.DEFAULT_TYPE):
+    """Every 30 minutes: finish any MetaAPI removal that failed during an
+    unlink (also covers a restart that lost the in-memory retry)."""
+    try:
+        r = await asyncio.to_thread(
+            requests.get,
+            f"{SUPABASE_URL}/rest/v1/exness_unlink_log?metaapi_removed=eq.false&select=id,metaapi_account_id&limit=50",
+            headers=sb_headers(), timeout=10)
+        rows = r.json()
+    except Exception as e:
+        print(f"[EXNESS UNLINK] retry job read failed: {type(e).__name__}")
+        return
+    if not isinstance(rows, list):
+        return
+    for row in rows:
+        mid = row.get("metaapi_account_id")
+        if not mid:
+            await asyncio.to_thread(_napp_unlink_mark_removed_sync, row["id"])
+            continue
+        if await _napp_remove_metaapi_checked(mid):
+            await asyncio.to_thread(_napp_unlink_mark_removed_sync, row["id"])
+            print(f"[EXNESS UNLINK] retry job removed MetaAPI account {mid}")
+
+
 async def nexora_app_exness_status_handler(request):
     synth, err = await _napp_deriv_auth(request, limit_per_min=40, allow_killed=True)
     if err:
         return err
+    payload = await _napp_exness_status_build(synth)
+    if payload is None:
+        return _napp_json({"error": "server", "message": "Could not load your Exness status. Try again."}, 503)
+    return _napp_json(payload)
+
+
+async def _napp_exness_status_build(synth):
+    """The status payload as a dict, or None if the database can't be read."""
     _napp_exness_prune_jobs()
     options = _napp_exness_options()
     verified, email, vok = await asyncio.to_thread(_napp_exness_verified_sync, synth)
     row, rok = await asyncio.to_thread(_napp_exness_row_sync, synth)
     if not vok or not rok:
-        return _napp_json({"error": "server", "message": "Could not load your Exness status. Try again."}, 503)
+        return None
 
     now = datetime.utcnow()
     expiry = _napp_exness_expiry(row)
@@ -4802,10 +4901,13 @@ async def nexora_app_exness_status_handler(request):
     if row and row.get("bot_choice") == "account_flip" and connected:
         flip_open = await asyncio.to_thread(_napp_exness_flip_open_sync, synth)
 
-    return _napp_json({
+    used, uok = await asyncio.to_thread(_napp_exness_unlinks_used_sync, synth)
+    return {
         "enabled": not _napp_exness_killed(),
         "verified": verified,
         "email": _napp_exness_mask_email(email) if email else None,
+        "exness_email": _napp_exness_mask_email2(email) if email else None,
+        "unlinks_left": max(0, NAPP_EXNESS_UNLINKS_PER_MONTH - used) if uok else None,
         "subscription": {
             "active": active_sub,
             "days_left": max(0, (expiry - now).days) if active_sub else 0,
@@ -4823,7 +4925,7 @@ async def nexora_app_exness_status_handler(request):
         "settings": _napp_exness_settings(row),
         "flip_open": flip_open,
         "options": options,
-    })
+    }
 
 
 async def _napp_exness_body(request):
@@ -4832,6 +4934,131 @@ async def _napp_exness_body(request):
     except Exception:
         return None
     return body if isinstance(body, dict) else None
+
+
+async def nexora_app_exness_disconnect_handler(request):
+    synth, err = await _napp_deriv_auth(request, limit_per_min=10, allow_killed=True)
+    if err:
+        return err
+    auth = request.headers.get("Authorization", "")
+    token = auth[7:].strip() if auth.lower().startswith("bearer ") else ""
+    user_key = await asyncio.to_thread(_napp_validate_token_sync, token)
+
+    verified, email, vok = await asyncio.to_thread(_napp_exness_verified_sync, synth)
+    row, rok = await asyncio.to_thread(_napp_exness_row_sync, synth)
+    if not vok or not rok:
+        return _napp_json({"error": "server", "message": "Could not check right now. Try again."}, 503)
+
+    connecting = (_napp_exness_jobs.get(synth) or {}).get("state") == "connecting"
+    has_account = bool(row and (row.get("metaapi_account_id") or row.get("account_number")))
+    if not (verified or has_account or connecting):
+        payload = await _napp_exness_status_build(synth) or {}
+        payload["message"] = "No Exness account is linked."
+        return _napp_json(payload)
+
+    used, uok = await asyncio.to_thread(_napp_exness_unlinks_used_sync, synth)
+    if not uok:
+        return _napp_json({"error": "server", "message": "Could not check right now. Try again."}, 503)
+    if used >= NAPP_EXNESS_UNLINKS_PER_MONTH:
+        return _napp_json({
+            "error": "limit_reached", "unlinks_left": 0,
+            "message": f"You can unlink your Exness account {NAPP_EXNESS_UNLINKS_PER_MONTH} times a month. Please try again next month."}, 429)
+
+    mt5_login = (row or {}).get("account_number")
+    metaapi_id = (row or {}).get("metaapi_account_id")
+
+    # A connection still in progress is cancelled: the connect job drops the
+    # new account itself as soon as MetaAPI hands it back.
+    if connecting:
+        _napp_exness_cancelled.add(synth)
+        _napp_exness_jobs.pop(synth, None)
+
+    # a) + c-db) + d): in ONE write - the bot can no longer see this account
+    # (it needs metaapi_account_id), and every credential is wiped. The row,
+    # subscription expiry and bot settings stay.
+    if row:
+        try:
+            r = await asyncio.to_thread(
+                requests.patch,
+                f"{SUPABASE_URL}/rest/v1/mt5_auto_trade_accounts?user_id=eq.{synth}",
+                headers=sb_headers(),
+                json={"metaapi_account_id": None, "account_number": None, "encrypted_password": None,
+                      "server": None, "account_name": None, "symbol_map": None, "is_active": False},
+                timeout=10)
+            if r.status_code not in (200, 204):
+                raise RuntimeError(f"HTTP {r.status_code}")
+        except Exception as e:
+            print(f"[EXNESS UNLINK] account wipe failed for {synth}: {type(e).__name__}")
+            if connecting:
+                _napp_exness_cancelled.discard(synth)
+            return _napp_json({"error": "server", "message": "Could not unlink right now. Please try again."}, 500)
+
+    # An Account Flip stack that was open is no longer managed: close it in
+    # our records. Nothing is closed on Exness.
+    try:
+        await asyncio.to_thread(
+            requests.patch,
+            f"{SUPABASE_URL}/rest/v1/mt5_flip_stacks?user_id=eq.{synth}&status=eq.OPEN",
+            headers=sb_headers(),
+            json={"status": "CLOSED", "closed_at": datetime.utcnow().isoformat()}, timeout=10)
+    except Exception as e:
+        print(f"[EXNESS UNLINK] flip stack close failed for {synth}: {type(e).__name__}")
+
+    # Any provisioning still in progress must not recreate the account later.
+    try:
+        await asyncio.to_thread(
+            requests.patch,
+            f"{SUPABASE_URL}/rest/v1/pending_mt5_provisioning?user_id=eq.{synth}&status=eq.in_progress",
+            headers=sb_headers(),
+            json={"status": "cancelled", "resolved_at": datetime.utcnow().isoformat()}, timeout=10)
+    except Exception as e:
+        print(f"[EXNESS UNLINK] pending provisioning cancel failed for {synth}: {type(e).__name__}")
+
+    # e) free the verified Exness email
+    if verified:
+        ok_v = await asyncio.to_thread(_remove_verified_user_sync, synth)
+        if not ok_v:
+            print(f"[EXNESS UNLINK] verified email removal failed for {synth}")
+
+    # c) remove the account from MetaAPI (cost). A failure is retried later.
+    removed = True
+    if metaapi_id:
+        try:
+            removed = await _napp_run_on_main(_napp_remove_metaapi_checked(metaapi_id), 60)
+        except Exception as e:
+            print(f"[EXNESS UNLINK] MetaAPI removal error for {synth}: {type(e).__name__}")
+            removed = False
+
+    # h) log it (also what the monthly limit counts)
+    log_id = None
+    try:
+        lr = await asyncio.to_thread(
+            requests.post,
+            f"{SUPABASE_URL}/rest/v1/exness_unlink_log",
+            headers={**sb_headers(), "Prefer": "return=representation"},
+            json={"user_key": user_key, "user_id": synth, "unlinked_email": email,
+                  "mt5_login": mt5_login, "metaapi_account_id": metaapi_id,
+                  "metaapi_removed": bool(removed)}, timeout=10)
+        data = lr.json()
+        log_id = data[0]["id"] if isinstance(data, list) and data else None
+        if lr.status_code not in (200, 201):
+            print(f"[EXNESS UNLINK] LOG WRITE REJECTED for {synth}: HTTP {lr.status_code}")
+    except Exception as e:
+        print(f"[EXNESS UNLINK] LOG WRITE FAILED for {synth}: {type(e).__name__}")
+    print(f"[EXNESS UNLINK] user_key={user_key} user_id={synth} email={email} mt5_login={mt5_login} "
+          f"metaapi_removed={removed} at {datetime.utcnow().isoformat()}Z")
+    if metaapi_id and not removed:
+        if log_id:
+            _napp_exness_spawn(_napp_unlink_retry_removal(log_id, metaapi_id))
+        else:
+            _napp_exness_spawn(_napp_remove_metaapi_checked(metaapi_id))
+
+    payload = await _napp_exness_status_build(synth)
+    if payload is None:
+        payload = {"enabled": not _napp_exness_killed(), "verified": False, "exness_email": None,
+                   "unlinks_left": max(0, NAPP_EXNESS_UNLINKS_PER_MONTH - used - 1)}
+    payload["message"] = "Your Exness account has been unlinked. Trades already open stay open on Exness."
+    return _napp_json(payload)
 
 
 async def nexora_app_exness_verify_handler(request):
@@ -4861,10 +5088,7 @@ async def nexora_app_exness_verify_handler(request):
     if owner and owner != synth:
         return _napp_json({
             "verified": False, "result": "taken",
-            "message": ("This email is not verified for auto-trading. It isn't linked to SpiritFX's Exness link, "
-                        "or it's already in use on another Nexora account. To enable auto-trading, use the email of an "
-                        "Exness account you created through our link, or create a new Exness account through our link "
-                        "(or change your IB to SpiritFX in your Exness account), then verify again.")}, 409)
+            "message": "This Exness account is already linked to another SpiritFX account."}, 409)
 
     try:
         verdict, detail, _accts = await _napp_run_on_main(exness_check_email(email), 70)
@@ -4953,6 +5177,7 @@ async def _napp_exness_connect_job(synth, number, password, server, name, replac
     job = {"state": "connecting", "message": "Connecting your Exness account. This can take a couple of minutes.",
            "ts": time.time()}
     _napp_exness_jobs[synth] = job
+    _napp_exness_cancelled.discard(synth)
     pending_id = None
     try:
         enc = encrypt_credential(password)
@@ -4968,6 +5193,13 @@ async def _napp_exness_connect_job(synth, number, password, server, name, replac
             await asyncio.to_thread(resolve_pending_mt5_provisioning, pending_id, "failed")
             _napp_exness_jobs[synth] = {"state": "failed", "message": clean_mt5_provision_error(error),
                                         "ts": time.time()}
+            return
+        if synth in _napp_exness_cancelled:
+            # The user unlinked while this was connecting: drop the new account.
+            _napp_exness_cancelled.discard(synth)
+            await asyncio.to_thread(resolve_pending_mt5_provisioning, pending_id, "cancelled")
+            _napp_exness_spawn(deprovision_mt5_account(account_id))
+            _napp_exness_jobs.pop(synth, None)
             return
         if replace_old_id and await asyncio.to_thread(_napp_exness_flip_open_sync, synth):
             # An Account Flip stack opened while connecting: swapping now would
@@ -5751,6 +5983,7 @@ def run_korapay_webhook_server():
     webhook_app.router.add_post("/api/nexora/exness/pay", nexora_app_exness_pay_handler)
     webhook_app.router.add_post("/api/nexora/exness/connect", nexora_app_exness_connect_handler)
     webhook_app.router.add_post("/api/nexora/exness/config", nexora_app_exness_config_handler)
+    webhook_app.router.add_post("/api/nexora/exness/disconnect", nexora_app_exness_disconnect_handler)
     webhook_app.router.add_get("/api/nexora/prop/status", nexora_app_prop_status_handler)
     webhook_app.router.add_post("/api/nexora/prop/pay", nexora_app_prop_pay_handler)
     webhook_app.router.add_post("/api/nexora/prop/connect", nexora_app_prop_connect_handler)
@@ -30917,6 +31150,14 @@ def main():
         check_mt5_zero_balance_notifications,
         time=parse_time("08:00"),
         name="mt5_zero_balance_check"
+    )
+
+    # Finish any MetaAPI removal that failed when a user unlinked their Exness account.
+    job_queue.run_repeating(
+        retry_exness_unlink_removals,
+        interval=1800,
+        first=300,
+        name="exness_unlink_removal_retry"
     )
 
     # MT5 auto-trade: live execution for the 4 bot presets - checks

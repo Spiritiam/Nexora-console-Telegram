@@ -2204,7 +2204,7 @@ async def _xc_get_subscribers():
     if isinstance(accts, list):
         _XC["subs"] = [
             a for a in accts
-            if a.get("bot_choice") == "account_flip"
+            if False  # USDCHF divergence retired: Account Flip now enters on the ML + M1 scan (run_account_flip_entry_scan)
             and a.get("pair_choice") in XC_PAIRS
             and a.get("metaapi_account_id")
         ]
@@ -3071,15 +3071,18 @@ async def run_account_flip_entry_scan(context: ContextTypes.DEFAULT_TYPE):
         combos.setdefault(account["pair_choice"], []).append(account)
 
     for pair_key, subscribers in combos.items():
-        if pair_key in XC_PAIRS:
-            continue  # gold/silver entries come from the metals x USDCHF divergence signal (run_xc_scalper_tick)
         pair_config = PAIR_CONFIG.get(pair_key)
         if not pair_config:
             continue
+        if pair_key != "btcusd" and _xc_market_closed():
+            continue
         try:
-            candles = await asyncio.to_thread(get_cached_candles, pair_key, pair_config, "1h", outputsize=210)
-            if not candles or len(candles) < 5:
+            # ML + 1-minute entry (same data the Aggressive bots use)
+            candles = await asyncio.to_thread(get_cached_candles, pair_key, pair_config, "1min", outputsize=210)
+            if not candles or len(candles) < 100:
                 continue
+            h4_c = await asyncio.to_thread(get_cached_candles, pair_key, pair_config, "4h", outputsize=60)
+            daily_c = await asyncio.to_thread(get_cached_candles, pair_key, pair_config, "1day", outputsize=10)
 
             # OPTION B, per explicit instruction: ML is now the
             # PRIMARY decision here too - account_flip_signal's own
@@ -3092,39 +3095,22 @@ async def run_account_flip_entry_scan(context: ContextTypes.DEFAULT_TYPE):
             # a genuine distribution mismatch the account owner chose
             # to accept rather than leave Account Flip without ML
             # involvement.
-            entry_price_ml = candles[-1]["close"]
-            ml_result = await asyncio.to_thread(predict_direction_via_ml, pair_key, entry_price_ml, candles, datetime.utcnow())
-            if ml_result:
-                ml_direction, ml_reason, buy_ev, sell_ev, ml_confidence = ml_result
-                print(f"[ML EV MODEL] Account Flip {pair_key}: BUY={buy_ev:+.3f}% SELL={sell_ev:+.3f}% -> chose {ml_direction}")
-                sl_mult, _ = get_sl_tp_multipliers(pair_key, entry_price_ml)
-                if ml_direction == "BUY":
-                    ml_stop_loss = entry_price_ml - (pair_config["pip_size"] * sl_mult)
-                else:
-                    ml_stop_loss = entry_price_ml + (pair_config["pip_size"] * sl_mult)
-                vote = {"direction": ml_direction, "invalidation": ml_stop_loss}
-            else:
-                # Only reached if the model itself is genuinely
-                # unavailable - the original dedicated pattern
-                # detector as the last safety net, not the normal
-                # path anymore.
-                vote = account_flip_signal(pair_key, pair_config, candles)
-                if not vote:
-                    continue
-
-            direction = vote["direction"]
+            ml = await asyncio.to_thread(run_ml_driven_decision, pair_key, pair_config, candles, h4_c, daily_c)
+            if not ml:
+                continue
+            direction = ml[0]
             entry_price = candles[-1]["close"]
-            invalidation = vote["invalidation"]
-            # Small buffer beyond the pattern's own invalidation point,
-            # using the pair's own pip_size so it scales sensibly per
-            # instrument rather than a flat price offset.
-            buffer_dist = pair_config["pip_size"] * 0.2
-            if direction == "BUY":
-                stop_loss = min(invalidation - buffer_dist, entry_price - pair_config["pip_size"] * 0.5)
+            atr = _accum_zone_atr(candles, 14)
+            if not atr:
+                continue
+            if pair_key in AGG_PAIR_CFG:
+                stop_dist = _ag_stop_distance(pair_key, entry_price, atr)
             else:
-                stop_loss = max(invalidation + buffer_dist, entry_price + pair_config["pip_size"] * 0.5)
+                stop_dist = max(atr * 2.0, pair_config["pip_size"] * 5)
+            stop_loss = round(entry_price - stop_dist if direction == "BUY" else entry_price + stop_dist, pair_config["decimals"])
+            vote = {"direction": direction, "strategy": "ML model (1-minute)"}
 
-            signal_marker = f"accountflip_{pair_key}_{int(time.time() // 3600)}"
+            signal_marker = f"accountflip_{pair_key}_{int(time.time() // 300)}"
 
             for account in subscribers:
                 user_id = account["user_id"]
@@ -3166,7 +3152,7 @@ async def run_account_flip_entry_scan(context: ContextTypes.DEFAULT_TYPE):
                             chat_id=int(user_id),
                             text=(
                                 f"🚀 <b>Account Flip — {direction} {pair_config['display']}</b>\n\n"
-                                f"Pattern: {vote['strategy']}\n"
+                                f"Signal: ML model on 1-minute candles\n"
                                 f"Entry: {entry_price:.4f} | SL: {stop_loss:.4f}\n"
                                 f"Volume: {base_lot} lots (layer 1)\n\n"
                                 f"No take-profit set - this position rides on a trailing "
@@ -30979,7 +30965,7 @@ def main():
     # without re-checking on every tick.
     job_queue.run_repeating(
         run_account_flip_entry_scan,
-        interval=300,
+        interval=60,
         first=100,
         name="account_flip_entry_scan"
     )

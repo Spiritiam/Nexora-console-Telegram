@@ -1760,8 +1760,6 @@ async def run_mt5_autotrade_bot_scan(context: ContextTypes.DEFAULT_TYPE):
         combos.setdefault(key, []).append(account)
 
     for (bot_key, pair_key), subscribers in combos.items():
-        if bot_key == "aggressive_scalper" and pair_key in XC_PAIRS:
-            continue  # handled by the dedicated metals x USDCHF divergence scalper (run_xc_scalper_tick)
         if bot_key in ("aggressive_scalper", "aggressive_breakout"):
             continue  # handled by the aggressive engine (run_aggressive_entry_scan)
         bot_info = MT5_AUTOTRADE_BOTS.get(bot_key)
@@ -2206,7 +2204,7 @@ async def _xc_get_subscribers():
     if isinstance(accts, list):
         _XC["subs"] = [
             a for a in accts
-            if a.get("bot_choice") in ("aggressive_scalper", "account_flip")
+            if a.get("bot_choice") == "account_flip"
             and a.get("pair_choice") in XC_PAIRS
             and a.get("metaapi_account_id")
         ]
@@ -2569,9 +2567,9 @@ async def manage_xc_positions(context: ContextTypes.DEFAULT_TYPE):
 
 
 # ============================================
-# AGGRESSIVE ENGINE: Aggressive Scalper (BTC, oil) and Aggressive Breakout
-# (gold, silver, BTC, oil). Gold/silver Aggressive Scalper stays on the
-# USDCHF divergence scalper above.
+# AGGRESSIVE ENGINE: Aggressive Scalper and Aggressive Breakout on every pair
+# (gold, silver, BTC, oil), all driven by the ML model on 1-minute candles.
+# The USDCHF divergence scalper above now only serves Account Flip.
 #   - 1-minute candles, ML model decides the direction
 #   - a bot-specific trigger must agree with the ML direction:
 #       Scalper : EMA pullback or MACD cross
@@ -2628,7 +2626,6 @@ async def _ag_get_subscribers():
             if a.get("bot_choice") in AGG_CORE
             and a.get("pair_choice") in AGG_PAIR_CFG
             and a.get("metaapi_account_id")
-            and not (a.get("bot_choice") == "aggressive_scalper" and a.get("pair_choice") in XC_PAIRS)
         ]
         _AG["subs_at"] = time.time()
     return _AG["subs"]

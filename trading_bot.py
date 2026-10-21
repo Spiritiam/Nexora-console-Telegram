@@ -18853,14 +18853,15 @@ def _chart_finish(fig, ax, x, times, candles, entry, sl, tp, title, save_path, s
             sub_ax.legend(loc="upper left", facecolor="#0f1115", edgecolor="#2d3139", labelcolor="#e5e7eb", fontsize=8)
         sub_ax.grid(color="#1f2329", linewidth=0.5, alpha=0.5)
 
-    plt.tight_layout() if sub_ax is None else None
+    if sub_ax is None:
+        fig.tight_layout()
     try:
-        plt.savefig(save_path, facecolor="#0f1115")
+        fig.savefig(save_path, facecolor="#0f1115")
     finally:
         plt.close(fig)
 
 
-def generate_daily_line_chart(display_name, direction, daily_history, save_path, entry=None, sl=None, tp=None):
+def _generate_daily_line_chart_unlocked(display_name, direction, daily_history, save_path, entry=None, sl=None, tp=None):
     """
     Dedicated chart for the XAGUSD daily fallback ONLY. Draws a real
     LINE chart of actual daily closes - deliberately NOT a
@@ -18937,8 +18938,8 @@ def generate_daily_line_chart(display_name, direction, daily_history, save_path,
         )
         ax.grid(color="#1f2329", linewidth=0.5, alpha=0.5)
 
-        plt.tight_layout()
-        plt.savefig(save_path, facecolor="#0f1115")
+        fig.tight_layout()
+        fig.savefig(save_path, facecolor="#0f1115")
         plt.close(fig)
         return True
     except Exception as e:
@@ -18950,7 +18951,7 @@ def generate_daily_line_chart(display_name, direction, daily_history, save_path,
         return False
 
 
-def generate_signal_chart(display_name, strategy_name, direction, candles, entry, sl, tp, save_path, display_window=70, anchor_live=True, tp1=None):
+def _generate_signal_chart_unlocked(display_name, strategy_name, direction, candles, entry, sl, tp, save_path, display_window=70, anchor_live=True, tp1=None):
     """
     Generates one chart PNG for a signal. candles = the SAME candle
     list the winning strategy actually used (h1_candles for most
@@ -19286,6 +19287,32 @@ def generate_signal_chart(display_name, strategy_name, direction, candles, entry
         except Exception:
             pass
         return False
+
+
+# Charts are rendered from worker threads (asyncio.to_thread), often several
+# at once when signals fire together. pyplot keeps ONE global "current
+# figure", so concurrent renders were saving/closing each other's figures -
+# the cause of the occasional candle-less, half-drawn charts. Rendering is
+# now serialized behind one lock (each takes about a second).
+_CHART_RENDER_LOCK = threading.Lock()
+
+
+def generate_signal_chart(*args, **kwargs):
+    with _CHART_RENDER_LOCK:
+        try:
+            plt.close("all")
+        except Exception:
+            pass
+        return _generate_signal_chart_unlocked(*args, **kwargs)
+
+
+def generate_daily_line_chart(*args, **kwargs):
+    with _CHART_RENDER_LOCK:
+        try:
+            plt.close("all")
+        except Exception:
+            pass
+        return _generate_daily_line_chart_unlocked(*args, **kwargs)
 
 
 # ============================================

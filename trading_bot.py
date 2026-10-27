@@ -4678,6 +4678,31 @@ def _napp_exness_account_owner_sync(number, synth):
         return None, False
 
 
+def _exness_account_owner_for_link_sync(number, uid):
+    """(other_user_id_or_None, ok) - who ELSE really has this trading account
+    linked, used by both the Telegram sign-up and the app connect.
+    An app row counts as linked as soon as it holds the number. A Telegram row
+    only counts once its MetaAPI account is set, because the Telegram sign-up
+    saves the account number at its first step, so a half-finished sign-up
+    must not block the real owner."""
+    try:
+        r = requests.get(
+            f"{SUPABASE_URL}/rest/v1/mt5_auto_trade_accounts",
+            params={"account_number": f"eq.{str(number).strip()}", "user_id": f"neq.{uid}",
+                    "select": "user_id,metaapi_account_id", "limit": "20"},
+            headers=sb_headers(), timeout=10)
+        rows = r.json()
+        if r.status_code != 200 or not isinstance(rows, list):
+            return None, False
+        for row in rows:
+            other = str(row.get("user_id"))
+            if _is_app_synth(other) or row.get("metaapi_account_id"):
+                return other, True
+        return None, True
+    except Exception:
+        return None, False
+
+
 def _napp_exness_expiry(row):
     """Naive UTC expiry datetime of the subscription, or None."""
     try:
@@ -5640,7 +5665,7 @@ async def _napp_exness_connect_checked(synth, number, password, server, name, re
     if accts and number not in [str(a) for a in accts]:
         return _napp_ex_reply("account_not_yours")
 
-    other, ook = await asyncio.to_thread(_napp_exness_account_owner_sync, number, synth)
+    other, ook = await asyncio.to_thread(_exness_account_owner_for_link_sync, number, synth)
     if not ook:
         return _napp_ex_reply("server_error", status=503)
     if other:
@@ -25932,7 +25957,7 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             "🔌 <b>Unlink your Exness account?</b>\n\n"
             "This will:\n"
             "• stop Exness Auto-Trade and remove your Exness trading account from Nexora AI\n"
-            + (f"• free your Exness email ({masked}) so you can use it on another Nexora account\n" if masked else "")
+            + (f"• free your Exness email ({masked}) so you can use it in the SpiritFX Academy app\n" if masked else "")
             + "\n⚠️ Trades already open on your Exness account stay open, but Nexora "
             "stops managing them (including any Account Flip stack).\n\n"
             f"You can unlink up to {NAPP_EXNESS_UNLINKS_PER_MONTH} times a month. "
@@ -25958,8 +25983,8 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if status == "ok":
             await query.message.edit_text(
                 "✅ <b>Exness account unlinked.</b>\n\n"
-                "Your Exness email is free now. You can use it on another "
-                "Nexora account, or verify it here again any time.",
+                "Your Exness email is free now. You can use it in the "
+                "SpiritFX Academy app, or verify it here again any time.",
                 parse_mode=ParseMode.HTML
             )
         elif status == "nothing":
@@ -27212,13 +27237,13 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
         existing_owner = get_verified_user_by_email(email)
         if existing_owner and str(existing_owner.get("user_id")) != user_id and _is_app_synth(existing_owner.get("user_id")):
-            # Linked on the other Nexora platform, not on another Telegram
+            # Linked in the SpiritFX Academy app, not on another Telegram
             # account: say where, and exactly how to free it.
             sent_email_other_platform = await update.message.reply_text(
-                "🚫 <b>This Exness email is already linked to another Nexora "
-                "account, outside this bot.</b>\n\n"
-                "To use it here, unlink it there first: open that account, "
-                "go to <b>Exness Auto-Trade</b> and tap <b>Unlink</b>. "
+                "🚫 <b>This Exness email is already linked in the "
+                "SpiritFX Academy app.</b>\n\n"
+                "To use it here, open the SpiritFX Academy app, go to "
+                "<b>Exness Auto-Trade</b> and tap <b>Unlink</b>. "
                 "Then come back here and enter your email again.",
                 parse_mode=ParseMode.HTML
             )
@@ -27774,6 +27799,42 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
         # showed a generic "here's what you can do" fallback instead.
         # Saving each field the moment it's collected means this
         # survives a restart - see the recovery check further below.
+        # The same trading account can only be linked once: check it before
+        # saving anything. The person stays on this step, so they can send
+        # the number again after unlinking, or send a different one.
+        other_owner, owner_ok = await asyncio.to_thread(
+            _exness_account_owner_for_link_sync, message.strip(), user_id
+        )
+        if not owner_ok:
+            sent_owner_check = await update.message.reply_text(
+                "⚠️ <b>Couldn't check that account right now.</b>\n\n"
+                "Please send your account number again in a moment.",
+                parse_mode=ParseMode.HTML
+            )
+            schedule_auto_delete(sent_owner_check.chat_id, sent_owner_check.message_id)
+            return
+        if other_owner:
+            if _is_app_synth(other_owner):
+                owner_text = (
+                    "🚫 <b>This Exness trading account is already linked in the "
+                    "SpiritFX Academy app.</b>\n\n"
+                    "To use it here, open the SpiritFX Academy app, go to "
+                    "<b>Exness Auto-Trade</b> and tap <b>Unlink</b>. Then come "
+                    "back here and send your account number again."
+                )
+            else:
+                owner_text = (
+                    "🚫 <b>This Exness trading account is already linked to "
+                    "another Nexora AI Telegram account.</b>\n\n"
+                    "Each trading account can only be linked once. If it is "
+                    "yours, use the Telegram account you linked it with, tap "
+                    "<b>🤖 Exness Auto-Trade</b> then <b>🔌 Unlink my Exness "
+                    "account</b> there, and then send your account number "
+                    "again here."
+                )
+            sent_owner_taken = await update.message.reply_text(owner_text, parse_mode=ParseMode.HTML)
+            schedule_auto_delete(sent_owner_taken.chat_id, sent_owner_taken.message_id)
+            return
         mt5_signup_state[user_id] = {"account_number": message.strip()}
         try:
             upsert_mt5_autotrade_account(user_id, {"account_number": message.strip()})

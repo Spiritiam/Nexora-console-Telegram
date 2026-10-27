@@ -4823,6 +4823,113 @@ async def _napp_unlink_retry_removal(log_id, metaapi_account_id):
             return
 
 
+async def exness_unlink_for_telegram(user_id):
+    """Telegram twin of nexora_app_exness_disconnect_handler: the same steps
+    and the same monthly limit (3, shared through exness_unlink_log), for a
+    user who unlinks from the bot. Returns (status, info) where status is
+    one of: ok, nothing, limit, error."""
+    uid = str(user_id)
+    verified, email, vok = await asyncio.to_thread(_napp_exness_verified_sync, uid)
+    row, rok = await asyncio.to_thread(_napp_exness_row_sync, uid)
+    if not vok or not rok:
+        return "error", {}
+    has_account = bool(row and (row.get("metaapi_account_id") or row.get("account_number")))
+    if not (verified or has_account):
+        return "nothing", {}
+    used, uok = await asyncio.to_thread(_napp_exness_unlinks_used_sync, uid)
+    if not uok:
+        return "error", {}
+    if used >= NAPP_EXNESS_UNLINKS_PER_MONTH:
+        return "limit", {"reset": _napp_ex_next_month_start()}
+
+    mt5_login = (row or {}).get("account_number")
+    metaapi_id = (row or {}).get("metaapi_account_id")
+
+    # The bot can no longer see this account (it needs metaapi_account_id)
+    # and every credential is wiped, in one write. The row, subscription
+    # expiry and bot settings stay.
+    if row:
+        try:
+            r = await asyncio.to_thread(
+                requests.patch,
+                f"{SUPABASE_URL}/rest/v1/mt5_auto_trade_accounts?user_id=eq.{uid}",
+                headers=sb_headers(),
+                json={"metaapi_account_id": None, "account_number": None, "encrypted_password": None,
+                      "server": None, "account_name": None, "symbol_map": None, "is_active": False},
+                timeout=10)
+            if r.status_code not in (200, 204):
+                raise RuntimeError(f"HTTP {r.status_code}")
+        except Exception as e:
+            print(f"[EXNESS UNLINK] telegram account wipe failed for {uid}: {type(e).__name__}")
+            return "error", {}
+
+    # An open Account Flip stack is no longer managed: closed in our records
+    # only, nothing is closed on Exness.
+    try:
+        await asyncio.to_thread(
+            requests.patch,
+            f"{SUPABASE_URL}/rest/v1/mt5_flip_stacks?user_id=eq.{uid}&status=eq.OPEN",
+            headers=sb_headers(),
+            json={"status": "CLOSED", "closed_at": datetime.utcnow().isoformat()}, timeout=10)
+    except Exception as e:
+        print(f"[EXNESS UNLINK] telegram flip stack close failed for {uid}: {type(e).__name__}")
+    try:
+        await asyncio.to_thread(
+            requests.patch,
+            f"{SUPABASE_URL}/rest/v1/pending_mt5_provisioning?user_id=eq.{uid}&status=eq.in_progress",
+            headers=sb_headers(),
+            json={"status": "cancelled", "resolved_at": datetime.utcnow().isoformat()}, timeout=10)
+    except Exception as e:
+        print(f"[EXNESS UNLINK] telegram provisioning cancel failed for {uid}: {type(e).__name__}")
+
+    # Free the verified Exness email. If this fails, stop before logging so
+    # the attempt is not counted against the monthly limit; tapping again
+    # finishes it.
+    if verified:
+        ok_v = await asyncio.to_thread(_remove_verified_user_sync, uid)
+        if not ok_v:
+            print(f"[EXNESS UNLINK] telegram verified email removal failed for {uid}")
+            # The account row is already wiped, so its MetaAPI account would
+            # be orphaned: remove it now (retried by the background job's own
+            # path if this fails) and let the person tap Unlink again to
+            # finish freeing the email.
+            if metaapi_id:
+                _napp_exness_spawn(_napp_remove_metaapi_checked(metaapi_id))
+            return "error", {}
+
+    removed = True
+    if metaapi_id:
+        try:
+            removed = await asyncio.wait_for(_napp_remove_metaapi_checked(metaapi_id), 60)
+        except Exception as e:
+            print(f"[EXNESS UNLINK] telegram MetaAPI removal error for {uid}: {type(e).__name__}")
+            removed = False
+
+    log_id = None
+    try:
+        lr = await asyncio.to_thread(
+            requests.post,
+            f"{SUPABASE_URL}/rest/v1/exness_unlink_log",
+            headers={**sb_headers(), "Prefer": "return=representation"},
+            json={"user_key": f"telegram:{uid}", "user_id": uid, "unlinked_email": email,
+                  "mt5_login": mt5_login, "metaapi_account_id": metaapi_id,
+                  "metaapi_removed": bool(removed)}, timeout=10)
+        data = lr.json()
+        log_id = data[0]["id"] if isinstance(data, list) and data else None
+        if lr.status_code not in (200, 201):
+            print(f"[EXNESS UNLINK] telegram LOG WRITE REJECTED for {uid}: HTTP {lr.status_code}")
+    except Exception as e:
+        print(f"[EXNESS UNLINK] telegram LOG WRITE FAILED for {uid}: {type(e).__name__}")
+    print(f"[EXNESS UNLINK] source=telegram user_id={uid} email={email} mt5_login={mt5_login} "
+          f"metaapi_removed={removed} at {datetime.utcnow().isoformat()}Z")
+    if metaapi_id and not removed:
+        if log_id:
+            _napp_exness_spawn(_napp_unlink_retry_removal(log_id, metaapi_id))
+        else:
+            _napp_exness_spawn(_napp_remove_metaapi_checked(metaapi_id))
+    return "ok", {"email": email}
+
+
 async def retry_exness_unlink_removals(context: ContextTypes.DEFAULT_TYPE):
     """Every 30 minutes: finish any MetaAPI removal that failed during an
     unlink (also covers a restart that lost the in-memory retry)."""
@@ -4999,6 +5106,12 @@ NAPP_EX_CODES = {
     "email_linked_elsewhere": (False, 409, "Email already in use",
                                "This email ({email}) is already linked to another SpiritFX account. Please use the email of your own Exness account.",
                                "retry", "taken"),
+    "email_linked_telegram": (False, 409, "Linked on the Telegram bot",
+                              "This Exness email ({email}) is linked to the Nexora AI Telegram bot. To use it here, open the bot on Telegram, tap Exness Auto-Trade, then tap Unlink my Exness account. After that, come back here, enter the email again and tap Check my Exness account.",
+                              "open_telegram_bot", "taken"),
+    "account_linked_telegram": (False, 409, "Account linked on the Telegram bot",
+                                "That trading account is linked to the Nexora AI Telegram bot. To use it here, open the bot on Telegram, tap Exness Auto-Trade, then tap Unlink my Exness account. After that, come back here and connect it again.",
+                                "open_telegram_bot", "account_taken"),
     "already_linked_other_email": (False, 409, "Another email is linked",
                                    "Your SpiritFX account is already linked to {email}. To use a different email, unlink that account first.",
                                    "none", "bad_request"),
@@ -5080,6 +5193,8 @@ def _napp_ex_reply(code, *, status=None, retry_at=None, ref_url=None, extra=None
         ref_url = ref_url or EXNESS_LINK
         fmt.setdefault("ref", ref_url)
         guide = _napp_ex_guide()
+    elif code in ("email_linked_telegram", "account_linked_telegram"):
+        ref_url = ref_url or f"https://t.me/{BOT_USERNAME}"
     try:
         message = message.format(**fmt) if fmt else message
     except Exception:
@@ -5292,8 +5407,13 @@ async def nexora_app_exness_verify_handler(request):
     if not ook:
         return _napp_ex_reply("server_error", status=503)
     if owner and owner != synth:
+        # Say WHERE it is linked: on the Telegram bot (the person unlinks
+        # there) or on another app account.
+        if not _is_app_synth(owner):
+            return _napp_ex_reply("email_linked_telegram", email=_napp_exness_mask_email2(email) or "This email",
+                                  extra={"verified": False, "result": "taken", "linked_on": "telegram"})
         return _napp_ex_reply("email_linked_elsewhere", email=_napp_exness_mask_email2(email) or "This email",
-                              extra={"verified": False, "result": "taken"})
+                              extra={"verified": False, "result": "taken", "linked_on": "app"})
 
     try:
         verdict, detail, _accts = await _napp_run_on_main(exness_check_email(email), 70)
@@ -5524,7 +5644,9 @@ async def _napp_exness_connect_checked(synth, number, password, server, name, re
     if not ook:
         return _napp_ex_reply("server_error", status=503)
     if other:
-        return _napp_ex_reply("account_linked_elsewhere")
+        if not _is_app_synth(other):
+            return _napp_ex_reply("account_linked_telegram", extra={"linked_on": "telegram"})
+        return _napp_ex_reply("account_linked_elsewhere", extra={"linked_on": "app"})
     if _napp_exness_limited("connect", synth, 10):
         retry = _napp_ex_limit_retry_at("connect", synth)
         return _napp_ex_reply("too_many_attempts", retry_at=retry,
@@ -24577,6 +24699,7 @@ async def build_exness_autotrade_dashboard(user_id, account, expiry, now):
         [InlineKeyboardButton("⚙️ Change lot size / risk %", callback_data="mt5settings_change")],
         [InlineKeyboardButton("🔄 Switch bot / signal mode", callback_data="mt5switch_menu")],
         [toggle_button],
+        [InlineKeyboardButton("🔌 Unlink my Exness account", callback_data="exunlink_ask")],
     ])
     return text, markup
 
@@ -24634,6 +24757,14 @@ async def send_exness_autotrade_intro(bot, chat_id):
     two different doors into it, mirroring the same pattern already
     used for send_connect_instructions/send_tier_selection.
     """
+    intro_rows = [[InlineKeyboardButton("➡️ Continue", callback_data="mt5auto_start")]]
+    # Anyone with a verified Exness email (or a saved Exness account) can
+    # unlink it here, even without an active subscription.
+    try:
+        if await asyncio.to_thread(get_verified_user_email, str(chat_id)):
+            intro_rows.append([InlineKeyboardButton("🔌 Unlink my Exness account", callback_data="exunlink_ask")])
+    except Exception as e:
+        print(f"[EXNESS UNLINK] intro unlink-button check failed: {type(e).__name__}")
     sent_info = await bot.send_message(
         chat_id=chat_id,
         text=(
@@ -24659,9 +24790,7 @@ async def send_exness_autotrade_intro(bot, chat_id):
             "Ready to continue?"
         ),
         parse_mode=ParseMode.HTML,
-        reply_markup=InlineKeyboardMarkup([
-            [InlineKeyboardButton("➡️ Continue", callback_data="mt5auto_start")]
-        ])
+        reply_markup=InlineKeyboardMarkup(intro_rows)
     )
     schedule_auto_delete(sent_info.chat_id, sent_info.message_id)
 
@@ -25784,6 +25913,68 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             parse_mode=ParseMode.HTML,
             reply_markup=InlineKeyboardMarkup(buttons)
         )
+        return
+
+    # Unlink the Exness account / verified email from the Telegram bot, so
+    # it can be used on another Nexora account. Same rules as the unlink in
+    # the app: a monthly limit of 3, credentials wiped, MetaAPI account
+    # removed, an open Account Flip stack is no longer managed.
+    if data == "exunlink_ask":
+        user_id = str(query.from_user.id)
+        verified_email = await asyncio.to_thread(get_verified_user_email, user_id)
+        row, _rok = await asyncio.to_thread(_napp_exness_row_sync, user_id)
+        has_account = bool(row and (row.get("metaapi_account_id") or row.get("account_number")))
+        if not verified_email and not has_account:
+            await query.message.edit_text("You don't have an Exness account linked to unlink.")
+            return
+        masked = _napp_exness_mask_email2(verified_email) if verified_email else None
+        await query.message.edit_text(
+            "🔌 <b>Unlink your Exness account?</b>\n\n"
+            "This will:\n"
+            "• stop Exness Auto-Trade and remove your Exness trading account from Nexora AI\n"
+            + (f"• free your Exness email ({masked}) so you can use it on another Nexora account\n" if masked else "")
+            + "\n⚠️ Trades already open on your Exness account stay open, but Nexora "
+            "stops managing them (including any Account Flip stack).\n\n"
+            f"You can unlink up to {NAPP_EXNESS_UNLINKS_PER_MONTH} times a month. "
+            "Any subscription days you have left are kept.",
+            parse_mode=ParseMode.HTML,
+            reply_markup=InlineKeyboardMarkup([
+                [InlineKeyboardButton("✅ Yes, unlink", callback_data="exunlink_yes")],
+                [InlineKeyboardButton("Cancel", callback_data="exunlink_no")],
+            ])
+        )
+        return
+
+    if data == "exunlink_no":
+        await query.message.edit_text("Okay, nothing was changed.")
+        return
+
+    if data == "exunlink_yes":
+        user_id = str(query.from_user.id)
+        await query.message.edit_text("⏳ <b>Unlinking...</b>", parse_mode=ParseMode.HTML)
+        status, info = await exness_unlink_for_telegram(user_id)
+        user_modes.pop(user_id, None)
+        mt5_signup_state.pop(user_id, None)
+        if status == "ok":
+            await query.message.edit_text(
+                "✅ <b>Exness account unlinked.</b>\n\n"
+                "Your Exness email is free now. You can use it on another "
+                "Nexora account, or verify it here again any time.",
+                parse_mode=ParseMode.HTML
+            )
+        elif status == "nothing":
+            await query.message.edit_text("You don't have an Exness account linked to unlink.")
+        elif status == "limit":
+            await query.message.edit_text(
+                f"⏳ <b>You've used all {NAPP_EXNESS_UNLINKS_PER_MONTH} unlinks for this month.</b>\n\n"
+                f"You can unlink again on {_napp_ex_date_words(info['reset'])}.",
+                parse_mode=ParseMode.HTML
+            )
+        else:
+            await query.message.edit_text(
+                "⚠️ <b>Couldn't unlink right now.</b>\n\nPlease try again in a moment.",
+                parse_mode=ParseMode.HTML
+            )
         return
 
     if data == "derivdisc_ask":
@@ -27020,6 +27211,19 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
             return
 
         existing_owner = get_verified_user_by_email(email)
+        if existing_owner and str(existing_owner.get("user_id")) != user_id and _is_app_synth(existing_owner.get("user_id")):
+            # Linked on the other Nexora platform, not on another Telegram
+            # account: say where, and exactly how to free it.
+            sent_email_other_platform = await update.message.reply_text(
+                "🚫 <b>This Exness email is already linked to another Nexora "
+                "account, outside this bot.</b>\n\n"
+                "To use it here, unlink it there first: open that account, "
+                "go to <b>Exness Auto-Trade</b> and tap <b>Unlink</b>. "
+                "Then come back here and enter your email again.",
+                parse_mode=ParseMode.HTML
+            )
+            schedule_auto_delete(sent_email_other_platform.chat_id, sent_email_other_platform.message_id)
+            return
         if existing_owner and str(existing_owner.get("user_id")) != user_id:
             sent_email_used = await update.message.reply_text(
                 "🚫 <b>This email has already been used and verified by "

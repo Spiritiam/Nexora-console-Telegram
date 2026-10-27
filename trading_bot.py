@@ -11044,6 +11044,13 @@ async def build_synthetic_signal_response(index_key, min_agree=2):
         "entry_price": entry_price,
         "sl_price": sl_price,
         "tp_price": tp_price,
+        # Inner Circle-only follow-up text. Popped by the channel poster
+        # before the context is stored, so it never reaches a user trade.
+        "_rationale": build_inner_circle_rationale(
+            config["display"], direction, entry_price, sl_price, tp_price,
+            None, h1_candles, h4_candles, daily_candles,
+            agreeing_strategies, confidence, None, 2,
+        ),
     }
 
     return image_file_id, message, trade_context
@@ -18372,6 +18379,341 @@ def get_market_session():
     return "Market Closing Session 🌙"
 
 # ============================================
+# INNER CIRCLE EXCLUSIVE CONTENT
+# Two things that go ONLY to the Inner Circle channel (CHANNEL_2_ID),
+# never to the public channel or the official Nexora AI channel:
+#   1. A short "Why this trade" follow-up under every signal.
+#   2. "Key Point" education cards, 4 a week.
+# Everything here is read-only text built from data the signal already
+# had; it never changes a signal, a trade or any other channel's post.
+# ============================================
+
+def build_inner_circle_rationale(display, direction, entry, sl, tp2, tp1=None,
+                                 h1=None, h4=None, daily=None, agreeing=None,
+                                 confidence=None, session=None, decimals=2):
+    """Returns the Inner Circle 'Why this trade' HTML message, or None if
+    there isn't enough real data to say anything honest. Only states
+    facts computed from the same candles the signal used."""
+    try:
+        if direction not in ("BUY", "SELL") or entry is None or sl is None:
+            return None
+        buy = direction == "BUY"
+        entry = float(entry)
+        sl = float(sl)
+
+        def fmt(v):
+            return f"{float(v):.{decimals}f}"
+
+        def ema_side(candles, period):
+            if not candles or len(candles) < period + 5:
+                return None
+            ema = calculate_ema_series(candles, period)
+            if not ema:
+                return None
+            return candles[-1]["close"] > ema[-1]
+
+        def mark(up):
+            return "✅" if (up == buy) else "⚠️"
+
+        lines = []
+
+        trend_bits = []
+        for label, candles in (("H1", h1), ("H4", h4)):
+            side = ema_side(candles, 50)
+            if side is not None:
+                trend_bits.append(f"{mark(side)} {label} {'above' if side else 'below'} EMA50")
+        if daily and len(daily) >= 6:
+            up = daily[-1]["close"] > daily[-6]["close"]
+            trend_bits.append(f"{mark(up)} Daily {'up' if up else 'down'} over 5 days")
+        if trend_bits:
+            lines.append("<b>Trend:</b> " + " · ".join(trend_bits))
+
+        if h1 and len(h1) >= 30:
+            rsi = calculate_rsi(h1, 14)
+            if rsi:
+                r = rsi[-1]
+                if r >= 70:
+                    tag = "overbought zone"
+                elif r <= 30:
+                    tag = "oversold zone"
+                elif r >= 55:
+                    tag = "bullish momentum"
+                elif r <= 45:
+                    tag = "bearish momentum"
+                else:
+                    tag = "neutral"
+                lines.append(f"<b>Momentum:</b> RSI(14) on H1 is {r:.0f} ({tag})")
+
+        if h1 and len(h1) >= 40:
+            swings = find_swing_points(h1[-120:], strength=3)
+            if buy:
+                levels = [s["price"] for s in swings if s["type"] == "low" and s["price"] < entry]
+                if levels:
+                    lines.append(f"<b>Nearest support:</b> {fmt(levels[-1])} (latest H1 swing low)")
+            else:
+                levels = [s["price"] for s in swings if s["type"] == "high" and s["price"] > entry]
+                if levels:
+                    lines.append(f"<b>Nearest resistance:</b> {fmt(levels[-1])} (latest H1 swing high)")
+
+        risk = abs(entry - sl)
+        if risk > 0:
+            atr_txt = ""
+            atr = calculate_atr_series(h1, 14) if h1 else []
+            if atr and atr[-1] > 0:
+                atr_txt = f" (about {risk / atr[-1]:.1f}× the H1 ATR)"
+            rr = []
+            if tp1 is not None:
+                rr.append(f"TP1 1:{abs(float(tp1) - entry) / risk:.1f}")
+            if tp2 is not None:
+                rr.append(f"TP2 1:{abs(float(tp2) - entry) / risk:.1f}")
+            lines.append(
+                f"<b>Risk:</b> stop is {fmt(risk)} from entry{atr_txt}"
+                + (" · " + " · ".join(rr) if rr else "")
+            )
+
+        names = [str(n) for n in (agreeing or []) if n]
+        if names:
+            shown = ", ".join(names[:4]) + (f" +{len(names) - 4} more" if len(names) > 4 else "")
+            lines.append(f"<b>Confluence:</b> {len(names)} strategies agree: {_esc(shown)}")
+
+        extra = []
+        if confidence:
+            extra.append(f"model confidence {confidence}%")
+        if session:
+            extra.append(str(session))
+        if extra:
+            lines.append("<b>Context:</b> " + " · ".join(extra))
+
+        lines.append(f"<b>The idea is wrong if</b> price trades through {fmt(sl)}. That level is the plan, not a suggestion.")
+
+        # Fewer than 3 real facts besides the closing line is not worth sending.
+        if len(lines) < 4:
+            return None
+
+        return (
+            f"🔐 <b>INNER CIRCLE · Why this trade</b>\n"
+            f"<b>{direction} {_esc(str(display))}</b>\n\n"
+            + "\n".join(f"• {l}" for l in lines)
+            + "\n\n<i>Inner Circle only · education, not financial advice</i>"
+        )
+    except Exception as e:
+        print(f"[INNER CIRCLE] rationale build failed: {e}")
+        return None
+
+
+async def send_inner_circle_rationale(bot, text, reply_to_message_id=None):
+    """Posts the 'Why this trade' follow-up to the Inner Circle channel
+    only, as a reply under that channel's copy of the signal."""
+    if not text:
+        return
+    try:
+        from telegram import ReplyParameters
+        kwargs = {}
+        if reply_to_message_id:
+            kwargs["reply_parameters"] = ReplyParameters(
+                message_id=reply_to_message_id, allow_sending_without_reply=True
+            )
+        await bot.send_message(
+            chat_id=CHANNEL_2_ID,
+            text=text,
+            parse_mode=ParseMode.HTML,
+            disable_web_page_preview=True,
+            **kwargs
+        )
+        print("[INNER CIRCLE] ✅ rationale posted")
+    except Exception as e:
+        print(f"[INNER CIRCLE] ❌ rationale failed: {e}")
+
+
+# Key Point cards: (title, [bullets]). Plain education, no promises, no
+# claims about how any specific trade will end. Rotation is stateless
+# (derived from the date) so a restart can never repeat or skip a card.
+INNER_CIRCLE_KEY_POINTS = [
+    ("Risk a small, fixed slice of your account", [
+        "Most professionals risk 0.5% to 1% of the account on a single trade.",
+        "At 1%, ten losses in a row cost about 10%, which you can recover from.",
+        "At 10% per trade, the same streak nearly wipes you out.",
+        "Pick the percentage first. Then size the trade to fit it.",
+    ]),
+    ("Size the trade from the stop, not from a feeling", [
+        "Lot size = money you accept to lose ÷ (stop distance in pips × value per pip).",
+        "Example: $1,000 account, 1% risk = $10. A 50-pip stop on EURUSD means 0.02 lots.",
+        "A wider stop means a smaller lot, never the same lot with more hope.",
+    ]),
+    ("The stop loss is where the idea fails", [
+        "A stop is not a price you hope to avoid. It is the level where the trade idea is proven wrong.",
+        "Decide it before you enter, from the chart, not from how much you can afford to lose.",
+        "If the stop you need is too wide for your risk, reduce the lot or skip the trade.",
+    ]),
+    ("Never move a stop further away", [
+        "Moving a stop closer to lock in profit is a decision. Moving it further away is hoping.",
+        "One widened stop can erase ten small disciplined wins.",
+        "If you would not enter the trade at the new stop, you should not hold it there.",
+    ]),
+    ("Why signals show TP1 and TP2", [
+        "TP1 is the nearer target. It is where many traders take part of the profit.",
+        "TP2 is the full target, where the larger move would complete.",
+        "Taking some at TP1 reduces stress. Leaving some for TP2 keeps the reward larger than the risk.",
+        "Choose your approach before the trade starts and stick to it.",
+    ]),
+    ("Win rate is not the whole story", [
+        "With a 1:2 risk-to-reward, you can lose more often than you win and still come out ahead.",
+        "Example: 10 trades, 4 wins at +2R and 6 losses at -1R = +2R overall.",
+        "Judge a method by results over many trades, not by the last two.",
+    ]),
+    ("A losing trade is not a mistake", [
+        "A trade that followed the plan and lost is a normal cost of doing business.",
+        "A trade that broke the plan and won is still a bad habit being rewarded.",
+        "Review your process, not just the result.",
+    ]),
+    ("Do not chase a signal that already moved", [
+        "Your entry decides your risk-to-reward. The later you enter, the worse it gets.",
+        "If price has already run a large part of the way to TP1, the setup you were given is gone.",
+        "Missing a trade costs nothing. Chasing one can cost a full stop.",
+    ]),
+    ("Higher timeframes set the direction", [
+        "A buy on H1 with the daily and H4 also rising has more room to run.",
+        "A buy against a falling daily trend is a counter-trend trade and deserves a smaller size.",
+        "Check the bigger picture first, then look for the entry.",
+    ]),
+    ("RSI overbought does not mean sell", [
+        "Above 70 means price has moved strongly. In a strong trend it can stay there for a long time.",
+        "RSI is most useful for judging momentum and spotting divergence, not for guessing tops.",
+        "Combine it with trend and structure before acting on it.",
+    ]),
+    ("What ATR tells you", [
+        "ATR is the average distance price moves per candle, so it measures how volatile the market is right now.",
+        "A stop tighter than normal volatility gets hit by noise, not by a real reversal.",
+        "That is why stop distances differ between pairs and between quiet and busy days.",
+    ]),
+    ("Support and resistance flip", [
+        "When price breaks above resistance, that old ceiling often becomes support.",
+        "The reverse is true when support breaks.",
+        "Retests of a broken level are where many continuation entries are taken.",
+    ]),
+    ("Liquidity sweeps: why stops get run", [
+        "Clusters of stop orders sit just above recent highs and just below recent lows.",
+        "Price sometimes pokes through that level, triggers those stops, then reverses.",
+        "A close back inside the range after the poke is a stronger sign than the poke itself.",
+    ]),
+    ("Trade the sessions that move", [
+        "London and New York carry most of the volume in gold and the major pairs.",
+        "The London and New York overlap is usually the busiest window of the day.",
+        "The Asian session is often quieter, so moves can be smaller and choppier.",
+    ]),
+    ("High-impact news changes the rules", [
+        "Around major releases, spreads widen and price can jump past your stop.",
+        "Check the economic calendar before you hold a trade through a big release.",
+        "Staying flat through the news is a position too.",
+    ]),
+    ("Drawdown math is not symmetric", [
+        "Lose 10% and you need 11.1% to get back. Lose 20% and you need 25%.",
+        "Lose 50% and you need 100%.",
+        "Protecting capital matters more than chasing a big week.",
+    ]),
+    ("Leverage multiplies risk, not skill", [
+        "High leverage lets you open a bigger position. It does not make the trade better.",
+        "The danger is the position size relative to your account, not the leverage number on the screen.",
+        "Size by risk percentage and leverage stops being the problem.",
+    ]),
+    ("Do not revenge trade", [
+        "After a loss the urge to win it back immediately is the most expensive impulse in trading.",
+        "Rules that help: a daily loss limit, and a walk away after two losses in a row.",
+        "The next good setup will still be there tomorrow.",
+    ]),
+    ("Fewer, better trades", [
+        "More trades means more spread, more fees and more chances to make an emotional mistake.",
+        "Waiting for a clear setup is part of the job.",
+        "A day with no trade can be the right result.",
+    ]),
+    ("Keep a trading journal", [
+        "Write down the pair, entry, stop, target, reason, and how you felt.",
+        "After 30 trades you will see patterns you cannot see in your head.",
+        "Most traders repeat the same two or three mistakes. A journal shows you which.",
+    ]),
+    ("Do not stack the same bet", [
+        "EURUSD and GBPUSD often move together. Two buys on both is close to one double-sized trade.",
+        "Check what you already hold before you add another pair.",
+        "Real diversification means different risks, not different tickers.",
+    ]),
+    ("Spread and slippage cost real money", [
+        "Every trade starts slightly negative because of the spread.",
+        "On very small targets, that cost is a big share of the potential profit.",
+        "Avoid entering right at a news release or at the daily rollover, when spreads are widest.",
+    ]),
+    ("Weekend gaps", [
+        "Markets can open on Monday away from Friday's close.",
+        "A stop does not guarantee the exit price when the market gaps past it.",
+        "Many traders reduce or close positions before the weekend for this reason.",
+    ]),
+    ("Sample size: do not judge a method on five trades", [
+        "Any method has winning and losing streaks, even a good one.",
+        "Five trades tell you almost nothing. A few hundred start to.",
+        "Judge your results over a long enough window before you change the plan.",
+    ]),
+    ("Let the plan do the work", [
+        "Decide entry, stop and targets before the trade, then do not renegotiate them while it is live.",
+        "Watching every tick makes people close winners early and hold losers too long.",
+        "Set it, then step away from the screen.",
+    ]),
+    ("Protect profits without choking the trade", [
+        "Moving a stop to break-even after TP1 removes the risk, but it also makes it easier to be stopped on a normal pullback.",
+        "There is no perfect answer. It is a trade-off between safety and room to run.",
+        "Pick one rule, apply it every time, and measure it over many trades.",
+    ]),
+]
+
+# Four cards a week. Days use the same cron-style numbering as every
+# other run_daily job here (0=Sunday): Monday, Tuesday, Thursday, Friday.
+INNER_CIRCLE_CARD_DAYS = (1, 2, 4, 5)
+INNER_CIRCLE_CARD_EPOCH = datetime(2026, 10, 26)  # a Monday: card 0 is the first Monday slot
+
+_inner_circle_last_card_date = {"d": None}
+
+
+def get_inner_circle_card_index(now=None):
+    """Stateless slot -> card mapping. Slot number = (weeks since the epoch
+    Monday) * 4 + position of today's weekday in the weekly card days."""
+    now = now or datetime.utcnow()
+    cron_day = (now.weekday() + 1) % 7  # Python Mon=0 -> cron Mon=1 ... Sun=0
+    if cron_day not in INNER_CIRCLE_CARD_DAYS:
+        return None
+    weeks = (now.date() - INNER_CIRCLE_CARD_EPOCH.date()).days // 7
+    slot = weeks * len(INNER_CIRCLE_CARD_DAYS) + INNER_CIRCLE_CARD_DAYS.index(cron_day)
+    return slot % len(INNER_CIRCLE_KEY_POINTS)
+
+
+def format_inner_circle_card(index):
+    title, bullets = INNER_CIRCLE_KEY_POINTS[index]
+    return (
+        "🔐 <b>INNER CIRCLE · KEY POINT</b>\n\n"
+        f"<b>{_esc(title)}</b>\n\n"
+        + "\n".join(f"• {_esc(b)}" for b in bullets)
+        + "\n\n<i>Inner Circle only · education, not financial advice</i>"
+    )
+
+
+async def post_inner_circle_key_point(context: ContextTypes.DEFAULT_TYPE):
+    """Scheduled job: one short education card to the Inner Circle only."""
+    today = datetime.utcnow().date()
+    if _inner_circle_last_card_date["d"] == today:
+        return  # already sent today (guards against a double fire on restart)
+    idx = get_inner_circle_card_index()
+    if idx is None:
+        return
+    try:
+        await context.bot.send_message(
+            chat_id=CHANNEL_2_ID,
+            text=format_inner_circle_card(idx),
+            parse_mode=ParseMode.HTML,
+            disable_web_page_preview=True,
+        )
+        _inner_circle_last_card_date["d"] = today
+        print(f"[INNER CIRCLE] ✅ key point #{idx + 1} posted")
+    except Exception as e:
+        print(f"[INNER CIRCLE] ❌ key point failed: {e}")
+
+# ============================================
 # WEEKEND MARKET GATE (NEW)
 # Forex, gold, silver and oil are all closed
 # Saturday/Sunday. Mirrors the same Sat/Sun
@@ -20255,6 +20597,15 @@ async def build_signal_response(question, user_id=None, retry_mismatch=False):
         # instead of a guess, the next time it comes up.
         "agreeing_strategies": agreeing_strategies if bank_result else [],
         "confidence": confidence,
+        # Inner Circle-only "Why this trade" follow-up text. Built from
+        # the same candles/levels as this signal; only the Inner Circle
+        # post path reads it. None when there isn't enough data.
+        "rationale": build_inner_circle_rationale(
+            display, direction, entry_price, stop_loss, take_profit,
+            take_profit_1, h1_candles, h4_candles, daily_candles,
+            agreeing_strategies if bank_result else [], confidence,
+            session, decimals,
+        ),
         # ADDED, per explicit instruction to start retraining the ML
         # EV model on real accumulated outcomes: signal_log never
         # stored the actual feature vector each decision was based on,
@@ -27792,6 +28143,7 @@ async def _post_signal_for_pair(bot, pair_keyword):
 
         signal_id = log_signal(signal_data)
 
+        ic_signal_message_id = None
         for channel_id in [CHANNEL_1_ID, CHANNEL_2_ID, CHANNEL_3_ID]:
             try:
                 markup = (
@@ -27807,6 +28159,8 @@ async def _post_signal_for_pair(bot, pair_keyword):
                     parse_mode=ParseMode.HTML,
                     reply_markup=markup
                 )
+                if str(channel_id) == str(CHANNEL_2_ID):
+                    ic_signal_message_id = sent_msg.message_id
                 log_channel_message(signal_id, sent_msg.chat_id, sent_msg.message_id)
                 print(
                     f"[AUTO SIGNAL] ✅ {pair_keyword.upper()} "
@@ -27815,6 +28169,13 @@ async def _post_signal_for_pair(bot, pair_keyword):
 
             except Exception as e:
                 print(f"[AUTO SIGNAL] ❌ Failed for {channel_id}: {e}")
+
+        # Inner Circle only: the "Why this trade" follow-up, as a reply
+        # under that channel's copy of the signal. Never blocks or
+        # changes the signal itself or the trade placement below.
+        await send_inner_circle_rationale(
+            bot, signal_data.get("rationale"), ic_signal_message_id
+        )
     except Exception as e:
         # CATCH-ALL: per explicit instruction, after a real incident
         # where a screenshot of this exact job's logs cut off right
@@ -27914,12 +28275,14 @@ async def _post_synthetic_signal_for_index(bot, index_key):
     # own permanent, never-overwritten row - see ChannelSignalContext
     # Store's docstring above for the full explanation.
     signal_key = f"{index_key}_{int(time.time())}"
+    ic_rationale = trade_context.pop("_rationale", None)
     trade_context["index_key"] = index_key
     channel_signal_context[signal_key] = trade_context
 
+    ic_signal_message_id = None
     for channel_id in [CHANNEL_1_ID, CHANNEL_2_ID, CHANNEL_3_ID]:
         try:
-            await bot.send_photo(
+            sent_synth = await bot.send_photo(
                 chat_id=channel_id,
                 photo=signal_image_id,
                 caption=signal_message,
@@ -27931,9 +28294,15 @@ async def _post_synthetic_signal_for_index(bot, index_key):
                     )
                 ]])
             )
+            if str(channel_id) == str(CHANNEL_2_ID):
+                ic_signal_message_id = sent_synth.message_id
             print(f"[AUTO SYNTH] ✅ {index_key.upper()} posted to {channel_id}")
         except Exception as e:
             print(f"[AUTO SYNTH] ❌ Failed for {channel_id}: {e}")
+
+    # Inner Circle only: the "Why this trade" follow-up under that
+    # channel's copy of the signal.
+    await send_inner_circle_rationale(bot, ic_rationale, ic_signal_message_id)
 
     # Fired once per signal, after both channel posts - never inside
     # the loop above, same double-fire mistake already fixed once for
@@ -31507,6 +31876,18 @@ def main():
         check_milestone_progress,
         time=parse_time("09:00"),
         name="check_milestone_progress",
+        job_kwargs={"misfire_grace_time": 300}
+    )
+
+    # Inner Circle Key Point card - Mon/Tue/Thu/Fri at 10:00 UTC (11:00
+    # Lagos), clear of the 07:00 / 13:00 / 19:00 UTC signal slots. Goes
+    # ONLY to the Inner Circle channel. Same cron-style day numbering as
+    # every other run_daily call here (0=Sunday).
+    job_queue.run_daily(
+        post_inner_circle_key_point,
+        time=parse_time("10:00"),
+        name="inner_circle_key_point",
+        days=INNER_CIRCLE_CARD_DAYS,
         job_kwargs={"misfire_grace_time": 300}
     )
 

@@ -4930,6 +4930,38 @@ async def _napp_exness_body(request):
 # it in a pop-up). Legacy keys (error / verified / result / state) are kept so
 # older builds keep working.
 # ---------------------------------------------------------------------------
+# How to get under SpiritFX (same two routes the Telegram bot gives).
+NAPP_EX_GUIDE_TEXT = (
+    "Here is how to fix it:\n\n"
+    "Option 1: open a new Exness account with our link:\n{ref}\n\n"
+    "Option 2: keep your account and ask Exness to move it to SpiritFX. "
+    "In your Exness Personal Area, tap the chat icon, type \"Partner Change\", fill in the form, "
+    "and send them our link:\n{ref}\nThis can take up to 3 days.\n\n"
+    "When you are done, come back here, enter your email again and tap Check my Exness account."
+)
+
+
+def _napp_ex_guide():
+    return {
+        "title": "How to get under SpiritFX",
+        "options": [
+            {"title": "Open a new Exness account with our link",
+             "steps": ["Tap the button to open the SpiritFX sign-up link.",
+                       "Create your free Exness account."],
+             "button": {"label": "Open Exness sign-up", "url": EXNESS_LINK}},
+            {"title": "Keep your account and move it to SpiritFX",
+             "steps": ["Go to your Exness Personal Area.",
+                       "Tap the chat icon.",
+                       "Type: Partner Change",
+                       "Fill in the form they send you.",
+                       "When they ask for the partner link, send them our link.",
+                       "Wait for Exness to confirm. This can take up to 3 days."],
+             "button": {"label": "Copy our link", "url": EXNESS_LINK}},
+        ],
+        "after": "When you are done, come back here, enter your email again and tap Check my Exness account.",
+    }
+
+
 # code: (ok, http_status, title, message, action, legacy_error_key)
 NAPP_EX_CODES = {
     # success
@@ -4971,10 +5003,10 @@ NAPP_EX_CODES = {
                                    "Your SpiritFX account is already linked to {email}. To use a different email, unlink that account first.",
                                    "none", "bad_request"),
     "not_found": (False, 404, "No Exness account found",
-                  "We couldn't find an Exness account with this email. Check the spelling, or open a new account with our link and try again.",
-                  "retry", None),
+                  "We couldn't find an Exness account with this email. Check the spelling and try again. " + NAPP_EX_GUIDE_TEXT,
+                  "open_ref_link", None),
     "not_under_spiritfx": (False, 403, "This account isn't under SpiritFX",
-                           "Your Exness account was opened without the SpiritFX link. Open a new account with our link, or ask Exness support to move you to partner SpiritFX.",
+                           "This Exness account was opened without the SpiritFX link, so Auto-Trade can't use it yet. " + NAPP_EX_GUIDE_TEXT,
                            "open_ref_link", "not_verified"),
     "recently_unlinked": (False, 429, "Please wait a little",
                           "This email or account was unlinked recently and can't be linked again just yet. You can link again on {when}.",
@@ -5043,8 +5075,11 @@ def _napp_ex_next_month_start():
 
 def _napp_ex_reply(code, *, status=None, retry_at=None, ref_url=None, extra=None, **fmt):
     ok, http, title, message, action, legacy = NAPP_EX_CODES[code]
+    guide = None
     if code in ("not_under_spiritfx", "not_found"):
         ref_url = ref_url or EXNESS_LINK
+        fmt.setdefault("ref", ref_url)
+        guide = _napp_ex_guide()
     try:
         message = message.format(**fmt) if fmt else message
     except Exception:
@@ -5054,6 +5089,8 @@ def _napp_ex_reply(code, *, status=None, retry_at=None, ref_url=None, extra=None
         "ok": ok, "code": code, "title": title, "message": message, "action": action,
         "ref_url": ref_url, "retry_at": _napp_ex_iso(retry_at),
     })
+    if guide:
+        body["guide"] = guide
     if not ok and legacy:
         body["error"] = legacy
     return _napp_json(body, status or http)

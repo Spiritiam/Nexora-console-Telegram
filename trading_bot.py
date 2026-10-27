@@ -8,6 +8,7 @@ import hashlib
 import threading
 import requests
 import re
+import traceback
 import json
 import time
 import secrets
@@ -4919,8 +4920,189 @@ async def _napp_exness_body(request):
     return body if isinstance(body, dict) else None
 
 
+
+# ---------------------------------------------------------------------------
+# Uniform replies for the Exness verify / connect / disconnect endpoints.
+# Every outcome (success or failure) has the same shape:
+#   {ok, code, title, message, action, ref_url, retry_at}
+# `code` is a fixed lowercase key the app picks its screen from - never rename
+# one once it ships. `message` is always filled (older app versions only show
+# it in a pop-up). Legacy keys (error / verified / result / state) are kept so
+# older builds keep working.
+# ---------------------------------------------------------------------------
+# code: (ok, http_status, title, message, action, legacy_error_key)
+NAPP_EX_CODES = {
+    # success
+    "verified": (True, 200, "Account verified",
+                 "You're an Exness client under SpiritFX. You can now connect your trading account and start Auto-Trade.",
+                 "continue", None),
+    "already_verified": (True, 200, "Already verified",
+                         "This Exness email is already linked to your account. You can carry on setting up Auto-Trade.",
+                         "continue", None),
+    "unlinked": (True, 200, "Account unlinked",
+                 "Your Exness account has been unlinked. Trades already open stay open on Exness.",
+                 "none", None),
+    "nothing_linked": (True, 200, "Nothing to unlink",
+                       "No Exness account is linked.", "none", None),
+    "connecting": (True, 200, "Connecting your account",
+                   "We're connecting your Exness account. This can take a couple of minutes.",
+                   "none", None),
+    # user problems
+    "invalid_email": (False, 400, "Check your email",
+                      "Enter the email address you used to register on Exness, like name@example.com.",
+                      "retry", "bad_request"),
+    "invalid_request": (False, 400, "Couldn't read that",
+                        "Something was missing from your request. Please try again.", "retry", "bad_request"),
+    "invalid_account_number": (False, 400, "Check the account number",
+                               "Enter your Exness account number. It is digits only, 4 to 12 numbers long.",
+                               "retry", "bad_request"),
+    "invalid_password": (False, 400, "Enter your trading password",
+                         "Enter the trading password of your Exness account. This is not your Exness login password.",
+                         "retry", "bad_request"),
+    "invalid_server": (False, 400, "Check the server name",
+                       "Enter your server name exactly as shown on Exness, for example Exness-Real4.",
+                       "retry", "bad_request"),
+    "invalid_nickname": (False, 400, "Add a nickname",
+                         "Give the account a short nickname so you can recognise it.", "retry", "bad_request"),
+    "email_linked_elsewhere": (False, 409, "Email already in use",
+                               "This email ({email}) is already linked to another SpiritFX account. Please use the email of your own Exness account.",
+                               "retry", "taken"),
+    "already_linked_other_email": (False, 409, "Another email is linked",
+                                   "Your SpiritFX account is already linked to {email}. To use a different email, unlink that account first.",
+                                   "none", "bad_request"),
+    "not_found": (False, 404, "No Exness account found",
+                  "We couldn't find an Exness account with this email. Check the spelling, or open a new account with our link and try again.",
+                  "retry", None),
+    "not_under_spiritfx": (False, 403, "This account isn't under SpiritFX",
+                           "Your Exness account was opened without the SpiritFX link. Open a new account with our link, or ask Exness support to move you to partner SpiritFX.",
+                           "open_ref_link", "not_verified"),
+    "recently_unlinked": (False, 429, "Please wait a little",
+                          "This email or account was unlinked recently and can't be linked again just yet. You can link again on {when}.",
+                          "none", "slow_down"),
+    "unlink_limit_reached": (False, 429, "Unlink limit reached",
+                             "You've used all {limit} unlinks for this month. You can unlink again on {when}.",
+                             "none", "limit_reached"),
+    "too_many_attempts": (False, 429, "Too many attempts",
+                          "You've tried a few times in a row. Please wait {wait} and try again.",
+                          "retry", "slow_down"),
+    "not_verified": (False, 403, "Verify your email first",
+                     "Verify your Exness email first, then connect your trading account.", "continue", "not_verified"),
+    "subscription_required": (False, 402, "Subscription needed",
+                              "Start your Auto-Trade subscription first, then connect your account.",
+                              "continue", "no_subscription"),
+    "already_connecting": (False, 409, "Already connecting",
+                           "We're still connecting your account. Please wait a couple of minutes.", "none", "busy"),
+    "already_connected": (False, 409, "Account already connected",
+                          "An Exness account is already connected. Unlink it first, or choose to replace it.",
+                          "none", "already_connected"),
+    "flip_trade_open": (False, 409, "A trade is still open",
+                        "Your Account Flip trade is still open. You can change accounts once it closes.",
+                        "none", "flip_open"),
+    "account_not_yours": (False, 403, "Not one of your accounts",
+                          "That account number isn't one of your Exness accounts under SpiritFX. Check the number and try again.",
+                          "retry", "account_not_yours"),
+    "account_linked_elsewhere": (False, 409, "Account already in use",
+                                 "That trading account is already linked to another SpiritFX user. If it is yours, please contact support.",
+                                 "contact_support", "account_taken"),
+    # not the user's fault
+    "exness_unavailable": (False, 503, "Exness isn't responding",
+                           "We couldn't reach Exness just now. This isn't your fault. Please try again in a few minutes.",
+                           "retry", "server"),
+    "feature_disabled": (False, 503, "Auto-Trade is paused",
+                         "Exness Auto-Trade is switched off for now. Please check back later.", "none", "unavailable"),
+    "session_expired": (False, 401, "Please log in again",
+                        "Your session has ended. Log in again, then carry on.", "none", "auth"),
+    "server_error": (False, 500, "Something went wrong",
+                     "Something went wrong on our side. Please try again in a few minutes. If it keeps happening, contact support.",
+                     "retry", "server"),
+}
+
+
+def _napp_ex_date_words(dt):
+    return f"{dt.day} {dt.strftime('%B')}"
+
+
+def _napp_ex_wait_words(seconds):
+    seconds = max(0, int(seconds))
+    if seconds < 90:
+        return "a minute"
+    if seconds < 3300:
+        return f"about {round(seconds / 60)} minutes"
+    hours = round(seconds / 3600)
+    return "about an hour" if hours <= 1 else f"about {hours} hours"
+
+
+def _napp_ex_iso(dt):
+    return dt.replace(microsecond=0).isoformat() + "Z" if dt else None
+
+
+def _napp_ex_next_month_start():
+    now = datetime.utcnow()
+    return datetime(now.year + (now.month == 12), 1 if now.month == 12 else now.month + 1, 1)
+
+
+def _napp_ex_reply(code, *, status=None, retry_at=None, ref_url=None, extra=None, **fmt):
+    ok, http, title, message, action, legacy = NAPP_EX_CODES[code]
+    if code in ("not_under_spiritfx", "not_found"):
+        ref_url = ref_url or EXNESS_LINK
+    try:
+        message = message.format(**fmt) if fmt else message
+    except Exception:
+        pass
+    body = dict(extra or {})
+    body.update({
+        "ok": ok, "code": code, "title": title, "message": message, "action": action,
+        "ref_url": ref_url, "retry_at": _napp_ex_iso(retry_at),
+    })
+    if not ok and legacy:
+        body["error"] = legacy
+    return _napp_json(body, status or http)
+
+
+async def _napp_ex_auth(request, limit_per_min):
+    """Same as _napp_deriv_auth, but its failures come back in the uniform shape."""
+    synth, err = await _napp_deriv_auth(request, limit_per_min=limit_per_min, allow_killed=True)
+    if not err:
+        return synth, None
+    try:
+        key = (json.loads(err.text) or {}).get("error")
+    except Exception:
+        key = None
+    if key == "auth":
+        return None, _napp_ex_reply("session_expired")
+    if key == "slow_down":
+        until = datetime.utcnow() + timedelta(seconds=60)
+        return None, _napp_ex_reply("too_many_attempts", retry_at=until, wait="a minute")
+    return None, _napp_ex_reply("server_error")
+
+
+def _napp_ex_guard(fn):
+    """Any unexpected error: log the real one, send the user a friendly one."""
+    async def wrapper(request):
+        try:
+            return await fn(request)
+        except web.HTTPException:
+            raise
+        except asyncio.CancelledError:
+            raise
+        except Exception as e:
+            print(f"[NEXORA EXNESS] unexpected error in {fn.__name__}: {type(e).__name__}: {str(e)[:300]}")
+            traceback.print_exc()
+            return _napp_ex_reply("server_error")
+    wrapper.__name__ = fn.__name__
+    return wrapper
+
+
+def _napp_ex_limit_retry_at(kind, synth):
+    hits = _napp_exness_hits.get((kind, synth)) or []
+    if not hits:
+        return datetime.utcnow() + timedelta(hours=1)
+    return datetime.utcfromtimestamp(min(hits) + 3600)
+
+
+@_napp_ex_guard
 async def nexora_app_exness_disconnect_handler(request):
-    synth, err = await _napp_deriv_auth(request, limit_per_min=10, allow_killed=True)
+    synth, err = await _napp_ex_auth(request, 10)
     if err:
         return err
     auth = request.headers.get("Authorization", "")
@@ -4930,22 +5112,21 @@ async def nexora_app_exness_disconnect_handler(request):
     verified, email, vok = await asyncio.to_thread(_napp_exness_verified_sync, synth)
     row, rok = await asyncio.to_thread(_napp_exness_row_sync, synth)
     if not vok or not rok:
-        return _napp_json({"error": "server", "message": "Could not check right now. Try again."}, 503)
+        return _napp_ex_reply("server_error", status=503)
 
     connecting = (_napp_exness_jobs.get(synth) or {}).get("state") == "connecting"
     has_account = bool(row and (row.get("metaapi_account_id") or row.get("account_number")))
     if not (verified or has_account or connecting):
         payload = await _napp_exness_status_build(synth) or {}
-        payload["message"] = "No Exness account is linked."
-        return _napp_json(payload)
+        return _napp_ex_reply("nothing_linked", extra=payload)
 
     used, uok = await asyncio.to_thread(_napp_exness_unlinks_used_sync, synth)
     if not uok:
-        return _napp_json({"error": "server", "message": "Could not check right now. Try again."}, 503)
+        return _napp_ex_reply("server_error", status=503)
     if used >= NAPP_EXNESS_UNLINKS_PER_MONTH:
-        return _napp_json({
-            "error": "limit_reached", "unlinks_left": 0,
-            "message": f"You can unlink your Exness account {NAPP_EXNESS_UNLINKS_PER_MONTH} times a month. Please try again next month."}, 429)
+        reset = _napp_ex_next_month_start()
+        return _napp_ex_reply("unlink_limit_reached", retry_at=reset, extra={"unlinks_left": 0},
+                              limit=NAPP_EXNESS_UNLINKS_PER_MONTH, when=_napp_ex_date_words(reset))
 
     mt5_login = (row or {}).get("account_number")
     metaapi_id = (row or {}).get("metaapi_account_id")
@@ -4974,7 +5155,7 @@ async def nexora_app_exness_disconnect_handler(request):
             print(f"[EXNESS UNLINK] account wipe failed for {synth}: {type(e).__name__}")
             if connecting:
                 _napp_exness_cancelled.discard(synth)
-            return _napp_json({"error": "server", "message": "Could not unlink right now. Please try again."}, 500)
+            return _napp_ex_reply("server_error")
 
     # An Account Flip stack that was open is no longer managed: close it in
     # our records. Nothing is closed on Exness.
@@ -5040,59 +5221,62 @@ async def nexora_app_exness_disconnect_handler(request):
     if payload is None:
         payload = {"enabled": not _napp_exness_killed(), "verified": False, "exness_email": None,
                    "unlinks_left": max(0, NAPP_EXNESS_UNLINKS_PER_MONTH - used - 1)}
-    payload["message"] = "Your Exness account has been unlinked. Trades already open stay open on Exness."
-    return _napp_json(payload)
+    return _napp_ex_reply("unlinked", extra=payload)
 
 
+@_napp_ex_guard
 async def nexora_app_exness_verify_handler(request):
-    synth, err = await _napp_deriv_auth(request, limit_per_min=20, allow_killed=True)
+    synth, err = await _napp_ex_auth(request, 20)
     if err:
         return err
     if _napp_exness_killed():
-        return _napp_json({"error": "unavailable", "message": "Exness in the app is switched off right now."}, 503)
+        return _napp_ex_reply("feature_disabled")
     body = await _napp_exness_body(request)
     if body is None:
-        return _napp_json({"error": "bad_request", "message": "Could not read that."}, 400)
+        return _napp_ex_reply("invalid_request")
     email = str(body.get("email", "")).strip().lower()
     if not re.fullmatch(r"[a-z0-9._+\-]{1,64}@[a-z0-9.\-]+\.[a-z]{2,}", email) or len(email) > 120:
-        return _napp_json({"error": "bad_request", "message": "Enter the email you used to register on Exness."}, 400)
+        return _napp_ex_reply("invalid_email")
 
-    verified, _, vok = await asyncio.to_thread(_napp_exness_verified_sync, synth)
+    verified, linked_email, vok = await asyncio.to_thread(_napp_exness_verified_sync, synth)
     if not vok:
-        return _napp_json({"error": "server", "message": "Could not check right now. Try again."}, 503)
+        return _napp_ex_reply("server_error", status=503)
     if verified:
-        return _napp_json({"verified": True, "message": "You're already verified."})
+        if (linked_email or "").strip().lower() == email:
+            return _napp_ex_reply("already_verified", extra={"verified": True})
+        return _napp_ex_reply("already_linked_other_email", email=_napp_exness_mask_email2(linked_email) or "another email",
+                              extra={"verified": True})
     if _napp_exness_limited("verify", synth, 6):
-        return _napp_json({"error": "slow_down", "message": "Too many attempts. Try again in an hour."}, 429)
+        retry = _napp_ex_limit_retry_at("verify", synth)
+        return _napp_ex_reply("too_many_attempts", retry_at=retry,
+                              wait=_napp_ex_wait_words((retry - datetime.utcnow()).total_seconds()))
 
     owner, ook = await asyncio.to_thread(_napp_exness_email_owner_sync, email)
     if not ook:
-        return _napp_json({"error": "server", "message": "Could not check right now. Try again."}, 503)
+        return _napp_ex_reply("server_error", status=503)
     if owner and owner != synth:
-        return _napp_json({
-            "verified": False, "result": "taken",
-            "message": "This Exness account is already linked to another SpiritFX account."}, 409)
+        return _napp_ex_reply("email_linked_elsewhere", email=_napp_exness_mask_email2(email) or "This email",
+                              extra={"verified": False, "result": "taken"})
 
     try:
         verdict, detail, _accts = await _napp_run_on_main(exness_check_email(email), 70)
     except Exception as e:
-        print(f"[NEXORA EXNESS] verify error: {type(e).__name__}")
-        verdict = "unknown"
+        print(f"[NEXORA EXNESS] verify error: {type(e).__name__}: {str(e)[:200]}")
+        verdict, detail = "unknown", ""
     if verdict == "approved":
         ok = await asyncio.to_thread(add_verified_user, synth, email)
         if not ok:
-            return _napp_json({"error": "server", "message": "Verified, but saving failed. Try again."}, 503)
+            return _napp_ex_reply("server_error", status=503)
         print(f"[NEXORA EXNESS] verified app user {synth}")
-        return _napp_json({"verified": True, "message": "Verified. You're an Exness client under SpiritFX."})
+        return _napp_ex_reply("verified", extra={"verified": True})
     if verdict == "declined":
-        return _napp_json({
-            "verified": False, "result": "declined",
-            "message": ("This email is not verified. It isn't an Exness client under SpiritFX's link. To enable auto-trading, "
-                        "create an Exness account through our link (or change your IB to SpiritFX in your Exness account), "
-                        "then verify again.")})
-    return _napp_json({
-        "verified": False, "result": "unknown",
-        "message": "We couldn't check right now. Please try again in a few minutes."}, 503)
+        # Exness answers 404 when it has no client with this email under SpiritFX's
+        # partner account, and affiliation=false when the client exists elsewhere.
+        if str(detail).startswith("no client found"):
+            return _napp_ex_reply("not_found", extra={"verified": False, "result": "declined"})
+        return _napp_ex_reply("not_under_spiritfx", extra={"verified": False, "result": "declined"})
+    print(f"[NEXORA EXNESS] verify unavailable for {synth}: {str(detail)[:200]}")
+    return _napp_ex_reply("exness_unavailable", extra={"verified": False, "result": "unknown"})
 
 
 async def nexora_app_exness_pay_handler(request):
@@ -5227,15 +5411,16 @@ async def _napp_exness_connect_job(synth, number, password, server, name, replac
             await asyncio.to_thread(resolve_pending_mt5_provisioning, pending_id, "failed")
 
 
+@_napp_ex_guard
 async def nexora_app_exness_connect_handler(request):
-    synth, err = await _napp_deriv_auth(request, limit_per_min=20, allow_killed=True)
+    synth, err = await _napp_ex_auth(request, 20)
     if err:
         return err
     if _napp_exness_killed():
-        return _napp_json({"error": "unavailable", "message": "Exness in the app is switched off right now."}, 503)
+        return _napp_ex_reply("feature_disabled")
     body = await _napp_exness_body(request)
     if body is None:
-        return _napp_json({"error": "bad_request", "message": "Could not read that."}, 400)
+        return _napp_ex_reply("invalid_request")
 
     number = str(body.get("account_number", "")).strip()
     password = str(body.get("password", ""))
@@ -5243,28 +5428,28 @@ async def nexora_app_exness_connect_handler(request):
     name = _napp_clean_label(str(body.get("name", ""))).strip()[:40]
     replace = bool(body.get("replace"))
     if not re.fullmatch(r"\d{4,12}", number):
-        return _napp_json({"error": "bad_request", "message": "Enter your Exness account number (digits only)."}, 400)
+        return _napp_ex_reply("invalid_account_number")
     if not password or len(password) > 128 or "\n" in password or "\r" in password:
-        return _napp_json({"error": "bad_request", "message": "Enter your trading password."}, 400)
+        return _napp_ex_reply("invalid_password")
     if not re.fullmatch(r"[A-Za-z0-9._\- ]{2,60}", server):
-        return _napp_json({"error": "bad_request", "message": "Enter your server name, for example Exness-Real4."}, 400)
+        return _napp_ex_reply("invalid_server")
     if not name:
-        return _napp_json({"error": "bad_request", "message": "Give the account a nickname."}, 400)
+        return _napp_ex_reply("invalid_nickname")
 
     verified, _, vok = await asyncio.to_thread(_napp_exness_verified_sync, synth)
     row, rok = await asyncio.to_thread(_napp_exness_row_sync, synth)
     if not vok or not rok:
-        return _napp_json({"error": "server", "message": "Could not check right now. Try again."}, 503)
+        return _napp_ex_reply("server_error", status=503)
     if not verified:
-        return _napp_json({"error": "not_verified", "message": "Verify your Exness account first."}, 403)
+        return _napp_ex_reply("not_verified")
     expiry = _napp_exness_expiry(row)
     if not (expiry and datetime.utcnow() < expiry):
-        return _napp_json({"error": "no_subscription", "message": "Start your subscription first."}, 402)
+        return _napp_ex_reply("subscription_required")
 
     # Claim the "connecting" slot right now (no await between the check and
     # the claim) so a double tap can't start two provisioning jobs.
     if (_napp_exness_jobs.get(synth) or {}).get("state") == "connecting":
-        return _napp_json({"error": "busy", "message": "Already connecting. Please wait."}, 409)
+        return _napp_ex_reply("already_connecting", extra={"state": "connecting"})
     claim = {"state": "connecting", "message": "Checking your details...", "ts": time.time()}
     _napp_exness_jobs[synth] = claim
     try:
@@ -5278,13 +5463,12 @@ async def nexora_app_exness_connect_handler(request):
 async def _napp_exness_connect_checked(synth, number, password, server, name, replace, row, claim):
     old_id = (row or {}).get("metaapi_account_id")
     if old_id and not replace:
-        return _napp_json({"error": "already_connected", "message": "An account is already connected."}, 409)
+        return _napp_ex_reply("already_connected")
     if old_id and str(row.get("account_number")) == number and (row.get("server") or "") == server:
-        return _napp_json({"error": "already_connected", "message": "That account is already connected."}, 409)
+        return _napp_ex_reply("already_connected", extra={})
     if old_id and row.get("bot_choice") == "account_flip":
         if await asyncio.to_thread(_napp_exness_flip_open_sync, synth):
-            return _napp_json({"error": "flip_open", "message":
-                               "An Account Flip trade is still open. Let it close before changing accounts."}, 409)
+            return _napp_ex_reply("flip_trade_open")
     # The account must belong to this client under SpiritFX's Exness link.
     _, email_v, _ = await asyncio.to_thread(_napp_exness_verified_sync, synth)
     try:
@@ -5293,33 +5477,32 @@ async def _napp_exness_connect_checked(synth, number, password, server, name, re
         print(f"[NEXORA EXNESS] connect affiliation error: {type(e).__name__}")
         verdict, accts = "unknown", []
     if verdict == "declined":
-        return _napp_json({"error": "not_verified", "message":
-                           "We no longer find you as an Exness client under SpiritFX's link."}, 403)
+        return _napp_ex_reply("not_under_spiritfx")
     if verdict != "approved":
-        return _napp_json({"error": "server", "message": "Couldn't check your Exness account right now. Try again in a few minutes."}, 503)
+        return _napp_ex_reply("exness_unavailable")
     if accts and number not in [str(a) for a in accts]:
-        return _napp_json({"error": "account_not_yours", "message":
-                           "That account number isn't one of your Exness accounts under SpiritFX's link."}, 403)
+        return _napp_ex_reply("account_not_yours")
 
     other, ook = await asyncio.to_thread(_napp_exness_account_owner_sync, number, synth)
     if not ook:
-        return _napp_json({"error": "server", "message": "Could not check right now. Try again."}, 503)
+        return _napp_ex_reply("server_error", status=503)
     if other:
-        return _napp_json({"error": "account_taken", "message":
-                           "That trading account is already linked to another Nexora user."}, 409)
+        return _napp_ex_reply("account_linked_elsewhere")
     if _napp_exness_limited("connect", synth, 10):
-        return _napp_json({"error": "slow_down", "message": "Too many attempts. Try again later."}, 429)
+        retry = _napp_ex_limit_retry_at("connect", synth)
+        return _napp_ex_reply("too_many_attempts", retry_at=retry,
+                              wait=_napp_ex_wait_words((retry - datetime.utcnow()).total_seconds()))
 
     loop = _main_loop
     if loop is None or not loop.is_running():
-        return _napp_json({"error": "server", "message": "The service is starting up. Try again in a minute."}, 503)
+        return _napp_ex_reply("server_error", status=503)
     claim["started"] = True
     claim["message"] = "Starting..."
     fut = asyncio.run_coroutine_threadsafe(
         _napp_exness_connect_job(synth, number, password, server, name, old_id if replace else None), loop)
     _napp_exness_futs.add(fut)
     fut.add_done_callback(_napp_exness_futs.discard)
-    return _napp_json({"state": "connecting"})
+    return _napp_ex_reply("connecting", extra={"state": "connecting"})
 
 
 def _napp_exness_num(body, key, lo, hi, decimals=2):

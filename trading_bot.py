@@ -18538,7 +18538,8 @@ def get_market_session():
 def build_inner_circle_rationale(display, direction, entry, sl, tp2, tp1=None,
                                  h1=None, h4=None, daily=None, agreeing=None,
                                  confidence=None, session=None, decimals=2):
-    """Returns the Inner Circle 'Why this trade' HTML message, or None if
+    """Returns the Inner Circle 'Why this trade' post as a dict
+    {"caption": <short HTML>, "plan": <data for the picture>}, or None if
     there isn't enough real data to say anything honest. Only states
     facts computed from the same candles the signal used."""
     try:
@@ -18559,99 +18560,281 @@ def build_inner_circle_rationale(display, direction, entry, sl, tp2, tp1=None,
                 return None
             return candles[-1]["close"] > ema[-1]
 
-        def mark(up):
-            return "✅" if (up == buy) else "⚠️"
-
-        lines = []
-
-        trend_bits = []
-        for label, candles in (("H1", h1), ("H4", h4)):
+        # (label, True when it agrees with the trade direction)
+        checks = []
+        for label, candles in (("H4", h4), ("H1", h1)):
             side = ema_side(candles, 50)
             if side is not None:
-                trend_bits.append(f"{mark(side)} {label} {'above' if side else 'below'} EMA50")
+                checks.append((label, side == buy))
         if daily and len(daily) >= 6:
             up = daily[-1]["close"] > daily[-6]["close"]
-            trend_bits.append(f"{mark(up)} Daily {'up' if up else 'down'} over 5 days")
-        if trend_bits:
-            lines.append("<b>Trend:</b> " + " · ".join(trend_bits))
+            checks.insert(1 if checks else 0, ("Daily", up == buy))
 
+        rows = []  # (emoji, label, text) in display order
+
+        if checks:
+            rows.append(("📈", "Trend", "  ".join(
+                f"{n} {'✅' if ok else '⚠️'}" for n, ok in checks)))
+
+        rsi_val = None
         if h1 and len(h1) >= 30:
             rsi = calculate_rsi(h1, 14)
             if rsi:
-                r = rsi[-1]
-                if r >= 70:
-                    tag = "overbought zone"
-                elif r <= 30:
-                    tag = "oversold zone"
-                elif r >= 55:
-                    tag = "bullish momentum"
-                elif r <= 45:
-                    tag = "bearish momentum"
+                rsi_val = rsi[-1]
+                if rsi_val >= 70:
+                    tag = "overbought"
+                elif rsi_val <= 30:
+                    tag = "oversold"
+                elif rsi_val >= 55:
+                    tag = "bullish"
+                elif rsi_val <= 45:
+                    tag = "bearish"
                 else:
                     tag = "neutral"
-                lines.append(f"<b>Momentum:</b> RSI(14) on H1 is {r:.0f} ({tag})")
+                rows.append(("⚡", "Momentum", f"RSI {rsi_val:.0f} · {tag}"))
 
+        level = None
         if h1 and len(h1) >= 40:
             swings = find_swing_points(h1[-120:], strength=3)
             if buy:
                 levels = [s["price"] for s in swings if s["type"] == "low" and s["price"] < entry]
                 if levels:
-                    lines.append(f"<b>Nearest support:</b> {fmt(levels[-1])} (latest H1 swing low)")
+                    level = ("Support", levels[-1])
             else:
                 levels = [s["price"] for s in swings if s["type"] == "high" and s["price"] > entry]
                 if levels:
-                    lines.append(f"<b>Nearest resistance:</b> {fmt(levels[-1])} (latest H1 swing high)")
+                    level = ("Resistance", levels[-1])
+            if level:
+                rows.append(("🧱", "Key level", f"{level[0]} {fmt(level[1])}"))
 
         risk = abs(entry - sl)
+        atr_mult = None
         if risk > 0:
-            atr_txt = ""
             atr = calculate_atr_series(h1, 14) if h1 else []
             if atr and atr[-1] > 0:
-                atr_txt = f" (about {risk / atr[-1]:.1f}× the H1 ATR)"
-            rr = []
+                atr_mult = risk / atr[-1]
+            bits = [f"Stop {fmt(risk)}" + (f" ({atr_mult:.1f}× ATR)" if atr_mult else "")]
             if tp1 is not None:
-                rr.append(f"TP1 1:{abs(float(tp1) - entry) / risk:.1f}")
+                bits.append(f"TP1 1:{abs(float(tp1) - entry) / risk:.1f}")
             if tp2 is not None:
-                rr.append(f"TP2 1:{abs(float(tp2) - entry) / risk:.1f}")
-            lines.append(
-                f"<b>Risk:</b> stop is {fmt(risk)} from entry{atr_txt}"
-                + (" · " + " · ".join(rr) if rr else "")
-            )
+                bits.append(f"TP2 1:{abs(float(tp2) - entry) / risk:.1f}")
+            rows.append(("🎯", "Risk", " · ".join(bits)))
 
         names = [str(n) for n in (agreeing or []) if n]
         if names:
-            shown = ", ".join(names[:4]) + (f" +{len(names) - 4} more" if len(names) > 4 else "")
-            lines.append(f"<b>Confluence:</b> {len(names)} strategies agree: {_esc(shown)}")
+            shown = ", ".join(names[:3]) + (f" +{len(names) - 3}" if len(names) > 3 else "")
+            rows.append(("🤝", "Confluence", _esc(shown)))
 
-        extra = []
-        if confidence:
-            extra.append(f"model confidence {confidence}%")
-        if session:
-            extra.append(str(session))
-        if extra:
-            lines.append("<b>Context:</b> " + " · ".join(extra))
-
-        lines.append(f"<b>The idea is wrong if</b> price trades through {fmt(sl)}. That level is the plan, not a suggestion.")
-
-        # Fewer than 3 real facts besides the closing line is not worth sending.
-        if len(lines) < 4:
+        # Fewer than 3 real facts is not worth sending.
+        if len(rows) < 3:
             return None
 
-        return (
-            f"🔐 <b>INNER CIRCLE · Why this trade</b>\n"
-            f"<b>{direction} {_esc(str(display))}</b>\n\n"
-            + "\n".join(f"• {l}" for l in lines)
-            + "\n\n<i>Inner Circle only · education, not financial advice</i>"
+        head = [f"<b>{direction} {_esc(str(display))}</b>"]
+        if session:
+            head.append(_esc(str(session)))
+        if confidence:
+            head.append(f"{confidence}% confidence")
+
+        caption = (
+            "🔐 <b>INNER CIRCLE · WHY THIS TRADE</b>\n"
+            + "  ·  ".join(head) + "\n\n"
+            + "\n".join(f"{e} <b>{l}</b>  {t}" for e, l, t in rows)
+            + f"\n\n🚫 <b>Wrong if</b> price trades through <b>{fmt(sl)}</b>"
+            + "\n\n<i>✅ with the trade · ⚠️ against it\nEducation, not financial advice</i>"
         )
+
+        plan = {
+            "display": re.sub(r"[^\x00-\x7F]+", "", str(display)).strip(),
+            "direction": direction,
+            "entry": entry,
+            "sl": sl,
+            "tp1": float(tp1) if tp1 is not None else None,
+            "tp2": float(tp2) if tp2 is not None else None,
+            "decimals": decimals,
+            "checks": checks,
+            "rsi": rsi_val,
+            "confidence": confidence,
+        }
+        return {"caption": caption, "plan": plan}
     except Exception as e:
         print(f"[INNER CIRCLE] rationale build failed: {e}")
         return None
 
 
-async def send_inner_circle_rationale(bot, text, reply_to_message_id=None):
-    """Posts the 'Why this trade' follow-up to the Inner Circle channel
-    only, as a reply under that channel's copy of the signal."""
-    if not text:
+_IC_BG = "#0b1220"
+_IC_PANEL = "#131c2f"
+_IC_TEXT = "#e5e7eb"
+_IC_MUTED = "#8b97ad"
+_IC_GREEN = "#22c55e"
+_IC_RED = "#ef4444"
+_IC_AMBER = "#f59e0b"
+_IC_GOLD = "#d4af37"
+
+
+def _ic_render_plan_image(plan, save_path):
+    """Trade-plan picture: a price ladder (SL / entry / TP1 / TP2) with the
+    distance and risk:reward of each level, plus trend chips. Pure drawing
+    of numbers the signal already has."""
+    fig = plt.figure(figsize=(8, 5.2), dpi=135, facecolor=_IC_BG)
+    ax = fig.add_axes([0, 0, 1, 1])
+    ax.set_xlim(0, 100)
+    ax.set_ylim(0, 65)
+    ax.axis("off")
+
+    buy = plan["direction"] == "BUY"
+    entry, sl = plan["entry"], plan["sl"]
+    dec = plan["decimals"]
+    risk = abs(entry - sl) or 1.0
+
+    # Header
+    ax.text(5, 59, "INNER CIRCLE", color=_IC_GOLD, fontsize=11, fontweight="bold", va="center")
+    ax.text(5, 52.5, f"{plan['direction']}  {plan['display']}", color=_IC_TEXT,
+            fontsize=22, fontweight="bold", va="center")
+    ax.add_patch(plt.Rectangle((72, 50), 23, 9, facecolor=_IC_GREEN if buy else _IC_RED,
+                               edgecolor="none", zorder=2))
+    ax.text(83.5, 54.5, plan["direction"], color="white", fontsize=15,
+            fontweight="bold", ha="center", va="center", zorder=3)
+
+    # Levels, highest price first
+    levels = [("SL", sl, _IC_RED, None)]
+    levels.append(("ENTRY", entry, _IC_AMBER, None))
+    if plan.get("tp1") is not None:
+        levels.append(("TP1", plan["tp1"], _IC_GREEN, abs(plan["tp1"] - entry) / risk))
+    if plan.get("tp2") is not None:
+        levels.append(("TP2", plan["tp2"], _IC_GREEN, abs(plan["tp2"] - entry) / risk))
+    levels.sort(key=lambda t: -t[1])
+
+    n = len(levels)
+    top, bottom = 43.0, 17.0
+    row_y = [top - i * (top - bottom) / max(n - 1, 1) for i in range(n)]
+
+    # Proportional track on the left
+    vals = [v for _, v, _, _ in levels]
+    vmax, vmin = max(vals), min(vals)
+    span = (vmax - vmin) or 1.0
+
+    def ty(v):
+        return bottom + (v - vmin) / span * (top - bottom)
+
+    track_x = 9
+    ax.add_patch(plt.Rectangle((track_x - 0.6, ty(min(entry, sl)) if False else bottom),
+                               1.2, top - bottom, facecolor="#243049", edgecolor="none"))
+    lo, hi = sorted([ty(entry), ty(sl)])
+    ax.add_patch(plt.Rectangle((track_x - 1.2, lo), 2.4, hi - lo, facecolor=_IC_RED,
+                               edgecolor="none", alpha=0.9))
+    tps = [v for name, v, _, _ in levels if name.startswith("TP")]
+    if tps:
+        far = max(tps, key=lambda v: abs(v - entry))
+        lo2, hi2 = sorted([ty(entry), ty(far)])
+        ax.add_patch(plt.Rectangle((track_x - 1.2, lo2), 2.4, hi2 - lo2,
+                                   facecolor=_IC_GREEN, edgecolor="none", alpha=0.9))
+
+    for (name, v, color, rr), y in zip(levels, row_y):
+        ax.plot([track_x + 1.2, 22], [ty(v), y], color=color, lw=1.2, alpha=0.7)
+        ax.add_patch(plt.Circle((track_x, ty(v)), 1.1, color=color, zorder=3))
+        ax.add_patch(plt.Rectangle((22, y - 3.3), 73, 6.6, facecolor=_IC_PANEL,
+                                   edgecolor=color, lw=1.4, zorder=2))
+        ax.text(25, y, name, color=color, fontsize=13, fontweight="bold", va="center", zorder=3)
+        ax.text(45, y, f"{v:.{dec}f}", color=_IC_TEXT, fontsize=15, fontweight="bold",
+                va="center", zorder=3)
+        dist = abs(v - entry)
+        if name == "ENTRY":
+            note = "your entry"
+        elif name == "SL":
+            note = f"-{dist:.{dec}f}  ·  1R risk"
+        else:
+            note = f"+{dist:.{dec}f}  ·  1:{rr:.1f}"
+        ax.text(92, y, note, color=_IC_MUTED, fontsize=10.5, va="center", ha="right", zorder=3)
+
+    # Trend chips
+    x = 5
+    for label, ok in plan.get("checks", [])[:3]:
+        c = _IC_GREEN if ok else _IC_AMBER
+        ax.add_patch(plt.Rectangle((x, 4.2), 27, 6.2, facecolor=_IC_PANEL, edgecolor=c, lw=1.2))
+        ax.add_patch(plt.Circle((x + 3, 7.3), 1.1, color=c))
+        ax.text(x + 6, 7.3, f"{label} {'with' if ok else 'against'}", color=_IC_TEXT,
+                fontsize=10, va="center")
+        x += 30
+
+    ax.text(95, 1.8, "Education, not financial advice", color=_IC_MUTED, fontsize=8,
+            ha="right", va="center")
+    fig.savefig(save_path, facecolor=_IC_BG)
+    plt.close(fig)
+
+
+def _ic_render_key_point_image(index, save_path):
+    title, _ = INNER_CIRCLE_KEY_POINTS[index]
+    fig = plt.figure(figsize=(8, 4.5), dpi=135, facecolor=_IC_BG)
+    ax = fig.add_axes([0, 0, 1, 1])
+    ax.set_xlim(0, 100)
+    ax.set_ylim(0, 56)
+    ax.axis("off")
+    ax.add_patch(plt.Rectangle((0, 0), 1.6, 56, facecolor=_IC_GOLD, edgecolor="none"))
+    ax.text(7, 48, "INNER CIRCLE", color=_IC_GOLD, fontsize=12, fontweight="bold", va="center")
+    ax.text(93, 48, f"KEY POINT  {index + 1:02d}", color=_IC_MUTED, fontsize=12,
+            ha="right", va="center")
+    import textwrap
+    wrapped = "\n".join(textwrap.wrap(title, 26)[:4])
+    ax.text(7, 27, wrapped, color=_IC_TEXT, fontsize=26, fontweight="bold",
+            va="center", linespacing=1.25)
+    ax.text(7, 6, "Nexora AI", color=_IC_MUTED, fontsize=10, va="center")
+    fig.savefig(save_path, facecolor=_IC_BG)
+    plt.close(fig)
+
+
+def _ic_make_image(kind, arg):
+    """Renders under the shared chart lock; returns a file path or None."""
+    import tempfile
+    fd, path = tempfile.mkstemp(suffix=".png", prefix="ic_")
+    os.close(fd)
+    try:
+        with _CHART_RENDER_LOCK:
+            try:
+                plt.close("all")
+            except Exception:
+                pass
+            if kind == "plan":
+                _ic_render_plan_image(arg, path)
+            else:
+                _ic_render_key_point_image(arg, path)
+        return path
+    except Exception as e:
+        print(f"[INNER CIRCLE] picture failed, sending text only: {e}")
+        try:
+            os.remove(path)
+        except Exception:
+            pass
+        return None
+
+
+async def _ic_send_with_picture(bot, caption, kind, arg, **kwargs):
+    """Sends picture+caption (caption max 1024 chars); falls back to plain
+    text if the picture can't be made or sent."""
+    path = None
+    if len(caption) <= 1000:
+        path = await asyncio.to_thread(_ic_make_image, kind, arg)
+    if path:
+        try:
+            with open(path, "rb") as f:
+                await bot.send_photo(chat_id=CHANNEL_2_ID, photo=f, caption=caption,
+                                     parse_mode=ParseMode.HTML, **kwargs)
+            return
+        except Exception as e:
+            print(f"[INNER CIRCLE] photo send failed, falling back to text: {e}")
+        finally:
+            try:
+                os.remove(path)
+            except Exception:
+                pass
+    await bot.send_message(chat_id=CHANNEL_2_ID, text=caption, parse_mode=ParseMode.HTML,
+                           disable_web_page_preview=True, **kwargs)
+
+
+async def send_inner_circle_rationale(bot, payload, reply_to_message_id=None):
+    """Posts the 'Why this trade' follow-up (picture + short caption) to the
+    Inner Circle channel only, as a reply under that channel's copy of the
+    signal."""
+    if not payload:
         return
     try:
         from telegram import ReplyParameters
@@ -18660,13 +18843,12 @@ async def send_inner_circle_rationale(bot, text, reply_to_message_id=None):
             kwargs["reply_parameters"] = ReplyParameters(
                 message_id=reply_to_message_id, allow_sending_without_reply=True
             )
-        await bot.send_message(
-            chat_id=CHANNEL_2_ID,
-            text=text,
-            parse_mode=ParseMode.HTML,
-            disable_web_page_preview=True,
-            **kwargs
-        )
+        if isinstance(payload, str):
+            await bot.send_message(chat_id=CHANNEL_2_ID, text=payload,
+                                   parse_mode=ParseMode.HTML,
+                                   disable_web_page_preview=True, **kwargs)
+        else:
+            await _ic_send_with_picture(bot, payload["caption"], "plan", payload["plan"], **kwargs)
         print("[INNER CIRCLE] ✅ rationale posted")
     except Exception as e:
         print(f"[INNER CIRCLE] ❌ rationale failed: {e}")
@@ -18831,12 +19013,13 @@ def get_inner_circle_card_index(now=None):
 
 
 def format_inner_circle_card(index):
+    """Short caption that goes under the Key Point picture (the title is
+    already large on the picture)."""
     title, bullets = INNER_CIRCLE_KEY_POINTS[index]
     return (
-        "🔐 <b>INNER CIRCLE · KEY POINT</b>\n\n"
-        f"<b>{_esc(title)}</b>\n\n"
-        + "\n".join(f"• {_esc(b)}" for b in bullets)
-        + "\n\n<i>Inner Circle only · education, not financial advice</i>"
+        f"🔐 <b>INNER CIRCLE · KEY POINT</b>\n<b>{_esc(title)}</b>\n\n"
+        + "\n".join(f"▫️ {_esc(b)}" for b in bullets)
+        + "\n\n<i>Education, not financial advice</i>"
     )
 
 
@@ -18849,11 +19032,8 @@ async def post_inner_circle_key_point(context: ContextTypes.DEFAULT_TYPE):
     if idx is None:
         return
     try:
-        await context.bot.send_message(
-            chat_id=CHANNEL_2_ID,
-            text=format_inner_circle_card(idx),
-            parse_mode=ParseMode.HTML,
-            disable_web_page_preview=True,
+        await _ic_send_with_picture(
+            context.bot, format_inner_circle_card(idx), "key", idx
         )
         _inner_circle_last_card_date["d"] = today
         print(f"[INNER CIRCLE] ✅ key point #{idx + 1} posted")

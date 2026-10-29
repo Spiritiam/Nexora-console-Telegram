@@ -18573,7 +18573,7 @@ def build_inner_circle_rationale(display, direction, entry, sl, tp2, tp1=None,
         rows = []  # (emoji, label, text) in display order
 
         if checks:
-            rows.append(("📈", "Trend", "  ".join(
+            rows.append(("📈", "", "  ".join(
                 f"{n} {'✅' if ok else '⚠️'}" for n, ok in checks)))
 
         rsi_val = None
@@ -18591,7 +18591,7 @@ def build_inner_circle_rationale(display, direction, entry, sl, tp2, tp1=None,
                     tag = "bearish"
                 else:
                     tag = "neutral"
-                rows.append(("⚡", "Momentum", f"RSI {rsi_val:.0f} · {tag}"))
+                rows.append(("⚡", "", f"RSI {rsi_val:.0f} · {tag}"))
 
         level = None
         if h1 and len(h1) >= 40:
@@ -18605,7 +18605,7 @@ def build_inner_circle_rationale(display, direction, entry, sl, tp2, tp1=None,
                 if levels:
                     level = ("Resistance", levels[-1])
             if level:
-                rows.append(("🧱", "Key level", f"{level[0]} {fmt(level[1])}"))
+                rows.append(("🧱", "", f"{level[0]} {fmt(level[1])}"))
 
         risk = abs(entry - sl)
         atr_mult = None
@@ -18618,29 +18618,25 @@ def build_inner_circle_rationale(display, direction, entry, sl, tp2, tp1=None,
                 bits.append(f"TP1 1:{abs(float(tp1) - entry) / risk:.1f}")
             if tp2 is not None:
                 bits.append(f"TP2 1:{abs(float(tp2) - entry) / risk:.1f}")
-            rows.append(("🎯", "Risk", " · ".join(bits)))
+            pass  # stop and targets are in the picture
 
         names = [str(n) for n in (agreeing or []) if n]
-        if names:
-            shown = ", ".join(names[:3]) + (f" +{len(names) - 3}" if len(names) > 3 else "")
-            rows.append(("🤝", "Confluence", _esc(shown)))
-
-        # Fewer than 3 real facts is not worth sending.
-        if len(rows) < 3:
+        # Fewer than 2 real facts is not worth sending.
+        if len(rows) < 2:
             return None
 
-        head = [f"<b>{direction} {_esc(str(display))}</b>"]
+        sub = []
         if session:
-            head.append(_esc(str(session)))
+            sub.append(_esc(str(session).replace(" Session", "")))
         if confidence:
-            head.append(f"{confidence}% confidence")
+            sub.append(f"{confidence}% confidence")
 
         caption = (
-            "🔐 <b>INNER CIRCLE · WHY THIS TRADE</b>\n"
-            + "  ·  ".join(head) + "\n\n"
-            + "\n".join(f"{e} <b>{l}</b>  {t}" for e, l, t in rows)
-            + f"\n\n🚫 <b>Wrong if</b> price trades through <b>{fmt(sl)}</b>"
-            + "\n\n<i>✅ with the trade · ⚠️ against it\nEducation, not financial advice</i>"
+            f"🔐 <b>INNER CIRCLE</b> · <b>{direction} {_esc(str(display))}</b>\n"
+            + ((" · ".join(sub) + "\n") if sub else "")
+            + "\n"
+            + "\n".join(f"{e} {t}" for e, _l, t in rows)
+            + f"\n🚫 Wrong if price trades through <b>{fmt(sl)}</b>"
         )
 
         plan = {

@@ -11197,6 +11197,7 @@ async def build_synthetic_signal_response(index_key, min_agree=2):
             config["display"], direction, entry_price, sl_price, tp_price,
             None, h1_candles, h4_candles, daily_candles,
             agreeing_strategies, confidence, None, 2,
+            None, True,
         ),
     }
 
@@ -18537,7 +18538,8 @@ def get_market_session():
 
 def build_inner_circle_rationale(display, direction, entry, sl, tp2, tp1=None,
                                  h1=None, h4=None, daily=None, agreeing=None,
-                                 confidence=None, session=None, decimals=2):
+                                 confidence=None, session=None, decimals=2,
+                                 fundamental=None, synthetic=False):
     """Returns the Inner Circle 'Why this trade' post as a dict
     {"caption": <short HTML>, "plan": <data for the picture>}, or None if
     there isn't enough real data to say anything honest. Only states
@@ -18631,12 +18633,28 @@ def build_inner_circle_rationale(display, direction, entry, sl, tp2, tp1=None,
         if confidence:
             sub.append(f"{confidence}% confidence")
 
+        # One fundamental reason (real news/calendar context the signal
+        # already used, never against the direction), then at most 2
+        # technical lines. Never invents a news reason.
+        if fundamental:
+            why = _esc(str(fundamental).strip())
+        elif synthetic:
+            why = "Synthetic index: it moves on its own price action, not on news."
+        else:
+            why = "No news driver backing this trade right now. It is a technical setup."
+
+        trend_txt = next((t for e, _l, t in rows if e == "📈"), None)
+        rsi_txt = next((t for e, _l, t in rows if e == "⚡"), None)
+        level_txt = next((t for e, _l, t in rows if e == "🧱"), None)
+        line1 = " · ".join(x for x in (trend_txt, rsi_txt) if x)
+        line2 = ((f"🧱 {level_txt}  ·  ") if level_txt else "") + f"🚫 Wrong if price trades through <b>{fmt(sl)}</b>"
+
         caption = (
             f"🔐 <b>INNER CIRCLE</b> · <b>{direction} {_esc(str(display))}</b>\n"
             + ((" · ".join(sub) + "\n") if sub else "")
-            + "\n"
-            + "\n".join(f"{e} {t}" for e, _l, t in rows)
-            + f"\n🚫 Wrong if price trades through <b>{fmt(sl)}</b>"
+            + f"\n📰 {why}\n\n"
+            + (f"📊 {line1}\n" if line1 else "")
+            + line2
         )
 
         plan = {
@@ -20703,6 +20721,18 @@ async def build_signal_response(question, user_id=None, retry_mismatch=False):
             record_ai_bias_usage(user_id)
             used_ai_layer = True
 
+    # Inner Circle only: the follow-up leads with a fundamental reason, so
+    # scheduled signals (which don't show one publicly) get it computed here.
+    # Same filtered, direction-safe generator as above; not shown on any
+    # other channel and not counted against any user's AI limit.
+    ic_fundamental = fundamental_reason
+    if not ic_fundamental and user_id is None:
+        try:
+            ic_fundamental = await generate_fundamental_context(pair_name, direction)
+        except Exception as e:
+            print(f"[INNER CIRCLE] fundamental skipped: {e}")
+            ic_fundamental = None
+
     strength = "STRONG"
 
     # SL/TP pip distances, per explicit instruction with EVERY value
@@ -20927,7 +20957,7 @@ async def build_signal_response(question, user_id=None, retry_mismatch=False):
             display, direction, entry_price, stop_loss, take_profit,
             take_profit_1, h1_candles, h4_candles, daily_candles,
             agreeing_strategies if bank_result else [], confidence,
-            session, decimals,
+            session, decimals, ic_fundamental,
         ),
         # ADDED, per explicit instruction to start retraining the ML
         # EV model on real accumulated outcomes: signal_log never

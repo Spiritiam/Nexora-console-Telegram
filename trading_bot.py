@@ -6,6 +6,8 @@ import math
 import hmac
 import hashlib
 import threading
+import contextvars
+import types
 import requests
 import re
 import traceback
@@ -30478,6 +30480,194 @@ async def _handle_broadcastchannels_request(update: Update, context: ContextType
     await update.effective_message.reply_text(result_text)
 
 
+# ============================================
+# CHANNEL POSTING SWITCH (admin only)
+# ============================================
+# /channels off  -> nothing is posted to the three channels (public,
+#                   Inner Circle, official Nexora AI): no signals, news,
+#                   reports, education or milestones.
+# /channels on   -> posting resumes. Posts missed while off are NOT
+#                   back-filled.
+# Everything for individual users is untouched: personal signal requests,
+# auto-trading, copy trading, DMs and the app. The signals still get
+# generated and any trades still run - only the channel posts are held.
+# The gate sits on the Telegram send methods themselves, so every channel
+# post is covered, including ones added later. The admin's own manual
+# commands (/broadcastchannels, /welcome, /testsignal ...) still go
+# through while the switch is off, because they are deliberate.
+# The state is saved in the bot_flags table, so it survives restarts.
+
+_channels_state = {"on": True, "since": None, "suppressed": 0}
+_CHANNEL_FORCE = contextvars.ContextVar("nexora_channel_force", default=False)
+_CHANNELS_FLAG_KEY = "channels_enabled"
+
+
+def _channel_id_set():
+    return {str(CHANNEL_1_ID), str(CHANNEL_2_ID), str(CHANNEL_3_ID)}
+
+
+class _ChannelHeldMsg(_AppMsg):
+    """Stand-in returned for a post that was held back, so code that reads
+    .message_id / .chat_id / .chat.id after sending keeps working."""
+    def __init__(self, chat_id, text=""):
+        super().__init__(chat_id, text)
+        self.caption = text
+        self.chat = types.SimpleNamespace(id=chat_id)
+        self.date = None
+
+
+def _channels_blocked(chat_id):
+    if _channels_state["on"] or _CHANNEL_FORCE.get():
+        return False
+    return str(chat_id) in _channel_id_set()
+
+
+def _install_channel_gate():
+    from telegram.ext import ExtBot
+    if getattr(ExtBot, "_channel_gate", False):
+        return
+    names = ["send_message", "send_photo", "send_document", "send_video",
+             "send_animation", "send_audio", "send_voice", "send_sticker",
+             "send_media_group", "send_poll", "copy_message", "forward_message"]
+
+    def make(orig, name):
+        async def wrapper(self, *args, **kwargs):
+            cid = kwargs.get("chat_id", args[0] if args else None)
+            if _channels_blocked(cid):
+                _channels_state["suppressed"] += 1
+                print(f"[CHANNELS] OFF - held back {name} to {cid}")
+                if name == "send_media_group":
+                    return ()
+                return _ChannelHeldMsg(cid, kwargs.get("text") or kwargs.get("caption") or "")
+            return await orig(self, *args, **kwargs)
+        wrapper.__name__ = name
+        return wrapper
+
+    for name in names:
+        orig = getattr(ExtBot, name, None)
+        if orig is not None:
+            setattr(ExtBot, name, make(orig, name))
+    ExtBot._channel_gate = True
+    print("[CHANNELS] posting gate installed")
+
+
+def _channels_load_state_sync():
+    """Reads the saved switch at startup. Any failure leaves it ON, which
+    is the normal behaviour."""
+    try:
+        r = requests.get(
+            f"{SUPABASE_URL}/rest/v1/bot_flags?key=eq.{_CHANNELS_FLAG_KEY}&select=value,updated_at&limit=1",
+            headers=sb_headers(), timeout=10)
+        rows = r.json() if r.status_code == 200 else []
+        if isinstance(rows, list) and rows:
+            _channels_state["on"] = str(rows[0].get("value")) != "off"
+            _channels_state["since"] = rows[0].get("updated_at")
+        print(f"[CHANNELS] startup: posting is {'ON' if _channels_state['on'] else 'OFF'}")
+    except Exception as e:
+        print(f"[CHANNELS] could not read saved switch, leaving ON: {type(e).__name__}")
+
+
+def _channels_save_state_sync(on):
+    try:
+        headers = dict(sb_headers())
+        headers["Prefer"] = "resolution=merge-duplicates,return=minimal"
+        r = requests.post(
+            f"{SUPABASE_URL}/rest/v1/bot_flags?on_conflict=key", headers=headers, timeout=10,
+            json={"key": _CHANNELS_FLAG_KEY, "value": "on" if on else "off",
+                  "updated_at": datetime.utcnow().isoformat() + "Z"})
+        return r.status_code in (200, 201, 204)
+    except Exception as e:
+        print(f"[CHANNELS] save failed: {type(e).__name__}")
+        return False
+
+
+def _channels_status_text():
+    on = _channels_state["on"]
+    if on:
+        head = "📡 <b>Channel posting: 🟢 ON</b>\n\nSignals, news, reports and education are going out to all 3 channels as normal."
+    else:
+        since = ""
+        raw = _channels_state.get("since")
+        if raw:
+            try:
+                t = datetime.fromisoformat(str(raw).replace("Z", "+00:00")) + timedelta(hours=1)
+                since = f" since {t.strftime('%a %d %b, %H:%M')} (WAT)"
+            except Exception:
+                pass
+        head = (f"📡 <b>Channel posting: 🔴 OFF</b>{since}\n\n"
+                "Nothing is being posted to the Public, Inner Circle or official Nexora AI channels. "
+                f"Held back so far this run: <b>{_channels_state['suppressed']}</b>. They are not sent later.")
+    return (head + "\n\n<b>Still working for everyone:</b> personal signal requests, auto-trading, "
+            "copy trading, DMs and the app.\n<i>Your own admin commands (like /broadcastchannels) still post.</i>")
+
+
+def _channels_markup():
+    if _channels_state["on"]:
+        btn = InlineKeyboardButton("🔴 Turn OFF channel posting", callback_data="chsw_off")
+    else:
+        btn = InlineKeyboardButton("🟢 Turn ON channel posting", callback_data="chsw_on")
+    return InlineKeyboardMarkup([[btn]])
+
+
+async def _channels_apply(on):
+    _channels_state["on"] = on
+    _channels_state["suppressed"] = 0
+    _channels_state["since"] = datetime.utcnow().isoformat() + "Z"
+    ok = await asyncio.to_thread(_channels_save_state_sync, on)
+    print(f"[CHANNELS] switched {'ON' if on else 'OFF'} by admin (saved={ok})")
+    return ok
+
+
+async def channels_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Admin only. /channels shows the switch; /channels off or on flips it."""
+    if not update.message or not ADMIN_USER_ID or str(update.message.from_user.id) != str(ADMIN_USER_ID):
+        return
+    arg = context.args[0].lower() if context.args else ""
+    note = ""
+    if arg in ("off", "stop", "pause"):
+        if not await _channels_apply(False):
+            note = "\n\n⚠️ Could not save this, so it resets to ON if the bot restarts."
+    elif arg in ("on", "start", "resume"):
+        if not await _channels_apply(True):
+            note = "\n\n⚠️ Could not save this, so it may revert to OFF if the bot restarts."
+    await update.message.reply_text(
+        _channels_status_text() + note, parse_mode=ParseMode.HTML, reply_markup=_channels_markup())
+
+
+async def channels_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    q = update.callback_query
+    if not q or not ADMIN_USER_ID or str(q.from_user.id) != str(ADMIN_USER_ID):
+        if q:
+            await q.answer()
+        return
+    note = ""
+    if q.data == "chsw_off":
+        if not await _channels_apply(False):
+            note = "\n\n⚠️ Could not save this, so it resets to ON if the bot restarts."
+    elif q.data == "chsw_on":
+        if not await _channels_apply(True):
+            note = "\n\n⚠️ Could not save this, so it may revert to OFF if the bot restarts."
+    await q.answer("Done")
+    try:
+        await q.edit_message_text(
+            _channels_status_text() + note, parse_mode=ParseMode.HTML, reply_markup=_channels_markup())
+    except Exception as e:
+        print(f"[CHANNELS] could not refresh status message: {type(e).__name__}")
+
+
+async def _channel_force_for_admin(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Runs first on every update: lets the admin's own deliberate commands
+    post to the channels even while the switch is off. Set on every update
+    (True or False) so it can never carry over to someone else's."""
+    uid = None
+    try:
+        if update.effective_user:
+            uid = str(update.effective_user.id)
+    except Exception:
+        pass
+    _CHANNEL_FORCE.set(bool(ADMIN_USER_ID) and uid == str(ADMIN_USER_ID))
+
+
 async def broadcastchannels_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await _handle_broadcastchannels_request(update, context, update.message.text)
 
@@ -30690,6 +30880,7 @@ async def catch_up_missed_signals(app):
                 BotCommand("testsynth", "Test a synthetic index signal (r10-r100)"),
                 BotCommand("discoversymbols", "Look up real Deriv symbol codes"),
                 BotCommand("broadcast", "DM a message to every bot user"),
+                BotCommand("channels", "Turn channel posting ON or OFF"),
                 BotCommand("broadcastchannels", "Post a message to all 3 channels"),
                 BotCommand("milestone", "Post a milestone announcement with CTA button"),
                 BotCommand("welcome", "Repost the welcome message to all 3 channels"),
@@ -31657,6 +31848,11 @@ def main():
         _napp_install_push_bridge()
     except Exception as _e:
         print(f"[PUSH] Could not install app push bridge: {type(_e).__name__}: {_e}")
+    try:
+        _install_channel_gate()
+        _channels_load_state_sync()
+    except Exception as _e:
+        print(f"[CHANNELS] Could not install channel gate: {type(_e).__name__}: {_e}")
     app = (
         Application.builder()
         .token(TELEGRAM_TOKEN)
@@ -31809,6 +32005,9 @@ def main():
     app.add_handler(TypeHandler(Update, refresh_menu_if_stale), group=-1)
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("broadcast", broadcast_command))
+    app.add_handler(TypeHandler(Update, _channel_force_for_admin), group=-1)
+    app.add_handler(CommandHandler("channels", channels_command))
+    app.add_handler(CallbackQueryHandler(channels_callback, pattern=r"^chsw_"))
     app.add_handler(CommandHandler("broadcastchannels", broadcastchannels_command))
     app.add_handler(CommandHandler("backfillmlfeatures", backfillmlfeatures_command))
     app.add_handler(CommandHandler("backtestderivbot", backtestderivbot_command))

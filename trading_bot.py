@@ -18538,6 +18538,12 @@ def get_market_session():
 # had; it never changes a signal, a trade or any other channel's post.
 # ============================================
 
+# Switched OFF by the owner: the Inner Circle gets only the Key Point cards.
+# Set to True to bring the "Why this trade" follow-up (picture + short
+# caption) back under every signal; nothing else needs to change.
+INNER_CIRCLE_WHY_TRADE_ENABLED = False
+
+
 def build_inner_circle_rationale(display, direction, entry, sl, tp2, tp1=None,
                                  h1=None, h4=None, daily=None, agreeing=None,
                                  confidence=None, session=None, decimals=2,
@@ -18546,6 +18552,8 @@ def build_inner_circle_rationale(display, direction, entry, sl, tp2, tp1=None,
     {"caption": <short HTML>, "plan": <data for the picture>}, or None if
     there isn't enough real data to say anything honest. Only states
     facts computed from the same candles the signal used."""
+    if not INNER_CIRCLE_WHY_TRADE_ENABLED:
+        return None
     try:
         if direction not in ("BUY", "SELL") or entry is None or sl is None:
             return None
@@ -20728,7 +20736,7 @@ async def build_signal_response(question, user_id=None, retry_mismatch=False):
     # Same filtered, direction-safe generator as above; not shown on any
     # other channel and not counted against any user's AI limit.
     ic_fundamental = fundamental_reason
-    if not ic_fundamental and user_id is None:
+    if INNER_CIRCLE_WHY_TRADE_ENABLED and not ic_fundamental and user_id is None:
         try:
             ic_fundamental = await generate_fundamental_context(pair_name, direction)
         except Exception as e:

@@ -23378,8 +23378,15 @@ async def place_mt5_trade(signal_data, signal_id=None, leg=None, volume=0.1):
         # that position's own IDs are used directly and no duplicate
         # order is ever submitted - real resilience AND real safety,
         # not one traded for the other.
-        transient_statuses = (429, 502, 503, 504)
-        max_attempts = 3
+        transient_statuses = (429, 502, 503, 504, 500)
+        # MetaAPI sometimes answers 500 "Failed to execute a callable"
+        # (a fault inside its own servers, usually a brief broker-link
+        # hiccup). Confirmed live: a real signal was dropped because a
+        # 500 was treated as final. 500 now gets up to 5 attempts with
+        # longer waits (5/10/20/30s); every other status keeps 3.
+        # The duplicate-order check below still runs before every retry.
+        max_attempts = 5
+        server_error_waits = (5, 10, 20, 30)
         last_response = None
         idempotent_match = None
         attempt_started_at = datetime.utcnow()
@@ -23408,8 +23415,8 @@ async def place_mt5_trade(signal_data, signal_id=None, leg=None, volume=0.1):
             try:
                 response = await asyncio.to_thread(requests.post, url, headers=headers, json=payload, timeout=30)
             except requests.exceptions.RequestException as network_exc:
-                if attempt == max_attempts:
-                    print(f"[MT5 PERSONAL COPY] ❌ Network error on final attempt {attempt}/{max_attempts}: {network_exc}")
+                if attempt >= 3:
+                    print(f"[MT5 PERSONAL COPY] ❌ Network error on final attempt {attempt}: {network_exc}")
                     late = await _late_confirm_position(METAAPI_ACCOUNT_ID, mt5_symbol, trade_comment, attempt_started_at)
                     if late:
                         return late.get("id", "unknown")
@@ -23445,7 +23452,7 @@ async def place_mt5_trade(signal_data, signal_id=None, leg=None, volume=0.1):
                     break
                 wait_seconds = 2 * attempt
                 print(
-                    f"[MT5] ⚠️ Network error on attempt {attempt}/{max_attempts}: {network_exc} "
+                    f"[MT5] ⚠️ Network error on attempt {attempt}/3: {network_exc} "
                     f"- retrying in {wait_seconds}s..."
                 )
                 await asyncio.sleep(wait_seconds)
@@ -23454,7 +23461,8 @@ async def place_mt5_trade(signal_data, signal_id=None, leg=None, volume=0.1):
             last_response = response
             if response.status_code in (200, 201):
                 break
-            if response.status_code not in transient_statuses or attempt == max_attempts:
+            attempt_cap = max_attempts if response.status_code == 500 else 3
+            if response.status_code not in transient_statuses or attempt >= attempt_cap:
                 break
 
             # Before resubmitting, confirm the PRIOR attempt genuinely
@@ -23470,6 +23478,17 @@ async def place_mt5_trade(signal_data, signal_id=None, leg=None, volume=0.1):
             check_result = await check_for_matching_recent_position(
                 METAAPI_ACCOUNT_ID, mt5_symbol, trade_comment, attempt_started_at
             )
+            if check_result == "CHECK_FAILED" and response.status_code == 500:
+                # During a MetaAPI 500 spell the positions read can fail
+                # too. Re-try the safety check a few times before giving
+                # up - still never resubmits without a successful check.
+                for _ in range(3):
+                    await asyncio.sleep(5)
+                    check_result = await check_for_matching_recent_position(
+                        METAAPI_ACCOUNT_ID, mt5_symbol, trade_comment, attempt_started_at
+                    )
+                    if check_result != "CHECK_FAILED":
+                        break
             if check_result == "CHECK_FAILED":
                 # Per explicit instruction: if the safety check itself
                 # can't be trusted, the safe direction is to STOP, not
@@ -23485,10 +23504,13 @@ async def place_mt5_trade(signal_data, signal_id=None, leg=None, volume=0.1):
                 )
                 break
 
-            wait_seconds = 2 * attempt
+            if response.status_code == 500:
+                wait_seconds = server_error_waits[min(attempt - 1, len(server_error_waits) - 1)]
+            else:
+                wait_seconds = 2 * attempt
             print(
                 f"[MT5] ⚠️ Trade request got {response.status_code} "
-                f"(attempt {attempt}/{max_attempts}) - retrying in {wait_seconds}s..."
+                f"(attempt {attempt}/{attempt_cap}) - retrying in {wait_seconds}s..."
             )
             await asyncio.sleep(wait_seconds)
 
@@ -23542,8 +23564,13 @@ async def place_mt5_trade(signal_data, signal_id=None, leg=None, volume=0.1):
             # margin, etc.) was never visible anywhere, only ever a
             # bare number. Logging the full body now so a future
             # failure is actually diagnosable instead of another guess.
-            print(f"[MT5 PERSONAL COPY] ❌ Trade failed after {max_attempts} attempt(s): {response.status_code} | {response.text}")
-            if response.status_code in transient_statuses:
+            print(f"[MT5 PERSONAL COPY] ❌ Trade failed after {attempt} attempt(s): {response.status_code} | {response.text}")
+            if response.status_code == 500:
+                _PERSONAL_COPY_LAST_FAILURE["reason"] = (
+                    f"MetaAPI error 500 (server fault on their side) - still failing after {attempt} attempts "
+                    f"over about a minute: {response.text[:120]}"
+                )
+            elif response.status_code in transient_statuses:
                 _PERSONAL_COPY_LAST_FAILURE["reason"] = (
                     f"MetaAPI error {response.status_code}: account not connected to the broker (timed out)"
                 )

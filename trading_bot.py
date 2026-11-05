@@ -15417,7 +15417,7 @@ async def backfill_signal_ml_features(progress_callback=None):
     return results
 
 
-async def exnesstest_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def exnessapitest_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """
     Admin-only, READ-ONLY check of the Exness Trader API connection:
     signs a request with the keys stored in Railway variables, looks up
@@ -32243,7 +32243,7 @@ def main():
     app.add_handler(CallbackQueryHandler(channels_callback, pattern=r"^chsw_"))
     app.add_handler(CommandHandler("broadcastchannels", broadcastchannels_command))
     app.add_handler(CommandHandler("backfillmlfeatures", backfillmlfeatures_command))
-    app.add_handler(CommandHandler("exnesstest", exnesstest_command))
+    app.add_handler(CommandHandler("exnessapitest", exnessapitest_command))
     app.add_handler(CommandHandler("backtestderivbot", backtestderivbot_command))
     app.add_handler(CommandHandler("milestone", milestone_command))
     app.add_handler(CommandHandler("registerfallbackimages", registerfallbackimages_command))

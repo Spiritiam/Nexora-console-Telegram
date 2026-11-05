@@ -32402,7 +32402,8 @@ def main():
     job_queue.run_once(
         backfill_deriv_live_ml_features,
         when=150,
-        name="deriv_live_ml_backfill"
+        name="deriv_live_ml_backfill",
+        job_kwargs={"misfire_grace_time": 600},
     )
 
     # MT5 auto-trade close monitor - detects closed orders every 15

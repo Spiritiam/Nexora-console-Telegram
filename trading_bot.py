@@ -5194,6 +5194,8 @@ async def _napp_exness_status_build(synth):
             "reachable": reachable,
         },
         "connect": {"state": job.get("state"), "message": job.get("message")},
+        "free": True,
+        "api_connected": bool(row and _is_exness_ref(row.get("metaapi_account_id"))),
         "settings": _napp_exness_settings(row),
         "flip_open": flip_open,
         "options": options,
@@ -5282,6 +5284,15 @@ NAPP_EX_CODES = {
     "invalid_server": (False, 400, "Check the server name",
                        "Enter your server name exactly as shown on Exness, for example Exness-Real4.",
                        "retry", "bad_request"),
+    "invalid_api_key": (False, 400, "Check your API key",
+                        "Paste the API key and the secret key you created on the Exness website.",
+                        "retry", "bad_request"),
+    "exness_keys_rejected": (False, 400, "Exness did not accept these keys",
+                             "Check that the API key was created for this exact account number, with Trading access turned on, and that you copied the secret key in full.",
+                             "retry", "bad_request"),
+    "exness_api_connected": (True, 200, "Exness account connected",
+                             "Your Exness account is connected and ready. Choose how Nexora should trade for you below.",
+                             "none", None),
     "invalid_nickname": (False, 400, "Add a nickname",
                          "Give the account a short nickname so you can recognise it.", "retry", "bad_request"),
     "email_linked_elsewhere": (False, 409, "Email already in use",
@@ -5623,6 +5634,7 @@ async def nexora_app_exness_pay_handler(request):
         return err
     if _napp_exness_killed():
         return _napp_json({"error": "unavailable", "message": "Exness in the app is switched off right now."}, 503)
+    return _napp_json({"error": "free", "message": "Exness Auto-Trade is free now. Update the SpiritFX Trading Academy app, then connect your Exness account with an API key."}, 409)
     body = await _napp_exness_body(request)
     if body is None:
         return _napp_json({"error": "bad_request", "message": "Could not read that."}, 400)
@@ -5843,6 +5855,82 @@ async def _napp_exness_connect_checked(synth, number, password, server, name, re
     _napp_exness_futs.add(fut)
     fut.add_done_callback(_napp_exness_futs.discard)
     return _napp_ex_reply("connecting", extra={"state": "connecting"})
+
+
+@_napp_ex_guard
+async def nexora_app_exness_connect_api_handler(request):
+    synth, err = await _napp_ex_auth(request, 20)
+    if err:
+        return err
+    if _napp_exness_killed():
+        return _napp_ex_reply("feature_disabled")
+    body = await _napp_exness_body(request)
+    if body is None:
+        return _napp_ex_reply("invalid_request")
+    number = str(body.get("account_number", "")).strip()
+    api_key = str(body.get("api_key", "")).strip()
+    secret = str(body.get("secret_key", "")).strip()
+    if not re.fullmatch(r"\d{4,14}", number):
+        return _napp_ex_reply("invalid_account_number")
+    if not (8 <= len(api_key) <= 200) or not (8 <= len(secret) <= 400) or "\n" in api_key:
+        return _napp_ex_reply("invalid_api_key")
+
+    verified, email_v, vok = await asyncio.to_thread(_napp_exness_verified_sync, synth)
+    row, rok = await asyncio.to_thread(_napp_exness_row_sync, synth)
+    if not vok or not rok:
+        return _napp_ex_reply("server_error", status=503)
+    if not verified:
+        return _napp_ex_reply("not_verified")
+    old_id = (row or {}).get("metaapi_account_id")
+    if old_id and not _is_exness_ref(old_id):
+        expiry = _napp_exness_expiry(row)
+        if expiry and datetime.utcnow() < expiry:
+            return _napp_ex_reply("already_connected")
+    if row and row.get("bot_choice") == "account_flip" and old_id:
+        if await asyncio.to_thread(_napp_exness_flip_open_sync, synth):
+            return _napp_ex_reply("flip_trade_open")
+
+    # The account must belong to this client under SpiritFX's Exness link.
+    try:
+        verdict, _detail, accts = await _napp_run_on_main(exness_check_email(email_v), 70)
+    except Exception as e:
+        print(f"[NEXORA EXNESS] api connect affiliation error: {type(e).__name__}")
+        verdict, accts = "unknown", []
+    if verdict == "declined":
+        return _napp_ex_reply("not_under_spiritfx")
+    if verdict != "approved":
+        return _napp_ex_reply("exness_unavailable")
+    if accts and number not in [str(a) for a in accts]:
+        return _napp_ex_reply("account_not_yours")
+
+    other, ook = await asyncio.to_thread(_exness_account_owner_for_link_sync, number, synth)
+    if not ook:
+        return _napp_ex_reply("server_error", status=503)
+    if other:
+        if not _is_app_synth(other):
+            return _napp_ex_reply("account_linked_telegram", extra={"linked_on": "telegram"})
+        return _napp_ex_reply("account_linked_elsewhere", extra={"linked_on": "app"})
+    if _napp_exness_limited("connect", synth, 10):
+        retry = _napp_ex_limit_retry_at("connect", synth)
+        return _napp_ex_reply("too_many_attempts", retry_at=retry,
+                              wait=_napp_ex_wait_words((retry - datetime.utcnow()).total_seconds()))
+
+    ok, _detail, _bal = await asyncio.to_thread(_exness_verify_and_store_sync, synth, number, api_key, secret)
+    if not ok:
+        return _napp_ex_reply("exness_keys_rejected")
+    try:
+        await asyncio.to_thread(upsert_mt5_autotrade_account, synth, {
+            "account_number": number, "account_name": "Exness", "server": "Exness API",
+            "encrypted_password": None, "metaapi_account_id": f"{EXNESS_REF_PREFIX}{number}",
+            "symbol_map": None, "is_active": True, "trading_paused": False,
+            "subscription_expires_at": "2099-12-31T00:00:00+00:00"})
+    except Exception as e:
+        print(f"[NEXORA EXNESS] api connect save failed for {synth}: {type(e).__name__}")
+        return _napp_ex_reply("server_error", status=503)
+    if old_id and not _is_exness_ref(old_id):
+        _napp_exness_spawn(deprovision_mt5_account(old_id))
+    await _napp_exness_push(synth, "<b>Exness account connected</b>\nAuto-Trade is ready with your saved settings.")
+    return _napp_ex_reply("exness_api_connected")
 
 
 def _napp_exness_num(body, key, lo, hi, decimals=2):
@@ -6488,6 +6576,7 @@ def run_korapay_webhook_server():
     webhook_app.router.add_post("/api/nexora/exness/verify", nexora_app_exness_verify_handler)
     webhook_app.router.add_post("/api/nexora/exness/pay", nexora_app_exness_pay_handler)
     webhook_app.router.add_post("/api/nexora/exness/connect", nexora_app_exness_connect_handler)
+    webhook_app.router.add_post("/api/nexora/exness/connect_api", nexora_app_exness_connect_api_handler)
     webhook_app.router.add_post("/api/nexora/exness/config", nexora_app_exness_config_handler)
     webhook_app.router.add_post("/api/nexora/exness/disconnect", nexora_app_exness_disconnect_handler)
     webhook_app.router.add_get("/api/nexora/prop/status", nexora_app_prop_status_handler)

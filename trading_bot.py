@@ -24932,7 +24932,7 @@ EXN_SWITCH_HELP_TEXT = (
 )
 
 
-async def send_verification_gate(update, reason_intro=None):
+async def send_verification_gate(update, reason_intro=None, with_buttons=True):
     # FIX: CONFIRMED REAL BUG, per explicit instruction - this message
     # was hardcoded to always claim "you've used your 3 FREE trial
     # signals" AND to always talk about "unlimited signals/analysis/
@@ -24946,6 +24946,17 @@ async def send_verification_gate(update, reason_intro=None):
     # second time. Defaults to the original wording, so all 12
     # genuinely trial-triggered call sites are completely unaffected.
     intro = reason_intro or "🔐 <b>You've used your 5 FREE signals!</b>"
+    if not with_buttons:
+        await update.effective_message.reply_text(
+            f"{intro}\n\n"
+            "Open a <b>free</b> Exness account with our link. <b>No payment.</b>\n"
+            f"🔗 {EXNESS_LINK}\n\n"
+            "👉 Already registered with our link? <b>Type your Exness email below</b> "
+            "and send it for verification.",
+            parse_mode=ParseMode.HTML,
+            disable_web_page_preview=True
+        )
+        return
     await update.effective_message.reply_text(
         f"{intro}\n\n{VERIFY_GATE_STEP_TEXT}",
         parse_mode=ParseMode.HTML,
@@ -26113,7 +26124,8 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     "🔒 <b>Exness auto trade requires a verified Exness "
                     "account first to continue the connection process</b> "
                     "— you just need <b>one simple step:</b>"
-                )
+                ),
+                with_buttons=False
             )
             return
 
@@ -28820,7 +28832,7 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 f"✅ <b>Setup complete:</b>\n\n"
                 f"{summary}\n"
                 f"Lot size: {lot_size}\n\n"
-                f"Tap below to pay and unlock your MT5 connection:",
+                f"Tap below to continue:",
                 parse_mode=ParseMode.HTML,
                 reply_markup=InlineKeyboardMarkup([
                     [InlineKeyboardButton("➡️ Continue", callback_data="mt5auto_continue")]
@@ -28889,7 +28901,7 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
         # same pattern as the lot/risk % paths above.
         sent_ready = await update.message.reply_text(
             f"✅ <b>Setup complete:</b>\n\n🚀 Account Flip\n{summary}\n\n"
-            f"Tap below to pay and unlock your MT5 connection:",
+            f"Tap below to continue:",
             parse_mode=ParseMode.HTML,
             reply_markup=InlineKeyboardMarkup([
                 [InlineKeyboardButton("➡️ Continue", callback_data="mt5auto_continue")]
@@ -28971,7 +28983,7 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 f"✅ <b>Setup complete:</b>\n\n"
                 f"{summary}\n"
                 f"Risk: {risk_percent}%\n\n"
-                f"Tap below to pay and unlock your MT5 connection:",
+                f"Tap below to continue:",
                 parse_mode=ParseMode.HTML,
                 reply_markup=InlineKeyboardMarkup([
                     [InlineKeyboardButton("➡️ Continue", callback_data="mt5auto_continue")]

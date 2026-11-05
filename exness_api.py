@@ -83,7 +83,10 @@ def signed_request(base_url: str, api_key: str, private_key, method: str, path: 
     headers = signed_headers(api_key, private_key, method, path, body, idempotency_key)
     if body:
         headers["Content-Type"] = "application/json"
-    return requests.request(method.upper(), base_url.rstrip("/") + path,
+    base_url = base_url.strip().rstrip("/")
+    if not base_url.startswith(("http://", "https://")):
+        base_url = "https://" + base_url
+    return requests.request(method.upper(), base_url + path,
                             headers=headers, data=body if body else None, timeout=timeout)
 
 

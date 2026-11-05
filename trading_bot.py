@@ -10241,6 +10241,12 @@ async def run_ml_driven_decision_synthetic(index_key, config, h1_candles, h4_can
         chosen_sl = current_price + risk_price_move
         chosen_tp = current_price - win_price_move
     try:
+        # Record the model's input readings with every live signal so
+        # the Deriv model can be retrained on real outcomes.
+        live_features = compute_synthetic_backtest_features(
+            index_key, direction, agreeing_strategies, current_price,
+            chosen_sl, chosen_tp, h1_candles, datetime.utcnow()
+        )
         log_url = f"{SUPABASE_URL}/rest/v1/deriv_live_signals"
         requests.post(
             log_url, headers=sb_headers(),
@@ -10251,6 +10257,7 @@ async def run_ml_driven_decision_synthetic(index_key, config, h1_candles, h4_can
                 "stop_loss": chosen_sl,
                 "take_profit": chosen_tp,
                 "agreeing_strategies": agreeing_strategies,
+                "ml_features": live_features,
             },
             timeout=10,
         )
@@ -31103,6 +31110,109 @@ def _resolve_deriv_rows_against_candles(rows, candles):
     return out
 
 
+def _build_deriv_backfill_features(index_key, rows, candles):
+    """
+    Worker-thread helper: rebuilds the model's input readings for older
+    Deriv live signals that were logged without them. For each signal
+    it uses only candles that had already CLOSED at signal time, plus
+    one partial candle ending at the signal's own entry price - same
+    shape the live path sees, with no look-ahead. Returns
+    [{"id": ..., "f": {...}}, ...].
+    """
+    import bisect
+    series = []
+    for c in candles:
+        t = c.get("time")
+        if isinstance(t, (int, float)):
+            series.append((datetime.utcfromtimestamp(t), c))
+    series.sort(key=lambda x: x[0])
+    times = [x[0] for x in series]
+    out = []
+    for row in rows:
+        try:
+            posted_at = datetime.fromisoformat(row["posted_at"].replace("Z", "+00:00")).replace(tzinfo=None)
+            entry = float(row["entry_price"])
+            sl = float(row["stop_loss"])
+            tp = float(row["take_profit"])
+        except Exception:
+            continue
+        # candles whose open time is <= posted_at; the last of them is
+        # the one still in progress at signal time.
+        end = bisect.bisect_right(times, posted_at)
+        if end < 61:
+            continue
+        window = [dict(c) for _, c in series[max(0, end - 100):end]]
+        cur = window[-1]
+        cur["close"] = entry
+        cur["high"] = max(cur["open"], entry)
+        cur["low"] = min(cur["open"], entry)
+        feats = compute_synthetic_backtest_features(
+            index_key, row.get("direction"), row.get("agreeing_strategies") or [],
+            entry, sl, tp, window, posted_at
+        )
+        if feats is None:
+            continue
+        out.append({"id": row["id"], "f": feats})
+    return out
+
+
+async def backfill_deriv_live_ml_features(context: ContextTypes.DEFAULT_TYPE = None):
+    """
+    One-off, self-finishing job: fills ml_features for Deriv live
+    signals logged before the field was recorded. Safe to run on every
+    start - it only touches rows where ml_features is still empty and
+    does nothing once there are none. Updates go through the
+    set_deriv_live_ml_features database function so it never overwrites
+    a status the outcome tracker is writing at the same time.
+    """
+    total_filled = 0
+    try:
+        for index_key, config in SYNTHETIC_CONFIG.items():
+            candles = await get_cached_synthetic_candles(index_key, config["symbol"], "1h", 3600, 1000)
+            if not candles:
+                print(f"[DERIV ML BACKFILL] {index_key}: no candles, skipped this run")
+                continue
+            while True:
+                url = (
+                    f"{SUPABASE_URL}/rest/v1/deriv_live_signals?ml_features=is.null"
+                    f"&index_key=eq.{index_key}"
+                    f"&select=id,direction,entry_price,stop_loss,take_profit,posted_at,agreeing_strategies"
+                    f"&order=id.asc&limit=1000"
+                )
+                resp = await asyncio.to_thread(requests.get, url, headers=sb_headers(), timeout=30)
+                if resp.status_code != 200:
+                    print(f"[DERIV ML BACKFILL] fetch failed {resp.status_code}")
+                    break
+                rows = resp.json()
+                if not rows:
+                    break
+                built = await asyncio.to_thread(_build_deriv_backfill_features, index_key, rows, candles)
+                if not built:
+                    # Rows we cannot build (too old for the candle window)
+                    # would be refetched forever - mark them with an empty
+                    # object so they are skipped and we move on.
+                    built = [{"id": r["id"], "f": {}} for r in rows]
+                else:
+                    done_ids = {b["id"] for b in built}
+                    built += [{"id": r["id"], "f": {}} for r in rows if r["id"] not in done_ids]
+                for i in range(0, len(built), 500):
+                    chunk = built[i:i + 500]
+                    rr = await asyncio.to_thread(
+                        requests.post,
+                        f"{SUPABASE_URL}/rest/v1/rpc/set_deriv_live_ml_features",
+                        headers=sb_headers(), json={"p": chunk}, timeout=60,
+                    )
+                    if rr.status_code not in (200, 204):
+                        print(f"[DERIV ML BACKFILL] write failed {rr.status_code}: {rr.text[:200]}")
+                        return
+                    total_filled += len(chunk)
+                if len(rows) < 1000:
+                    break
+        print(f"[DERIV ML BACKFILL] done, {total_filled} row(s) processed")
+    except Exception as e:
+        print(f"[DERIV ML BACKFILL] error: {e}")
+
+
 async def check_deriv_live_signal_outcomes(context: ContextTypes.DEFAULT_TYPE):
     # FIX, per explicit instruction: ~51,000 Deriv signals sat OPEN for
     # days. Two real causes in the old version of this function:
@@ -32285,6 +32395,14 @@ def main():
         interval=900,
         first=90,
         name="deriv_live_signal_outcome_tracker"
+    )
+
+    # One-off backfill of Deriv model input readings (does nothing once
+    # every row has them).
+    job_queue.run_once(
+        backfill_deriv_live_ml_features,
+        when=150,
+        name="deriv_live_ml_backfill"
     )
 
     # MT5 auto-trade close monitor - detects closed orders every 15

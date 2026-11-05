@@ -24908,7 +24908,8 @@ def clean_text(text):
 VERIFY_GATE_STEP_TEXT = (
     "Unlock <b>unlimited free signals</b>, analysis and <b>free auto-trade</b> with "
     "one step: open a free Exness account with our link. <b>No payment.</b>\n\n"
-    "👉 Already registered with our link? <b>Type your Exness email below.</b>"
+    "👉 Already registered with our link?\n"
+    "👇 <b>Type your Exness email below and send for verification/approval.</b>"
 )
 
 
@@ -24916,7 +24917,8 @@ VERIFY_GATE_NOBTN_TEXT = (
     "Unlock <b>unlimited free signals</b>, analysis and <b>free auto-trade</b> with "
     "one step: open a free Exness account with our link. <b>No payment.</b>\n"
     f"🔗 {EXNESS_LINK}\n\n"
-    "👉 Already registered with our link? <b>Type your Exness email below.</b>"
+    "👉 Already registered with our link?\n"
+    "👇 <b>Type your Exness email below and send for verification/approval.</b>"
 )
 
 
@@ -24966,8 +24968,8 @@ async def send_verification_gate(update, reason_intro=None, with_buttons=False):
             f"{intro}\n\n"
             "Open a <b>free</b> Exness account with our link. <b>No payment.</b>\n"
             f"🔗 {EXNESS_LINK}\n\n"
-            "👉 Already registered with our link? <b>Type your Exness email below</b> "
-            "and send it for verification.",
+            "👉 Already registered with our link?\n"
+            "👇 <b>Type your Exness email below and send for verification/approval.</b>",
             parse_mode=ParseMode.HTML,
             disable_web_page_preview=True
         )

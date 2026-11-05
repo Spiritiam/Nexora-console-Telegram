@@ -15459,6 +15459,78 @@ async def exnessapitest_command(update: Update, context: ContextTypes.DEFAULT_TY
         await update.message.reply_text(f"❌ Exness API check failed: {str(e)[:500]}")
 
 
+async def exnessapitrade_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """
+    Admin-only one-off LIVE test: opens the smallest allowed EURUSD buy on
+    the Exness test account (stop loss + take profit set on entry), reads it
+    back, then closes it. Fixed instrument and size - takes no arguments.
+    """
+    user_id = str(update.message.from_user.id)
+    if not ADMIN_USER_ID or user_id != ADMIN_USER_ID:
+        return
+    api_key = os.environ.get("EXNESS_API_KEY", "").strip()
+    secret = os.environ.get("EXNESS_SECRET_KEY", "").strip()
+    gateway = os.environ.get("EXNESS_GATEWAY_URL", "").strip()
+    account_id = os.environ.get("EXNESS_ACCOUNT_ID", "10000776165").strip()
+    if not (api_key and secret and gateway):
+        await update.message.reply_text("Missing Exness Railway variables.")
+        return
+    await update.message.reply_text("Placing the 0.01-lot EURUSD test trade on Exness...")
+
+    def run_test():
+        import exness_api
+        log = []
+        c = exness_api.ExnessClient(gateway, api_key, secret, account_id)
+        names = c.instruments()
+        sym = next((n for n in names if str(n).upper() in ("EURUSD", "EURUSDM", "EURUSDC")), None)
+        if not sym:
+            sym = next((n for n in names if str(n).upper().startswith("EURUSD")), None)
+        log.append(f"Instruments available: {len(names)}; EURUSD name: {sym}")
+        if not sym:
+            return log + ["Could not find EURUSD in the instrument list."]
+        cond = c.conditions(sym)
+        digits = cond.get("point_digits", 5)
+        vmin = cond.get("volume_min", "0.01")
+        exec_mode = str(cond.get("exec_mode"))
+        log.append(f"Conditions: digits={digits} volume_min={vmin} exec_mode={exec_mode}")
+        bid = c.last_price(sym, "bid")
+        ask = c.last_price(sym, "ask")
+        dist = Decimal("0.0030")
+        sl = c.fmt_price(ask - dist, digits)
+        tp = c.fmt_price(ask + dist, digits)
+        price = c.fmt_price(ask, digits) if exec_mode.lower() == "instant" else None
+        log.append(f"Price bid {bid} ask {ask}; SL {sl} TP {tp}")
+        code, ack, _ = c.open_position(sym, "buy", vmin, sl, tp, price=price, comment="Nexora test")
+        log.append(f"Open request: HTTP {code} {ack.get('status', ack)}")
+        if code not in (200, 202) or not ack.get("operation_id"):
+            return log + [f"Open rejected: {str(ack)[:300]}"]
+        op = c.wait_operation(ack["operation_id"])
+        log.append(f"Open result: {op.get('status')} {op.get('error_code', '')}")
+        if op.get("status") != "confirmed":
+            return log
+        time.sleep(1)
+        snap = c.snapshot()
+        positions = [p for p in snap.get("positions", []) if p.get("instrument") == sym and p.get("state") == "open"]
+        if not positions:
+            return log + ["Opened, but position not found in snapshot - check the Exness app and close it if open."]
+        pos = sorted(positions, key=lambda p: p.get("create_time", ""))[-1]
+        log.append(f"Position {pos.get('position_id')} open at {pos.get('open_price')} vol {pos.get('volume')}")
+        code, ack2, _ = c.close_position(pos["position_id"])
+        log.append(f"Close request: HTTP {code} {ack2.get('status', ack2)}")
+        if ack2.get("operation_id"):
+            op2 = c.wait_operation(ack2["operation_id"])
+            log.append(f"Close result: {op2.get('status')} {op2.get('error_code', '')}")
+        return log
+
+    try:
+        import time
+        from decimal import Decimal
+        lines = await asyncio.to_thread(run_test)
+        await update.message.reply_text("\n".join(lines))
+    except Exception as e:
+        await update.message.reply_text(f"Exness test trade error: {str(e)[:500]}")
+
+
 async def backfillmlfeatures_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """
     Admin-only, one-off command that runs backfill_signal_ml_features
@@ -32244,6 +32316,7 @@ def main():
     app.add_handler(CommandHandler("broadcastchannels", broadcastchannels_command))
     app.add_handler(CommandHandler("backfillmlfeatures", backfillmlfeatures_command))
     app.add_handler(CommandHandler("exnessapitest", exnessapitest_command))
+    app.add_handler(CommandHandler("exnessapitrade", exnessapitrade_command))
     app.add_handler(CommandHandler("backtestderivbot", backtestderivbot_command))
     app.add_handler(CommandHandler("milestone", milestone_command))
     app.add_handler(CommandHandler("registerfallbackimages", registerfallbackimages_command))

@@ -108,3 +108,108 @@ def get_account_details(access_point: str, api_key: str, private_key, account_id
     if r.status_code != 200:
         raise RuntimeError(f"account details failed: HTTP {r.status_code} {r.text[:300]}")
     return r.json()
+
+
+# ---------------------------------------------------------------------------
+# Trading helpers (all signed). Opening/closing return an ACK only; the real
+# result is read from the operation status endpoint.
+# ---------------------------------------------------------------------------
+from datetime import datetime, timedelta, timezone
+from decimal import Decimal, ROUND_DOWN
+from urllib.parse import urlencode
+
+
+class ExnessClient:
+    def __init__(self, gateway_url, api_key, secret, account_id):
+        self.api_key = api_key
+        self.pk = load_private_key(secret)
+        self.account_id = str(account_id)
+        self.gateway_url = gateway_url
+        self._ap = None
+
+    @property
+    def access_point(self):
+        if not self._ap:
+            self._ap = discover_access_point(self.gateway_url, self.api_key, self.pk, self.account_id)
+        return self._ap
+
+    def _call(self, method, path, json_body=None, idem=""):
+        r = signed_request(self.access_point, self.api_key, self.pk, method, path,
+                           json_body=json_body, idempotency_key=idem)
+        try:
+            data = r.json() if r.text else {}
+        except ValueError:
+            data = {"raw": r.text[:300]}
+        return r.status_code, data
+
+    def instruments(self):
+        code, d = self._call("GET", f"/v1/configuration/accounts/{self.account_id}/instruments")
+        if code != 200:
+            raise RuntimeError(f"instruments: HTTP {code} {str(d)[:200]}")
+        items = d.get("instruments") or d.get("items") or d
+        return items if isinstance(items, list) else []
+
+    def conditions(self, instrument):
+        code, d = self._call("GET", f"/v1/configuration/accounts/{self.account_id}/instruments/{instrument}/conditions")
+        if code != 200:
+            raise RuntimeError(f"conditions {instrument}: HTTP {code} {str(d)[:200]}")
+        return d
+
+    def last_price(self, instrument, side="bid"):
+        now = datetime.now(timezone.utc)
+        q = urlencode({
+            "instrument": instrument, "price_type": side, "timeframe": "M1",
+            "from": (now - timedelta(minutes=15)).strftime("%Y-%m-%dT%H:%M:%SZ"),
+            "to": (now + timedelta(minutes=1)).strftime("%Y-%m-%dT%H:%M:%SZ"),
+        })
+        code, d = self._call("GET", f"/v1/market-data/accounts/{self.account_id}/candles?{q}")
+        if code != 200:
+            raise RuntimeError(f"candles {instrument}: HTTP {code} {str(d)[:200]}")
+        candles = d.get("candles") or []
+        if not candles:
+            raise RuntimeError(f"no recent {side} candles for {instrument} (market closed?)")
+        return Decimal(str(candles[-1]["close"]))
+
+    @staticmethod
+    def fmt_price(value, point_digits):
+        q = Decimal(1).scaleb(-int(point_digits))
+        return str(Decimal(value).quantize(q, rounding=ROUND_DOWN))
+
+    def open_position(self, instrument, side, volume, stop_loss=None, take_profit=None,
+                      price=None, comment="Nexora AI", idem=None):
+        body = {"instrument": instrument, "side": side, "volume": str(volume), "comment": comment[:30]}
+        if stop_loss is not None:
+            body["stop_loss_price"] = str(stop_loss)
+        if take_profit is not None:
+            body["take_profit_price"] = str(take_profit)
+        if price is not None:
+            body["price"] = str(price)
+        idem = idem or new_idempotency_key("open")
+        code, d = self._call("POST", f"/v1/trading/accounts/{self.account_id}/positions", json_body=body, idem=idem)
+        return code, d, idem
+
+    def close_position(self, position_id, idem=None):
+        idem = idem or new_idempotency_key("close")
+        code, d = self._call("DELETE", f"/v1/trading/accounts/{self.account_id}/positions/{position_id}", idem=idem)
+        return code, d, idem
+
+    def operation(self, operation_id):
+        code, d = self._call("GET", f"/v1/trading/accounts/{self.account_id}/operations/{operation_id}")
+        return code, d
+
+    def wait_operation(self, operation_id, timeout=20):
+        end = time.time() + timeout
+        last = {}
+        while time.time() < end:
+            code, d = self.operation(operation_id)
+            last = d
+            if code == 200 and d.get("status") in ("confirmed", "rejected", "failed"):
+                return d
+            time.sleep(1)
+        return last or {"status": "pending"}
+
+    def snapshot(self):
+        code, d = self._call("GET", f"/v1/trading/accounts/{self.account_id}/snapshot")
+        if code != 200:
+            raise RuntimeError(f"snapshot: HTTP {code} {str(d)[:200]}")
+        return d

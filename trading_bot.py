@@ -25505,8 +25505,12 @@ EXNESS_API_CONNECT_INSTRUCTIONS = (
     "5️⃣ Select the <b>account you want to connect</b>\n"
     "6️⃣ Scroll down and set <b>Expiry date</b> to <b>Never</b>\n"
     "7️⃣ Tap <b>Generate key</b>, then copy the <b>API key</b> and the <b>secret key</b> (Exness shows the secret only once)\n\n"
-    "<b>Then, here in Telegram:</b> send your Exness <b>account number</b> now:\n\n"
-    "<i>Your key messages are deleted immediately after you send them.</i>"
+    "<b>Then come back here to Telegram.</b> You will send <b>3 separate messages, one after the other</b> — I will ask for each one:\n"
+    "• Message 1: your Exness <b>account number</b>\n"
+    "• Message 2: paste your <b>API key</b>\n"
+    "• Message 3: paste your <b>secret key</b>\n\n"
+    "<i>I delete your key messages right after you send them, to keep them safe.</i>\n\n"
+    "👉 <b>Message 1 now: send your Exness account number.</b>"
 )
 
 
@@ -28544,7 +28548,8 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
         mt5_signup_state.setdefault(user_id, {})["exn_account"] = number
         user_modes[user_id] = "exn_awaiting_key"
         sent_k = await update.message.reply_text(
-            "🔑 Now send the <b>API key</b> you created on the Exness website.\n\n"
+            "✅ Account number received.\n\n"
+            "🔑 <b>Message 2:</b> copy the <b>API key</b> from the Exness website, paste it here and send it.\n\n"
             "<i>Your message will be deleted immediately.</i>", parse_mode=ParseMode.HTML)
         schedule_auto_delete(sent_k.chat_id, sent_k.message_id)
         return
@@ -28557,8 +28562,9 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
         except Exception:
             pass
         sent_s = await update.message.reply_text(
-            "🔐 Now send the <b>secret key</b> from the Exness website.\n\n"
-            "<i>Your message will be deleted immediately.</i>", parse_mode=ParseMode.HTML)
+            "✅ API key received.\n\n"
+            "🔐 <b>Message 3:</b> now copy the <b>secret key</b> from the Exness website, paste it here and send it.\n\n"
+            "<i>Your message will be deleted immediately. Then I check the connection with Exness.</i>", parse_mode=ParseMode.HTML)
         schedule_auto_delete(sent_s.chat_id, sent_s.message_id)
         return
 

@@ -24912,6 +24912,14 @@ VERIFY_GATE_STEP_TEXT = (
 )
 
 
+VERIFY_GATE_NOBTN_TEXT = (
+    "Unlock <b>unlimited free signals</b>, analysis and <b>free auto-trade</b> with "
+    "one step: open a free Exness account with our link. <b>No payment.</b>\n"
+    f"🔗 {EXNESS_LINK}\n\n"
+    "👉 Already registered with our link? <b>Type your Exness email below.</b>"
+)
+
+
 def verify_gate_markup():
     return InlineKeyboardMarkup([
         [InlineKeyboardButton("📝 Open Exness account (free)", url=EXNESS_LINK)],
@@ -24932,7 +24940,7 @@ EXN_SWITCH_HELP_TEXT = (
 )
 
 
-async def send_verification_gate(update, reason_intro=None, with_buttons=True):
+async def send_verification_gate(update, reason_intro=None, with_buttons=False):
     # FIX: CONFIRMED REAL BUG, per explicit instruction - this message
     # was hardcoded to always claim "you've used your 3 FREE trial
     # signals" AND to always talk about "unlimited signals/analysis/
@@ -24946,6 +24954,13 @@ async def send_verification_gate(update, reason_intro=None, with_buttons=True):
     # second time. Defaults to the original wording, so all 12
     # genuinely trial-triggered call sites are completely unaffected.
     intro = reason_intro or "🔐 <b>You've used your 5 FREE signals!</b>"
+    if not with_buttons and not reason_intro:
+        await update.effective_message.reply_text(
+            f"{intro}\n\n{VERIFY_GATE_NOBTN_TEXT}",
+            parse_mode=ParseMode.HTML,
+            disable_web_page_preview=True
+        )
+        return
     if not with_buttons:
         await update.effective_message.reply_text(
             f"{intro}\n\n"
@@ -27404,9 +27419,9 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         user_modes[user_id] = "awaiting_email"
         await context.bot.send_message(
             chat_id=int(user_id),
-            text=("🔐 <b>You've used your 5 FREE signals!</b>\n\n" + VERIFY_GATE_STEP_TEXT),
+            text=("🔐 <b>You've used your 5 FREE signals!</b>\n\n" + VERIFY_GATE_NOBTN_TEXT),
             parse_mode=ParseMode.HTML,
-            reply_markup=verify_gate_markup()
+            disable_web_page_preview=True
         )
 
     elif data == "exn_switch_help":

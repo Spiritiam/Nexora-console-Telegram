@@ -31056,80 +31056,126 @@ async def check_open_signals(context: ContextTypes.DEFAULT_TYPE):
 # threshold (stop_loss/take_profit) was touched first.
 # ============================================
 
+def _resolve_deriv_rows_against_candles(rows, candles):
+    """
+    Pure-CPU helper (run in a worker thread): walks the real candles
+    for each OPEN row, same rule as before - whichever of stop_loss /
+    take_profit was touched first, SL first if one candle touched both
+    (the conservative call). Returns {"TP_HIT": [ids], "SL_HIT": [ids]}.
+    """
+    import bisect
+    series = []
+    for c in candles:
+        t = c.get("time")
+        if isinstance(t, (int, float)):
+            series.append((datetime.utcfromtimestamp(t), c["low"], c["high"]))
+    series.sort(key=lambda x: x[0])
+    times = [x[0] for x in series]
+    out = {"TP_HIT": [], "SL_HIT": []}
+    for row in rows:
+        try:
+            posted_at = datetime.fromisoformat(row["posted_at"].replace("Z", "+00:00")).replace(tzinfo=None)
+            stop_loss = float(row["stop_loss"])
+            take_profit = float(row["take_profit"])
+        except Exception:
+            continue
+        direction = row.get("direction")
+        start = bisect.bisect_right(times, posted_at)
+        status = None
+        for i in range(start, len(series)):
+            _, low, high = series[i]
+            if direction == "BUY":
+                if low <= stop_loss:
+                    status = "SL_HIT"
+                    break
+                if high >= take_profit:
+                    status = "TP_HIT"
+                    break
+            else:
+                if high >= stop_loss:
+                    status = "SL_HIT"
+                    break
+                if low <= take_profit:
+                    status = "TP_HIT"
+                    break
+        if status:
+            out[status].append(row["id"])
+    return out
+
+
 async def check_deriv_live_signal_outcomes(context: ContextTypes.DEFAULT_TYPE):
+    # FIX, per explicit instruction: ~51,000 Deriv signals sat OPEN for
+    # days. Two real causes in the old version of this function:
+    #  1. it fetched open rows with no limit/order, and the database
+    #     returns at most 1000 rows per request - so only an arbitrary
+    #     first 1000 were ever checked, the rest never were;
+    #  2. it only looked back 300 H1 candles (~12 days), so anything
+    #     older could never resolve.
+    # Now: pages through ALL open rows, looks back 1000 H1 candles
+    # (~41 days), checks each index's rows in a worker thread, and
+    # writes results in batches instead of one request per row.
+    # Rows that genuinely never touched either level stay OPEN.
+    page_size = 1000
+    max_rows = 120000
+    open_rows = []
     try:
-        url = f"{SUPABASE_URL}/rest/v1/deriv_live_signals?status=eq.OPEN&select=*"
-        response = await asyncio.to_thread(requests.get, url, headers=sb_headers(), timeout=15)
-        if response.status_code != 200:
-            print(f"[DERIV LIVE SIGNALS] Failed to fetch open rows: {response.status_code}")
-            return
-        open_rows = response.json()
+        offset = 0
+        while offset < max_rows:
+            url = (
+                f"{SUPABASE_URL}/rest/v1/deriv_live_signals?status=eq.OPEN"
+                f"&select=id,index_key,direction,stop_loss,take_profit,posted_at"
+                f"&order=id.asc&limit={page_size}&offset={offset}"
+            )
+            response = await asyncio.to_thread(requests.get, url, headers=sb_headers(), timeout=30)
+            if response.status_code != 200:
+                print(f"[DERIV LIVE SIGNALS] Failed to fetch open rows: {response.status_code}")
+                break
+            page = response.json()
+            open_rows.extend(page)
+            if len(page) < page_size:
+                break
+            offset += page_size
     except Exception as e:
         print(f"[DERIV LIVE SIGNALS] Error fetching open rows: {e}")
-        return
 
     if not open_rows:
         return
 
+    by_index = {}
     for row in open_rows:
-        index_key = row.get("index_key")
+        by_index.setdefault(row.get("index_key"), []).append(row)
+
+    total_closed = 0
+    for index_key, rows in by_index.items():
         config = SYNTHETIC_CONFIG.get(index_key)
         if not config:
             continue
-
         try:
-            posted_at = datetime.fromisoformat(row["posted_at"].replace("Z", "+00:00")).replace(tzinfo=None)
-        except Exception:
-            continue
-
-        # A generous 300-candle H1 lookback comfortably covers any
-        # signal still open from the last ~12 days - older than that,
-        # a row is almost certainly stuck (an index that stopped
-        # trading, or similar) rather than genuinely still pending;
-        # left OPEN rather than guessed at, same as the forex tracker
-        # does for a lookup it can't resolve.
-        candles = await get_cached_synthetic_candles(index_key, config["symbol"], "1h", 3600, 300)
-        if not candles:
-            continue
-
-        direction = row.get("direction")
-        stop_loss = float(row["stop_loss"])
-        take_profit = float(row["take_profit"])
-        status = None
-
-        for c in candles:
-            c_time = c.get("time")
-            if isinstance(c_time, (int, float)):
-                c_dt = datetime.utcfromtimestamp(c_time)
-            else:
+            candles = await get_cached_synthetic_candles(index_key, config["symbol"], "1h", 3600, 1000)
+            if not candles:
                 continue
-            if c_dt <= posted_at:
-                continue
-            if direction == "BUY":
-                if c["low"] <= stop_loss:
-                    status = "SL_HIT"
-                    break
-                if c["high"] >= take_profit:
-                    status = "TP_HIT"
-                    break
-            else:
-                if c["high"] >= stop_loss:
-                    status = "SL_HIT"
-                    break
-                if c["low"] <= take_profit:
-                    status = "TP_HIT"
-                    break
-
-        if status:
-            try:
-                patch_url = f"{SUPABASE_URL}/rest/v1/deriv_live_signals?id=eq.{row['id']}"
-                await asyncio.to_thread(
-                    requests.patch, patch_url, headers=sb_headers(),
-                    json={"status": status, "closed_at": datetime.utcnow().isoformat()},
-                    timeout=10,
-                )
-            except Exception as e:
-                print(f"[DERIV LIVE SIGNALS] Failed to update row {row['id']}: {e}")
+            resolved = await asyncio.to_thread(_resolve_deriv_rows_against_candles, rows, candles)
+        except Exception as e:
+            print(f"[DERIV LIVE SIGNALS] {index_key} check failed: {e}")
+            continue
+        closed_at = datetime.utcnow().isoformat()
+        for status, ids in resolved.items():
+            for i in range(0, len(ids), 150):
+                chunk = ids[i:i + 150]
+                id_list = ",".join(str(x) for x in chunk)
+                patch_url = f"{SUPABASE_URL}/rest/v1/deriv_live_signals?id=in.({id_list})"
+                try:
+                    r = await asyncio.to_thread(
+                        requests.patch, patch_url, headers=sb_headers(),
+                        json={"status": status, "closed_at": closed_at}, timeout=30,
+                    )
+                    if r.status_code in (200, 204):
+                        total_closed += len(chunk)
+                    else:
+                        print(f"[DERIV LIVE SIGNALS] Batch update got {r.status_code} for {index_key}")
+                except Exception as e:
+                    print(f"[DERIV LIVE SIGNALS] Batch update failed for {index_key}: {e}")
+    print(f"[DERIV LIVE SIGNALS] Checked {len(open_rows)} open row(s), closed {total_closed}.")
 
 
 # ============================================

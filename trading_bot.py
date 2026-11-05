@@ -599,6 +599,9 @@ async def deprovision_mt5_account(metaapi_account_id):
     logs on failure but never raises, since a failed cleanup shouldn't
     block the customer from connecting their new account.
     """
+    if _is_exness_ref(metaapi_account_id):
+        await asyncio.to_thread(_exness_forget_credentials_sync, metaapi_account_id)
+        return
     try:
         api = MetaApi(token=METAAPI_TOKEN)
         account = await api.metatrader_account_api.get_account(account_id=metaapi_account_id)
@@ -1126,6 +1129,49 @@ async def _exness_call(account_ref, method_name, *args, **kwargs):
     if broker is None:
         raise RuntimeError("Exness account not found or its credentials could not be read")
     return await asyncio.to_thread(getattr(broker, method_name), *args, **kwargs)
+
+
+def _exness_forget_credentials_sync(account_ref):
+    """Unlinking an Exness-API account: delete the stored API key + secret."""
+    _EXNESS_BROKERS.pop(account_ref, None)
+    try:
+        acct = str(account_ref)[len(EXNESS_REF_PREFIX):]
+        requests.delete(f"{SUPABASE_URL}/rest/v1/exness_api_accounts?account_number=eq.{acct}",
+                        headers=sb_headers(), timeout=10)
+    except Exception as e:
+        print(f"[EXNESS] could not delete stored credentials: {type(e).__name__}")
+
+
+def _exness_verify_and_store_sync(user_id, account_number, api_key, secret):
+    """Checks the keys against Exness, then stores them (secret encrypted).
+    Returns (ok, message, balance)."""
+    import exness_api
+    gateway = os.environ.get("EXNESS_GATEWAY_URL", "api.exness.com")
+    try:
+        broker = exness_api.ExnessBroker(gateway, api_key, secret, account_number)
+    except Exception:
+        return False, "That secret key doesn't look right. Copy it again exactly as Exness shows it.", None
+    try:
+        info = broker.account_info()
+    except Exception as e:
+        print(f"[EXNESS CONNECT] verify failed for {user_id}: {type(e).__name__}: {str(e)[:120]}")
+        return False, ("Exness rejected these keys for this account. Check that the API key was created for "
+                       "THIS account number, with Trading access, and that you copied the secret key fully."), None
+    try:
+        headers = {**sb_headers(), "Prefer": "return=minimal"}
+        requests.delete(f"{SUPABASE_URL}/rest/v1/exness_api_accounts?user_id=eq.{user_id}", headers=sb_headers(), timeout=10)
+        requests.delete(f"{SUPABASE_URL}/rest/v1/exness_api_accounts?account_number=eq.{account_number}", headers=sb_headers(), timeout=10)
+        r = requests.post(f"{SUPABASE_URL}/rest/v1/exness_api_accounts", headers=headers, timeout=10, json={
+            "user_id": str(user_id), "account_number": str(account_number), "api_key": api_key,
+            "secret_encrypted": encrypt_credential(secret), "gateway_url": gateway,
+            "last_ok_at": datetime.utcnow().isoformat()})
+        if r.status_code not in (200, 201, 204):
+            raise RuntimeError(f"HTTP {r.status_code}")
+    except Exception as e:
+        print(f"[EXNESS CONNECT] store failed for {user_id}: {type(e).__name__}")
+        return False, "Couldn't save your connection right now. Please try again in a moment.", None
+    _EXNESS_BROKERS.pop(f"{EXNESS_REF_PREFIX}{account_number}", None)
+    return True, "ok", info.get("balance")
 
 
 class ExnessConnection:
@@ -4921,6 +4967,9 @@ def _napp_exness_unlinks_used_sync(synth):
 async def _napp_remove_metaapi_checked(metaapi_account_id):
     """True if the MetaAPI account is gone (or was already gone), False if the
     removal failed and should be retried."""
+    if _is_exness_ref(metaapi_account_id):
+        await asyncio.to_thread(_exness_forget_credentials_sync, metaapi_account_id)
+        return True
     try:
         api = MetaApi(token=METAAPI_TOKEN)
         try:
@@ -25139,6 +25188,7 @@ async def build_exness_autotrade_dashboard(user_id, account, expiry, now):
     entry points can never silently drift apart from each other.
     """
     days_left = (expiry - now).days
+    is_exn = _is_exness_ref(account.get("metaapi_account_id"))
     risk_mode = account.get("risk_mode", "lot")
     if risk_mode == "lot":
         risk_display = f"{account.get('lot_size', 0.01)} lots"
@@ -25193,10 +25243,10 @@ async def build_exness_autotrade_dashboard(user_id, account, expiry, now):
     text = (
         f"🤖 <b>Exness Auto-Trade — Active</b>\n\n"
         f"Account: {account.get('account_name') or account.get('account_number', 'N/A')}\n"
-        f"Server: {account.get('server', 'N/A')}\n"
-        f"Balance: {balance_display}\n\n"
-        f"Subscription: {days_left} day(s) left\n"
-        f"Mode: {bot_label}"
+        + (f"Connection: Exness API\n" if is_exn else f"Server: {account.get('server', 'N/A')}\n")
+        + f"Balance: {balance_display}\n\n"
+        + ("Plan: Free\n" if is_exn else f"Subscription: {days_left} day(s) left\n")
+        + f"Mode: {bot_label}"
         + (f" on {account.get('pair_choice', '').upper()}" if account.get("pair_choice") else "")
         + f"\nRisk: {risk_display}\n\n"
         + autotrade_status_line
@@ -25260,6 +25310,22 @@ async def send_education_content(bot, chat_id):
     )
 
 
+EXNESS_API_CONNECT_INSTRUCTIONS = (
+    "🔗 <b>Connect your Exness account — free</b>\n\n"
+    "Exness Auto-Trade is now <b>free</b>. It trades on your Exness account itself, "
+    "so you create <b>an Exness account</b> (choose the Exness account itself, "
+    "<b>not MT4 or MT5</b>) under our link and fund it, then give the bot "
+    "permission to trade it.\n\n"
+    "<b>On the Exness website (Personal Area):</b>\n"
+    "1️⃣ Open <b>API key management</b>\n"
+    "2️⃣ Create a new API key for <b>this trading account</b>\n"
+    "3️⃣ Turn on <b>Trading</b> (Full access). Nothing else is needed.\n"
+    "4️⃣ Copy the <b>API key</b> and the <b>secret key</b> — Exness shows the secret only once\n\n"
+    "<b>Then, here in Telegram:</b> send your Exness <b>account number</b> now:\n\n"
+    "<i>Your key messages are deleted immediately after you send them.</i>"
+)
+
+
 async def send_exness_autotrade_intro(bot, chat_id):
     """
     Shared by the normal "🤖 Exness Auto-Trade" button tap (handle_buttons
@@ -25280,14 +25346,13 @@ async def send_exness_autotrade_intro(bot, chat_id):
         chat_id=chat_id,
         text=(
             "🤖 <b>Exness Auto-Trade</b>\n\n"
-            "Let Nexora AI trade directly on your own Exness MT5/MT4 "
+            "Let Nexora AI trade directly on your own Exness "
             "account, automatically, using the same technical strategy "
             "already powering your signals — no need to manually "
             "watch charts or place trades yourself.\n\n"
-            f"💵 <b>Price:</b> {MT5_AUTOTRADE_DISPLAY_PRICE}\n"
-            f"<i>Covers your dedicated MT5 connection, server uptime, "
-            f"and continuous strategy execution — running for you "
-            f"around the clock, not just a one-time signal.</i>\n\n"
+            f"💵 <b>Price:</b> Free\n"
+            f"<i>Connect your Exness account and the bot trades it for "
+            f"you around the clock — no subscription.</i>\n\n"
             "📈 <b>Why auto-trade?</b> Markets move fast, and the best "
             "setups don't always happen when you're free to act on "
             "them. Auto-trading lets you stay in the market on your "
@@ -25938,14 +26003,11 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             # replacement - if KoraPay doesn't work for someone (e.g.
             # their country isn't supported), they can try crypto
             # instead, without needing to start the whole flow over.
+            user_modes[user_id] = "exn_awaiting_account"
             await query.message.edit_text(
-                f"🤖 <b>Exness Auto-Trade — {MT5_SUBSCRIPTION_DAYS}-day subscription</b>\n\n"
-                f"Choose how you'd like to pay:",
+                EXNESS_API_CONNECT_INSTRUCTIONS,
                 parse_mode=ParseMode.HTML,
-                reply_markup=InlineKeyboardMarkup([
-                    [InlineKeyboardButton("💳 Pay with Card", callback_data="mt5auto_pay_card")],
-                    [InlineKeyboardButton("₿ Pay with Crypto", callback_data="mt5auto_pay_crypto")],
-                ])
+                disable_web_page_preview=True,
             )
             return
 
@@ -28273,6 +28335,92 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
             schedule_auto_delete(sent_fetch_failed.chat_id, sent_fetch_failed.message_id)
         return
 
+    if mode == "exn_awaiting_account":
+        number = message.strip()
+        if not number.isdigit() or not (5 <= len(number) <= 14):
+            sent_bad = await update.message.reply_text(
+                "⚠️ Send just your Exness <b>account number</b> (digits only).",
+                parse_mode=ParseMode.HTML)
+            schedule_auto_delete(sent_bad.chat_id, sent_bad.message_id)
+            return
+        other_owner, owner_ok = await asyncio.to_thread(_exness_account_owner_for_link_sync, number, user_id)
+        if not owner_ok:
+            sent_oc = await update.message.reply_text(
+                "⚠️ <b>Couldn't check that account right now.</b> Please send it again in a moment.",
+                parse_mode=ParseMode.HTML)
+            schedule_auto_delete(sent_oc.chat_id, sent_oc.message_id)
+            return
+        if other_owner:
+            sent_taken = await update.message.reply_text(
+                "🚫 <b>This Exness account is already linked to another user.</b>\n\n"
+                "Each account can only be linked once. If it is yours, unlink it where you linked it first, "
+                "then send the number again.", parse_mode=ParseMode.HTML)
+            schedule_auto_delete(sent_taken.chat_id, sent_taken.message_id)
+            return
+        mt5_signup_state.setdefault(user_id, {})["exn_account"] = number
+        user_modes[user_id] = "exn_awaiting_key"
+        sent_k = await update.message.reply_text(
+            "🔑 Now send the <b>API key</b> you created on the Exness website.\n\n"
+            "<i>Your message will be deleted immediately.</i>", parse_mode=ParseMode.HTML)
+        schedule_auto_delete(sent_k.chat_id, sent_k.message_id)
+        return
+
+    if mode == "exn_awaiting_key":
+        mt5_signup_state.setdefault(user_id, {})["exn_key"] = message.strip()
+        user_modes[user_id] = "exn_awaiting_secret"
+        try:
+            await update.message.delete()
+        except Exception:
+            pass
+        sent_s = await update.message.reply_text(
+            "🔐 Now send the <b>secret key</b> from the Exness website.\n\n"
+            "<i>Your message will be deleted immediately.</i>", parse_mode=ParseMode.HTML)
+        schedule_auto_delete(sent_s.chat_id, sent_s.message_id)
+        return
+
+    if mode == "exn_awaiting_secret":
+        secret_value = message.strip()
+        try:
+            await update.message.delete()
+        except Exception:
+            pass
+        st = mt5_signup_state.get(user_id, {})
+        number, api_key = st.get("exn_account"), st.get("exn_key")
+        if not number or not api_key:
+            user_modes[user_id] = None
+            await update.message.reply_text(
+                "⚠️ Something's missing. Tap 🤖 Exness Auto-Trade to start again.",
+                reply_markup=main_keyboard)
+            return
+        wait_msg = await update.message.reply_text("🔗 <b>Checking your Exness connection...</b>", parse_mode=ParseMode.HTML)
+        ok, detail, balance = await asyncio.to_thread(
+            _exness_verify_and_store_sync, user_id, number, api_key, secret_value)
+        if not ok:
+            user_modes[user_id] = "exn_awaiting_account"
+            mt5_signup_state.get(user_id, {}).pop("exn_key", None)
+            await wait_msg.edit_text(
+                f"⚠️ <b>Couldn't connect.</b>\n\n{detail}\n\nSend your Exness <b>account number</b> to try again.",
+                parse_mode=ParseMode.HTML)
+            return
+        user_modes[user_id] = None
+        mt5_signup_state.pop(user_id, None)
+        previous = get_mt5_autotrade_account(user_id) or {}
+        old_ref = previous.get("metaapi_account_id")
+        await asyncio.to_thread(upsert_mt5_autotrade_account, user_id, {
+            "account_number": number, "account_name": "Exness", "server": "Exness API",
+            "encrypted_password": None, "metaapi_account_id": f"{EXNESS_REF_PREFIX}{number}",
+            "symbol_map": None, "is_active": True, "trading_paused": False,
+            "subscription_expires_at": "2099-12-31T00:00:00+00:00"})
+        if old_ref and not _is_exness_ref(old_ref):
+            asyncio.create_task(deprovision_mt5_account(old_ref))
+        bal_txt = f"${balance:,.2f}" if isinstance(balance, (int, float)) else "n/a"
+        await wait_msg.edit_text(
+            f"✅ <b>Exness account connected.</b>\n\nAccount: {number}\nBalance: {bal_txt}\n\n"
+            f"Auto-trade is now ON with the bot options you picked. Tap 🤖 Exness Auto-Trade any time "
+            f"to see your dashboard, change lot size or switch bot.",
+            parse_mode=ParseMode.HTML)
+        return
+
     if mode == "mt5_awaiting_account_number":
         # REDESIGNED per explicit instruction - saves to Supabase
         # IMMEDIATELY instead of only holding it in the in-memory
@@ -28536,7 +28684,7 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 f"Tap below to pay and unlock your MT5 connection:",
                 parse_mode=ParseMode.HTML,
                 reply_markup=InlineKeyboardMarkup([
-                    [InlineKeyboardButton("➡️ Continue to Payment", callback_data="mt5auto_continue")]
+                    [InlineKeyboardButton("➡️ Continue", callback_data="mt5auto_continue")]
                 ])
             )
             schedule_auto_delete(sent_ready.chat_id, sent_ready.message_id)
@@ -28605,7 +28753,7 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
             f"Tap below to pay and unlock your MT5 connection:",
             parse_mode=ParseMode.HTML,
             reply_markup=InlineKeyboardMarkup([
-                [InlineKeyboardButton("➡️ Continue to Payment", callback_data="mt5auto_continue")]
+                [InlineKeyboardButton("➡️ Continue", callback_data="mt5auto_continue")]
             ])
         )
         schedule_auto_delete(sent_ready.chat_id, sent_ready.message_id)
@@ -28687,7 +28835,7 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 f"Tap below to pay and unlock your MT5 connection:",
                 parse_mode=ParseMode.HTML,
                 reply_markup=InlineKeyboardMarkup([
-                    [InlineKeyboardButton("➡️ Continue to Payment", callback_data="mt5auto_continue")]
+                    [InlineKeyboardButton("➡️ Continue", callback_data="mt5auto_continue")]
                 ])
             )
             schedule_auto_delete(sent_ready.chat_id, sent_ready.message_id)
@@ -31547,7 +31695,13 @@ async def check_mt5_autotrade_closed_orders(context: ContextTypes.DEFAULT_TYPE):
         if not order_id or not user_id:
             continue
 
-        outcome, profit = await get_mt5_trade_outcome(order_id)
+        acct_row = await asyncio.to_thread(get_mt5_autotrade_account, str(user_id))
+        acct_ref = (acct_row or {}).get("metaapi_account_id")
+        if _is_exness_ref(acct_ref):
+            profit = await asyncio.to_thread(_cbe_leg_profit_sync, acct_ref, order_id)
+            outcome = "CLOSED" if profit is not None else None
+        else:
+            outcome, profit = await get_mt5_trade_outcome(order_id)
         if outcome != "CLOSED" or profit is None:
             continue  # still open, or lookup failed - retry next sweep
 

@@ -1081,7 +1081,73 @@ async def notify_admin_of_scheduled_signal_failure(pair_keyword, reason):
         print(f"[AUTO SIGNAL] Couldn't notify admin of scheduled signal failure: {e}")
 
 
+# ---------------------------------------------------------------------------
+# EXNESS TRADER API ACCOUNTS. A client who connects their Exness account
+# (no MT4/MT5, no MetaAPI) is stored with metaapi_account_id = "exness:<account
+# number>". Every client-account helper below recognises that prefix and talks
+# to the Exness Trader API instead, so the engines (full coverage, follow
+# platform signals, Account Flip, aggressive) run unchanged on Exness.
+# ---------------------------------------------------------------------------
+EXNESS_REF_PREFIX = "exness:"
+_EXNESS_BROKERS = {}
+
+
+def _is_exness_ref(account_ref):
+    return str(account_ref or "").startswith(EXNESS_REF_PREFIX)
+
+
+def _exness_broker_sync(account_ref):
+    """Cached ExnessBroker for this account, or None if its credentials are missing."""
+    broker = _EXNESS_BROKERS.get(account_ref)
+    if broker:
+        return broker
+    try:
+        acct = str(account_ref)[len(EXNESS_REF_PREFIX):]
+        r = requests.get(
+            f"{SUPABASE_URL}/rest/v1/exness_api_accounts?account_number=eq.{acct}&select=*&limit=1",
+            headers=sb_headers(), timeout=10)
+        rows = r.json() if r.status_code == 200 else []
+        if not rows:
+            return None
+        row = rows[0]
+        import exness_api
+        broker = exness_api.ExnessBroker(
+            row.get("gateway_url") or os.environ.get("EXNESS_GATEWAY_URL", "api.exness.com"),
+            row["api_key"], decrypt_credential(row["secret_encrypted"]), acct)
+        _EXNESS_BROKERS[account_ref] = broker
+        return broker
+    except Exception as e:
+        print(f"[EXNESS] could not load credentials for {account_ref}: {type(e).__name__}")
+        return None
+
+
+async def _exness_call(account_ref, method_name, *args, **kwargs):
+    broker = await asyncio.to_thread(_exness_broker_sync, account_ref)
+    if broker is None:
+        raise RuntimeError("Exness account not found or its credentials could not be read")
+    return await asyncio.to_thread(getattr(broker, method_name), *args, **kwargs)
+
+
+class ExnessConnection:
+    """Stands in for a MetaAPI RPC connection in the few places that use one."""
+    def __init__(self, account_ref):
+        self.account_ref = account_ref
+
+    async def get_positions(self):
+        return await _exness_call(self.account_ref, "positions_metaapi")
+
+    async def get_account_information(self):
+        return await _exness_call(self.account_ref, "account_info")
+
+
 async def get_client_mt5_connection(metaapi_account_id):
+    if _is_exness_ref(metaapi_account_id):
+        broker = await asyncio.to_thread(_exness_broker_sync, metaapi_account_id)
+        return ExnessConnection(metaapi_account_id) if broker else None
+    return await _get_metaapi_client_connection(metaapi_account_id)
+
+
+async def _get_metaapi_client_connection(metaapi_account_id):
     """
     FIX: CONFIRMED REAL BUG in the previous version of this function,
     per explicit instruction to fix it properly. That version tried
@@ -1348,6 +1414,16 @@ async def resolve_client_symbol_map(metaapi_account_id):
     # connection's pattern - a persistently-struggling account (like
     # one currently undeployed) won't repeatedly attempt this same
     # slow call on every single scan cycle.
+    if _is_exness_ref(metaapi_account_id):
+        try:
+            return await _exness_call(
+                metaapi_account_id, "resolve_symbol_map",
+                [cfg["pair_name"] for cfg in PAIR_CONFIG.values()],
+                ["m", "z", "c", "pro", "raw", "ecn", "micro", ".raw", "-ecn", "_m", ".a", ".r"])
+        except Exception as e:
+            print(f"[EXNESS] symbol map failed for {metaapi_account_id}: {e}")
+            return {}
+
     last_failure = _SYMBOL_MAP_FAILURES.get(metaapi_account_id)
     if last_failure and (time.time() - last_failure) < _SYMBOL_MAP_FAILURE_COOLDOWN_SECONDS:
         return {}
@@ -1493,6 +1569,19 @@ async def place_client_mt5_trade(metaapi_account_id, mt5_symbol, direction, volu
     original shared comment if not provided, so any caller that
     doesn't pass one keeps working exactly as before.
     """
+    if _is_exness_ref(metaapi_account_id):
+        try:
+            pid, detail = await _exness_call(
+                metaapi_account_id, "place_trade", mt5_symbol, direction, volume,
+                stop_loss, take_profit, (trade_comment or "Nexora AI")[:30])
+        except Exception as e:
+            print(f"[EXNESS] ❌ Exception placing trade for {metaapi_account_id}: {e}")
+            return None
+        if pid:
+            print(f"[EXNESS] ✅ Trade placed for {metaapi_account_id} - position {pid}")
+            return pid
+        print(f"[EXNESS] ❌ Trade failed for {metaapi_account_id}: {detail}")
+        return None
     if not METAAPI_TOKEN:
         # FIX: CONFIRMED REAL GAP - this was the ONLY return in the
         # entire function with no print attached at all. Live
@@ -1645,6 +1734,14 @@ async def close_all_client_mt5_positions(metaapi_account_id, mt5_symbol):
     (metaapi.cloud/docs/client/restApi/api/trade) - same endpoint
     place_client_mt5_trade already uses successfully.
     """
+    if _is_exness_ref(metaapi_account_id):
+        try:
+            ok, detail = await _exness_call(metaapi_account_id, "close_symbol", mt5_symbol)
+            print(f"[EXNESS] close stack {metaapi_account_id} {mt5_symbol}: {ok} {detail}")
+            return bool(ok)
+        except Exception as e:
+            print(f"[EXNESS] ❌ Exception closing stack for {metaapi_account_id}: {e}")
+            return False
     if not METAAPI_TOKEN:
         return False
     try:
@@ -2259,6 +2356,14 @@ async def _xc_get_positions(metaapi_account_id, mt5_symbol):
 
 
 def _xc_trade_action_sync(metaapi_account_id, payload):
+    if _is_exness_ref(metaapi_account_id):
+        broker = _exness_broker_sync(metaapi_account_id)
+        if broker is None:
+            return False, "Exness credentials unavailable"
+        try:
+            return broker.trade_action(payload)
+        except Exception as e:
+            return False, f"error: {e}"
     try:
         r = requests.post(
             f"https://mt-client-api-v1.london.agiliumtrade.ai/users/current/accounts/"
@@ -23765,6 +23870,11 @@ def _patch_signal_sync(signal_id, fields):
 
 
 async def _fetch_open_positions(account_id=None):
+    if _is_exness_ref(account_id):
+        try:
+            return await _exness_call(account_id, "positions_metaapi")
+        except Exception:
+            return None
     try:
         url = f"https://mt-client-api-v1.london.agiliumtrade.ai/users/current/accounts/{account_id or METAAPI_ACCOUNT_ID}/positions"
         r = await asyncio.to_thread(requests.get, url, headers={"auth-token": METAAPI_TOKEN, "Accept": "application/json"}, timeout=8)
@@ -23778,6 +23888,12 @@ async def _fetch_open_positions(account_id=None):
 
 async def _metaapi_trade_action(payload, account_id=None):
     """Returns (ok, detail) for a MetaAPI trade action (modify / close)."""
+    if _is_exness_ref(account_id):
+        try:
+            ok, detail = await _exness_call(account_id, "trade_action", payload)
+            return ok, str(detail)
+        except Exception as e:
+            return False, f"error: {e}"
     try:
         url = f"https://mt-client-api-v1.london.agiliumtrade.ai/users/current/accounts/{account_id or METAAPI_ACCOUNT_ID}/trade"
         r = await asyncio.to_thread(
@@ -23974,6 +24090,12 @@ def _cbe_finish_sync(order_a):
 
 def _cbe_leg_profit_sync(acct_id, position_id):
     """Total profit of a CLOSED position from deal history, or None if unknown."""
+    if _is_exness_ref(acct_id):
+        broker = _exness_broker_sync(acct_id)
+        try:
+            return broker.closed_position_profit(position_id) if broker else None
+        except Exception:
+            return None
     try:
         r = requests.get(
             f"https://mt-client-api-v1.london.agiliumtrade.ai/users/current/accounts/{acct_id}"

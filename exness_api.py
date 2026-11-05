@@ -115,7 +115,7 @@ def get_account_details(access_point: str, api_key: str, private_key, account_id
 # result is read from the operation status endpoint.
 # ---------------------------------------------------------------------------
 from datetime import datetime, timedelta, timezone
-from decimal import Decimal, ROUND_DOWN
+from decimal import Decimal, ROUND_DOWN, ROUND_HALF_UP
 from urllib.parse import urlencode
 
 
@@ -173,7 +173,7 @@ class ExnessClient:
     @staticmethod
     def fmt_price(value, point_digits):
         q = Decimal(1).scaleb(-int(point_digits))
-        return str(Decimal(value).quantize(q, rounding=ROUND_DOWN))
+        return str(Decimal(str(value)).quantize(q, rounding=ROUND_HALF_UP))
 
     def open_position(self, instrument, side, volume, stop_loss=None, take_profit=None,
                       price=None, comment="Nexora AI", idem=None):
@@ -213,3 +213,261 @@ class ExnessClient:
         if code != 200:
             raise RuntimeError(f"snapshot: HTTP {code} {str(d)[:200]}")
         return d
+
+
+# ---------------------------------------------------------------------------
+# MetaAPI-shaped adapter. The bot's engines (full coverage, follow platform
+# signals, Account Flip, aggressive) were written against MetaAPI position
+# dicts and a handful of helper calls. ExnessBroker answers the same questions
+# from the Exness Trader API so those engines work unchanged.
+# ---------------------------------------------------------------------------
+import threading
+
+
+class ExnessBroker(ExnessClient):
+    TRANSIENT = (429, 500, 502, 503, 504)
+
+    def __init__(self, gateway_url, api_key, secret, account_id):
+        super().__init__(gateway_url, api_key, secret, account_id)
+        self._cond = {}
+        self._names = None
+        self._px = {}
+        self._lock = threading.Lock()
+
+    # -- reference data ----------------------------------------------------
+    def instrument_names(self):
+        if self._names is None:
+            self._names = [str(n) for n in self.instruments()]
+        return self._names
+
+    def cond(self, instrument):
+        if instrument not in self._cond:
+            self._cond[instrument] = self.conditions(instrument)
+        return self._cond[instrument]
+
+    def quantize_volume(self, instrument, volume):
+        c = self.cond(instrument)
+        vmin = Decimal(str(c.get("volume_min") or "0.01"))
+        vmax = Decimal(str(c.get("volume_max") or "100"))
+        step = Decimal(str(c.get("volume_step") or "0.01"))
+        v = Decimal(str(volume))
+        v = max(vmin, min(vmax, v))
+        n = ((v - vmin) / step).to_integral_value(rounding=ROUND_DOWN)
+        v = vmin + n * step
+        return format(v.normalize(), "f") if v == v.to_integral() else str(v)
+
+    def price(self, instrument, side="bid", max_age=4):
+        key = (instrument, side)
+        hit = self._px.get(key)
+        if hit and time.time() - hit[1] < max_age:
+            return hit[0]
+        p = self.last_price(instrument, side)
+        self._px[key] = (p, time.time())
+        return p
+
+    # -- account -----------------------------------------------------------
+    def account_info(self):
+        st = (self.snapshot().get("account_state") or {})
+        def f(k):
+            try:
+                return float(st.get(k))
+            except (TypeError, ValueError):
+                return None
+        return {"balance": f("balance"), "equity": f("equity"), "margin": f("used_margin")}
+
+    # -- positions (MetaAPI-shaped) ----------------------------------------
+    def _usd_per_quote(self, quote_ccy, instrument_price):
+        q = (quote_ccy or "").upper()
+        if q in ("", "USD"):
+            return Decimal(1)
+        try:
+            rate = self.price("USD" + q, "bid")  # units of q per 1 USD
+            return Decimal(1) / rate
+        except Exception:
+            return None
+
+    def positions_metaapi(self):
+        snap = self.snapshot()
+        sltp = {}
+        for o in snap.get("orders") or []:
+            pid = o.get("position_id")
+            if pid and str(o.get("state", "")).lower() in ("placed", "active", "open", "") :
+                sltp.setdefault(str(pid), []).append(o)
+        out = []
+        for p in snap.get("positions") or []:
+            if str(p.get("state", "open")).lower() != "open":
+                continue
+            inst = p.get("instrument")
+            buy = str(p.get("direction")).lower() == "buy"
+            try:
+                vol = Decimal(str(p.get("volume")))
+                opn = Decimal(str(p.get("open_price")))
+            except Exception:
+                continue
+            cur = profit = None
+            try:
+                cur = self.price(inst, "bid" if buy else "ask")
+                diff = (cur - opn) if buy else (opn - cur)
+                cs = Decimal(str(self.cond(inst).get("contract_size") or "100000"))
+                conv = self._usd_per_quote(self.cond(inst).get("quote_currency"), cur)
+                profit = float(diff * vol * cs * conv) if conv is not None else 0.0
+            except Exception:
+                pass
+            sl = tp = None
+            for o in sltp.get(str(p.get("position_id")), []):
+                if o.get("stop_loss_price"):
+                    sl = float(o["stop_loss_price"])
+                if o.get("take_profit_price"):
+                    tp = float(o["take_profit_price"])
+            out.append({
+                "id": str(p.get("position_id")),
+                "symbol": inst,
+                "type": "POSITION_TYPE_BUY" if buy else "POSITION_TYPE_SELL",
+                "volume": float(vol),
+                "openPrice": float(opn),
+                "currentPrice": float(cur) if cur is not None else float(opn),
+                "profit": profit if profit is not None else 0.0,
+                "stopLoss": sl,
+                "takeProfit": tp,
+                "time": p.get("create_time"),
+                "comment": "",
+            })
+        return out
+
+    # -- trading -----------------------------------------------------------
+    def place_trade(self, symbol, direction, volume, stop_loss, take_profit, comment="Nexora AI"):
+        """Returns (position_id_or_None, detail). One idempotency key is reused
+        across retries so a retried request can never open a second position."""
+        cond = self.cond(symbol)
+        digits = cond.get("point_digits", 5)
+        vol = self.quantize_volume(symbol, volume)
+        buy = str(direction).upper() == "BUY"
+        sl = self.fmt_price(stop_loss, digits) if stop_loss else None
+        tp = self.fmt_price(take_profit, digits) if take_profit else None
+        price = None
+        if "instant" in str(cond.get("exec_mode", "")).lower():
+            price = self.fmt_price(self.price(symbol, "ask" if buy else "bid", max_age=0), digits)
+        idem = new_idempotency_key("open")
+        started = datetime.now(timezone.utc) - timedelta(seconds=5)
+        ack = {}
+        for attempt in range(3):
+            code, ack, _ = self.open_position(symbol, "buy" if buy else "sell", vol, sl, tp,
+                                              price=price, comment=comment, idem=idem)
+            if code in (200, 202) and ack.get("operation_id"):
+                break
+            if code in self.TRANSIENT and attempt < 2:
+                time.sleep(2 * (attempt + 1))
+                continue
+            return None, f"Exness rejected the request (HTTP {code}): {str(ack)[:200]}"
+        op = self.wait_operation(ack["operation_id"], timeout=25)
+        status = op.get("status")
+        if status != "confirmed":
+            return None, f"Exness {status or 'pending'}: {op.get('error_code', '')} {op.get('error_message', '')}".strip()
+        try:
+            time.sleep(0.5)
+            mine = [p for p in self.positions_metaapi() if p["symbol"] == symbol and p["time"]
+                    and datetime.fromisoformat(str(p["time"]).replace("Z", "+00:00")) >= started]
+            if mine:
+                return mine[-1]["id"], "ok"
+        except Exception:
+            pass
+        return str(ack["operation_id"]), "ok"
+
+    def close_one(self, position_id):
+        code, ack, _ = self.close_position(position_id)
+        if code not in (200, 202) or not ack.get("operation_id"):
+            return False, f"HTTP {code} {str(ack)[:200]}"
+        op = self.wait_operation(ack["operation_id"], timeout=25)
+        return op.get("status") == "confirmed", f"{op.get('status')} {op.get('error_code', '')}".strip()
+
+    def close_symbol(self, symbol):
+        ok_all, detail = True, "no positions"
+        for p in self.positions_metaapi():
+            if p["symbol"].upper() == str(symbol).upper():
+                ok, d = self.close_one(p["id"])
+                ok_all = ok_all and ok
+                detail = d
+        return ok_all, detail
+
+    def set_sltp(self, position_id, stop_loss=None, take_profit=None):
+        snap = self.snapshot()
+        pos = next((p for p in snap.get("positions") or [] if str(p.get("position_id")) == str(position_id)), None)
+        if not pos:
+            return False, "position not found"
+        digits = self.cond(pos["instrument"]).get("point_digits", 5)
+        body = {}
+        if stop_loss is not None:
+            body["stop_loss_price"] = self.fmt_price(stop_loss, digits)
+        if take_profit is not None:
+            body["take_profit_price"] = self.fmt_price(take_profit, digits)
+        if not body:
+            return True, "nothing to change"
+        existing = next((o for o in snap.get("orders") or [] if str(o.get("position_id")) == str(position_id)
+                         and str(o.get("order_type", "")).lower() == "sltp"), None)
+        idem = new_idempotency_key("sltp")
+        if existing:
+            code, ack = self._call("PATCH", f"/v1/trading/accounts/{self.account_id}/orders/{existing['order_id']}",
+                                   json_body=body, idem=idem)
+        else:
+            body.update({"type": "sltp", "position_id": str(position_id)})
+            code, ack = self._call("POST", f"/v1/trading/accounts/{self.account_id}/orders",
+                                   json_body=body, idem=idem)
+        if code not in (200, 202) or not ack.get("operation_id"):
+            return False, f"HTTP {code} {str(ack)[:200]}"
+        op = self.wait_operation(ack["operation_id"], timeout=20)
+        return op.get("status") == "confirmed", f"{op.get('status')} {op.get('error_code', '')}".strip()
+
+    def trade_action(self, payload):
+        """Translate the MetaAPI trade payloads the engines send."""
+        t = payload.get("actionType")
+        if t == "POSITION_MODIFY":
+            return self.set_sltp(payload.get("positionId"), payload.get("stopLoss"), payload.get("takeProfit"))
+        if t == "POSITION_CLOSE_ID":
+            return self.close_one(payload.get("positionId"))
+        if t == "POSITIONS_CLOSE_SYMBOL":
+            return self.close_symbol(payload.get("symbol"))
+        return False, f"unsupported action {t}"
+
+    def resolve_symbol_map(self, pair_names, known_suffixes=()):
+        """{canonical pair name: this account's real instrument name}."""
+        names = self.instrument_names()
+        upper = {n.upper(): n for n in names}
+        out = {}
+        for base in pair_names:
+            b = base.upper()
+            if b in upper:
+                out[base] = upper[b]
+                continue
+            hit = next((upper[b + s.upper()] for s in known_suffixes if (b + s.upper()) in upper), None)
+            if not hit:
+                cands = [n for n in names if n.upper().startswith(b) and len(n) - len(b) <= 5]
+                hit = min(cands, key=len) if cands else None
+            if hit:
+                out[base] = hit
+        return out
+
+
+def _closed_position_profit(self, position_id):
+    """Total profit (incl. commission and swap) of a CLOSED position from deal
+    history, or None while it is still open / unknown."""
+    now = datetime.now(timezone.utc)
+    q = urlencode({"from": (now - timedelta(days=30)).strftime("%Y-%m-%dT%H:%M:%SZ"),
+                   "to": (now + timedelta(minutes=1)).strftime("%Y-%m-%dT%H:%M:%SZ"), "limit": 200})
+    code, d = self._call("GET", f"/v1/history/accounts/{self.account_id}/deals?{q}")
+    if code != 200:
+        return None
+    deals = [x for x in (d.get("items") or d.get("deals") or [])
+             if str(x.get("position_id")) == str(position_id)]
+    if not any(str(x.get("type")).lower() == "close" for x in deals):
+        return None
+    total = 0.0
+    for x in deals:
+        for k in ("profit", "commission", "swap"):
+            try:
+                total += float(x.get(k) or 0)
+            except (TypeError, ValueError):
+                pass
+    return total
+
+
+ExnessBroker.closed_position_profit = _closed_position_profit

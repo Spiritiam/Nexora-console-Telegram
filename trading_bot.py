@@ -2314,6 +2314,9 @@ def _xc_market_closed(now=None):
 def _xc_fetch_quote(mt5_symbol):
     """(bid, ask) or None. Primary MetaAPI account first (real bid/ask, freshness
     checked), then the backup account (mid only, has its own stale-quote guard)."""
+    _q = get_quote_exness(mt5_symbol)
+    if _q:
+        return float(_q[0]), float(_q[1])
     if METAAPI_TOKEN and METAAPI_ACCOUNT_ID:
         try:
             r = requests.get(
@@ -14943,6 +14946,10 @@ def get_price_metaapi(mt5_symbol):
     price, not two separate flags for the same underlying account
     connection.
     """
+    _q = get_quote_exness(mt5_symbol)
+    if _q:
+        _selfheal_note_price_ok()
+        return (_q[0] + _q[1]) / 2
     if not METAAPI_TOKEN or not METAAPI_ACCOUNT_ID:
         return None
     url = (
@@ -15292,6 +15299,88 @@ def get_candle_symbol_candidates(config):
         return ["WTI/USD"]
     return [config.get("td_symbol", config["symbol"])]
 
+# ---------------------------------------------------------------------------
+# EXNESS MARKET DATA. Live prices and candles for signals come from the
+# master Exness account's own API key first (free, same broker the clients
+# trade on). MetaAPI stays as the fallback. EXNESS_MARKET_DATA=0 turns it off.
+# ---------------------------------------------------------------------------
+_EXNESS_MD = {"broker": None, "names": None, "map": {}, "fail_until": 0.0}
+
+
+def _exness_md_broker():
+    if os.getenv("EXNESS_MARKET_DATA", "1") == "0":
+        return None
+    if time.time() < _EXNESS_MD["fail_until"]:
+        return None
+    if _EXNESS_MD["broker"] is not None:
+        return _EXNESS_MD["broker"]
+    key, secret = os.getenv("EXNESS_API_KEY"), os.getenv("EXNESS_SECRET_KEY")
+    acct = os.getenv("EXNESS_ACCOUNT_ID", "10000776165")
+    if not key or not secret:
+        return None
+    try:
+        import exness_api
+        _EXNESS_MD["broker"] = exness_api.ExnessClient(
+            os.getenv("EXNESS_GATEWAY_URL", "api.exness.com"), key, secret, acct)
+        return _EXNESS_MD["broker"]
+    except Exception as e:
+        print(f"[EXNESS DATA] setup failed: {type(e).__name__}")
+        _EXNESS_MD["fail_until"] = time.time() + 300
+        return None
+
+
+def _exness_md_instrument(broker, mt5_symbol):
+    cached = _EXNESS_MD["map"].get(mt5_symbol)
+    if cached:
+        return cached
+    if _EXNESS_MD["names"] is None:
+        _EXNESS_MD["names"] = [str(n) for n in broker.instruments()]
+    want = str(mt5_symbol).upper()
+    names = {n.upper(): n for n in _EXNESS_MD["names"]}
+    pick = names.get(want)
+    if not pick:
+        best = [n for u, n in names.items() if want.startswith(u) or u.startswith(want)]
+        pick = max(best, key=len) if best else None
+    if pick:
+        _EXNESS_MD["map"][mt5_symbol] = pick
+    return pick
+
+
+def get_candles_exness(mt5_symbol, interval, outputsize):
+    """Same return shape as get_candles_metaapi, or None (caller falls back)."""
+    tf = {"1min": "M1", "5min": "M5", "15min": "M15", "1h": "H1", "4h": "H4", "1day": "D1"}.get(interval)
+    broker = _exness_md_broker()
+    if not tf or broker is None:
+        return None
+    try:
+        inst = _exness_md_instrument(broker, mt5_symbol)
+        if not inst:
+            return None
+        rows = broker.candles(inst, tf, min(int(outputsize), 1000))
+        out = [{"time": r.get("time"), "open": float(r["open"]), "high": float(r["high"]),
+                "low": float(r["low"]), "close": float(r["close"]),
+                "volume": float(r.get("volume") or 0)} for r in rows]
+        if out:
+            print(f"[EXNESS DATA] ✅ {mt5_symbol} {tf} - {len(out)} candles")
+            return out
+    except Exception as e:
+        print(f"[EXNESS DATA] candles {mt5_symbol} failed: {type(e).__name__}: {str(e)[:120]}")
+    return None
+
+
+def get_quote_exness(mt5_symbol):
+    """(bid, ask) or None."""
+    broker = _exness_md_broker()
+    if broker is None:
+        return None
+    try:
+        inst = _exness_md_instrument(broker, mt5_symbol)
+        return broker.quote(inst) if inst else None
+    except Exception as e:
+        print(f"[EXNESS DATA] quote {mt5_symbol} failed: {type(e).__name__}: {str(e)[:120]}")
+        return None
+
+
 def get_candles_metaapi(mt5_symbol, interval, outputsize):
     """
     Pulls historical candles directly from the connected MT5 account
@@ -15317,6 +15406,9 @@ def get_candles_metaapi(mt5_symbol, interval, outputsize):
     of broker data-feed setup, the same standard proxy already used
     for the VAH/VAL Reaction strategy's zone detection.
     """
+    _ex = get_candles_exness(mt5_symbol, interval, outputsize)
+    if _ex:
+        return _ex
     if not METAAPI_TOKEN or not METAAPI_ACCOUNT_ID:
         print("[METAAPI CANDLES] Credentials not set")
         record_metaapi_candles_failure()

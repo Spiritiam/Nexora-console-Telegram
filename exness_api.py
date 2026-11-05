@@ -471,3 +471,58 @@ def _closed_position_profit(self, position_id):
 
 
 ExnessBroker.closed_position_profit = _closed_position_profit
+
+
+# ---------------------------------------------------------------------------
+# Market data (used with the master account's own key for live signals)
+# ---------------------------------------------------------------------------
+_TF_SECONDS = {"M1": 60, "M5": 300, "M15": 900, "H1": 3600, "H4": 14400, "D1": 86400}
+
+
+def _client_candles(self, instrument, timeframe, count):
+    """Last `count` bid candles, oldest first, as dicts with ISO time or None."""
+    tf = _TF_SECONDS[timeframe]
+    now = datetime.now(timezone.utc)
+    for factor in (1.3, 3.0, 8.0):
+        span = int(count * tf * factor)
+        span = min(span, 1000 * tf)
+        q = urlencode({
+            "instrument": instrument, "price_type": "bid", "timeframe": timeframe,
+            "from": (now - timedelta(seconds=span)).strftime("%Y-%m-%dT%H:%M:%SZ"),
+            "to": (now + timedelta(seconds=tf)).strftime("%Y-%m-%dT%H:%M:%SZ"),
+        })
+        code, d = self._call("GET", f"/v1/market-data/accounts/{self.account_id}/candles?{q}")
+        if code != 200:
+            raise RuntimeError(f"candles {instrument} {timeframe}: HTTP {code} {str(d)[:160]}")
+        rows = d.get("candles") or []
+        if len(rows) >= count * 0.9 or span >= 1000 * tf:
+            return rows[-count:]
+    return rows[-count:]
+
+
+def _client_quote(self, instrument, max_age_seconds=240):
+    """(bid, ask) from the latest M1 candle, or None if the feed looks stale."""
+    now = datetime.now(timezone.utc)
+    q = urlencode({
+        "instrument": instrument, "price_type": "both", "timeframe": "M1",
+        "from": (now - timedelta(minutes=10)).strftime("%Y-%m-%dT%H:%M:%SZ"),
+        "to": (now + timedelta(minutes=1)).strftime("%Y-%m-%dT%H:%M:%SZ"),
+    })
+    code, d = self._call("GET", f"/v1/market-data/accounts/{self.account_id}/candles?{q}")
+    if code != 200:
+        raise RuntimeError(f"quote {instrument}: HTTP {code}")
+    rows = d.get("candles") or []
+    if not rows:
+        return None
+    last = rows[-1]
+    try:
+        opened = datetime.fromisoformat(str(last["time"]).replace("Z", "+00:00"))
+        if (now - opened).total_seconds() > max_age_seconds:
+            return None
+        return float(last["bid"]["close"]), float(last["ask"]["close"])
+    except Exception:
+        return None
+
+
+ExnessClient.candles = _client_candles
+ExnessClient.quote = _client_quote

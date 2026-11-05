@@ -15417,6 +15417,48 @@ async def backfill_signal_ml_features(progress_callback=None):
     return results
 
 
+async def exnesstest_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """
+    Admin-only, READ-ONLY check of the Exness Trader API connection:
+    signs a request with the keys stored in Railway variables, looks up
+    the account's access point and fetches account details. Places no
+    trade and never prints the keys.
+    """
+    user_id = str(update.message.from_user.id)
+    if not ADMIN_USER_ID or user_id != ADMIN_USER_ID:
+        return
+
+    api_key = os.environ.get("EXNESS_API_KEY", "").strip()
+    secret = os.environ.get("EXNESS_SECRET_KEY", "").strip()
+    gateway = os.environ.get("EXNESS_GATEWAY_URL", "").strip()
+    account_id = os.environ.get("EXNESS_ACCOUNT_ID", "10000776165").strip()
+    missing = [n for n, v in (("EXNESS_API_KEY", api_key), ("EXNESS_SECRET_KEY", secret),
+                              ("EXNESS_GATEWAY_URL", gateway)) if not v]
+    if missing:
+        await update.message.reply_text("Missing Railway variable(s): " + ", ".join(missing))
+        return
+
+    def run_check():
+        import exness_api
+        pk = exness_api.load_private_key(secret)
+        ap = exness_api.discover_access_point(gateway, api_key, pk, account_id)
+        details = exness_api.get_account_details(ap, api_key, pk, account_id)
+        return ap, details
+
+    try:
+        ap, details = await asyncio.to_thread(run_check)
+        shown = {k: v for k, v in details.items() if k in (
+            "account_id", "currency", "leverage", "trading_status", "account_type", "status", "server")}
+        await update.message.reply_text(
+            "✅ Exness API connection works.\n"
+            f"Account: {account_id}\n"
+            f"Access point found: yes\n"
+            f"Details: {json.dumps(shown) if shown else 'received (no standard fields to show)'}"
+        )
+    except Exception as e:
+        await update.message.reply_text(f"❌ Exness API check failed: {str(e)[:500]}")
+
+
 async def backfillmlfeatures_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """
     Admin-only, one-off command that runs backfill_signal_ml_features
@@ -32201,6 +32243,7 @@ def main():
     app.add_handler(CallbackQueryHandler(channels_callback, pattern=r"^chsw_"))
     app.add_handler(CommandHandler("broadcastchannels", broadcastchannels_command))
     app.add_handler(CommandHandler("backfillmlfeatures", backfillmlfeatures_command))
+    app.add_handler(CommandHandler("exnesstest", exnesstest_command))
     app.add_handler(CommandHandler("backtestderivbot", backtestderivbot_command))
     app.add_handler(CommandHandler("milestone", milestone_command))
     app.add_handler(CommandHandler("registerfallbackimages", registerfallbackimages_command))

@@ -24905,6 +24905,33 @@ def clean_text(text):
 # VERIFICATION GATE MESSAGE
 # ============================================
 
+VERIFY_GATE_STEP_TEXT = (
+    "Unlock <b>unlimited free signals</b>, analysis and <b>free auto-trade</b> with "
+    "one step: open a free Exness account with our link. <b>No payment.</b>\n\n"
+    "👉 Already registered with our link? <b>Type your Exness email below.</b>"
+)
+
+
+def verify_gate_markup():
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("📝 Open Exness account (free)", url=EXNESS_LINK)],
+        [InlineKeyboardButton("🔁 Already have Exness? Switch to us", callback_data="exn_switch_help")],
+    ])
+
+
+EXN_SWITCH_HELP_TEXT = (
+    "🔁 <b>Switch your existing Exness account to us</b>\n\n"
+    "1️⃣ Go to your Exness Personal Area\n"
+    "2️⃣ Tap the Chat icon 💬\n"
+    "3️⃣ Type: \"Partner Change\"\n"
+    "4️⃣ Fill out the form they send you\n"
+    "5️⃣ When they ask for the partner link, send them this:\n"
+    f"🔗 {EXNESS_LINK}\n\n"
+    "Exness confirms the change (up to 3 days). Then come back here and "
+    "<b>type the email you used</b> on Exness."
+)
+
+
 async def send_verification_gate(update, reason_intro=None):
     # FIX: CONFIRMED REAL BUG, per explicit instruction - this message
     # was hardcoded to always claim "you've used your 3 FREE trial
@@ -24918,56 +24945,11 @@ async def send_verification_gate(update, reason_intro=None):
     # "continue enjoying signals" line repeating "one simple step" a
     # second time. Defaults to the original wording, so all 12
     # genuinely trial-triggered call sites are completely unaffected.
-    intro = reason_intro or (
-        "🔐 <b>You've used your 5 FREE trial signals!</b>\n\n"
-        "Hope you loved what you saw! 🔥\n\n"
-        "To continue enjoying <b>UNLIMITED FREE signals</b>, "
-        "live market analysis and AI breakdowns — "
-        "you just need <b>ONE simple step:</b>"
-    )
+    intro = reason_intro or "🔐 <b>You've used your 5 FREE signals!</b>"
     await update.effective_message.reply_text(
-        f"{intro}\n\n"
-        "━━━━━━━━━━━━━━━━━━━━━\n"
-        "🔓 <b>HOW TO UNLOCK FULL ACCESS</b>\n"
-        "━━━━━━━━━━━━━━━━━━━━━\n\n"
-        "📌 Register a <b>FREE</b> trading account with our official "
-        "broker partner — <b>Exness</b> — using our unique link.\n\n"
-        "<b>No payment. No subscription. Completely FREE.</b>\n\n"
-        "━━━━━━━━━━━━━━━━━━━━━\n"
-        "👇 <b>CHOOSE YOUR SITUATION:</b>\n"
-        "━━━━━━━━━━━━━━━━━━━━━\n\n"
-        "✅ <b>SITUATION 1</b> — Already registered on Exness "
-        "using our link before:\n"
-        "👉 Simply type the email address you used to register "
-        "on Exness below and we will verify you instantly.\n\n"
-        "📝 <b>SITUATION 2</b> — Not yet registered or registered "
-        "without our link:\n"
-        "👉 Click the button below to create your FREE Exness "
-        "account using our official link. Once done, come back "
-        "here and type the email you registered with.\n\n"
-        "🔁 <b>SITUATION 3</b> — Already have an Exness account and "
-        "don't want to create a new one:\n"
-        "👉 You can switch your existing account to our partnership "
-        "instead:\n"
-        "1️⃣ Go to your EXNESS Personal Area\n"
-        "2️⃣ Click on the Chat Icon 💬\n"
-        "3️⃣ Type: \"Partner Change\"\n"
-        "4️⃣ Fill out the form they provide\n"
-        "5️⃣ When they ask for the partner link, send them this:\n"
-        f"🔗 {EXNESS_LINK}\n\n"
-        "Wait for EXNESS to confirm the change (may take up to 3 "
-        "days). Once confirmed, create a new MT5 trading account, "
-        "name it \"NEXORA TRADES\", then come back here and type "
-        "the email you used.\n\n"
-        "━━━━━━━━━━━━━━━━━━━━━\n"
-        "📧 <b>Already registered? Type your Exness email now 👇</b>",
+        f"{intro}\n\n{VERIFY_GATE_STEP_TEXT}",
         parse_mode=ParseMode.HTML,
-        reply_markup=InlineKeyboardMarkup([
-            [InlineKeyboardButton(
-                "📝 I'm New — Register on Exness FREE 👆",
-                url=EXNESS_LINK
-            )]
-        ])
+        reply_markup=verify_gate_markup()
     )
 
 # ============================================
@@ -25236,8 +25218,8 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
             f"📰 <b>News</b> — Get a direct call on high-impact news\n\n"
             f"🔗 <b>Connect Deriv</b> — Link your Deriv account to trade "
             f"signals directly, manually or fully automatic\n\n"
-            f"🤖 <b>Exness Auto-Trade</b> — Subscribe to auto-trade "
-            f"directly on your own Exness MT5/MT4 account\n\n"
+            f"🤖 <b>Exness Auto-Trade</b> — Free auto-trade "
+            "on your own Exness account\n\n"
             f"<i>All four buttons are at the bottom of your screen 👇</i>",
             parse_mode=ParseMode.HTML,
             reply_markup=main_keyboard
@@ -25261,8 +25243,8 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
             f"📰 <b>News</b> — Get a direct call on high-impact news\n\n"
             f"🔗 <b>Connect Deriv</b> — Link your Deriv account to trade "
             f"signals directly, manually or fully automatic\n\n"
-            f"🤖 <b>Exness Auto-Trade</b> — Subscribe to auto-trade "
-            f"directly on your own Exness MT5/MT4 account\n\n"
+            f"🤖 <b>Exness Auto-Trade</b> — Free auto-trade "
+            "on your own Exness account\n\n"
             f"<i>All four buttons are at the bottom of your screen 👇</i>",
             parse_mode=ParseMode.HTML,
             reply_markup=main_keyboard
@@ -25541,16 +25523,7 @@ async def send_exness_autotrade_intro(bot, chat_id):
             f"💵 <b>Price:</b> Free\n"
             f"<i>Connect your Exness account and the bot trades it for "
             f"you around the clock — no subscription.</i>\n\n"
-            "📈 <b>Why auto-trade?</b> Markets move fast, and the best "
-            "setups don't always happen when you're free to act on "
-            "them. Auto-trading lets you stay in the market on your "
-            "own terms — your own lot size, your own risk %, executed "
-            "the moment a real setup appears.\n\n"
-            "⚠️ <b>Disclaimer:</b> Trading involves real risk. Past "
-            "performance is not a guarantee of future results, and "
-            "you can lose money. Only subscribe with funds you can "
-            "afford to risk, and never with borrowed money.\n\n"
-            "━━━━━━━━━━━━━━━━━━━━━\n"
+            "⚠️ Trading is risky and you can lose money. Only use funds you can afford to lose.\n\n"
             "Ready to continue?"
         ),
         parse_mode=ParseMode.HTML,
@@ -27381,8 +27354,8 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     f"📰 <b>News</b> — Get a direct call on high-impact news\n\n"
                     f"🔗 <b>Connect Deriv</b> — Link your Deriv account to trade "
                     f"signals directly, manually or fully automatic\n\n"
-                    f"🤖 <b>Exness Auto-Trade</b> — Subscribe to auto-trade "
-                    f"directly on your own Exness MT5/MT4 account\n\n"
+                    f"🤖 <b>Exness Auto-Trade</b> — Free auto-trade "
+                    "on your own Exness account\n\n"
                     f"<i>All four buttons are at the bottom of your screen 👇</i>"
                 ),
                 parse_mode=ParseMode.HTML,
@@ -27407,8 +27380,8 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     f"📰 <b>News</b> — Get a direct call on high-impact news\n\n"
                     f"🔗 <b>Connect Deriv</b> — Link your Deriv account to trade "
                     f"signals directly, manually or fully automatic\n\n"
-                    f"🤖 <b>Exness Auto-Trade</b> — Subscribe to auto-trade "
-                    f"directly on your own Exness MT5/MT4 account\n\n"
+                    f"🤖 <b>Exness Auto-Trade</b> — Free auto-trade "
+                    "on your own Exness account\n\n"
                     f"<i>All four buttons are at the bottom of your screen 👇</i>"
                 ),
                 parse_mode=ParseMode.HTML,
@@ -27419,41 +27392,20 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         user_modes[user_id] = "awaiting_email"
         await context.bot.send_message(
             chat_id=int(user_id),
-            text=(
-                "🔐 <b>You've used your 5 FREE trial signals!</b>\n\n"
-                "Hope you loved what you saw! 🔥\n\n"
-                "To continue enjoying <b>UNLIMITED FREE signals</b>, "
-                "live market analysis and AI breakdowns — "
-                "you just need <b>ONE simple step:</b>\n\n"
-                "━━━━━━━━━━━━━━━━━━━━━\n"
-                "🔓 <b>HOW TO UNLOCK FULL ACCESS</b>\n"
-                "━━━━━━━━━━━━━━━━━━━━━\n\n"
-                "📌 Register a <b>FREE</b> trading account with our official "
-                "broker partner — <b>Exness</b> — using our unique link.\n\n"
-                "<b>No payment. No subscription. Completely FREE.</b>\n\n"
-                "━━━━━━━━━━━━━━━━━━━━━\n"
-                "👇 <b>CHOOSE YOUR SITUATION:</b>\n"
-                "━━━━━━━━━━━━━━━━━━━━━\n\n"
-                "✅ <b>SITUATION 1</b> — Already registered on Exness "
-                "using our link before:\n"
-                "👉 Simply type the email address you used to register "
-                "on Exness below and we will verify you instantly.\n\n"
-                "📝 <b>SITUATION 2</b> — Not yet registered or registered "
-                "without our link:\n"
-                "👉 Click the button below to create your FREE Exness "
-                "account using our official link. Once done, come back "
-                "here and type the email you registered with.\n\n"
-                "━━━━━━━━━━━━━━━━━━━━━\n"
-                "📧 <b>Already registered? Type your Exness email now 👇</b>"
-            ),
+            text=("🔐 <b>You've used your 5 FREE signals!</b>\n\n" + VERIFY_GATE_STEP_TEXT),
             parse_mode=ParseMode.HTML,
-            reply_markup=InlineKeyboardMarkup([
-                [InlineKeyboardButton(
-                    "📝 I'm New — Register on Exness FREE 👆",
-                    url=EXNESS_LINK
-                )]
-            ])
+            reply_markup=verify_gate_markup()
         )
+
+    elif data == "exn_switch_help":
+        try:
+            await update.callback_query.answer()
+        except Exception:
+            pass
+        await context.bot.send_message(
+            chat_id=update.callback_query.from_user.id,
+            text=EXN_SWITCH_HELP_TEXT, parse_mode=ParseMode.HTML,
+            disable_web_page_preview=True)
 
     elif data == "followgate_check":
 
@@ -27504,8 +27456,8 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 f"📰 <b>News</b> — Get a direct call on high-impact news\n\n"
                 f"🔗 <b>Connect Deriv</b> — Link your Deriv account to trade "
                 f"signals directly, manually or fully automatic\n\n"
-                f"🤖 <b>Exness Auto-Trade</b> — Subscribe to auto-trade "
-                f"directly on your own Exness MT5/MT4 account\n\n"
+                f"🤖 <b>Exness Auto-Trade</b> — Free auto-trade "
+                "on your own Exness account\n\n"
                 f"<i>All four buttons are at the bottom of your screen 👇</i>"
             ),
             parse_mode=ParseMode.HTML,
@@ -28036,10 +27988,7 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
             return
 
         await update.message.reply_text(
-            "⏳ <b>Got it! Your verification request has been submitted.</b>\n\n"
-            "Our team is reviewing your details right now. "
-            "You'll receive a confirmation message shortly.\n\n"
-            "<i>Sit tight — greatness is loading! 🚀</i>",
+            "⏳ <b>Request received.</b> We're verifying you now — you'll get a message shortly.",
             parse_mode=ParseMode.HTML
         )
 
@@ -29860,27 +29809,9 @@ async def deliver_approval(bot, target_id, email, require_saved=False):
             await bot.send_message(
                 chat_id=int(target_id),
                 text=(
-                    "🎉 <b>Congratulations! You're now a verified "
-                    "Nexora AI trader!</b>\n\n"
-                    "✅ <b>Full access unlocked!</b>\n\n"
-                    "You now have <b>unlimited access</b> to:\n\n"
-                    "📊 <b>Live Trading Signals</b> — Real-time "
-                    "signals on Gold, Bitcoin, Oil, Forex and more\n\n"
-                    "📰 <b>News-Driven Calls</b> — Direct BUY/SELL calls "
-                    "on any pair you ask about\n\n"
-                    "📈 <b>Technical Analysis</b> — Professional "
-                    "grade insights powered by AI\n\n"
-                    "🤖 <b>Exness Auto-Trade</b> — Subscribe to auto-trade "
-                    "directly on your own Exness MT5/MT4 account\n\n"
-                    "━━━━━━━━━━━━━━━━━━━━━\n"
-                    "🔐 <b>EXCLUSIVE — INNER CIRCLE ACCESS</b>\n"
-                    "━━━━━━━━━━━━━━━━━━━━━\n\n"
-                    "As a verified trader you now have access to our "
-                    "<b>exclusive Inner Circle channel</b> — premium "
-                    "signals and real-time alerts reserved only for "
-                    "verified Exness traders like you.\n\n"
-                    "👇 <b>Your personal invite link — "
-                    "works once, just for you:</b>"
+                    "🎉 <b>You're verified! Full access unlocked.</b>\n\n"
+                    "📊 Live signals · 📰 News calls · 📈 Analysis · 🤖 Free Exness Auto-Trade\n\n"
+                    "🔐 <b>Your Inner Circle invite</b> (works once, just for you):"
                 ),
                 parse_mode=ParseMode.HTML,
                 reply_markup=InlineKeyboardMarkup([
@@ -29894,18 +29825,8 @@ async def deliver_approval(bot, target_id, email, require_saved=False):
             await bot.send_message(
                 chat_id=int(target_id),
                 text=(
-                    "🎉 <b>Congratulations! You're now a verified "
-                    "Nexora AI trader!</b>\n\n"
-                    "✅ <b>Full access unlocked!</b>\n\n"
-                    "You now have <b>unlimited access</b> to:\n\n"
-                    "📊 <b>Live Trading Signals</b> — Real-time "
-                    "signals on Gold, Bitcoin, Oil, Forex and more\n\n"
-                    "📰 <b>News-Driven Calls</b> — Direct BUY/SELL calls "
-                    "on any pair you ask about\n\n"
-                    "📈 <b>Technical Analysis</b> — Professional "
-                    "grade insights powered by AI\n\n"
-                    "🤖 <b>Exness Auto-Trade</b> — Subscribe to auto-trade "
-                    "directly on your own Exness MT5/MT4 account"
+                    "🎉 <b>You're verified! Full access unlocked.</b>\n\n"
+                    "📊 Live signals · 📰 News calls · 📈 Analysis · 🤖 Free Exness Auto-Trade"
                 ),
                 parse_mode=ParseMode.HTML,
             )
@@ -29913,17 +29834,7 @@ async def deliver_approval(bot, target_id, email, require_saved=False):
         await bot.send_message(
             chat_id=int(target_id),
             text=(
-                "━━━━━━━━━━━━━━━━━━━━━\n"
-                "💼 <i>Welcome to the winning side. "
-                "Let's get to work!</i> 🔥\n"
-                "━━━━━━━━━━━━━━━━━━━━━\n\n"
-                "👇 <b>TAP AN OPTION BELOW TO GET STARTED:</b>\n\n"
-                "📊 <b>Signal</b> — Get a live trading signal\n\n"
-                "📰 <b>News</b> — Get a direct call on high-impact news\n\n"
-                "🔗 <b>Connect Deriv</b> — Link your Deriv account to trade "
-                "signals directly, manually or fully automatic\n\n"
-                "🤖 <b>Exness Auto-Trade</b> — Subscribe to auto-trade "
-                "directly on your own Exness MT5/MT4 account"
+                "💼 <b>Welcome to the winning side.</b> 👇 Tap an option below to get started."
             ),
             parse_mode=ParseMode.HTML,
             reply_markup=main_keyboard
@@ -29940,24 +29851,17 @@ async def deliver_rejection(bot, target_id):
         await bot.send_message(
             chat_id=int(target_id),
             text=(
-                "❌ <b>Verification Failed</b>\n\n"
-                "Unfortunately, we could not find an Exness account "
-                "linked to your email that was registered through "
-                "our official link.\n\n"
-                "<b>This could mean:</b>\n"
-                "• You registered on Exness without using our link\n"
-                "• You used a different email address\n\n"
-                "━━━━━━━━━━━━━━━━━━━━━\n"
-                "✅ <b>HOW TO FIX THIS:</b>\n"
-                "━━━━━━━━━━━━━━━━━━━━━\n\n"
-                "Click the link below to create a <b>NEW Exness "
-                "account</b> using our official link. It's completely "
-                "<b>FREE</b> and takes less than 2 minutes.\n\n"
-                f"🔗 {EXNESS_LINK}\n\n"
-                "Once done, come back here and type your new "
-                "email address to get verified instantly. 🚀"
+                "❌ <b>This email is not registered under us.</b>\n\n"
+                "Either you registered on Exness without our link, or you used a different email.\n\n"
+                "<b>Two ways to fix it:</b>\n"
+                "1️⃣ Tap <b>Open Exness account</b> to create a free new account with our link, then type your new email here.\n"
+                "2️⃣ Tap <b>Switch my existing account</b> to move your current Exness account to us, then type your email here once Exness confirms."
             ),
-            parse_mode=ParseMode.HTML
+            parse_mode=ParseMode.HTML,
+            reply_markup=InlineKeyboardMarkup([
+                [InlineKeyboardButton("📝 Open Exness account (free)", url=EXNESS_LINK)],
+                [InlineKeyboardButton("🔁 Switch my existing account", callback_data="exn_switch_help")],
+            ])
         )
     except Exception as e:
         print(f"[REJECT] Could not message user: {e}")

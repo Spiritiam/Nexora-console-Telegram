@@ -3048,7 +3048,7 @@ async def manage_aggressive_positions(context: ContextTypes.DEFAULT_TYPE):
 async def run_mt5_autotrade_follow_channel_scan(context: ContextTypes.DEFAULT_TYPE):
     """
     Runs every 2 minutes. Handles TWO separate subscriber modes now,
-    per explicit instruction - "Copy Channel Signal" was split back out
+    per explicit instruction - "Channel Signals Only" was split back out
     as its own standalone mode, since some subscribers specifically
     want ONLY what the channel itself posts, not the broader coverage
     "Full Signal Coverage" provides (which also includes signals that
@@ -3170,7 +3170,7 @@ async def run_mt5_autotrade_follow_channel_scan(context: ContextTypes.DEFAULT_TY
             if order_id:
                 log_mt5_autotrade_order(user_id, metaapi_account_id, order_id, pair_config["display"], direction)
                 mode_header = (
-                    "📻 Copy Channel Signal — Trade Opened" if account.get("bot_choice") == "copy_channel"
+                    "📻 Channel Signals Only — Trade Opened" if account.get("bot_choice") == "copy_channel"
                     else "📡 Full Signal Coverage — Trade Opened"
                 )
                 if plan == "split" and split_ids:
@@ -25403,7 +25403,7 @@ async def build_exness_autotrade_dashboard(user_id, account, expiry, now):
     bot_choice = account.get("bot_choice", "follow_channel")
     bot_label = (
         "📡 Full Signal Coverage" if bot_choice == "follow_channel"
-        else "📻 Copy Channel Signal" if bot_choice == "copy_channel"
+        else "📻 Channel Signals Only" if bot_choice == "copy_channel"
         else "🚀 Account Flip (own price-action strategy)" if bot_choice == "account_flip"
         else MT5_AUTOTRADE_BOTS.get(bot_choice, {}).get("label", bot_choice)
     )
@@ -25891,12 +25891,12 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         mt5_signup_state[user_id] = {"flow": "presetup"}
         await query.message.edit_text(
             "🤖 <b>How should Exness Auto-Trade decide your trades?</b>\n\n"
-            "📡 <b>Full Signal Coverage</b> — auto-copies whatever "
+            "📡 <b>Full Signal Coverage</b> — auto-trades whatever "
             "the main channel already posts (XAUUSD, USOIL, XAGUSD, BTCUSD, "
             "etc). And trades every qualifying signal our system generates, "
             "giving you access to signals that never makes it to the "
             "channel. More coverage, more opportunities.\n\n"
-            "📻 <b>Copy Channel Signal</b> — trades only what's actually "
+            "📻 <b>Channel Signals Only</b> — trades only what's actually "
             "posted to the main channel, nothing else.\n\n"
             "🎯 <b>Pick a Bot</b> — choose one of 4 dedicated strategy "
             "bots and one specific pair for it to trade.\n\n"
@@ -25906,7 +25906,7 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             parse_mode=ParseMode.HTML,
             reply_markup=InlineKeyboardMarkup([
                 [InlineKeyboardButton("📡 Full Signal Coverage", callback_data="mt5auto_follow_channel")],
-                [InlineKeyboardButton("📻 Copy Channel Signal", callback_data="mt5auto_copy_channel")],
+                [InlineKeyboardButton("📻 Channel Signals Only", callback_data="mt5auto_copy_channel")],
                 [InlineKeyboardButton("🎯 Pick a Bot", callback_data="mt5auto_choose_bot")],
                 [InlineKeyboardButton("🚀 Account Flip", callback_data="mt5auto_account_flip")],
             ])
@@ -25921,7 +25921,7 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             "generates, not just what's posted to the channel. That "
             "means significantly more trades and more notifications "
             "than our other modes. If you'd prefer fewer, more "
-            "selective trades, Copy Channel Signal or Pick a Bot may "
+            "selective trades, Channel Signals Only or Pick a Bot may "
             "suit you better.",
             parse_mode=ParseMode.HTML,
             reply_markup=InlineKeyboardMarkup([
@@ -26429,12 +26429,12 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         user_id = str(query.from_user.id)
         await query.message.edit_text(
             "🔄 <b>Switch how Exness Auto-Trade decides your trades:</b>\n\n"
-            "📡 <b>Full Signal Coverage</b> — auto-copies whatever "
+            "📡 <b>Full Signal Coverage</b> — auto-trades whatever "
             "the main channel already posts (XAUUSD, USOIL, XAGUSD, BTCUSD, "
             "etc). And trades every qualifying signal our system generates, "
             "giving you access to signals that never makes it to the "
             "channel. More coverage, more opportunities.\n\n"
-            "📻 <b>Copy Channel Signal</b> — trades only what's actually "
+            "📻 <b>Channel Signals Only</b> — trades only what's actually "
             "posted to the main channel, nothing else.\n\n"
             "🎯 <b>Pick a Bot</b> — choose one of 4 dedicated strategy "
             "bots and one specific pair for it to trade.\n\n"
@@ -26444,7 +26444,7 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             parse_mode=ParseMode.HTML,
             reply_markup=InlineKeyboardMarkup([
                 [InlineKeyboardButton("📡 Full Signal Coverage", callback_data="mt5switch_follow_channel")],
-                [InlineKeyboardButton("📻 Copy Channel Signal", callback_data="mt5switch_copy_channel")],
+                [InlineKeyboardButton("📻 Channel Signals Only", callback_data="mt5switch_copy_channel")],
                 [InlineKeyboardButton("🎯 Pick a Bot", callback_data="mt5switch_choose_bot")],
                 [InlineKeyboardButton("🚀 Account Flip", callback_data="mt5switch_account_flip")],
                 [InlineKeyboardButton("⬅️ Back", callback_data="mt5auto_dashboard")],
@@ -26520,7 +26520,7 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             "generates, not just what's posted to the channel. That "
             "means significantly more trades and more notifications "
             "than our other modes. If you'd prefer fewer, more "
-            "selective trades, Copy Channel Signal or Pick a Bot may "
+            "selective trades, Channel Signals Only or Pick a Bot may "
             "suit you better.",
             parse_mode=ParseMode.HTML,
             reply_markup=InlineKeyboardMarkup([
@@ -26544,7 +26544,7 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         user_id = str(query.from_user.id)
         upsert_mt5_autotrade_account(user_id, {"bot_choice": "copy_channel", "pair_choice": None})
         await query.message.edit_text(
-            "✅ <b>Switched to Copy Channel Signal.</b>\n\n"
+            "✅ <b>Switched to Channel Signals Only.</b>\n\n"
             "Tap 🤖 Exness Auto-Trade anytime to check your status or switch again.",
             parse_mode=ParseMode.HTML
         )
@@ -28842,7 +28842,7 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
             bot_choice = signup.get("bot_choice", "follow_channel")
             summary = (
                 "📡 Full Signal Coverage" if bot_choice == "follow_channel"
-                else "📻 Copy Channel Signal" if bot_choice == "copy_channel"
+                else "📻 Channel Signals Only" if bot_choice == "copy_channel"
                 else f"{MT5_AUTOTRADE_BOTS[bot_choice]['label']} on {PAIR_CONFIG[signup['pair_choice']]['display']}"
             )
             sent_ready = await update.message.reply_text(
@@ -28993,7 +28993,7 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
             bot_choice = signup.get("bot_choice", "follow_channel")
             summary = (
                 "📡 Full Signal Coverage" if bot_choice == "follow_channel"
-                else "📻 Copy Channel Signal" if bot_choice == "copy_channel"
+                else "📻 Channel Signals Only" if bot_choice == "copy_channel"
                 else f"{MT5_AUTOTRADE_BOTS[bot_choice]['label']} on {PAIR_CONFIG[signup['pair_choice']]['display']}"
             )
             sent_ready = await update.message.reply_text(

@@ -3753,7 +3753,7 @@ async def deriv_oauth_callback_handler(request):
             )
         )
 
-    accounts_data = await _napp_run_on_main(deriv_get_options_accounts(access_token), 30)
+    accounts_data = await _napp_run_on_main(deriv_get_options_accounts(access_token, priority=True), 30)
     accounts_list = None
     if accounts_data:
         accounts_list = accounts_data.get("data")
@@ -8729,7 +8729,20 @@ async def check_deriv_service_token_health(context: ContextTypes.DEFAULT_TYPE):
 
 _DERIV_SERVICE_ACCOUNTS_CACHE = {}
 
-async def deriv_get_options_accounts(token):
+_DERIV_429_UNTIL = 0.0
+
+def _deriv_cooling_down():
+    return time.time() < _DERIV_429_UNTIL
+
+def _deriv_note_429():
+    # FIX: when Deriv answers 429 every caller used to retry 3 times, so
+    # dozens of background scans kept the rate limit tripped and real
+    # logins / status checks never got through. Now the first 429 pauses
+    # all background Deriv calls for 40 seconds so the limit can reset.
+    global _DERIV_429_UNTIL
+    _DERIV_429_UNTIL = time.time() + 40
+
+async def deriv_get_options_accounts(token, priority=False):
     """
     Step 1: lists every account (real and virtual) tied to this
     token. Returns the raw parsed JSON on success, or None on any
@@ -8761,12 +8774,19 @@ async def deriv_get_options_accounts(token):
         _hit = _DERIV_SERVICE_ACCOUNTS_CACHE.get("v")
         if _hit and _hit[0] > time.time():
             return _hit[1]
+    if not priority and _deriv_cooling_down():
+        return None
     url = f"{DERIV_API_BASE}/trading/v1/options/accounts"
     transient_statuses = (429, 502, 503, 504)
     max_attempts = 3
     for attempt in range(1, max_attempts + 1):
         try:
             response = requests.get(url, headers=deriv_api_headers(token), timeout=10)
+            if response.status_code == 429:
+                _deriv_note_429()
+                if not priority:
+                    print("[DERIV] Accounts lookup 429 - pausing background Deriv calls 40s")
+                    return None
             if response.status_code == 200:
                 if token == DERIV_SERVICE_TOKEN:
                     record_deriv_service_token_success()
@@ -8788,7 +8808,7 @@ async def deriv_get_options_accounts(token):
         await asyncio.sleep(1.5 * attempt)
     return None
 
-async def deriv_get_otp_url(token, account_id):
+async def deriv_get_otp_url(token, account_id, priority=False):
     """
     Step 2: exchanges the token + a specific account ID for the
     short-lived WebSocket URL with the one-time code embedded.
@@ -8796,12 +8816,19 @@ async def deriv_get_otp_url(token, account_id):
     Same retry fix as deriv_get_options_accounts above, for the same
     confirmed reason.
     """
+    if not priority and _deriv_cooling_down():
+        return None
     url = f"{DERIV_API_BASE}/trading/v1/options/accounts/{account_id}/otp"
     transient_statuses = (429, 502, 503, 504)
     max_attempts = 3
     for attempt in range(1, max_attempts + 1):
         try:
             response = requests.post(url, headers=deriv_api_headers(token), timeout=10)
+            if response.status_code == 429:
+                _deriv_note_429()
+                if not priority:
+                    print("[DERIV] OTP 429 - pausing background Deriv calls 40s")
+                    return None
             if response.status_code == 200:
                 data = response.json()
                 return data.get("data", {}).get("url")
@@ -9083,7 +9110,7 @@ async def get_deriv_contract_outcome(token, contract_id):
     itself failed (caller should treat this as "try again later", NOT
     as confirmation the trade is closed).
     """
-    accounts_data = await deriv_get_options_accounts(token)
+    accounts_data = await deriv_get_options_accounts(token, priority=True)
     if not accounts_data:
         return None, None
     accounts_list = accounts_data.get("data") or accounts_data.get("accounts")
@@ -9101,7 +9128,7 @@ async def get_deriv_contract_outcome(token, contract_id):
     if not account_id:
         return None, None
 
-    ws_url = await deriv_get_otp_url(token, account_id)
+    ws_url = await deriv_get_otp_url(token, account_id, priority=True)
     if not ws_url:
         return None, None
 
@@ -9608,7 +9635,7 @@ async def get_deriv_trading_ws_url(token):
     Returns None on any failure.
     """
     try:
-        accounts_data = await deriv_get_options_accounts(token)
+        accounts_data = await deriv_get_options_accounts(token, priority=True)
         if not accounts_data:
             return None
         accounts_list = accounts_data.get("data")
@@ -9632,7 +9659,7 @@ async def get_deriv_trading_ws_url(token):
             or real_account.get("loginid")
             or real_account.get("id")
         )
-        return await deriv_get_otp_url(token, account_id)
+        return await deriv_get_otp_url(token, account_id, priority=True)
     except Exception as e:
         print(f"[DERIV] get_deriv_trading_ws_url error: {e}")
         return None
@@ -11736,7 +11763,7 @@ async def deriv_execute_multiplier_trade(token, symbol, contract_type, multiplie
     nothing above the inner websocket try/except was protected).
     """
     try:
-        accounts_data = await deriv_get_options_accounts(token)
+        accounts_data = await deriv_get_options_accounts(token, priority=True)
         if not accounts_data:
             return None, "Couldn't verify your Deriv account."
 
@@ -11766,7 +11793,7 @@ async def deriv_execute_multiplier_trade(token, symbol, contract_type, multiplie
         )
         currency = real_account.get("currency", "USD")
 
-        ws_url = await deriv_get_otp_url(token, account_id)
+        ws_url = await deriv_get_otp_url(token, account_id, priority=True)
         if not ws_url:
             return None, "Couldn't establish a trading connection."
     except Exception as e:

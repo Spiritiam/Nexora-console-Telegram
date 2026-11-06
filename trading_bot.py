@@ -4510,6 +4510,9 @@ async def nexora_app_deriv_oauth_start_handler(request):
     return _napp_json({"url": url})
 
 
+_NAPP_DERIV_SNAP_CACHE = {}
+
+
 async def nexora_app_deriv_status_handler(request):
     synth, err = await _napp_deriv_auth(request)
     if err:
@@ -4524,6 +4527,15 @@ async def nexora_app_deriv_status_handler(request):
         snapshot = await _napp_run_on_main(deriv_fetch_account_snapshot(acct["api_token"]), 25)
     except Exception as e:
         print(f"[NEXORA APP] deriv snapshot error: {type(e).__name__}")
+    # FIX: when Deriv briefly rate-limits (HTTP 429) the live lookup fails and
+    # the app showed "Cannot reach" even though nothing was wrong. Remember
+    # the last good answer for 5 minutes and show that instead.
+    if snapshot and not snapshot.get("is_virtual"):
+        _NAPP_DERIV_SNAP_CACHE[synth] = (time.time() + 300, snapshot)
+    elif not snapshot:
+        _c = _NAPP_DERIV_SNAP_CACHE.get(synth)
+        if _c and _c[0] > time.time():
+            snapshot = _c[1]
     trades = await asyncio.to_thread(_napp_deriv_recent_trades_sync, synth)
     return _napp_json({
         "connected": True,

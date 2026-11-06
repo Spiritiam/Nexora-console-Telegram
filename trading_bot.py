@@ -22838,6 +22838,13 @@ async def check_upcoming_high_impact_news(context: ContextTypes.DEFAULT_TYPE):
             event_time = datetime.strptime(raw_dt[:16], "%Y-%m-%dT%H:%M")
         except Exception:
             continue
+        # FIX: events already in the past are never "pending" - after
+        # a restart (NOTIFIED_EVENTS_TODAY is in memory), an earlier,
+        # already-passed event (e.g. a morning speech) used to stay
+        # the "earliest" one forever, so the 25-30 minute window never
+        # matched and the later event (e.g. NFP) never got its reminder.
+        if event_time < now:
+            continue
         pending.append((idx, event, event_time))
 
     if not pending:
@@ -22849,7 +22856,7 @@ async def check_upcoming_high_impact_news(context: ContextTypes.DEFAULT_TYPE):
     pending.sort(key=lambda p: p[2])
     _, _, earliest_time = pending[0]
     minutes_until_earliest = (earliest_time - now).total_seconds() / 60
-    if not (25 <= minutes_until_earliest <= 30):
+    if not (0 <= minutes_until_earliest <= 30):
         return
 
     group = [(idx, event) for idx, event, _ in pending]

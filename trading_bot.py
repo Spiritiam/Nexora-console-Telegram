@@ -3685,6 +3685,20 @@ def render_deriv_oauth_page(heading, message, kind="info", emoji=None, app=False
 </html>"""
 
 
+async def _notify_deriv_moved(owner, loginid, new_is_app):
+    """Tells the previous owner their Deriv connection was moved away."""
+    if not _app_instance:
+        return
+    where = "the SpiritFX Trading Academy app" if new_is_app else "the Nexora AI Telegram bot"
+    text = (
+        "⚠️ <b>Deriv account disconnected</b>\n\n"
+        f"Your Deriv account {loginid} was connected through {where} on another login, "
+        "so it was disconnected here and Auto-Trade is off.\n\n"
+        "If this was not you, log in to Deriv again to take it back, and change your Deriv password."
+    )
+    await _app_instance.bot.send_message(chat_id=int(owner), text=text, parse_mode=ParseMode.HTML)
+
+
 async def deriv_oauth_callback_handler(request):
     """
     Deriv redirects here after a user logs in via the modern PKCE flow
@@ -3813,6 +3827,13 @@ async def deriv_oauth_callback_handler(request):
             if _r.status_code not in (200, 204):
                 raise RuntimeError(_r.status_code)
             print(f"[DERIV] Moved {real_loginid} from {owner} to {user_id} (new login proved ownership)")
+            # Tell the person who just lost the connection. Goes through the
+            # bot's own loop; for app users the push bridge turns this into
+            # a phone notification, for Telegram users it is a normal DM.
+            try:
+                await _napp_run_on_main(_notify_deriv_moved(owner, real_loginid, _is_app_synth(user_id)), 15)
+            except Exception as e:
+                print(f"[DERIV] Move notice to {owner} failed: {type(e).__name__}")
         except Exception as e:
             print(f"[DERIV] Could not move {real_loginid} from {owner}: {type(e).__name__}")
             return web.Response(

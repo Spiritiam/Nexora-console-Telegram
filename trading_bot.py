@@ -6648,7 +6648,7 @@ async def check_mt5_zero_balance_notifications(context: ContextTypes.DEFAULT_TYP
                     "but with a $0 balance, there's nothing for it to "
                     "trade with.\n\n"
                     "Fund your account to take full advantage of Nexora "
-                    "AI copy trading."
+                    "AI auto-trading."
                 ),
                 parse_mode=ParseMode.HTML
             )
@@ -25543,7 +25543,7 @@ async def send_exness_autotrade_intro(bot, chat_id):
     sent_info = await bot.send_message(
         chat_id=chat_id,
         text=(
-            "🤖 <b>Exness Auto-Trade</b>\n\n"
+            "🤖 <b>Exness Auto-Trade</b> <i>(also known as copy trading)</i>\n\n"
             "Let Nexora AI trade directly on your own Exness "
             "account, automatically, using the same technical strategy "
             "already powering your signals — no need to manually "
@@ -31147,7 +31147,7 @@ def _channels_status_text():
                 "Nothing is being posted to the Public, Inner Circle or official Nexora AI channels. "
                 f"Held back so far this run: <b>{_channels_state['suppressed']}</b>. They are not sent later.")
     return (head + "\n\n<b>Still working for everyone:</b> personal signal requests, auto-trading, "
-            "copy trading, DMs and the app.\n<i>Your own admin commands (like /broadcastchannels) still post.</i>")
+            "DMs and the app.\n<i>Your own admin commands (like /broadcastchannels) still post.</i>")
 
 
 def _channels_markup():

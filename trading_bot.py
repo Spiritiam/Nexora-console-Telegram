@@ -3746,6 +3746,20 @@ async def deriv_oauth_callback_handler(request):
         if not isinstance(accounts_list, list):
             accounts_list = accounts_data.get("accounts")
 
+    # FIX: if Deriv itself could not be reached (e.g. it answered 429 Too
+    # Many Requests), say so - this used to be reported as "only demo
+    # accounts were found", which was wrong and confusing.
+    if accounts_data is None:
+        return web.Response(
+            status=200, content_type="text/html",
+            text=render_deriv_oauth_page(
+                "Deriv is busy right now.",
+                "We could not check your Deriv accounts just now. This is not a problem with your account. "
+                "Wait about a minute, then go back and try again.",
+                kind="warning", app=_is_app_synth(user_id),
+            )
+        )
+
     real_loginid, real_currency = None, None
     if accounts_list:
         for acct in accounts_list:
@@ -3774,15 +3788,41 @@ async def deriv_oauth_callback_handler(request):
     # two engines (e.g. Telegram + the app) would trade it twice.
     owner = await asyncio.to_thread(_deriv_loginid_owner_sync, real_loginid)
     if owner and owner != str(user_id):
+        # Logging in to Deriv here already proves this person owns the
+        # Deriv account, so a lost/stolen/unreachable phone must not lock
+        # them out: move the connection to THIS login and switch the old
+        # one off. If the old one has an open trade, do NOT cut it loose -
+        # ask them to retry after it closes (same rule as Disconnect).
         where = "the SpiritFX Academy app" if _is_app_synth(owner) else "Nexora on Telegram"
-        return web.Response(
-            status=200, content_type="text/html",
-            text=render_deriv_oauth_page(
-                "This Deriv account is already connected.",
-                f"It is linked through {where}. Disconnect it there first, then connect it here.",
-                kind="warning", app=_is_app_synth(user_id),
+        await asyncio.to_thread(update_deriv_account_fields, owner, {"deriv_autotrade_enabled": False})
+        if await asyncio.to_thread(_napp_deriv_has_open_sync, owner):
+            return web.Response(
+                status=200, content_type="text/html",
+                text=render_deriv_oauth_page(
+                    "This Deriv account has an open trade.",
+                    f"It is connected through {where} and still has a Nexora trade running. "
+                    "Auto-Trade there is now off. Wait for the trade to close, then connect again here.",
+                    kind="warning", app=_is_app_synth(user_id),
+                )
             )
-        )
+        try:
+            _r = await asyncio.to_thread(
+                lambda: requests.delete(
+                    f"{SUPABASE_URL}/rest/v1/deriv_accounts?user_id=eq.{owner}",
+                    headers=sb_headers(), timeout=10))
+            if _r.status_code not in (200, 204):
+                raise RuntimeError(_r.status_code)
+            print(f"[DERIV] Moved {real_loginid} from {owner} to {user_id} (new login proved ownership)")
+        except Exception as e:
+            print(f"[DERIV] Could not move {real_loginid} from {owner}: {type(e).__name__}")
+            return web.Response(
+                status=200, content_type="text/html",
+                text=render_deriv_oauth_page(
+                    "Could not switch this account over.",
+                    "Please go back and try again in a minute.",
+                    kind="warning", app=_is_app_synth(user_id),
+                )
+            )
 
     await asyncio.to_thread(
         save_pending_deriv_oauth_connection,
@@ -8654,6 +8694,8 @@ async def check_deriv_service_token_health(context: ContextTypes.DEFAULT_TYPE):
                 print(f"[SERVICE CREDENTIALS] Couldn't send expiry reminder: {e}")
 
 
+_DERIV_SERVICE_ACCOUNTS_CACHE = {}
+
 async def deriv_get_options_accounts(token):
     """
     Step 1: lists every account (real and virtual) tied to this
@@ -8676,6 +8718,16 @@ async def deriv_get_options_accounts(token):
     if not DERIV_APP_ID:
         print("[DERIV] No DERIV_APP_ID set")
         return None
+    # FIX: every synthetic-index candle fetch, backtest and tick job
+    # called this for the SAME service token over and over, which got
+    # Deriv to answer 429 for everything - including users logging in.
+    # The service account list basically never changes, so it is cached
+    # for 10 minutes. Only the service token is cached - user tokens
+    # are always looked up live.
+    if token and token == DERIV_SERVICE_TOKEN:
+        _hit = _DERIV_SERVICE_ACCOUNTS_CACHE.get("v")
+        if _hit and _hit[0] > time.time():
+            return _hit[1]
     url = f"{DERIV_API_BASE}/trading/v1/options/accounts"
     transient_statuses = (429, 502, 503, 504)
     max_attempts = 3
@@ -8685,7 +8737,10 @@ async def deriv_get_options_accounts(token):
             if response.status_code == 200:
                 if token == DERIV_SERVICE_TOKEN:
                     record_deriv_service_token_success()
-                return response.json()
+                _data = response.json()
+                if token and token == DERIV_SERVICE_TOKEN and _data:
+                    _DERIV_SERVICE_ACCOUNTS_CACHE["v"] = (time.time() + 600, _data)
+                return _data
             if response.status_code not in transient_statuses or attempt == max_attempts:
                 print(f"[DERIV] Accounts lookup failed {response.status_code}: {response.text}")
                 if token == DERIV_SERVICE_TOKEN and response.status_code in (401, 403):

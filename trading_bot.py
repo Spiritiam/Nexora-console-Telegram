@@ -25267,6 +25267,8 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if context.args and context.args[0].startswith("goto_"):
         destination = context.args[0].replace("goto_", "")
         if destination == "exness":
+            if await exness_autotrade_needs_verification(update, user_id):
+                return
             await send_exness_autotrade_intro(context.bot, update.effective_chat.id)
         elif destination == "deriv":
             await send_connect_instructions(context.bot, user_id)
@@ -25646,6 +25648,23 @@ EXNESS_API_CONNECT_INSTRUCTIONS = (
 )
 
 
+_EXNESS_VERIFY_INTRO = (
+    "🔒 <b>Exness Auto-Trade requires a verified Exness "
+    "account first</b> — you just need <b>one simple step:</b>"
+)
+
+async def exness_autotrade_needs_verification(update, user_id):
+    """True (and shows the verification message) if this Telegram user has
+    not verified their Exness email yet. Exness Auto-Trade is only for
+    verified users, checked at the very start so nobody gets as far as
+    choosing a trading mode first."""
+    if await is_verified_async(user_id):
+        return False
+    user_modes[user_id] = "awaiting_email"
+    await send_verification_gate(update, reason_intro=_EXNESS_VERIFY_INTRO, with_buttons=False)
+    return True
+
+
 async def send_exness_autotrade_intro(bot, chat_id):
     """
     Shared by the normal "🤖 Exness Auto-Trade" button tap (handle_buttons
@@ -25851,6 +25870,8 @@ async def handle_buttons(update: Update, context: ContextTypes.DEFAULT_TYPE):
         # the mt5auto_start callback already uses, and goes straight
         # to the real dashboard here too when it's true.
         user_id = str(update.effective_user.id)
+        if await exness_autotrade_needs_verification(update, user_id):
+            return
         account = get_mt5_autotrade_account(user_id)
         now = datetime.utcnow()
         expiry = None
@@ -25955,6 +25976,8 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     if data == "mt5auto_start":
         user_id = str(query.from_user.id)
+        if await exness_autotrade_needs_verification(update, user_id):
+            return
         account = get_mt5_autotrade_account(user_id)
         now = datetime.utcnow()
         expiry = None

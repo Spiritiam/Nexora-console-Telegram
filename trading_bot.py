@@ -7171,6 +7171,22 @@ VERIFY_GROUP_ID = "-1002400215654"
 # ============================================
 
 EXNESS_LINK = "https://www.exness.com/boarding/sign-up/a/vlnafmua"
+DERIV_SIGNUP_LINK = "https://track.deriv.com/_eBizfEiAKzC6tyDIijdDK2Nd7ZgqdRLk/1/"
+# Small Telegram quote added under every signal (HTML <blockquote>).
+SIGNAL_QUOTE_SYNTH = f'<blockquote>🔗 <a href="{DERIV_SIGNUP_LINK}">Sign up to trade synthetics on Deriv</a></blockquote>'
+SIGNAL_QUOTE_FOREX = f'<blockquote>🔗 <a href="{EXNESS_LINK}">Open a free Exness account to trade this</a></blockquote>'
+
+
+def _short_ml_reason(reason):
+    """'ML model favors BUY (predicted edge -20.39%) - 2 strategies leaning buy
+    (A, B).'  ->  'ML model favors BUY + A, B'  (no edge percentage)."""
+    try:
+        m = re.match(r"^ML model favors (BUY|SELL) \(predicted edge [^)]*\)(?: - \d+ strateg(?:y|ies) leaning \w+ \((.*)\))?\.?$", str(reason).strip())
+        if m:
+            return f"ML model favors {m.group(1)}" + (f" + {m.group(2)}" if m.group(2) else "")
+    except Exception:
+        pass
+    return reason
 
 # ============================================
 # BOT USERNAME
@@ -11570,14 +11586,13 @@ async def _build_synthetic_signal_response_inner(index_key, min_agree=2):
         )
 
     message = (
-        f"{emoji} <b>STRONG {direction} {config['display']}</b> ⚡\n\n"
+        f"{emoji} <b>STRONG {direction} {config['display']}</b> ⚡\n"
         f"<b>Confidence:</b> {confidence}%\n\n"
-        f"{narrative}\n\n"
+        f"{_short_ml_reason(narrative)}\n\n"
         f"{entry_sl_tp_block}"
-        f"<b>Suggested:</b> ${DEFAULT_SYNTHETIC_STAKE} stake | "
-        f"Risk ${DEFAULT_RISK} → Target ${DEFAULT_WIN}\n"
-        f"<i>(Stake and risk/target are adjustable before you confirm)</i>\n\n"
-        f"<i>Trade safe 💼🔥</i>"
+        f"<b>Suggested:</b> ${DEFAULT_SYNTHETIC_STAKE} stake "
+        f"<i>(adjust before confirming)</i>\n\n"
+        f"{SIGNAL_QUOTE_SYNTH}"
     )
 
     trade_context = {
@@ -21544,7 +21559,12 @@ async def build_signal_response(question, user_id=None, retry_mismatch=False):
     )
     if fundamental_reason:
         response += f"<b>Fundamental Analysis:</b> {fundamental_reason}\n\n"
-    response += f"<i>Trade safe 💼🔥</i>"
+    # Telegram photo captions max out at 1024 chars: if adding both the
+    # "Trade safe" line and the link quote would overflow, drop "Trade safe".
+    if len(response) + len("<i>Trade safe 💼🔥</i>\n\n") + len(SIGNAL_QUOTE_FOREX) <= 1000:
+        response += f"<i>Trade safe 💼🔥</i>\n\n{SIGNAL_QUOTE_FOREX}"
+    else:
+        response += SIGNAL_QUOTE_FOREX
 
     signal_data = {
         "symbol": symbol,

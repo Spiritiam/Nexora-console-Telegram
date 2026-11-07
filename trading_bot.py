@@ -30824,6 +30824,38 @@ async def exnesscheck_command(update: Update, context: ContextTypes.DEFAULT_TYPE
     await update.message.reply_text("\n".join(lines))
 
 
+async def unlinkappemail_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Admin-only: unlink an Exness email that is linked inside the SpiritFX
+    Trading Academy app (same full steps as the in-app Unlink: credentials
+    wiped, MetaAPI/account removed, email freed). Usage: /unlinkappemail <email>.
+    Refuses anything that is not an app link."""
+    user_id = str(update.message.from_user.id)
+    if not ADMIN_USER_ID or user_id != str(ADMIN_USER_ID):
+        return
+    if not context.args:
+        await update.message.reply_text("Usage: /unlinkappemail your@email.com")
+        return
+    email = context.args[0].strip().lower()
+    owner = await asyncio.to_thread(get_verified_user_by_email, email)
+    if not owner:
+        await update.message.reply_text("That email is not linked anywhere.")
+        return
+    owner_uid = str(owner.get("user_id"))
+    if not _is_app_synth(owner_uid):
+        await update.message.reply_text("That email is linked on Telegram, not in the app. Nothing changed.")
+        return
+    status, _info = await exness_unlink_for_telegram(owner_uid)
+    if status == "ok":
+        await update.message.reply_text(
+            "✅ Unlinked from the SpiritFX Trading Academy app. You can now verify that email here in Telegram.")
+    elif status == "limit":
+        await update.message.reply_text("⚠️ That account has hit its monthly unlink limit. Nothing changed.")
+    elif status == "nothing":
+        await update.message.reply_text("Nothing to unlink.")
+    else:
+        await update.message.reply_text("⚠️ Unlink failed. Nothing was lost; try again in a minute.")
+
+
 async def inactivereport_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = str(update.message.from_user.id)
     if not ADMIN_USER_ID or user_id != str(ADMIN_USER_ID):
@@ -33138,6 +33170,7 @@ def main():
     app.add_handler(CommandHandler("exnesslinkreport", exnesslinkreport_command))
     app.add_handler(CommandHandler("exnesslinkremove", exnesslinkremove_command))
     app.add_handler(CommandHandler("exnesscheck", exnesscheck_command))
+    app.add_handler(CommandHandler("unlinkappemail", unlinkappemail_command))
     app.add_handler(CommandHandler("inactivityrun", inactivityrun_command))
     app.add_handler(CommandHandler("testsynth", testsynth_command))
     app.add_handler(CommandHandler("discoversymbols", discoversymbols_command))

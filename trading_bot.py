@@ -7173,7 +7173,7 @@ VERIFY_GROUP_ID = "-1002400215654"
 EXNESS_LINK = "https://www.exness.com/boarding/sign-up/a/vlnafmua"
 DERIV_SIGNUP_LINK = "https://track.deriv.com/_eBizfEiAKzC6tyDIijdDK2Nd7ZgqdRLk/1/"
 # Small Telegram quote added under every signal (HTML <blockquote>).
-SIGNAL_QUOTE_SYNTH = f'<blockquote>🔗 <a href="{DERIV_SIGNUP_LINK}">Sign up to trade synthetics on Deriv</a></blockquote>'
+SIGNAL_QUOTE_SYNTH = f'<blockquote>🔗 <a href="{DERIV_SIGNUP_LINK}">Sign up to trade Volatility Indices on Deriv</a></blockquote>'
 SIGNAL_QUOTE_FOREX = f'<blockquote>🔗 <a href="{EXNESS_LINK}">Open a free Exness account to trade this</a></blockquote>'
 
 

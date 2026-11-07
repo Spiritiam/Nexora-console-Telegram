@@ -30790,6 +30790,40 @@ async def exnesslinkremove_command(update: Update, context: ContextTypes.DEFAULT
     await update.message.reply_text("⏳ Re-checking and removing - you'll get a summary when done.")
 
 
+async def exnesscheck_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Admin-only diagnostic on the CALLER'S OWN verified email: shows exactly
+    what Exness's affiliation endpoint returns. Usage: /exnesscheck <account number>"""
+    user_id = str(update.message.from_user.id)
+    if not ADMIN_USER_ID or user_id != str(ADMIN_USER_ID):
+        return
+    email = await asyncio.to_thread(get_verified_user_email, user_id)
+    if not email:
+        await update.message.reply_text("No verified email on your own account.")
+        return
+    number = (context.args[0].strip() if context.args else "")
+    r, err = await asyncio.to_thread(_exness_post_sync, EXNESS_AFFILIATION_PATH, {"email": email})
+    if r is None:
+        await update.message.reply_text(f"Exness request failed: {err}")
+        return
+    try:
+        body = r.json()
+    except Exception:
+        body = None
+    lines = [f"HTTP {r.status_code}"]
+    if isinstance(body, dict):
+        accts = body.get("accounts")
+        lines.append("keys: " + ", ".join(sorted(body.keys())))
+        lines.append(f"affiliation: {body.get('affiliation')}")
+        lines.append(f"accounts type: {type(accts).__name__}, count: {len(accts) if hasattr(accts, '__len__') else 'n/a'}")
+        if isinstance(accts, list):
+            lines.append("accounts: " + ", ".join(repr(a)[:40] for a in accts[:30]))
+            if number:
+                lines.append(f"{number} in list: {number in [str(a) for a in accts]}")
+    else:
+        lines.append(f"body: {str(r.text)[:300]}")
+    await update.message.reply_text("\n".join(lines))
+
+
 async def inactivereport_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = str(update.message.from_user.id)
     if not ADMIN_USER_ID or user_id != str(ADMIN_USER_ID):
@@ -33103,6 +33137,7 @@ def main():
     app.add_handler(CommandHandler("inactivereport", inactivereport_command))
     app.add_handler(CommandHandler("exnesslinkreport", exnesslinkreport_command))
     app.add_handler(CommandHandler("exnesslinkremove", exnesslinkremove_command))
+    app.add_handler(CommandHandler("exnesscheck", exnesscheck_command))
     app.add_handler(CommandHandler("inactivityrun", inactivityrun_command))
     app.add_handler(CommandHandler("testsynth", testsynth_command))
     app.add_handler(CommandHandler("discoversymbols", discoversymbols_command))

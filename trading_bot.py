@@ -30689,6 +30689,106 @@ async def exnesslinkreport_command(update: Update, context: ContextTypes.DEFAULT
     await update.message.reply_text("⏳ Starting the report - this can take a few minutes.")
 
 
+async def run_exness_link_remove(bot, admin_chat_id):
+    """ADMIN-RUN removal: re-checks every connected Exness Auto-Trade account
+    and disconnects ONLY those where Exness confirms the email is under the
+    partner link but the connected account number is NOT under that email.
+    Anything Exness could not confirm is left alone. The verified email stays
+    on file (only the account connection is removed). Each person is told why."""
+    removed, skipped_unknown, failed = 0, 0, 0
+    try:
+        rows = await asyncio.to_thread(
+            _sb_get_all_sync,
+            "mt5_auto_trade_accounts?metaapi_account_id=not.is.null&select=user_id,account_number,metaapi_account_id")
+        vusers = await asyncio.to_thread(_sb_get_all_sync, "verified_users?select=user_id,email")
+        emails = {str(u.get("user_id")): (u.get("email") or "").strip().lower() for u in vusers}
+        await bot.send_message(chat_id=admin_chat_id, text=f"🔎 Checking {len(rows)} connected accounts before removing any...")
+        for row in rows:
+            uid = str(row.get("user_id"))
+            ref = str(row.get("metaapi_account_id") or "")
+            number = str(row.get("account_number") or (ref[len(EXNESS_REF_PREFIX):] if _is_exness_ref(ref) else ""))
+            email = emails.get(uid, "")
+            if not email or "@" not in email or not number:
+                continue
+            try:
+                verdict, _d, accts = await exness_check_email(email)
+            except Exception:
+                verdict, accts = "unknown", []
+            if verdict != "approved":
+                if verdict != "declined":
+                    skipped_unknown += 1
+                continue
+            if not accts or number in [str(a) for a in accts]:
+                continue
+            # Confirmed mismatch: disconnect this account only.
+            try:
+                r = await asyncio.to_thread(
+                    requests.patch,
+                    f"{SUPABASE_URL}/rest/v1/mt5_auto_trade_accounts?user_id=eq.{uid}",
+                    headers=sb_headers(),
+                    json={"metaapi_account_id": None, "account_number": None, "encrypted_password": None,
+                          "server": None, "account_name": None, "symbol_map": None, "is_active": False},
+                    timeout=10)
+                if r.status_code not in (200, 204):
+                    raise RuntimeError(f"HTTP {r.status_code}")
+                try:
+                    await asyncio.to_thread(
+                        requests.patch,
+                        f"{SUPABASE_URL}/rest/v1/mt5_flip_stacks?user_id=eq.{uid}&status=eq.OPEN",
+                        headers=sb_headers(),
+                        json={"status": "CLOSED", "closed_at": datetime.utcnow().isoformat()}, timeout=10)
+                except Exception:
+                    pass
+                try:
+                    await asyncio.wait_for(_napp_remove_metaapi_checked(ref), 60)
+                except Exception:
+                    _napp_exness_spawn(_napp_remove_metaapi_checked(ref))
+            except Exception as e:
+                failed += 1
+                print(f"[EXNESS LINK REMOVE] failed for {uid}: {type(e).__name__}")
+                continue
+            where = "the SpiritFX Trading Academy app" if _is_app_synth(uid) else "the Nexora AI Telegram bot"
+            try:
+                await bot.send_message(
+                    chat_id=int(uid),
+                    parse_mode=ParseMode.HTML,
+                    text=("🚫 <b>Your Exness Auto-Trade was disconnected.</b>\n\n"
+                          f"The Exness account you connected (<b>{number}</b>) is not under the email you verified with us "
+                          f"({_mask_email(email)}) on SpiritFX's Exness link. Exness Auto-Trade only works with an Exness account "
+                          "opened under our link, using the same email you verified.\n\n"
+                          f"To use it again, open Exness Auto-Trade in {where} and connect an Exness account that belongs to "
+                          f"{_mask_email(email)} under our link."))
+            except Exception as e:
+                print(f"[EXNESS LINK REMOVE] notice not delivered to {uid}: {type(e).__name__}")
+            removed += 1
+            await asyncio.sleep(0.3)
+        await bot.send_message(
+            chat_id=admin_chat_id,
+            text=(f"✅ <b>Removal done</b>\n\n🗑 Disconnected and notified: <b>{removed}</b>\n"
+                  f"⚪ Left alone (Exness did not answer): <b>{skipped_unknown}</b>\n"
+                  f"⚠️ Failed: <b>{failed}</b>"),
+            parse_mode=ParseMode.HTML)
+    except Exception as e:
+        print(f"[EXNESS LINK REMOVE] error: {type(e).__name__}: {e}")
+        try:
+            await bot.send_message(chat_id=admin_chat_id, text=f"⚠️ Removal stopped: {type(e).__name__}. Removed so far: {removed}.")
+        except Exception:
+            pass
+
+
+async def exnesslinkremove_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = str(update.message.from_user.id)
+    if not ADMIN_USER_ID or user_id != str(ADMIN_USER_ID):
+        return
+    if not exness_creds_present():
+        await update.message.reply_text("Exness credentials aren't set in Railway.")
+        return
+    t = asyncio.create_task(run_exness_link_remove(context.bot, update.message.chat_id))
+    _auto_verify_tasks.add(t)
+    t.add_done_callback(_auto_verify_tasks.discard)
+    await update.message.reply_text("⏳ Re-checking and removing - you'll get a summary when done.")
+
+
 async def inactivereport_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = str(update.message.from_user.id)
     if not ADMIN_USER_ID or user_id != str(ADMIN_USER_ID):
@@ -33001,6 +33101,7 @@ def main():
     app.add_handler(CommandHandler("exnesstest", exnesstest_command))
     app.add_handler(CommandHandler("inactivereport", inactivereport_command))
     app.add_handler(CommandHandler("exnesslinkreport", exnesslinkreport_command))
+    app.add_handler(CommandHandler("exnesslinkremove", exnesslinkremove_command))
     app.add_handler(CommandHandler("inactivityrun", inactivityrun_command))
     app.add_handler(CommandHandler("testsynth", testsynth_command))
     app.add_handler(CommandHandler("discoversymbols", discoversymbols_command))

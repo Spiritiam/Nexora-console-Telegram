@@ -6689,7 +6689,7 @@ async def check_mt5_zero_balance_notifications(context: ContextTypes.DEFAULT_TYP
     try:
         url = (
             f"{SUPABASE_URL}/rest/v1/mt5_auto_trade_accounts"
-            f"?is_active=eq.true&metaapi_account_id=not.is.null&select=user_id,metaapi_account_id"
+            f"?is_active=eq.true&metaapi_account_id=not.is.null&select=user_id,metaapi_account_id,account_number,trading_paused"
         )
         response = requests.get(url, headers=sb_headers(), timeout=10)
         active_accounts = response.json()
@@ -6710,18 +6710,37 @@ async def check_mt5_zero_balance_notifications(context: ContextTypes.DEFAULT_TYP
             balance = await get_client_mt5_balance(metaapi_account_id)
             if balance is None:
                 continue  # couldn't read it this round - real value unknown, not the same as genuinely zero
+            where = ("the SpiritFX Trading Academy app" if _is_app_synth(str(user_id))
+                     else "the Nexora AI Telegram bot")
+            acct_no = row.get("account_number")
+            acct_txt = f"Exness account <b>{acct_no}</b>" if acct_no else "your Exness account"
             if balance > 0.01:
-                continue  # real funds present, nothing to say
+                # Has money. If they switched the bot off, remind them once a day.
+                if row.get("trading_paused"):
+                    how = ("open the <b>Auto-Trade</b> section of the app" if _is_app_synth(str(user_id))
+                           else "tap <b>🤖 Exness Auto-Trade</b>")
+                    await bot.send_message(
+                        chat_id=int(user_id),
+                        text=(
+                            "⏸️ <b>Your Exness Auto-Trade is switched off.</b>\n\n"
+                            f"{acct_txt} has funds, but the bot is switched off, so no trades "
+                            f"are being taken. Whenever you feel like it, {how} and switch it "
+                            "back on so Nexora AI can trade for you."
+                        ),
+                        parse_mode=ParseMode.HTML
+                    )
+                    print(f"[MT5 PAUSED REMINDER] Notified {user_id}")
+                continue
             await bot.send_message(
                 chat_id=int(user_id),
                 text=(
                     "⚠️ <b>No trades have been taken on your account - "
                     "your balance is too low.</b>\n\n"
-                    "Your Exness Auto-Trade subscription is still active, "
-                    "but with a $0 balance, there's nothing for it to "
-                    "trade with.\n\n"
-                    "Fund your account to take full advantage of Nexora "
-                    "AI auto-trading."
+                    "Your Exness Auto-Trade is connected, but with a $0 balance, "
+                    "there's nothing for it to trade with.\n\n"
+                    f"Fund your {acct_txt}. This is your <b>Exness account itself</b>, "
+                    f"not MT4 or MT5, and it is the account connected to {where}.\n\n"
+                    "Fund it to take full advantage of Nexora AI auto-trading."
                 ),
                 parse_mode=ParseMode.HTML
             )
@@ -28642,6 +28661,34 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 "Each account can only be linked once. If it is yours, unlink it where you linked it first, "
                 "then send the number again.", parse_mode=ParseMode.HTML)
             schedule_auto_delete(sent_taken.chat_id, sent_taken.message_id)
+            return
+        # The trading account must belong to this client under SpiritFX's Exness
+        # link (same check the app does), so every connected account is ours.
+        v_email = await asyncio.to_thread(get_verified_user_email, user_id)
+        try:
+            verdict, _d, accts = await exness_check_email(v_email) if v_email else ("unknown", "", [])
+        except Exception as e:
+            print(f"[EXNESS CONNECT] affiliation check error: {type(e).__name__}")
+            verdict, accts = "unknown", []
+        if verdict == "declined":
+            sent_nl = await update.message.reply_text(
+                "🚫 <b>This email is not under SpiritFX's Exness link.</b>\n\n"
+                "Exness Auto-Trade only works with an Exness account opened under our link.",
+                parse_mode=ParseMode.HTML)
+            schedule_auto_delete(sent_nl.chat_id, sent_nl.message_id)
+            return
+        if verdict != "approved":
+            sent_un = await update.message.reply_text(
+                "⚠️ <b>Couldn't check that account with Exness right now.</b> Please send the number again in a moment.",
+                parse_mode=ParseMode.HTML)
+            schedule_auto_delete(sent_un.chat_id, sent_un.message_id)
+            return
+        if accts and number not in [str(a) for a in accts]:
+            sent_ny = await update.message.reply_text(
+                "🚫 <b>That account number is not one of your accounts under SpiritFX's Exness link.</b>\n\n"
+                "Send the number of the Exness account you opened under our link.",
+                parse_mode=ParseMode.HTML)
+            schedule_auto_delete(sent_ny.chat_id, sent_ny.message_id)
             return
         mt5_signup_state.setdefault(user_id, {})["exn_account"] = number
         user_modes[user_id] = "exn_awaiting_key"

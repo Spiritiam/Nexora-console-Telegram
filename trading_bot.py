@@ -8749,6 +8749,9 @@ async def check_deriv_service_token_health(context: ContextTypes.DEFAULT_TYPE):
 _DERIV_SERVICE_ACCOUNTS_CACHE = {}
 
 _DERIV_429_UNTIL = 0.0
+# Set while building a signal for people (scheduled channel post or a manual
+# request): those calls must NOT be skipped by the background 429 pause.
+_DERIV_PRIORITY_CTX = contextvars.ContextVar("deriv_priority", default=False)
 
 def _deriv_cooling_down():
     return time.time() < _DERIV_429_UNTIL
@@ -8793,6 +8796,7 @@ async def deriv_get_options_accounts(token, priority=False):
         _hit = _DERIV_SERVICE_ACCOUNTS_CACHE.get("v")
         if _hit and _hit[0] > time.time():
             return _hit[1]
+    priority = priority or _DERIV_PRIORITY_CTX.get()
     if not priority and _deriv_cooling_down():
         return None
     url = f"{DERIV_API_BASE}/trading/v1/options/accounts"
@@ -8835,6 +8839,7 @@ async def deriv_get_otp_url(token, account_id, priority=False):
     Same retry fix as deriv_get_options_accounts above, for the same
     confirmed reason.
     """
+    priority = priority or _DERIV_PRIORITY_CTX.get()
     if not priority and _deriv_cooling_down():
         return None
     url = f"{DERIV_API_BASE}/trading/v1/options/accounts/{account_id}/otp"
@@ -11354,6 +11359,14 @@ async def analyze_synthetic_structure(index_key, config):
     return direction, confidence, reason
 
 async def build_synthetic_signal_response(index_key, min_agree=2):
+    _tok = _DERIV_PRIORITY_CTX.set(True)
+    try:
+        return await _build_synthetic_signal_response_inner(index_key, min_agree)
+    finally:
+        _DERIV_PRIORITY_CTX.reset(_tok)
+
+
+async def _build_synthetic_signal_response_inner(index_key, min_agree=2):
     """
     Builds the signal message, image, and the trade context that
     gets stored for if/when the user taps "Trade This Signal".

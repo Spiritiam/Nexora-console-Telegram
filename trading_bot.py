@@ -28670,23 +28670,28 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
         except Exception as e:
             print(f"[EXNESS CONNECT] affiliation check error: {type(e).__name__}")
             verdict, accts = "unknown", []
+        masked = _mask_email(v_email)
         if verdict == "declined":
             sent_nl = await update.message.reply_text(
-                "🚫 <b>This email is not under SpiritFX's Exness link.</b>\n\n"
-                "Exness Auto-Trade only works with an Exness account opened under our link.",
+                f"🚫 <b>Your verified email ({masked}) is not under SpiritFX's Exness link.</b>\n\n"
+                "Exness Auto-Trade only works with an Exness account opened under our link, using the same "
+                "email you verified with us.",
                 parse_mode=ParseMode.HTML)
             schedule_auto_delete(sent_nl.chat_id, sent_nl.message_id)
             return
         if verdict != "approved":
             sent_un = await update.message.reply_text(
-                "⚠️ <b>Couldn't check that account with Exness right now.</b> Please send the number again in a moment.",
+                "⚠️ <b>Exness did not answer just now,</b> so I can't tell yet whether this account number "
+                f"matches your verified email ({masked}). This is not a problem with your account. "
+                "Please send the account number again in a few minutes.",
                 parse_mode=ParseMode.HTML)
             schedule_auto_delete(sent_un.chat_id, sent_un.message_id)
             return
         if accts and number not in [str(a) for a in accts]:
             sent_ny = await update.message.reply_text(
-                "🚫 <b>That account number is not one of your accounts under SpiritFX's Exness link.</b>\n\n"
-                "Send the number of the Exness account you opened under our link.",
+                f"🚫 <b>Account {number} is not connected to your verified email ({masked}).</b>\n\n"
+                "That account number doesn't match any Exness account under this email on our link. "
+                "Check the number, and use the Exness account you opened with the same email you verified with us.",
                 parse_mode=ParseMode.HTML)
             schedule_auto_delete(sent_ny.chat_id, sent_ny.message_id)
             return
@@ -30577,6 +30582,111 @@ async def run_inactive_report(bot, admin_chat_id, days):
                                    text=f"⚠️ Inactive-client report failed: {type(e).__name__}")
         except Exception:
             pass
+
+
+def _mask_email(email):
+    try:
+        name, dom = str(email).split("@", 1)
+        return f"{name[:1]}***@{dom}"
+    except Exception:
+        return "your email"
+
+
+def _sb_get_all_sync(path_and_query):
+    rows, offset = [], 0
+    while True:
+        sep = "&" if "?" in path_and_query else "?"
+        r = requests.get(f"{SUPABASE_URL}/rest/v1/{path_and_query}{sep}limit=1000&offset={offset}",
+                         headers=sb_headers(), timeout=20)
+        if r.status_code != 200:
+            raise RuntimeError(f"{path_and_query.split('?')[0]} HTTP {r.status_code}")
+        batch = r.json()
+        rows += batch
+        if len(batch) < 1000:
+            return rows
+        offset += 1000
+
+
+async def run_exness_link_report(bot, admin_chat_id):
+    """ONE-TIME, READ-ONLY report: every connected Exness Auto-Trade account,
+    checked for (1) verified email on file and (2) the email and trading
+    account number being under SpiritFX's Exness partner link. Changes nothing."""
+    try:
+        rows = await asyncio.to_thread(
+            _sb_get_all_sync,
+            "mt5_auto_trade_accounts?metaapi_account_id=not.is.null&select=user_id,account_number,metaapi_account_id,is_active,trading_paused")
+        vusers = await asyncio.to_thread(_sb_get_all_sync, "verified_users?select=user_id,email")
+        emails = {str(u.get("user_id")): (u.get("email") or "").strip().lower() for u in vusers}
+        await bot.send_message(
+            chat_id=admin_chat_id,
+            text=f"🔎 Exness link report started: {len(rows)} connected accounts. Read-only - nobody will be changed. I'll message you when it's done.")
+        buckets = {"not_verified": [], "email_not_under_link": [], "account_not_under_email": [], "could_not_check": [], "ok": []}
+        for row in rows:
+            uid = str(row.get("user_id"))
+            ref = str(row.get("metaapi_account_id") or "")
+            number = str(row.get("account_number") or (ref[len(EXNESS_REF_PREFIX):] if _is_exness_ref(ref) else ""))
+            where = "app" if _is_app_synth(uid) else "telegram"
+            kind = "api" if _is_exness_ref(ref) else "old-mt5"
+            email = emails.get(uid, "")
+            line = f"{where} | user {uid} | account {number} | {kind} | active={row.get('is_active')} paused={row.get('trading_paused')} | email {email or 'NONE'}"
+            if not email or "@" not in email:
+                buckets["not_verified"].append(line)
+                continue
+            try:
+                verdict, _d, accts = await exness_check_email(email)
+            except Exception:
+                verdict, accts = "unknown", []
+            if verdict == "declined":
+                buckets["email_not_under_link"].append(line)
+            elif verdict != "approved":
+                buckets["could_not_check"].append(line)
+            elif accts and number not in [str(a) for a in accts]:
+                buckets["account_not_under_email"].append(line)
+            else:
+                buckets["ok"].append(line)
+            await asyncio.sleep(0.3)
+        titles = [("not_verified", "NOT VERIFIED (no verified email on our platform)"),
+                  ("email_not_under_link", "EMAIL NOT UNDER YOUR EXNESS LINK"),
+                  ("account_not_under_email", "ACCOUNT NUMBER NOT UNDER THAT EMAIL"),
+                  ("could_not_check", "COULD NOT CHECK (Exness did not answer; run again later)"),
+                  ("ok", "OK (verified and under your link)")]
+        lines = [f"Exness link report - {datetime.utcnow():%Y-%m-%d %H:%M} UTC - {len(rows)} connected accounts", ""]
+        for key, title in titles:
+            lines.append(f"== {title}: {len(buckets[key])}")
+            if key != "ok":
+                lines += buckets[key]
+            lines.append("")
+        buf = io.BytesIO("\n".join(lines).encode("utf-8"))
+        buf.name = f"exness_link_report_{datetime.utcnow():%Y%m%d_%H%M}.txt"
+        await bot.send_message(
+            chat_id=admin_chat_id,
+            text=("✅ <b>Exness link report ready</b> (read-only, nothing changed)\n\n"
+                  f"🚫 Not verified: <b>{len(buckets['not_verified'])}</b>\n"
+                  f"🚫 Email not under your link: <b>{len(buckets['email_not_under_link'])}</b>\n"
+                  f"🚫 Account not under that email: <b>{len(buckets['account_not_under_email'])}</b>\n"
+                  f"⚪ Could not check: <b>{len(buckets['could_not_check'])}</b>\n"
+                  f"✅ OK: <b>{len(buckets['ok'])}</b>"),
+            parse_mode=ParseMode.HTML)
+        await bot.send_document(chat_id=admin_chat_id, document=buf)
+    except Exception as e:
+        print(f"[EXNESS LINK REPORT] error: {type(e).__name__}: {e}")
+        try:
+            await bot.send_message(chat_id=admin_chat_id, text=f"⚠️ Exness link report failed: {type(e).__name__}")
+        except Exception:
+            pass
+
+
+async def exnesslinkreport_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = str(update.message.from_user.id)
+    if not ADMIN_USER_ID or user_id != str(ADMIN_USER_ID):
+        return
+    if not exness_creds_present():
+        await update.message.reply_text("Exness credentials aren't set in Railway.")
+        return
+    t = asyncio.create_task(run_exness_link_report(context.bot, update.message.chat_id))
+    _auto_verify_tasks.add(t)
+    t.add_done_callback(_auto_verify_tasks.discard)
+    await update.message.reply_text("⏳ Starting the report - this can take a few minutes.")
 
 
 async def inactivereport_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -32890,6 +33000,7 @@ def main():
     app.add_handler(CommandHandler("mt5revenue", mt5revenue_command))
     app.add_handler(CommandHandler("exnesstest", exnesstest_command))
     app.add_handler(CommandHandler("inactivereport", inactivereport_command))
+    app.add_handler(CommandHandler("exnesslinkreport", exnesslinkreport_command))
     app.add_handler(CommandHandler("inactivityrun", inactivityrun_command))
     app.add_handler(CommandHandler("testsynth", testsynth_command))
     app.add_handler(CommandHandler("discoversymbols", discoversymbols_command))

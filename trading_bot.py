@@ -31895,6 +31895,15 @@ async def catch_up_missed_signals(app):
                 BotCommand("registerfallbackimages", "Generate backup images for news posts"),
                 BotCommand("mt5revenue", "View MT5 Auto-Trade revenue (KoraPay)"),
                 BotCommand("purgedigests", "Clean up stale daily-digest message links"),
+                BotCommand("exnesslinkreport", "Read-only: connected Exness accounts vs your link"),
+                BotCommand("exnesslinkremove", "Disconnect + notify accounts not under their email"),
+                BotCommand("exnesscheck", "Check what Exness returns for your own email"),
+                BotCommand("unlinkappemail", "Unlink an Exness email linked in the app"),
+                BotCommand("inactivereport", "Read-only: inactive verified clients report"),
+                BotCommand("inactivityrun", "Run the inactivity cycle (add 'dry' to preview)"),
+                BotCommand("exnesstest", "Test Exness partner check on an email"),
+                BotCommand("exnessapitest", "Read-only test of the Exness Trader API"),
+                BotCommand("exnessapitrade", "LIVE one-off EURUSD test trade on test account"),
             ]
             await app.bot.set_my_commands(
                 admin_commands,

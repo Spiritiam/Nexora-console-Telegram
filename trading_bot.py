@@ -25663,6 +25663,7 @@ EXNESS_API_CONNECT_INSTRUCTIONS = (
     "• Message 2: paste your <b>API key</b>\n"
     "• Message 3: paste your <b>secret key</b>\n\n"
     "<i>I delete your key messages right after you send them, to keep them safe.</i>\n\n"
+    "🎥 <b>Watch the step-by-step video:</b> https://youtu.be/3CiHl-4gISI\n\n"
     "👉 <b>Message 1 now: send your Exness account number.</b>"
 )
 

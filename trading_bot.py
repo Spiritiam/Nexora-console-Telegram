@@ -221,13 +221,13 @@ MT5_AUTOTRADE_BOTS = {
             "strategy_williams_r", "strategy_heikin_ashi_trend",
         ],
         "timeframe": "1min",
-        "description": "Fast 1-minute straddle: a Buy Stop and a Sell Stop 15 pips either side of price, trailing stop on the winner, then it re-arms.",
+        "description": "Buy Stop and Sell Stop 15 pips either side of price on the 1-minute chart. 20 pip stop loss; at +10 pips the stop moves to break-even, then trails 10 pips behind. Re-arms after every trade.",
     },
     "flip_fast": {
         "label": "⚡ Account Flip (Fast)",
         "strategy_functions": ["strategy_ema_pullback_scalper", "strategy_momentum_macd"],
         "timeframe": "1min",
-        "description": "Straddle entry like the Scalper, but adds up to 4 more trades while the move keeps running, each protected by a trailing stop.",
+        "description": "Buy Stop and Sell Stop 25 pips either side of price. 15 pip stop loss, trailing from +15 pips by 8. Adds up to 4 more trades every further 15 pips, only once the earlier ones are protected. Higher risk.",
     },
     "aggressive_breakout": {
         # EXPANDED per explicit instruction - core: Volatility
@@ -297,7 +297,12 @@ DERIV_AUTOTRADE_BOTS = {
     "aggressive": {
         "label": "🐆 Aggressive Scalper",
         "min_agree": 1,
-        "description": "Fast straddle: enters when price breaks out of a tight range either way, trails the profit, then re-arms.",
+        "description": "Straddle: enters when price breaks out of a tight range either way. Your risk is the stop; at half your risk in profit the stop moves to break-even, then it trails. Re-arms after every trade.",
+    },
+    "flip_fast": {
+        "label": "⚡ Account Flip (Fast)",
+        "min_agree": 1,
+        "description": "Same straddle entry, wider. Adds up to 4 more trades each time the move gains another stop-distance, only once earlier ones are protected, and closes them together on a pullback. Higher risk.",
     },
     "conservative": {
         "label": "🛡️Conservative",
@@ -13105,7 +13110,7 @@ async def run_deriv_autotrade_bot_scan(context: ContextTypes.DEFAULT_TYPE):
     bot_accounts = [
         a for a in accounts
         if a.get("deriv_autotrade_enabled") and a.get("deriv_bot_choice") in DERIV_AUTOTRADE_BOTS and a.get("deriv_pair_choice")
-        and a.get("deriv_bot_choice") != "aggressive"  # served by the straddle engine (run_dsc_tick)
+        and a.get("deriv_bot_choice") not in ("aggressive", "flip_fast")  # served by the straddle engine (run_dsc_tick)
     ]
     if not bot_accounts:
         return
@@ -13274,18 +13279,26 @@ async def run_deriv_autotrade_bot_scan(context: ContextTypes.DEFAULT_TYPE):
 # DERIV AGGRESSIVE SCALPER (straddle) - same idea as the Exness one, in the
 # user's own stake/risk terms because synthetics have no pips and a multiplier
 # can never lose more than its stake:
-#   stop loss      = the user's risk $            (the "10 pip" stop)
-#   pending levels = 1.5 x that stop distance      (the "15 pip" Buy/Sell Stop)
-#   trailing       = starts once profit = 1.0 x risk, closes on a pullback of
-#                    0.5 x risk from the peak     (the "+10 / trail 5")
+#   stop loss      = the user's risk $            (the "20 pip" stop)
+#   pending levels = 0.75 x stop distance          (the "15 pip" Buy/Sell Stop)
+#   break-even     = at 0.5 x risk in profit (the "+10 pips"), then it closes
+#                    on a pullback of 1.0 x risk from the peak, never below 0
 # Virtual levels (no real pending order exists on Deriv): watch the latest tick,
 # open the multiplier on the side that is hit, drop the other, re-arm after it
 # closes. No daily cap; pauses for the day after 3 losses in a row.
 # ============================================
 DSC_CFG = {
-    "pending_mult": 1.5, "activate_mult": 1.0, "trail_mult": 0.5,
     "max_consecutive_losses": 3, "fail_backoff_s": 60, "pending_expiry_s": 300,
     "max_slippage_frac": 0.5,
+}
+# All distances are multiples of the stop distance (= the user's risk $).
+# Scalper 15/20/10/10 pips -> 0.75 / 0.5 (break-even) / trail 1.0 behind peak.
+# Flip Fast 25/15/15/8 pips -> 1.67 / 1.0 / trail 0.53 behind peak, +1.0 per added trade.
+DSC_MODES = {
+    "aggressive": {"pending_mult": 0.75, "activate_mult": 0.5, "trail_mult": 1.0,
+                   "max_layers": 1, "add_mult": 1.0, "label": "🐆 Aggressive Scalper"},
+    "flip_fast": {"pending_mult": 1.67, "activate_mult": 1.0, "trail_mult": 0.53,
+                  "max_layers": 5, "add_mult": 1.0, "label": "⚡ Account Flip (Fast)"},
 }
 _DSC = {"subs": [], "subs_at": 0.0, "st": {}, "px": {}}
 
@@ -13332,7 +13345,7 @@ async def _dsc_get_subscribers():
     if isinstance(accts, list):
         _DSC["subs"] = [
             a for a in accts
-            if a.get("deriv_autotrade_enabled") and a.get("deriv_bot_choice") == "aggressive"
+            if a.get("deriv_autotrade_enabled") and a.get("deriv_bot_choice") in DSC_MODES
             and a.get("deriv_pair_choice") in SYNTHETIC_CONFIG
             and a.get("deriv_pair_choice") not in AUTO_COPY_EXCLUDED_INDICES
             and a.get("api_token") and a.get("deriv_bot_stake")
@@ -13345,6 +13358,7 @@ async def _dsc_tick_one(context, account):
     user_id = str(account["user_id"])
     token = account["api_token"]
     index_key = account["deriv_pair_choice"]
+    mode = DSC_MODES[account["deriv_bot_choice"]]
     key = (user_id, index_key)
     try:
         config = SYNTHETIC_CONFIG[index_key]
@@ -13355,36 +13369,65 @@ async def _dsc_tick_one(context, account):
         now = time.time()
         today = datetime.utcnow().strftime("%Y-%m-%d")
         st = _DSC["st"].setdefault(key, {"phase": "arm", "day": today, "losses": 0})
+        if st.get("mode") != account["deriv_bot_choice"]:
+            st.update({"mode": account["deriv_bot_choice"], "phase": "arm", "cids": [], "losses": 0, "notified": False})
         if st["day"] != today:
             st.update({"day": today, "losses": 0, "notified": False})
 
-        # ---- running trade: trail by profit pullback --------------------
+        async def open_trade(direction):
+            ctype = "MULTUP" if direction == "BUY" else "MULTDOWN"
+            return await deriv_execute_multiplier_trade(token, symbol, ctype, mult, stake, risk, None)
+
+        # ---- running trade(s): break-even then trail by profit pullback ---
         if st["phase"] == "open":
-            profit, sold = await get_deriv_contract_live_profit(token, st["cid"])
-            if profit is None:
-                return
-            if sold:
-                won = bool(st.get("trailed")) or profit > 0
+            total, open_n = 0.0, 0
+            for cid in st["cids"]:
+                profit, sold = await get_deriv_contract_live_profit(token, cid)
+                if profit is None:
+                    return
+                total += profit
+                if not sold:
+                    open_n += 1
+            if open_n == 0:
+                won = bool(st.get("trailed")) or total > 0
                 st["losses"] = 0 if won else st["losses"] + 1
-                print(f"[DSC] closed {index_key} user={user_id} {'win' if won else 'loss'} profit={profit:.2f} consecutive_losses={st['losses']}")
-                st.update({"phase": "arm", "cid": None, "trailed": False, "peak": 0.0})
+                print(f"[DSC] closed {index_key} user={user_id} {'win' if won else 'loss'} profit={total:.2f} consecutive_losses={st['losses']}")
+                st.update({"phase": "arm", "cids": [], "trailed": False, "peak": 0.0, "last_layer_profit": 0.0})
                 return
-            st["peak"] = max(st.get("peak", 0.0), profit)
-            if st["peak"] >= risk * DSC_CFG["activate_mult"]:
+            st["peak"] = max(st.get("peak", 0.0), total)
+            if st["peak"] >= risk * mode["activate_mult"]:
                 st["trailed"] = True
-            if st.get("trailed") and (st["peak"] - profit) >= risk * DSC_CFG["trail_mult"]:
-                ok = await deriv_sell_contract(token, st["cid"])
-                print(f"[DSC] trailing close {index_key} user={user_id} profit={profit:.2f} peak={st['peak']:.2f} ok={ok}")
+            if st.get("trailed"):
+                # stop level = peak - trail, but never below break-even
+                floor = max(0.0, st["peak"] - risk * mode["trail_mult"])
+                if total <= floor:
+                    for cid in st["cids"]:
+                        await deriv_sell_contract(token, cid)
+                    print(f"[DSC] trailing close {index_key} user={user_id} profit={total:.2f} peak={st['peak']:.2f}")
+                    return
+            # add another trade while the move runs (Account Flip Fast)
+            if (mode["max_layers"] > 1 and len(st["cids"]) < mode["max_layers"] and st.get("trailed")
+                    and total - st.get("last_layer_profit", 0.0) >= risk * mode["add_mult"]
+                    and not account.get("trading_paused") and now - st.get("last_add", 0) > 15):
+                st["last_add"] = now
+                buy_data, error = await open_trade(st["dir"])
+                if buy_data and not error:
+                    st["cids"].append(buy_data.get("contract_id"))
+                    st["last_layer_profit"] = total
+                    log_auto_copy_trade(user_id, symbol, buy_data.get("contract_id"), st["dir"], stake, risk, None)
+                    print(f"[DSC] ➕ layer {len(st['cids'])}/{mode['max_layers']} {index_key} user={user_id}")
             return
 
         # ---- stop conditions -------------------------------------------
+        if account.get("trading_paused"):
+            return
         if st["losses"] >= DSC_CFG["max_consecutive_losses"]:
             if not st.get("notified"):
                 st["notified"] = True
                 try:
                     await context.bot.send_message(
                         chat_id=int(user_id),
-                        text=f"🐆 <b>Aggressive Scalper paused for today</b>\n\nIt had {DSC_CFG['max_consecutive_losses']} losses in a row. It starts again tomorrow (UTC).",
+                        text=f"{mode['label']} <b>paused for today</b>\n\nIt had {DSC_CFG['max_consecutive_losses']} losses in a row. It starts again tomorrow (UTC).",
                         parse_mode=ParseMode.HTML)
                 except Exception:
                     pass
@@ -13396,7 +13439,7 @@ async def _dsc_tick_one(context, account):
         if not price:
             return
         sl_dist = price * risk / (stake * mult)
-        dist = sl_dist * DSC_CFG["pending_mult"]
+        dist = sl_dist * mode["pending_mult"]
         if st["phase"] == "arm" or now - st.get("armed_at", 0) > DSC_CFG["pending_expiry_s"]:
             st.update({"phase": "armed", "armed_at": now, "buy_lvl": price + dist, "sell_lvl": price - dist})
             return
@@ -13433,8 +13476,7 @@ async def _dsc_tick_one(context, account):
         if account.get("low_balance_notified"):
             set_low_balance_notified(user_id, False)
 
-        contract_type = "MULTUP" if direction == "BUY" else "MULTDOWN"
-        buy_data, error = await deriv_execute_multiplier_trade(token, symbol, contract_type, mult, stake, risk, None)
+        buy_data, error = await open_trade(direction)
         if error or not buy_data:
             log_auto_copy_failure(user_id, symbol, friendly_trade_error(error, auto_copy_context=True))
             st["backoff_until"] = now + DSC_CFG["fail_backoff_s"]
@@ -13442,15 +13484,17 @@ async def _dsc_tick_one(context, account):
             return
         cid = buy_data.get("contract_id")
         log_auto_copy_trade(user_id, symbol, cid, direction, stake, risk, None)
-        st.update({"phase": "open", "cid": cid, "peak": 0.0, "trailed": False})
-        print(f"[DSC] ✅ {direction} {index_key} user={user_id} stake={stake} risk={risk}")
+        st.update({"phase": "open", "cids": [cid], "dir": direction, "peak": 0.0, "trailed": False, "last_layer_profit": 0.0})
+        print(f"[DSC] ✅ {account['deriv_bot_choice']} {direction} {index_key} user={user_id} stake={stake} risk={risk}")
         if not st.get("told"):
             st["told"] = True
+            extra = (f" It adds up to {mode['max_layers'] - 1} more trades while the move runs, only once the earlier ones are protected."
+                     if mode["max_layers"] > 1 else "")
             try:
                 await context.bot.send_message(
                     chat_id=int(user_id),
-                    text=(f"🐆 <b>Aggressive Scalper is trading</b>\n\nFirst trade: {direction} {config['display']} — "
-                          f"${stake} stake, ${risk} stop, trailing profit on.\nIt re-arms after each trade. "
+                    text=(f"{mode['label']} <b>is trading</b>\n\nFirst trade: {direction} {config['display']} — "
+                          f"${stake} stake, ${risk} stop, trailing profit on.{extra}\nIt re-arms after each trade. "
                           f"I won't message you for each one."),
                     parse_mode=ParseMode.HTML)
             except Exception as e:

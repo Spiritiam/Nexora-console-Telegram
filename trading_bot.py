@@ -221,7 +221,7 @@ MT5_AUTOTRADE_BOTS = {
             "strategy_williams_r", "strategy_heikin_ashi_trend",
         ],
         "timeframe": "1min",
-        "description": "Fast 1-minute entries on pullbacks. Adds to winning trades and trails its stop.",
+        "description": "Fast 1-minute straddle: a Buy Stop and a Sell Stop 15 pips either side of price, trailing stop on the winner, then it re-arms.",
     },
     "aggressive_breakout": {
         "label": "⚡ Aggressive Breakout",
@@ -264,6 +264,13 @@ MT5_AUTOTRADE_BOTS = {
     },
 }
 
+# Only these two are offered in the menus. The other presets stay defined so
+# anyone already running one keeps working until they change bot.
+MT5_AUTOTRADE_BOTS_VISIBLE = {
+    k: v for k, v in MT5_AUTOTRADE_BOTS.items()
+    if k in ("aggressive_scalper", "conservative_structure")
+}
+
 # Curated subset of PAIR_CONFIG for bot trading - not all 12 pairs,
 # to keep the choice simple and recognizable.
 # Only the high-volatility instruments people actually trade: gold, bitcoin, oil, silver.
@@ -283,7 +290,7 @@ MT5_AUTOTRADE_PAIRS = ["xauusd", "btcusd", "usoil", "xagusd"]
 # higher-conviction), both drawing from the full synthetic pool.
 DERIV_AUTOTRADE_BOTS = {
     "aggressive": {
-        "label": "🐆 Aggressive",
+        "label": "🐆 Aggressive Scalper",
         "min_agree": 1,
         "description": "Fast, frequent entries - fires on just 1 agreeing strategy.",
     },
@@ -2781,6 +2788,7 @@ async def _ag_get_subscribers():
         _AG["subs"] = [
             a for a in accts
             if a.get("bot_choice") in AGG_CORE
+            and a.get("bot_choice") != "aggressive_scalper"  # served by the straddle engine (run_sc_tick)
             and a.get("pair_choice") in AGG_PAIR_CFG
             and a.get("metaapi_account_id")
         ]
@@ -3043,6 +3051,254 @@ async def manage_aggressive_positions(context: ContextTypes.DEFAULT_TYPE):
         await asyncio.gather(*(one(a) for a in targets), return_exceptions=True)
     except Exception as e:
         print(f"[AGG] ❌ manager error: {type(e).__name__}: {e}")
+
+
+# ============================================
+# AGGRESSIVE SCALPER (straddle) - gold, silver, BTC, oil
+# Two virtual pending orders are kept 15 pips above the Ask (Buy Stop) and
+# 15 pips below the Bid (Sell Stop). The Exness trading API only takes market
+# orders, so the bot watches live price and sends the market order the moment
+# a level is touched; the other side is then dropped. Each trade has its own
+# 10 pip stop loss, a trailing stop (starts at +10 pips, trails 5 pips behind,
+# never moves back), and once it closes a fresh pair is armed again.
+# Trade ids are remembered (and re-adopted after a restart) because the Exness
+# API does not return trade comments.
+# All values below are the defaults from the strategy spec; edit here.
+# ============================================
+SC_CFG = {
+    "pending_pips": 15,
+    "sl_pips": 10,
+    "trail_activate_pips": 10,
+    "trail_pips": 5,
+    "trail_min_step_pips": 1,
+    "reentry_delay_s": 0,
+    "pending_expiry_s": 300,       # unfilled pair is re-centred after this long
+    "max_trades_per_day": 15,
+    "max_consecutive_losses": 3,
+    "max_slippage_frac": 0.5,      # skip if price overshot the level by > 50% of the stop
+    "fail_backoff_s": 30,
+}
+SC_PAIR_CFG = {
+    "xauusd": {"pip": 0.1,   "max_spread_pips": 4},
+    "xagusd": {"pip": 0.01,  "max_spread_pips": 6},
+    "btcusd": {"pip": 9.918, "max_spread_pips": 8},
+    "usoil":  {"pip": 0.01,  "max_spread_pips": 6},
+}
+_SC = {"subs": [], "subs_at": 0.0, "st": {}, "q": {}, "tick_n": 0}
+
+
+async def _sc_get_subscribers():
+    if time.time() - _SC["subs_at"] < 60:
+        return _SC["subs"]
+    accts = await asyncio.to_thread(get_all_active_mt5_autotrade_accounts)
+    if isinstance(accts, list):
+        _SC["subs"] = [
+            a for a in accts
+            if a.get("bot_choice") == "aggressive_scalper"
+            and a.get("pair_choice") in SC_PAIR_CFG
+            and a.get("metaapi_account_id")
+        ]
+        _SC["subs_at"] = time.time()
+    return _SC["subs"]
+
+
+async def _sc_quote(resolved):
+    hit = _SC["q"].get(resolved)
+    if hit and time.time() - hit[0] < 3:
+        return hit[1]
+    q = await asyncio.to_thread(_xc_fetch_quote, resolved)
+    if q:
+        _SC["q"][resolved] = (time.time(), q)
+        if len(_SC["q"]) > 200:
+            _SC["q"].pop(next(iter(_SC["q"])))
+    return q
+
+
+def sc_trail_target(direction, entry, cur, cur_sl, pip):
+    """New stop price, or None. Starts at +activate pips, trails `trail` pips
+    behind price, only ever tightens, and ignores moves smaller than a step."""
+    act = SC_CFG["trail_activate_pips"] * pip
+    trail = SC_CFG["trail_pips"] * pip
+    step = SC_CFG["trail_min_step_pips"] * pip
+    if direction == "BUY":
+        if cur - entry < act:
+            return None
+        tgt = cur - trail
+        if cur_sl is not None and tgt <= cur_sl + step:
+            return None
+        return tgt
+    if entry - cur < act:
+        return None
+    tgt = cur + trail
+    if cur_sl is not None and tgt >= cur_sl - step:
+        return None
+    return tgt
+
+
+async def _sc_notify(context, user_id, text):
+    try:
+        await context.bot.send_message(chat_id=int(user_id), text=text, parse_mode=ParseMode.HTML)
+    except Exception as e:
+        print(f"[SC] Couldn't notify {user_id}: {type(e).__name__}")
+
+
+async def _sc_tick_one(context, account):
+    user_id = str(account["user_id"])
+    acct_id = account["metaapi_account_id"]
+    pair_key = account["pair_choice"]
+    key = (user_id, pair_key)
+    try:
+        pc = SC_PAIR_CFG[pair_key]
+        pip = pc["pip"]
+        pair_config = PAIR_CONFIG[pair_key]
+        decimals = pair_config["decimals"]
+        now = time.time()
+        today = datetime.utcnow().strftime("%Y-%m-%d")
+        st = _SC["st"].setdefault(key, {"phase": None, "day": today, "trades": 0, "losses": 0, "stopped": False})
+        if st["day"] != today:
+            st.update({"day": today, "trades": 0, "losses": 0, "stopped": False, "notified": False})
+
+        symbol_map = await get_client_symbol_map(account)
+        resolved = resolve_trade_symbol(symbol_map, pair_config)
+
+        # ---- manage a running trade ------------------------------------
+        if st["phase"] in (None, "open"):
+            positions = await _xc_get_positions(acct_id, resolved)
+            if positions is None:
+                return
+            mine = [p for p in positions if str(p.get("id")) == st.get("pid")
+                    or str(p.get("comment") or "").startswith("NexoraSC")]
+            if not mine and st["phase"] is None and positions and _is_exness_ref(acct_id):
+                mine = positions[:1]  # adopt after a restart (Exness API has no comments)
+            if mine:
+                p = mine[0]
+                direction = "BUY" if "BUY" in str(p.get("type", "")).upper() else "SELL"
+                entry = float(p.get("openPrice") or 0)
+                cur = float(p.get("currentPrice") or 0)
+                sl = float(p["stopLoss"]) if p.get("stopLoss") else None
+                st.update({"phase": "open", "pid": str(p.get("id")), "dir": direction, "entry": entry})
+                if sl is not None:
+                    st["last_sl"] = sl
+                if entry and cur:
+                    new_sl = sc_trail_target(direction, entry, cur, sl, pip)
+                    if new_sl is not None:
+                        new_sl = round(new_sl, decimals)
+                        payload = {"actionType": "POSITION_MODIFY", "positionId": str(p.get("id")), "stopLoss": new_sl}
+                        if p.get("takeProfit"):
+                            payload["takeProfit"] = p["takeProfit"]
+                        ok, detail = await asyncio.to_thread(_xc_trade_action_sync, acct_id, payload)
+                        print(f"[SC] trail {pair_key} {direction} user={user_id} sl {sl} -> {new_sl} ok={ok} {'' if ok else detail}")
+                        if ok:
+                            st["last_sl"] = new_sl
+                return
+            if st["phase"] == "open":
+                # closed: trailing stop already past entry = win, otherwise a loss
+                ent, ls, d = st.get("entry"), st.get("last_sl"), st.get("dir")
+                won = bool(ent and ls and ((d == "BUY" and ls >= ent) or (d == "SELL" and ls <= ent)))
+                st["losses"] = 0 if won else st["losses"] + 1
+                print(f"[SC] closed {pair_key} user={user_id} {'win' if won else 'loss'} consecutive_losses={st['losses']}")
+                st["phase"] = "cool"
+                st["cool_until"] = now + SC_CFG["reentry_delay_s"]
+                st["pid"] = None
+            else:
+                st["phase"] = "arm"
+
+        # ---- nothing running: stop conditions --------------------------
+        if account.get("trading_paused"):
+            return
+        if st["losses"] >= SC_CFG["max_consecutive_losses"] or st["trades"] >= SC_CFG["max_trades_per_day"]:
+            if not st.get("notified"):
+                st["notified"] = True
+                why = (f"{SC_CFG['max_consecutive_losses']} losses in a row"
+                       if st["losses"] >= SC_CFG["max_consecutive_losses"]
+                       else f"the daily limit of {SC_CFG['max_trades_per_day']} trades")
+                await _sc_notify(context, user_id,
+                                 f"🐆 <b>Aggressive Scalper paused for today</b>\n\nIt hit {why}. It starts again tomorrow (UTC).")
+            return
+        if st["phase"] == "cool":
+            if now < st.get("cool_until", 0):
+                return
+            st["phase"] = "arm"
+        if pair_key != "btcusd" and _xc_market_closed():
+            st["phase"] = "arm"
+            return
+        if now < st.get("backoff_until", 0):
+            return
+
+        quote = await _sc_quote(resolved)
+        if not quote:
+            return
+        bid, ask = quote
+        if (ask - bid) / pip > pc["max_spread_pips"]:
+            return  # spread too wide: neither arm nor trigger
+
+        dist = SC_CFG["pending_pips"] * pip
+        if st["phase"] in ("arm", None) or now - st.get("armed_at", 0) > SC_CFG["pending_expiry_s"]:
+            st.update({"phase": "armed", "armed_at": now, "buy_lvl": ask + dist, "sell_lvl": bid - dist})
+            return
+
+        direction = None
+        if ask >= st["buy_lvl"]:
+            direction = "BUY"
+        elif bid <= st["sell_lvl"]:
+            direction = "SELL"
+        if not direction:
+            return
+
+        sl_dist = SC_CFG["sl_pips"] * pip
+        fill = ask if direction == "BUY" else bid
+        overshoot = (ask - st["buy_lvl"]) if direction == "BUY" else (st["sell_lvl"] - bid)
+        if overshoot > sl_dist * SC_CFG["max_slippage_frac"]:
+            print(f"[SC] skip {pair_key} {direction}: price jumped {overshoot / pip:.1f} pips past the level")
+            st.update({"phase": "arm"})
+            return
+        positions = await _xc_get_positions(acct_id, resolved)
+        if positions is None:
+            return
+        if positions:
+            st["phase"] = None  # something is open: next tick adopts/manages it
+            return
+        sl = round(fill - sl_dist if direction == "BUY" else fill + sl_dist, decimals)
+        if account.get("risk_mode") == "percent":
+            account["_live_balance"] = await get_client_mt5_balance(acct_id)
+        volume = compute_lot_size(account, fill, sl)
+        order_id = await place_client_mt5_trade(
+            acct_id, resolved, direction, volume, sl, None, trade_comment=f"NexoraSC-{int(now)}")
+        if not order_id:
+            st["backoff_until"] = now + SC_CFG["fail_backoff_s"]
+            st["phase"] = "arm"
+            return
+        st.update({"phase": "open", "pid": str(order_id), "dir": direction, "entry": fill, "last_sl": sl})
+        st["trades"] += 1
+        print(f"[SC] ✅ {direction} {resolved} user={user_id} vol={volume} entry~{fill} sl={sl} (trade {st['trades']} today)")
+        if not st.get("told"):
+            st["told"] = True
+            await _sc_notify(
+                context, user_id,
+                f"🐆 <b>Aggressive Scalper is trading</b>\n\n"
+                f"First trade: {direction} {pair_config['display']} — {volume} lots, "
+                f"{SC_CFG['sl_pips']} pip stop, trailing stop on.\n"
+                f"It keeps a Buy Stop and Sell Stop {SC_CFG['pending_pips']} pips either side of price and "
+                f"re-arms after each trade. I won't message you for each one.")
+    except Exception as e:
+        print(f"[SC] ❌ error for {user_id}: {type(e).__name__}: {e}")
+
+
+async def run_sc_tick(context: ContextTypes.DEFAULT_TYPE):
+    """Every 5s: arm/trigger the straddle and trail running trades."""
+    try:
+        subs = await _sc_get_subscribers()
+        if not subs:
+            return
+        sem = asyncio.Semaphore(6)
+
+        async def one(a):
+            async with sem:
+                await _sc_tick_one(context, a)
+
+        await asyncio.gather(*(one(a) for a in subs), return_exceptions=True)
+    except Exception as e:
+        print(f"[SC] ❌ tick error: {type(e).__name__}: {e}")
 
 
 async def run_mt5_autotrade_follow_channel_scan(context: ContextTypes.DEFAULT_TYPE):
@@ -4960,7 +5216,7 @@ def _napp_exness_options():
     return {
         "bots": [
             {"key": k, "label": _napp_clean_label(v["label"]), "description": v["description"]}
-            for k, v in MT5_AUTOTRADE_BOTS.items()
+            for k, v in MT5_AUTOTRADE_BOTS_VISIBLE.items()
         ],
         "pairs": [
             {"key": p, "display": _napp_clean_label(PAIR_CONFIG[p]["display"]),
@@ -26224,12 +26480,12 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         user_id = str(query.from_user.id)
         buttons = [
             [InlineKeyboardButton(bot["label"], callback_data=f"mt5auto_bot_{key}")]
-            for key, bot in MT5_AUTOTRADE_BOTS.items()
+            for key, bot in MT5_AUTOTRADE_BOTS_VISIBLE.items()
         ]
         buttons.append([InlineKeyboardButton("⬅️ Back", callback_data="mt5auto_start")])
         await query.message.edit_text(
             "🎯 <b>Choose a bot:</b>\n\n" + "\n".join(
-                f"{bot['label']} — {bot['description']}" for bot in MT5_AUTOTRADE_BOTS.values()
+                f"{bot['label']} — {bot['description']}" for bot in MT5_AUTOTRADE_BOTS_VISIBLE.values()
             ),
             parse_mode=ParseMode.HTML,
             reply_markup=InlineKeyboardMarkup(buttons)
@@ -26721,12 +26977,12 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         user_id = str(query.from_user.id)
         buttons = [
             [InlineKeyboardButton(bot["label"], callback_data=f"mt5switch_bot_{key}")]
-            for key, bot in MT5_AUTOTRADE_BOTS.items()
+            for key, bot in MT5_AUTOTRADE_BOTS_VISIBLE.items()
         ]
         buttons.append([InlineKeyboardButton("⬅️ Back", callback_data="mt5switch_menu")])
         await query.message.edit_text(
             "🎯 <b>Choose a bot:</b>\n\n" + "\n".join(
-                f"{bot['label']} — {bot['description']}" for bot in MT5_AUTOTRADE_BOTS.values()
+                f"{bot['label']} — {bot['description']}" for bot in MT5_AUTOTRADE_BOTS_VISIBLE.values()
             ),
             parse_mode=ParseMode.HTML,
             reply_markup=InlineKeyboardMarkup(buttons)
@@ -33373,6 +33629,7 @@ def main():
     )
     job_queue.run_repeating(run_aggressive_entry_scan, interval=60, first=50, name="aggressive_entry_scan")
     job_queue.run_repeating(manage_aggressive_positions, interval=5, first=55, name="aggressive_manager")
+    job_queue.run_repeating(run_sc_tick, interval=5, first=58, name="aggressive_scalper_straddle")
 
     # TP/SL monitor - checks every OPEN logged signal every 15 minutes
     job_queue.run_repeating(

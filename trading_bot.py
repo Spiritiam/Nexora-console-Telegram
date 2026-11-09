@@ -272,8 +272,8 @@ MT5_AUTOTRADE_BOTS = {
 # Only these two are offered in the menus. The other presets stay defined so
 # anyone already running one keeps working until they change bot.
 MT5_AUTOTRADE_BOTS_VISIBLE = {
-    k: v for k, v in MT5_AUTOTRADE_BOTS.items()
-    if k in ("aggressive_scalper", "flip_fast", "conservative_structure")
+    k: MT5_AUTOTRADE_BOTS[k]
+    for k in ("aggressive_scalper", "conservative_structure", "flip_fast")
 }
 
 # Curated subset of PAIR_CONFIG for bot trading - not all 12 pairs,
@@ -299,15 +299,15 @@ DERIV_AUTOTRADE_BOTS = {
         "min_agree": 1,
         "description": "Straddle: enters when price breaks out of a tight range either way. Your risk is the stop; at half your risk in profit the stop moves to break-even, then it trails. Re-arms after every trade.",
     },
+    "conservative": {
+        "label": "🛡️ Conservative Structure",
+        "min_agree": 3,
+        "description": "Slower, higher-conviction entries - needs 3+ strategies to agree.",
+    },
     "flip_fast": {
         "label": "⚡ Account Flip (Fast)",
         "min_agree": 1,
         "description": "Same straddle entry, wider. Adds up to 4 more trades each time the move gains another stop-distance, only once earlier ones are protected, and closes them together on a pullback. Higher risk.",
-    },
-    "conservative": {
-        "label": "🛡️Conservative",
-        "min_agree": 3,
-        "description": "Slower, higher-conviction entries - needs 3+ strategies to agree.",
     },
 }
 # DERIV_AUTOTRADE_PAIRS is defined further down, right after
@@ -26811,7 +26811,7 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         ]
         buttons.append([InlineKeyboardButton("⬅️ Back", callback_data="mt5auto_start")])
         await query.message.edit_text(
-            "🎯 <b>Choose a bot:</b>\n\n" + "\n".join(
+            "🎯 <b>Choose a bot:</b>\n\n" + "\n\n".join(
                 f"{bot['label']} — {bot['description']}" for bot in MT5_AUTOTRADE_BOTS_VISIBLE.values()
             ),
             parse_mode=ParseMode.HTML,
@@ -27307,7 +27307,7 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         ]
         buttons.append([InlineKeyboardButton("⬅️ Back", callback_data="mt5switch_menu")])
         await query.message.edit_text(
-            "🎯 <b>Choose a bot:</b>\n\n" + "\n".join(
+            "🎯 <b>Choose a bot:</b>\n\n" + "\n\n".join(
                 f"{bot['label']} — {bot['description']}" for bot in MT5_AUTOTRADE_BOTS_VISIBLE.values()
             ),
             parse_mode=ParseMode.HTML,
@@ -27606,7 +27606,7 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         ]
         buttons.append([InlineKeyboardButton("⬅️ Back", callback_data="derivauto_menu")])
         await query.message.edit_text(
-            "🎯 <b>Choose a bot:</b>\n\n" + "\n".join(
+            "🎯 <b>Choose a bot:</b>\n\n" + "\n\n".join(
                 f"{bot['label']} — {bot['description']}" for bot in DERIV_AUTOTRADE_BOTS.values()
             ),
             parse_mode=ParseMode.HTML,

@@ -223,8 +223,13 @@ MT5_AUTOTRADE_BOTS = {
         "timeframe": "1min",
         "description": "Fast 1-minute straddle: a Buy Stop and a Sell Stop 15 pips either side of price, trailing stop on the winner, then it re-arms.",
     },
+    "flip_fast": {
+        "label": "⚡ Account Flip (Fast)",
+        "strategy_functions": ["strategy_ema_pullback_scalper", "strategy_momentum_macd"],
+        "timeframe": "1min",
+        "description": "Straddle entry like the Scalper, but adds up to 4 more trades while the move keeps running, each protected by a trailing stop.",
+    },
     "aggressive_breakout": {
-        "label": "⚡ Aggressive Breakout",
         # EXPANDED per explicit instruction - core: Volatility
         # Breakout Scalper + ATR Volatility Breakout, plus all 8 new.
         "strategy_functions": [
@@ -268,7 +273,7 @@ MT5_AUTOTRADE_BOTS = {
 # anyone already running one keeps working until they change bot.
 MT5_AUTOTRADE_BOTS_VISIBLE = {
     k: v for k, v in MT5_AUTOTRADE_BOTS.items()
-    if k in ("aggressive_scalper", "conservative_structure")
+    if k in ("aggressive_scalper", "flip_fast", "conservative_structure")
 }
 
 # Curated subset of PAIR_CONFIG for bot trading - not all 12 pairs,
@@ -292,7 +297,7 @@ DERIV_AUTOTRADE_BOTS = {
     "aggressive": {
         "label": "🐆 Aggressive Scalper",
         "min_agree": 1,
-        "description": "Fast, frequent entries - fires on just 1 agreeing strategy.",
+        "description": "Fast straddle: enters when price breaks out of a tight range either way, trails the profit, then re-arms.",
     },
     "conservative": {
         "label": "🛡️Conservative",
@@ -1913,8 +1918,8 @@ async def run_mt5_autotrade_bot_scan(context: ContextTypes.DEFAULT_TYPE):
         combos.setdefault(key, []).append(account)
 
     for (bot_key, pair_key), subscribers in combos.items():
-        if bot_key in ("aggressive_scalper", "aggressive_breakout"):
-            continue  # handled by the aggressive engine (run_aggressive_entry_scan)
+        if bot_key in ("aggressive_scalper", "aggressive_breakout", "flip_fast"):
+            continue  # handled by the aggressive / straddle engines (run_aggressive_entry_scan)
         bot_info = MT5_AUTOTRADE_BOTS.get(bot_key)
         pair_config = PAIR_CONFIG.get(pair_key)
         if not bot_info or not pair_config:
@@ -3054,16 +3059,20 @@ async def manage_aggressive_positions(context: ContextTypes.DEFAULT_TYPE):
 
 
 # ============================================
-# AGGRESSIVE SCALPER (straddle) - gold, silver, BTC, oil
-# Two virtual pending orders are kept 15 pips above the Ask (Buy Stop) and
-# 15 pips below the Bid (Sell Stop). The Exness trading API only takes market
-# orders, so the bot watches live price and sends the market order the moment
-# a level is touched; the other side is then dropped. Each trade has its own
-# 10 pip stop loss, a trailing stop (starts at +10 pips, trails 5 pips behind,
-# never moves back), and once it closes a fresh pair is armed again.
+# STRADDLE ENGINE: Aggressive Scalper and Account Flip (Fast) - gold, silver,
+# BTC, oil.
+# Two virtual pending orders are kept above the Ask (Buy Stop) and below the
+# Bid (Sell Stop). The Exness trading API only takes market orders, so the bot
+# watches live price and sends the market order the moment a level is touched;
+# the other side is then dropped. Each trade has its own stop loss and a
+# trailing stop (never moves back). Once everything closes a fresh pair is
+# armed again. No daily trade cap.
+#   aggressive_scalper : 15 pip stops, 10 pip SL, trail from +10 by 5, one trade at a time
+#   flip_fast          : wider (25 / 15 / trail from +15 by 8) and ADDS another
+#                        trade (up to 5) each time price runs a further 15 pips
+#                        and every open trade is already protected.
 # Trade ids are remembered (and re-adopted after a restart) because the Exness
-# API does not return trade comments.
-# All values below are the defaults from the strategy spec; edit here.
+# API does not return trade comments. Edit the numbers below to tune.
 # ============================================
 SC_CFG = {
     "pending_pips": 15,
@@ -3073,10 +3082,18 @@ SC_CFG = {
     "trail_min_step_pips": 1,
     "reentry_delay_s": 0,
     "pending_expiry_s": 300,       # unfilled pair is re-centred after this long
-    "max_trades_per_day": 15,
+    "max_trades_per_day": None,    # no daily cap
     "max_consecutive_losses": 3,
     "max_slippage_frac": 0.5,      # skip if price overshot the level by > 50% of the stop
     "fail_backoff_s": 30,
+    "max_layers": 1,
+    "add_pips": 15,
+    "label": "🐆 Aggressive Scalper",
+}
+SC_MODES = {
+    "aggressive_scalper": SC_CFG,
+    "flip_fast": dict(SC_CFG, pending_pips=25, sl_pips=15, trail_activate_pips=15, trail_pips=8,
+                      max_layers=5, add_pips=15, label="⚡ Account Flip (Fast)"),
 }
 SC_PAIR_CFG = {
     "xauusd": {"pip": 0.1,   "max_spread_pips": 4},
@@ -3094,7 +3111,7 @@ async def _sc_get_subscribers():
     if isinstance(accts, list):
         _SC["subs"] = [
             a for a in accts
-            if a.get("bot_choice") == "aggressive_scalper"
+            if a.get("bot_choice") in SC_MODES
             and a.get("pair_choice") in SC_PAIR_CFG
             and a.get("metaapi_account_id")
         ]
@@ -3114,12 +3131,13 @@ async def _sc_quote(resolved):
     return q
 
 
-def sc_trail_target(direction, entry, cur, cur_sl, pip):
+def sc_trail_target(direction, entry, cur, cur_sl, pip, cfg=None):
     """New stop price, or None. Starts at +activate pips, trails `trail` pips
     behind price, only ever tightens, and ignores moves smaller than a step."""
-    act = SC_CFG["trail_activate_pips"] * pip
-    trail = SC_CFG["trail_pips"] * pip
-    step = SC_CFG["trail_min_step_pips"] * pip
+    cfg = cfg or SC_CFG
+    act = cfg["trail_activate_pips"] * pip
+    trail = cfg["trail_pips"] * pip
+    step = cfg["trail_min_step_pips"] * pip
     if direction == "BUY":
         if cur - entry < act:
             return None
@@ -3146,6 +3164,7 @@ async def _sc_tick_one(context, account):
     user_id = str(account["user_id"])
     acct_id = account["metaapi_account_id"]
     pair_key = account["pair_choice"]
+    cfg = SC_MODES[account["bot_choice"]]
     key = (user_id, pair_key)
     try:
         pc = SC_PAIR_CFG[pair_key]
@@ -3154,33 +3173,41 @@ async def _sc_tick_one(context, account):
         decimals = pair_config["decimals"]
         now = time.time()
         today = datetime.utcnow().strftime("%Y-%m-%d")
-        st = _SC["st"].setdefault(key, {"phase": None, "day": today, "trades": 0, "losses": 0, "stopped": False})
+        st = _SC["st"].setdefault(key, {"phase": None, "day": today, "trades": 0, "losses": 0, "pids": []})
+        if st.get("mode") != account["bot_choice"]:
+            st.update({"mode": account["bot_choice"], "phase": None, "pids": [], "losses": 0, "notified": False})
         if st["day"] != today:
-            st.update({"day": today, "trades": 0, "losses": 0, "stopped": False, "notified": False})
+            st.update({"day": today, "trades": 0, "losses": 0, "notified": False})
 
         symbol_map = await get_client_symbol_map(account)
         resolved = resolve_trade_symbol(symbol_map, pair_config)
 
-        # ---- manage a running trade ------------------------------------
+        # ---- manage running trades -------------------------------------
         if st["phase"] in (None, "open"):
             positions = await _xc_get_positions(acct_id, resolved)
             if positions is None:
                 return
-            mine = [p for p in positions if str(p.get("id")) == st.get("pid")
+            mine = [p for p in positions if str(p.get("id")) in st["pids"]
                     or str(p.get("comment") or "").startswith("NexoraSC")]
             if not mine and st["phase"] is None and positions and _is_exness_ref(acct_id):
-                mine = positions[:1]  # adopt after a restart (Exness API has no comments)
+                mine = list(positions)  # adopt after a restart (Exness API has no comments)
             if mine:
-                p = mine[0]
-                direction = "BUY" if "BUY" in str(p.get("type", "")).upper() else "SELL"
-                entry = float(p.get("openPrice") or 0)
-                cur = float(p.get("currentPrice") or 0)
-                sl = float(p["stopLoss"]) if p.get("stopLoss") else None
-                st.update({"phase": "open", "pid": str(p.get("id")), "dir": direction, "entry": entry})
-                if sl is not None:
-                    st["last_sl"] = sl
-                if entry and cur:
-                    new_sl = sc_trail_target(direction, entry, cur, sl, pip)
+                st["phase"] = "open"
+                st["pids"] = [str(p.get("id")) for p in mine]
+                st["dir"] = "BUY" if "BUY" in str(mine[0].get("type", "")).upper() else "SELL"
+                direction = st["dir"]
+                protected = 0
+                cur = 0.0
+                for p in mine:
+                    entry = float(p.get("openPrice") or 0)
+                    cur = float(p.get("currentPrice") or 0)
+                    sl = float(p["stopLoss"]) if p.get("stopLoss") else None
+                    if sl is not None and ((direction == "BUY" and sl >= entry) or (direction == "SELL" and sl <= entry)):
+                        protected += 1
+                        st["trailed"] = True
+                    if not entry or not cur:
+                        continue
+                    new_sl = sc_trail_target(direction, entry, cur, sl, pip, cfg)
                     if new_sl is not None:
                         new_sl = round(new_sl, decimals)
                         payload = {"actionType": "POSITION_MODIFY", "positionId": str(p.get("id")), "stopLoss": new_sl}
@@ -3189,31 +3216,48 @@ async def _sc_tick_one(context, account):
                         ok, detail = await asyncio.to_thread(_xc_trade_action_sync, acct_id, payload)
                         print(f"[SC] trail {pair_key} {direction} user={user_id} sl {sl} -> {new_sl} ok={ok} {'' if ok else detail}")
                         if ok:
-                            st["last_sl"] = new_sl
+                            st["trailed"] = True
+                # add another trade while the move continues (Account Flip Fast)
+                if (cfg["max_layers"] > 1 and len(mine) < cfg["max_layers"] and protected == len(mine)
+                        and not account.get("trading_paused") and cur
+                        and now - st.get("last_add", 0) > 10):
+                    entries = [float(p.get("openPrice") or 0) for p in mine]
+                    far = max(entries) if direction == "BUY" else min(entries)
+                    moved = (cur - far) if direction == "BUY" else (far - cur)
+                    if moved >= cfg["add_pips"] * pip:
+                        sls = [float(p["stopLoss"]) for p in mine if p.get("stopLoss")]
+                        best = max(sls) if direction == "BUY" else min(sls)
+                        if abs(cur - best) < cfg["sl_pips"] * pip * 0.3:
+                            best = cur - cfg["sl_pips"] * pip * 0.5 if direction == "BUY" else cur + cfg["sl_pips"] * pip * 0.5
+                        vol = float(mine[0].get("volume") or account.get("lot_size") or 0.01)
+                        st["last_add"] = now
+                        oid = await place_client_mt5_trade(
+                            acct_id, resolved, direction, vol, round(best, decimals), None,
+                            trade_comment=f"NexoraSC-{int(now)}")
+                        if oid:
+                            st["pids"].append(str(oid))
+                            st["trades"] += 1
+                            print(f"[SC] ➕ layer {len(mine) + 1}/{cfg['max_layers']} {pair_key} {direction} user={user_id} sl={round(best, decimals)}")
                 return
             if st["phase"] == "open":
-                # closed: trailing stop already past entry = win, otherwise a loss
-                ent, ls, d = st.get("entry"), st.get("last_sl"), st.get("dir")
-                won = bool(ent and ls and ((d == "BUY" and ls >= ent) or (d == "SELL" and ls <= ent)))
+                # everything closed: any trailing stop past entry = win, otherwise a loss
+                won = bool(st.get("trailed"))
                 st["losses"] = 0 if won else st["losses"] + 1
                 print(f"[SC] closed {pair_key} user={user_id} {'win' if won else 'loss'} consecutive_losses={st['losses']}")
-                st["phase"] = "cool"
-                st["cool_until"] = now + SC_CFG["reentry_delay_s"]
-                st["pid"] = None
+                st.update({"phase": "cool", "cool_until": now + cfg["reentry_delay_s"], "pids": [], "trailed": False})
             else:
                 st["phase"] = "arm"
 
         # ---- nothing running: stop conditions --------------------------
         if account.get("trading_paused"):
             return
-        if st["losses"] >= SC_CFG["max_consecutive_losses"] or st["trades"] >= SC_CFG["max_trades_per_day"]:
+        cap = cfg.get("max_trades_per_day")
+        if st["losses"] >= cfg["max_consecutive_losses"] or (cap and st["trades"] >= cap):
             if not st.get("notified"):
                 st["notified"] = True
-                why = (f"{SC_CFG['max_consecutive_losses']} losses in a row"
-                       if st["losses"] >= SC_CFG["max_consecutive_losses"]
-                       else f"the daily limit of {SC_CFG['max_trades_per_day']} trades")
                 await _sc_notify(context, user_id,
-                                 f"🐆 <b>Aggressive Scalper paused for today</b>\n\nIt hit {why}. It starts again tomorrow (UTC).")
+                                 f"{cfg['label']} <b>paused for today</b>\n\nIt had {cfg['max_consecutive_losses']} losses in a row. "
+                                 f"It starts again tomorrow (UTC).")
             return
         if st["phase"] == "cool":
             if now < st.get("cool_until", 0):
@@ -3232,8 +3276,8 @@ async def _sc_tick_one(context, account):
         if (ask - bid) / pip > pc["max_spread_pips"]:
             return  # spread too wide: neither arm nor trigger
 
-        dist = SC_CFG["pending_pips"] * pip
-        if st["phase"] in ("arm", None) or now - st.get("armed_at", 0) > SC_CFG["pending_expiry_s"]:
+        dist = cfg["pending_pips"] * pip
+        if st["phase"] in ("arm", None) or now - st.get("armed_at", 0) > cfg["pending_expiry_s"]:
             st.update({"phase": "armed", "armed_at": now, "buy_lvl": ask + dist, "sell_lvl": bid - dist})
             return
 
@@ -3245,12 +3289,12 @@ async def _sc_tick_one(context, account):
         if not direction:
             return
 
-        sl_dist = SC_CFG["sl_pips"] * pip
+        sl_dist = cfg["sl_pips"] * pip
         fill = ask if direction == "BUY" else bid
         overshoot = (ask - st["buy_lvl"]) if direction == "BUY" else (st["sell_lvl"] - bid)
-        if overshoot > sl_dist * SC_CFG["max_slippage_frac"]:
+        if overshoot > sl_dist * cfg["max_slippage_frac"]:
             print(f"[SC] skip {pair_key} {direction}: price jumped {overshoot / pip:.1f} pips past the level")
-            st.update({"phase": "arm"})
+            st["phase"] = "arm"
             return
         positions = await _xc_get_positions(acct_id, resolved)
         if positions is None:
@@ -3265,21 +3309,23 @@ async def _sc_tick_one(context, account):
         order_id = await place_client_mt5_trade(
             acct_id, resolved, direction, volume, sl, None, trade_comment=f"NexoraSC-{int(now)}")
         if not order_id:
-            st["backoff_until"] = now + SC_CFG["fail_backoff_s"]
+            st["backoff_until"] = now + cfg["fail_backoff_s"]
             st["phase"] = "arm"
             return
-        st.update({"phase": "open", "pid": str(order_id), "dir": direction, "entry": fill, "last_sl": sl})
+        st.update({"phase": "open", "pids": [str(order_id)], "dir": direction, "trailed": False})
         st["trades"] += 1
-        print(f"[SC] ✅ {direction} {resolved} user={user_id} vol={volume} entry~{fill} sl={sl} (trade {st['trades']} today)")
+        print(f"[SC] ✅ {account['bot_choice']} {direction} {resolved} user={user_id} vol={volume} entry~{fill} sl={sl} (trade {st['trades']} today)")
         if not st.get("told"):
             st["told"] = True
+            extra = (f"It adds up to {cfg['max_layers'] - 1} more trades while the move runs, only once the earlier ones are protected. "
+                     if cfg["max_layers"] > 1 else "")
             await _sc_notify(
                 context, user_id,
-                f"🐆 <b>Aggressive Scalper is trading</b>\n\n"
+                f"{cfg['label']} <b>is trading</b>\n\n"
                 f"First trade: {direction} {pair_config['display']} — {volume} lots, "
-                f"{SC_CFG['sl_pips']} pip stop, trailing stop on.\n"
-                f"It keeps a Buy Stop and Sell Stop {SC_CFG['pending_pips']} pips either side of price and "
-                f"re-arms after each trade. I won't message you for each one.")
+                f"{cfg['sl_pips']} pip stop, trailing stop on.\n"
+                f"It keeps a Buy Stop and Sell Stop {cfg['pending_pips']} pips either side of price and "
+                f"re-arms after each trade. {extra}I won't message you for each one.")
     except Exception as e:
         print(f"[SC] ❌ error for {user_id}: {type(e).__name__}: {e}")
 
@@ -3747,6 +3793,16 @@ async def manage_account_flip_stacks(context: ContextTypes.DEFAULT_TYPE):
             update_flip_stack(stack_id, updates)
         except Exception as e:
             print(f"[ACCOUNT FLIP] ❌ Stack manager error for stack {stack.get('id')}: {e}")
+
+
+async def deriv_site_verification_handler(request):
+    """Root page carrying Deriv's domain-ownership meta tag (needed to receive
+    app markup commission)."""
+    return web.Response(
+        text=('<!doctype html><html><head><meta charset="utf-8">'
+              '<meta name="deriv-site-verification" content="d9d7d2e90deadd85462b68c0c9bbc5c7eb1c4cc556d24775fb113fffb8de3f0f">'
+              '<title>Nexora AI</title></head><body>Nexora AI</body></html>'),
+        content_type="text/html")
 
 
 async def korapay_webhook_handler(request):
@@ -6895,6 +6951,8 @@ def run_korapay_webhook_server():
     an inbound HTTP endpoint before now.
     """
     webhook_app = web.Application()
+    webhook_app.router.add_get("/", deriv_site_verification_handler)
+    webhook_app.router.add_get("/index.html", deriv_site_verification_handler)
     webhook_app.router.add_post("/korapay-webhook", korapay_webhook_handler)
     webhook_app.router.add_post("/nowpayments-webhook", nowpayments_webhook_handler)
     webhook_app.router.add_get("/deriv-oauth-callback", deriv_oauth_callback_handler)
@@ -13047,6 +13105,7 @@ async def run_deriv_autotrade_bot_scan(context: ContextTypes.DEFAULT_TYPE):
     bot_accounts = [
         a for a in accounts
         if a.get("deriv_autotrade_enabled") and a.get("deriv_bot_choice") in DERIV_AUTOTRADE_BOTS and a.get("deriv_pair_choice")
+        and a.get("deriv_bot_choice") != "aggressive"  # served by the straddle engine (run_dsc_tick)
     ]
     if not bot_accounts:
         return
@@ -13209,6 +13268,212 @@ async def run_deriv_autotrade_bot_scan(context: ContextTypes.DEFAULT_TYPE):
                     print(f"[DERIV BOT SCAN] Couldn't notify {user_id}: {e}")
         except Exception as e:
             print(f"[DERIV BOT SCAN] ❌ Error for {bot_choice}/{index_key}: {e}")
+
+
+# ============================================
+# DERIV AGGRESSIVE SCALPER (straddle) - same idea as the Exness one, in the
+# user's own stake/risk terms because synthetics have no pips and a multiplier
+# can never lose more than its stake:
+#   stop loss      = the user's risk $            (the "10 pip" stop)
+#   pending levels = 1.5 x that stop distance      (the "15 pip" Buy/Sell Stop)
+#   trailing       = starts once profit = 1.0 x risk, closes on a pullback of
+#                    0.5 x risk from the peak     (the "+10 / trail 5")
+# Virtual levels (no real pending order exists on Deriv): watch the latest tick,
+# open the multiplier on the side that is hit, drop the other, re-arm after it
+# closes. No daily cap; pauses for the day after 3 losses in a row.
+# ============================================
+DSC_CFG = {
+    "pending_mult": 1.5, "activate_mult": 1.0, "trail_mult": 0.5,
+    "max_consecutive_losses": 3, "fail_backoff_s": 60, "pending_expiry_s": 300,
+    "max_slippage_frac": 0.5,
+}
+_DSC = {"subs": [], "subs_at": 0.0, "st": {}, "px": {}}
+
+
+async def deriv_get_latest_price(symbol):
+    """Latest tick price for a synthetic index, or None."""
+    if not DERIV_SERVICE_TOKEN:
+        return None
+    try:
+        accounts_data = await deriv_get_options_accounts(DERIV_SERVICE_TOKEN)
+        lst = (accounts_data or {}).get("data")
+        if not isinstance(lst, list):
+            lst = (accounts_data or {}).get("accounts")
+        if not lst:
+            return None
+        account_id = lst[0].get("account_id") or lst[0].get("loginid") or lst[0].get("id")
+        ws_url = await deriv_get_otp_url(DERIV_SERVICE_TOKEN, account_id) if account_id else None
+        if not ws_url:
+            return None
+        async with websockets.connect(ws_url, open_timeout=10, close_timeout=5) as ws:
+            await ws.send(json.dumps({"ticks_history": symbol, "style": "ticks", "count": 1, "end": "latest"}))
+            resp = json.loads(await ws.recv())
+            prices = (resp.get("history") or {}).get("prices") or []
+            return float(prices[-1]) if prices else None
+    except Exception as e:
+        print(f"[DSC] price read failed for {symbol}: {type(e).__name__}")
+        return None
+
+
+async def _dsc_price(symbol):
+    hit = _DSC["px"].get(symbol)
+    if hit and time.time() - hit[0] < 8:
+        return hit[1]
+    p = await deriv_get_latest_price(symbol)
+    if p:
+        _DSC["px"][symbol] = (time.time(), p)
+    return p
+
+
+async def _dsc_get_subscribers():
+    if time.time() - _DSC["subs_at"] < 60:
+        return _DSC["subs"]
+    accts = await asyncio.to_thread(get_all_deriv_accounts_with_token)
+    if isinstance(accts, list):
+        _DSC["subs"] = [
+            a for a in accts
+            if a.get("deriv_autotrade_enabled") and a.get("deriv_bot_choice") == "aggressive"
+            and a.get("deriv_pair_choice") in SYNTHETIC_CONFIG
+            and a.get("deriv_pair_choice") not in AUTO_COPY_EXCLUDED_INDICES
+            and a.get("api_token") and a.get("deriv_bot_stake")
+        ]
+        _DSC["subs_at"] = time.time()
+    return _DSC["subs"]
+
+
+async def _dsc_tick_one(context, account):
+    user_id = str(account["user_id"])
+    token = account["api_token"]
+    index_key = account["deriv_pair_choice"]
+    key = (user_id, index_key)
+    try:
+        config = SYNTHETIC_CONFIG[index_key]
+        symbol = config["symbol"]
+        stake = float(account["deriv_bot_stake"])
+        risk = float(account["deriv_bot_risk"]) if account.get("deriv_bot_risk") else float(DEFAULT_RISK)
+        mult = config["default_multiplier"]
+        now = time.time()
+        today = datetime.utcnow().strftime("%Y-%m-%d")
+        st = _DSC["st"].setdefault(key, {"phase": "arm", "day": today, "losses": 0})
+        if st["day"] != today:
+            st.update({"day": today, "losses": 0, "notified": False})
+
+        # ---- running trade: trail by profit pullback --------------------
+        if st["phase"] == "open":
+            profit, sold = await get_deriv_contract_live_profit(token, st["cid"])
+            if profit is None:
+                return
+            if sold:
+                won = bool(st.get("trailed")) or profit > 0
+                st["losses"] = 0 if won else st["losses"] + 1
+                print(f"[DSC] closed {index_key} user={user_id} {'win' if won else 'loss'} profit={profit:.2f} consecutive_losses={st['losses']}")
+                st.update({"phase": "arm", "cid": None, "trailed": False, "peak": 0.0})
+                return
+            st["peak"] = max(st.get("peak", 0.0), profit)
+            if st["peak"] >= risk * DSC_CFG["activate_mult"]:
+                st["trailed"] = True
+            if st.get("trailed") and (st["peak"] - profit) >= risk * DSC_CFG["trail_mult"]:
+                ok = await deriv_sell_contract(token, st["cid"])
+                print(f"[DSC] trailing close {index_key} user={user_id} profit={profit:.2f} peak={st['peak']:.2f} ok={ok}")
+            return
+
+        # ---- stop conditions -------------------------------------------
+        if st["losses"] >= DSC_CFG["max_consecutive_losses"]:
+            if not st.get("notified"):
+                st["notified"] = True
+                try:
+                    await context.bot.send_message(
+                        chat_id=int(user_id),
+                        text=f"🐆 <b>Aggressive Scalper paused for today</b>\n\nIt had {DSC_CFG['max_consecutive_losses']} losses in a row. It starts again tomorrow (UTC).",
+                        parse_mode=ParseMode.HTML)
+                except Exception:
+                    pass
+            return
+        if now < st.get("backoff_until", 0):
+            return
+
+        price = await _dsc_price(symbol)
+        if not price:
+            return
+        sl_dist = price * risk / (stake * mult)
+        dist = sl_dist * DSC_CFG["pending_mult"]
+        if st["phase"] == "arm" or now - st.get("armed_at", 0) > DSC_CFG["pending_expiry_s"]:
+            st.update({"phase": "armed", "armed_at": now, "buy_lvl": price + dist, "sell_lvl": price - dist})
+            return
+        direction = "BUY" if price >= st["buy_lvl"] else ("SELL" if price <= st["sell_lvl"] else None)
+        if not direction:
+            return
+        overshoot = (price - st["buy_lvl"]) if direction == "BUY" else (st["sell_lvl"] - price)
+        if overshoot > sl_dist * DSC_CFG["max_slippage_frac"]:
+            print(f"[DSC] skip {index_key} {direction}: price jumped past the level")
+            st["phase"] = "arm"
+            return
+
+        snapshot = await deriv_fetch_account_snapshot(token)
+        if not snapshot or snapshot.get("balance") is None:
+            return
+        if any(c.get("symbol") == symbol for c in snapshot.get("open_contracts", [])):
+            st["phase"] = "arm"
+            st["backoff_until"] = now + 30
+            return
+        if snapshot["balance"] < stake:
+            if should_send_low_balance_notification(account):
+                try:
+                    await context.bot.send_message(
+                        chat_id=int(user_id),
+                        text=(f"⚠️ <b>Auto-Trade paused — balance too low.</b>\n\nYour balance (${snapshot['balance']}) is below your "
+                              f"${stake} stake on {config['display']}. Top up to resume."),
+                        parse_mode=ParseMode.HTML)
+                    set_low_balance_notified(user_id, True)
+                except Exception as e:
+                    if _user_unreachable(e):
+                        set_low_balance_notified(user_id, True)
+            st["backoff_until"] = now + 120
+            return
+        if account.get("low_balance_notified"):
+            set_low_balance_notified(user_id, False)
+
+        contract_type = "MULTUP" if direction == "BUY" else "MULTDOWN"
+        buy_data, error = await deriv_execute_multiplier_trade(token, symbol, contract_type, mult, stake, risk, None)
+        if error or not buy_data:
+            log_auto_copy_failure(user_id, symbol, friendly_trade_error(error, auto_copy_context=True))
+            st["backoff_until"] = now + DSC_CFG["fail_backoff_s"]
+            st["phase"] = "arm"
+            return
+        cid = buy_data.get("contract_id")
+        log_auto_copy_trade(user_id, symbol, cid, direction, stake, risk, None)
+        st.update({"phase": "open", "cid": cid, "peak": 0.0, "trailed": False})
+        print(f"[DSC] ✅ {direction} {index_key} user={user_id} stake={stake} risk={risk}")
+        if not st.get("told"):
+            st["told"] = True
+            try:
+                await context.bot.send_message(
+                    chat_id=int(user_id),
+                    text=(f"🐆 <b>Aggressive Scalper is trading</b>\n\nFirst trade: {direction} {config['display']} — "
+                          f"${stake} stake, ${risk} stop, trailing profit on.\nIt re-arms after each trade. "
+                          f"I won't message you for each one."),
+                    parse_mode=ParseMode.HTML)
+            except Exception as e:
+                print(f"[DSC] Couldn't notify {user_id}: {type(e).__name__}")
+    except Exception as e:
+        print(f"[DSC] ❌ error for {user_id}: {type(e).__name__}: {e}")
+
+
+async def run_dsc_tick(context: ContextTypes.DEFAULT_TYPE):
+    """Every 10s: arm/trigger the Deriv straddle and trail running trades."""
+    try:
+        subs = await _dsc_get_subscribers()
+        if not subs:
+            return
+        sem = asyncio.Semaphore(4)
+
+        async def one(a):
+            async with sem:
+                await _dsc_tick_one(context, a)
+
+        await asyncio.gather(*(one(a) for a in subs), return_exceptions=True)
+    except Exception as e:
+        print(f"[DSC] ❌ tick error: {type(e).__name__}: {e}")
 
 
 async def run_deriv_flip_entry_scan(context: ContextTypes.DEFAULT_TYPE):
@@ -33649,6 +33914,7 @@ def main():
     job_queue.run_repeating(run_aggressive_entry_scan, interval=60, first=50, name="aggressive_entry_scan")
     job_queue.run_repeating(manage_aggressive_positions, interval=5, first=55, name="aggressive_manager")
     job_queue.run_repeating(run_sc_tick, interval=5, first=58, name="aggressive_scalper_straddle")
+    job_queue.run_repeating(run_dsc_tick, interval=10, first=62, name="deriv_scalper_straddle")
 
     # TP/SL monitor - checks every OPEN logged signal every 15 minutes
     job_queue.run_repeating(

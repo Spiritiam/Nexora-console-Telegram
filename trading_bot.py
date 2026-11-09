@@ -26660,7 +26660,6 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 [InlineKeyboardButton("📡 Full Signal Coverage", callback_data="mt5auto_follow_channel")],
                 [InlineKeyboardButton("📻 Channel Signals Only", callback_data="mt5auto_copy_channel")],
                 [InlineKeyboardButton("🎯 Pick a Bot", callback_data="mt5auto_choose_bot")],
-                [InlineKeyboardButton("🚀 Account Flip", callback_data="mt5auto_account_flip")],
             ])
         )
         return
@@ -27197,7 +27196,6 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 [InlineKeyboardButton("📡 Full Signal Coverage", callback_data="mt5switch_follow_channel")],
                 [InlineKeyboardButton("📻 Channel Signals Only", callback_data="mt5switch_copy_channel")],
                 [InlineKeyboardButton("🎯 Pick a Bot", callback_data="mt5switch_choose_bot")],
-                [InlineKeyboardButton("🚀 Account Flip", callback_data="mt5switch_account_flip")],
                 [InlineKeyboardButton("⬅️ Back", callback_data="mt5auto_dashboard")],
             ])
         )
@@ -27398,7 +27396,6 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
         buttons = [
             [InlineKeyboardButton("🎯 Pick a Bot", callback_data="derivauto_choose_bot")],
-            [InlineKeyboardButton("🚀 Account Flip", callback_data="derivauto_account_flip")],
         ]
         # FIX: CONFIRMED REAL BUG, per explicit instruction after a
         # live "no response at all" report. This only ever added the
@@ -27574,7 +27571,6 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 parse_mode=ParseMode.HTML,
                 reply_markup=InlineKeyboardMarkup([
                     [InlineKeyboardButton("🎯 Pick a Bot", callback_data="derivauto_choose_bot")],
-                    [InlineKeyboardButton("🚀 Account Flip", callback_data="derivauto_account_flip")],
                 ])
             )
             return

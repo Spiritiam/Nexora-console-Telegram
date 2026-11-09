@@ -21554,17 +21554,11 @@ async def build_signal_response(question, user_id=None, retry_mismatch=False):
         f"<b>SL:</b> {stop_loss}{sl_pips_txt}\n"
         f"<b>TP1:</b> {take_profit_1}{tp1_pips_txt}\n"
         f"<b>TP2:</b> {take_profit}{tp2_pips_txt}\n\n"
-        f"<b>Confidence:</b> {confidence}%\n"
         f"<b>Session:</b> {session}\n\n"
     )
     if fundamental_reason:
         response += f"<b>Fundamental Analysis:</b> {fundamental_reason}\n\n"
-    # Telegram photo captions max out at 1024 chars: if adding both the
-    # "Trade safe" line and the link quote would overflow, drop "Trade safe".
-    if len(response) + len("<i>Trade safe 💼🔥</i>\n\n") + len(SIGNAL_QUOTE_FOREX) <= 1000:
-        response += f"<i>Trade safe 💼🔥</i>\n\n{SIGNAL_QUOTE_FOREX}"
-    else:
-        response += SIGNAL_QUOTE_FOREX
+    response += SIGNAL_QUOTE_FOREX
 
     signal_data = {
         "symbol": symbol,

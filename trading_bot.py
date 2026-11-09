@@ -3067,7 +3067,7 @@ async def manage_aggressive_positions(context: ContextTypes.DEFAULT_TYPE):
 # the other side is then dropped. Each trade has its own stop loss and a
 # trailing stop (never moves back). Once everything closes a fresh pair is
 # armed again. No daily trade cap.
-#   aggressive_scalper : 15 pip stops, 10 pip SL, trail from +10 by 5, one trade at a time
+#   aggressive_scalper : 15 pip stops, 20 pip SL, break-even at +10 then trails 10 behind, one trade at a time
 #   flip_fast          : wider (25 / 15 / trail from +15 by 8) and ADDS another
 #                        trade (up to 5) each time price runs a further 15 pips
 #                        and every open trade is already protected.
@@ -3076,9 +3076,9 @@ async def manage_aggressive_positions(context: ContextTypes.DEFAULT_TYPE):
 # ============================================
 SC_CFG = {
     "pending_pips": 15,
-    "sl_pips": 10,
-    "trail_activate_pips": 10,
-    "trail_pips": 5,
+    "sl_pips": 20,
+    "trail_activate_pips": 10,   # at +10 pips the stop jumps to break-even ...
+    "trail_pips": 10,            # ... then follows price 10 pips behind
     "trail_min_step_pips": 1,
     "reentry_delay_s": 0,
     "pending_expiry_s": 300,       # unfilled pair is re-centred after this long
@@ -3141,13 +3141,13 @@ def sc_trail_target(direction, entry, cur, cur_sl, pip, cfg=None):
     if direction == "BUY":
         if cur - entry < act:
             return None
-        tgt = cur - trail
+        tgt = max(cur - trail, entry)   # never below break-even once triggered
         if cur_sl is not None and tgt <= cur_sl + step:
             return None
         return tgt
     if entry - cur < act:
         return None
-    tgt = cur + trail
+    tgt = min(cur + trail, entry)
     if cur_sl is not None and tgt >= cur_sl - step:
         return None
     return tgt

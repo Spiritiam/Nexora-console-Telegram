@@ -9140,6 +9140,24 @@ async def deriv_get_otp_url(token, account_id, priority=False):
         await asyncio.sleep(1.5 * attempt)
     return None
 
+async def deriv_fetch_account_snapshot_user(token, retries=2):
+    """User-facing Deriv check. Runs as a priority call (not skipped by the
+    background 429 pause) and retries a couple of times, so one rate-limit or
+    network blip no longer shows the "token expired" message for a token that
+    is actually fine."""
+    _tok = _DERIV_PRIORITY_CTX.set(True)
+    try:
+        for i in range(retries + 1):
+            snap = await deriv_fetch_account_snapshot(token)
+            if snap:
+                return snap
+            if i < retries:
+                await asyncio.sleep(2)
+        return None
+    finally:
+        _DERIV_PRIORITY_CTX.reset(_tok)
+
+
 async def deriv_fetch_account_snapshot(token):
     """
     Full flow: list accounts -> pick the real one -> get its OTP
@@ -11974,7 +11992,7 @@ async def send_tier_selection(bot, user_id, trade_context):
     # broken - by which point they assumed the bot itself was faulty.
     # Checking the LIVE connection here, before showing any stake
     # options at all, catches this at the very first tap instead.
-    snapshot = await deriv_fetch_account_snapshot(account["api_token"])
+    snapshot = await deriv_fetch_account_snapshot_user(account["api_token"])
     if not snapshot:
         await bot.send_message(
             chat_id=int(user_id),
@@ -26021,7 +26039,7 @@ async def handle_buttons(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 "🔄 <b>Checking your linked Deriv account...</b>",
                 parse_mode=ParseMode.HTML
             )
-            snapshot = await deriv_fetch_account_snapshot(existing["api_token"])
+            snapshot = await deriv_fetch_account_snapshot_user(existing["api_token"])
             if snapshot:
                 open_count = len(snapshot["open_contracts"])
 
@@ -26071,15 +26089,16 @@ async def handle_buttons(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 reconnect_markup, oauth_state = await build_deriv_login_button(user_id)
                 reconnect_text = (
                     "⚠️ <b>Couldn't reach your linked Deriv account.</b>\n\n"
-                    "Your saved token may have expired or been revoked. "
-                    "Paste a new real-account API token below to relink."
+                    "Deriv didn't answer just now, or your saved login expired. "
+                    "Tap Connect Deriv again in a few seconds. If it keeps failing, "
+                    "paste a new real-account API token below to relink."
                 )
                 if reconnect_markup:
                     reconnect_text = (
                         "⚠️ <b>Couldn't reach your linked Deriv account.</b>\n\n"
-                        "Your saved token may have expired or been revoked. "
-                        "Tap below to log in directly with Deriv and relink "
-                        "instantly, or paste a new API token here instead."
+                        "Deriv didn't answer just now, or your saved login expired. "
+                        "Tap Connect Deriv again in a few seconds, or tap below to "
+                        "log in with Deriv and relink instantly."
                     )
                 sent_unreachable = await update.message.reply_text(
                     reconnect_text,

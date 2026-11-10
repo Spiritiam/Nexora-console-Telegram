@@ -13330,7 +13330,7 @@ async def deriv_get_latest_price(symbol):
 
 async def _dsc_price(symbol):
     hit = _DSC["px"].get(symbol)
-    if hit and time.time() - hit[0] < 8:
+    if hit and time.time() - hit[0] < 3:
         return hit[1]
     p = await deriv_get_latest_price(symbol)
     if p:
@@ -13446,12 +13446,8 @@ async def _dsc_tick_one(context, account):
         direction = "BUY" if price >= st["buy_lvl"] else ("SELL" if price <= st["sell_lvl"] else None)
         if not direction:
             return
-        overshoot = (price - st["buy_lvl"]) if direction == "BUY" else (st["sell_lvl"] - price)
-        if overshoot > sl_dist * DSC_CFG["max_slippage_frac"]:
-            print(f"[DSC] skip {index_key} {direction}: price jumped past the level")
-            st["phase"] = "arm"
-            return
-
+        # Deriv stop loss is a fixed dollar amount, so a price that moved past the level
+        # before we noticed does not raise the risk. Enter anyway.
         snapshot = await deriv_fetch_account_snapshot(token)
         if not snapshot or snapshot.get("balance") is None:
             return

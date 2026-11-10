@@ -10514,7 +10514,7 @@ async def deriv_sell_contract(token, contract_id):
         if not ws_url:
             return False
         async with websockets.connect(ws_url, open_timeout=10, close_timeout=10) as ws:
-            await ws.send(json.dumps({"sell": contract_id, "price": 0}))
+            await ws.send(json.dumps({"sell": int(contract_id), "price": 0}))
             raw = json.loads(await ws.recv())
             if "error" in raw:
                 print(f"[DERIV FLIP] Sell failed for {contract_id}: {raw['error'].get('message')}")

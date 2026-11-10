@@ -10490,7 +10490,7 @@ async def get_deriv_contract_live_profit(token, contract_id):
         if not ws_url:
             return None, None
         async with websockets.connect(ws_url, open_timeout=10, close_timeout=10) as ws:
-            await ws.send(json.dumps({"proposal_open_contract": 1, "contract_id": contract_id}))
+            await ws.send(json.dumps({"proposal_open_contract": 1, "contract_id": int(contract_id)}))
             raw = json.loads(await ws.recv())
             contract = raw.get("proposal_open_contract", {})
             if not contract:
@@ -13862,7 +13862,9 @@ async def _dsc_contract_profit(token, user_id, cid):
     """(profit, is_sold) from the live stream; falls back to a one-off read."""
     s = _dsc_user_stream(user_id, token)
     s.ensure()
-    await s.subscribe("c:" + str(cid), {"proposal_open_contract": 1, "contract_id": cid, "subscribe": 1})
+    # Deriv wants the contract id as a number; trades picked up after a restart carry it as text,
+    # which Deriv rejected ("Input validation failed: contract_id"), so they were never read.
+    await s.subscribe("c:" + str(cid), {"proposal_open_contract": 1, "contract_id": int(cid), "subscribe": 1})
     hit = s.data.get("c:" + str(cid))
     if hit and (hit[2] or time.time() - hit[0] < 12):
         return hit[1], hit[2]

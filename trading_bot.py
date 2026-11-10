@@ -9135,6 +9135,7 @@ async def check_deriv_service_token_health(context: ContextTypes.DEFAULT_TYPE):
 
 _DERIV_SERVICE_ACCOUNTS_CACHE = {}
 _DERIV_USER_ACCOUNTS_CACHE = {}
+_OTP_STATE = {"last": 0.0}
 
 _DERIV_429_UNTIL = 0.0
 # Set while building a signal for people (scheduled channel post or a manual
@@ -9245,6 +9246,11 @@ async def deriv_get_otp_url(token, account_id, priority=False):
     max_attempts = 3
     for attempt in range(1, max_attempts + 1):
         try:
+            # Space out login-link requests so Deriv doesn't rate-limit (429) a burst of them.
+            _gap = _OTP_STATE["last"] + 1.2 - time.time()
+            if _gap > 0:
+                await asyncio.sleep(_gap)
+            _OTP_STATE["last"] = time.time()
             response = requests.post(url, headers=deriv_api_headers(token), timeout=10)
             if response.status_code == 429:
                 _deriv_note_429()
@@ -13479,9 +13485,7 @@ async def deriv_set_stop_loss(token, contract_id, amount):
 
 async def _dsc_contract_profit(token, user_id, cid):
     """(profit, is_sold) from the live stream; falls back to a one-off read."""
-    s = _DSC_USER_STREAMS.get(user_id)
-    if s is None or s.token != token:
-        s = _DSC_USER_STREAMS[user_id] = _DerivStream(token, f"user-{str(user_id)[-4:]}")
+    s = _dsc_user_stream(user_id, token)
     s.ensure()
     await s.subscribe("c:" + str(cid), {"proposal_open_contract": 1, "contract_id": cid, "subscribe": 1})
     hit = s.data.get("c:" + str(cid))
@@ -13520,9 +13524,24 @@ async def deriv_get_latest_price(symbol):
         return None
 
 
-async def _dsc_price(symbol):
+def _dsc_user_stream(user_id, token):
+    s = _DSC_USER_STREAMS.get(user_id)
+    if s is None or s.token != token:
+        s = _DSC_USER_STREAMS[user_id] = _DerivStream(token, f"user-{str(user_id)[-4:]}")
+    return s
+
+
+async def _dsc_price(symbol, user_id=None, token=None):
     global _DSC_PRICE_STREAM
-    if DERIV_SERVICE_TOKEN:
+    if user_id and token:
+        # Prices ride on the user's own connection - one Deriv login instead of two.
+        _us = _dsc_user_stream(user_id, token)
+        _us.ensure()
+        await _us.subscribe("t:" + symbol, {"ticks": symbol, "subscribe": 1})
+        _tick = _us.data.get("tick:" + symbol)
+        if _tick and time.time() - _tick[0] < 10:
+            return _tick[1]
+    elif DERIV_SERVICE_TOKEN:
         if _DSC_PRICE_STREAM is None:
             _DSC_PRICE_STREAM = _DerivStream(DERIV_SERVICE_TOKEN, "prices", url_fn=_dsc_service_ws_url)
         _DSC_PRICE_STREAM.ensure()
@@ -13717,7 +13736,7 @@ async def _dsc_tick_one_inner(context, account):
         if now < st.get("backoff_until", 0):
             return
 
-        price = await _dsc_price(symbol)
+        price = await _dsc_price(symbol, user_id, token)
         if not price:
             return
         sl_dist = price * risk / (stake * mult)

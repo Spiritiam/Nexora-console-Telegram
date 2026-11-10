@@ -13736,7 +13736,7 @@ async def _dsc_tick_one_inner(context, account):
         if now < st.get("backoff_until", 0):
             return
 
-        price = await _dsc_price(symbol, user_id, token)
+        price = await _dsc_price(symbol)  # one shared price connection for everyone
         if not price:
             return
         sl_dist = price * risk / (stake * mult)

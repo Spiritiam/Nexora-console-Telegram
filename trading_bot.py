@@ -12194,10 +12194,10 @@ async def deriv_execute_multiplier_trade(token, symbol, contract_type, multiplie
                 "currency": currency,
                 "multiplier": multiplier,
                 "underlying_symbol": symbol,
-                "limit_order": {
-                    "stop_loss": risk,
-                    "take_profit": win,
-                },
+                "limit_order": (
+                    {"stop_loss": risk, "take_profit": win} if win is not None
+                    else {"stop_loss": risk}
+                ),
             }
             await ws.send(json.dumps(proposal_request))
             proposal_response = json.loads(await ws.recv())

@@ -13523,6 +13523,17 @@ async def _dsc_get_subscribers():
     return _DSC["subs"]
 
 
+def _dsc_open_rows_sync(user_id, symbol):
+    """Trades our own log still says are OPEN for this user+index (contract_id, direction)."""
+    try:
+        url = (f"{SUPABASE_URL}/rest/v1/auto_copy_trades"
+               f"?user_id=eq.{user_id}&symbol=eq.{symbol}&status=eq.OPEN&select=contract_id,direction")
+        rows = requests.get(url, headers=sb_headers(), timeout=10).json()
+        return rows if isinstance(rows, list) else None
+    except Exception:
+        return None
+
+
 async def _dsc_tick_one(context, account):
     """One check per user at a time (two overlapping checks opened two trades)."""
     lock_key = (str(account["user_id"]), account.get("deriv_pair_choice"))
@@ -13557,6 +13568,19 @@ async def _dsc_tick_one_inner(context, account):
             ctype = "MULTUP" if direction == "BUY" else "MULTDOWN"
             return await deriv_execute_multiplier_trade(token, symbol, ctype, mult, stake, risk, None)
 
+        # After a restart (or any lost state) pick up trades that are still open, instead of
+        # opening a second one on top of them.
+        if not st.get("adopted"):
+            rows = await asyncio.to_thread(_dsc_open_rows_sync, user_id, symbol)
+            if rows is None:
+                return
+            st["adopted"] = True
+            _cids = [str(r["contract_id"]) for r in rows if r.get("contract_id")]
+            if _cids and st["phase"] != "open":
+                st.update({"phase": "open", "cids": _cids, "dir": rows[0].get("direction") or "BUY",
+                           "peak": 0.0, "trailed": False, "last_layer_profit": 0.0})
+                print(f"[DSC] picked up {len(_cids)} open trade(s) on {index_key} after restart")
+
         # ---- running trade(s): break-even then trail by profit pullback ---
         if st["phase"] == "open":
             total, open_n = 0.0, 0
@@ -13571,6 +13595,11 @@ async def _dsc_tick_one_inner(context, account):
                 won = bool(st.get("trailed")) or total > 0
                 st["losses"] = 0 if won else st["losses"] + 1
                 print(f"[DSC] closed {index_key} user={user_id} {'win' if won else 'loss'} profit={total:.2f} consecutive_losses={st['losses']}")
+                for _cid in st["cids"]:
+                    try:
+                        await asyncio.to_thread(mark_auto_copy_trade_closed, _cid, total / max(1, len(st["cids"])))
+                    except Exception:
+                        pass
                 st.update({"phase": "arm", "cids": [], "trailed": False, "peak": 0.0, "last_layer_profit": 0.0})
                 return
             st["peak"] = max(st.get("peak", 0.0), total)

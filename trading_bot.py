@@ -13285,7 +13285,7 @@ async def run_deriv_autotrade_bot_scan(context: ContextTypes.DEFAULT_TYPE):
                             await bot.send_message(
                                 chat_id=int(user_id),
                                 text=(
-                                    f"⚠️ <b>Auto-Trade paused — balance too low.</b>\n\n"
+                                    f"⚠️ <b>DERIV Auto-Trade paused — balance too low.</b>\n\n"
                                     f"Your balance (${snapshot['balance']}) is below your "
                                     f"${stake} stake for {DERIV_AUTOTRADE_BOTS[bot_choice]['label']} "
                                     f"on {config['display']}. Top up to resume."
@@ -13669,7 +13669,7 @@ async def _dsc_tick_one_inner(context, account):
                 try:
                     await context.bot.send_message(
                         chat_id=int(user_id),
-                        text=(f"⚠️ <b>Auto-Trade paused — balance too low.</b>\n\nYour balance (${snapshot['balance']}) is below your "
+                        text=(f"⚠️ <b>DERIV Auto-Trade paused — balance too low.</b>\n\nYour balance (${snapshot['balance']}) is below your "
                               f"${stake} stake on {config['display']}. Top up to resume."),
                         parse_mode=ParseMode.HTML)
                     set_low_balance_notified(user_id, True)

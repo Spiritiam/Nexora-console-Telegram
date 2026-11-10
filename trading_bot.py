@@ -3310,7 +3310,7 @@ async def _sc_tick_one(context, account):
         if account.get("trading_paused"):
             return
         cap = cfg.get("max_trades_per_day")
-        if st["losses"] >= cfg["max_consecutive_losses"] or (cap and st["trades"] >= cap):
+        if cap and st["trades"] >= cap:
             if not st.get("notified"):
                 st["notified"] = True
                 await _sc_notify(context, user_id,
@@ -3349,11 +3349,7 @@ async def _sc_tick_one(context, account):
 
         sl_dist = cfg["sl_pips"] * pip
         fill = ask if direction == "BUY" else bid
-        overshoot = (ask - st["buy_lvl"]) if direction == "BUY" else (st["sell_lvl"] - bid)
-        if overshoot > sl_dist * cfg["max_slippage_frac"]:
-            print(f"[SC] skip {pair_key} {direction}: price jumped {overshoot / pip:.1f} pips past the level")
-            st["phase"] = "arm"
-            return
+        # Enter even if price already ran past the level: the stop loss is set from the real entry price.
         positions = await _xc_get_positions(acct_id, resolved)
         if positions is None:
             return
@@ -13748,7 +13744,7 @@ async def _dsc_tick_one_inner(context, account):
         # ---- stop conditions -------------------------------------------
         if account.get("trading_paused"):
             return
-        if st["losses"] >= DSC_CFG["max_consecutive_losses"]:
+        if False:  # no loss-streak pause: keeps trading until you turn it off
             if not st.get("notified"):
                 st["notified"] = True
                 try:

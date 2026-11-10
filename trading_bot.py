@@ -9859,7 +9859,7 @@ def has_open_auto_copy_trade(user_id, symbol):
         print(f"[AUTO-COPY LOG] has_open_auto_copy_trade error: {e}")
         return True  # fail CLOSED here - see docstring
 
-async def get_deriv_contract_outcome(token, contract_id):
+async def get_deriv_contract_outcome(token, contract_id, priority=True):
     """
     Asks Deriv directly whether a specific contract has closed yet,
     via proposal_open_contract - mirrors get_mt5_trade_outcome's role
@@ -9868,7 +9868,7 @@ async def get_deriv_contract_outcome(token, contract_id):
     itself failed (caller should treat this as "try again later", NOT
     as confirmation the trade is closed).
     """
-    accounts_data = await deriv_get_options_accounts(token, priority=True)
+    accounts_data = await deriv_get_options_accounts(token, priority=priority)
     if not accounts_data:
         return None, None
     accounts_list = accounts_data.get("data") or accounts_data.get("accounts")
@@ -9886,7 +9886,7 @@ async def get_deriv_contract_outcome(token, contract_id):
     if not account_id:
         return None, None
 
-    ws_url = await deriv_get_otp_url(token, account_id, priority=True)
+    ws_url = await deriv_get_otp_url(token, account_id, priority=priority)
     if not ws_url:
         return None, None
 
@@ -10382,7 +10382,7 @@ def update_deriv_account_fields(user_id, fields):
         return False
 
 
-async def get_deriv_trading_ws_url(token):
+async def get_deriv_trading_ws_url(token, priority=True):
     """
     Resolves a token down to its real (non-virtual) account's
     short-lived trading WebSocket URL - the same two-step lookup
@@ -10393,7 +10393,7 @@ async def get_deriv_trading_ws_url(token):
     Returns None on any failure.
     """
     try:
-        accounts_data = await deriv_get_options_accounts(token, priority=True)
+        accounts_data = await deriv_get_options_accounts(token, priority=priority)
         if not accounts_data:
             return None
         accounts_list = accounts_data.get("data")
@@ -10417,7 +10417,7 @@ async def get_deriv_trading_ws_url(token):
             or real_account.get("loginid")
             or real_account.get("id")
         )
-        return await deriv_get_otp_url(token, account_id, priority=True)
+        return await deriv_get_otp_url(token, account_id, priority=priority)
     except Exception as e:
         print(f"[DERIV] get_deriv_trading_ws_url error: {e}")
         return None
@@ -13736,7 +13736,8 @@ class _DerivStream:
         backoff = 5
         while time.time() - self.last_use < 600:
             try:
-                url = await (self.url_fn() if self.url_fn else get_deriv_trading_ws_url(self.token))
+                # Background connection: respects the 429 pause and never retries in a burst.
+                url = await (self.url_fn() if self.url_fn else get_deriv_trading_ws_url(self.token, priority=False))
                 if not url:
                     print(f"[DSC] stream {self.name}: no connection URL (Deriv busy?), retry in {backoff}s")
                     await asyncio.sleep(backoff)
@@ -13760,7 +13761,7 @@ class _DerivStream:
                 print(f"[DSC] stream {self.name} dropped: {type(e).__name__}")
             finally:
                 self.ws = None
-            await asyncio.sleep(backoff)
+            await asyncio.sleep(backoff + random.uniform(0, 5))   # spread reconnects so they don't arrive together
             backoff = min(backoff * 2, 60)
 
 
@@ -13807,12 +13808,9 @@ async def _dsc_contract_profit(token, user_id, cid):
     hit = s.data.get("c:" + str(cid))
     if hit and (hit[2] or time.time() - hit[0] < 12):
         return hit[1], hit[2]
-    # One-off fallback, at most once every 30s per trade (retrying every tick kept Deriv rate-limiting us).
-    _fb = _DSC.setdefault("fb", {})
-    if time.time() - _fb.get(str(cid), 0) < 30:
-        return None, None
-    _fb[str(cid)] = time.time()
-    return await get_deriv_contract_live_profit(token, cid)
+    # No extra one-off Deriv login here any more: the account's own open connection reconnects by
+    # itself, and a second login for the same read only added to Deriv's rate limit.
+    return None, None
 
 
 async def deriv_get_latest_price(symbol):
@@ -14097,7 +14095,7 @@ async def _dsc_tick_one_inner(context, account):
                 except Exception as e:
                     if _user_unreachable(e):
                         set_low_balance_notified(user_id, True)
-            st["backoff_until"] = now + 120
+            st["backoff_until"] = now + 300   # was 120s: each re-check is a full Deriv login
             return
         if account.get("low_balance_notified"):
             set_low_balance_notified(user_id, False)
@@ -33612,8 +33610,15 @@ async def check_open_auto_copy_trades(context: ContextTypes.DEFAULT_TYPE):
         if not account or not contract_id:
             continue
 
+        # Trades the live engine is already watching close themselves; a second login for the same
+        # trade only adds to Deriv's rate limit.
+        _tracked = any(str(contract_id) in [str(c) for c in (_v.get("cids") or [])]
+                       for _k, _v in _DSC["st"].items() if str(_k[0]) == str(user_id))
+        if _tracked:
+            continue
+
         outcome, profit = await get_deriv_contract_outcome(
-            account["api_token"], contract_id
+            account["api_token"], contract_id, priority=False
         )
         if outcome == "CLOSED":
             mark_auto_copy_trade_closed(contract_id, profit)

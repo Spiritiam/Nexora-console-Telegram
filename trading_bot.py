@@ -13467,6 +13467,11 @@ async def _dsc_contract_profit(token, user_id, cid):
     hit = s.data.get("c:" + str(cid))
     if hit and (hit[2] or time.time() - hit[0] < 12):
         return hit[1], hit[2]
+    # One-off fallback, at most once every 30s per trade (retrying every tick kept Deriv rate-limiting us).
+    _fb = _DSC.setdefault("fb", {})
+    if time.time() - _fb.get(str(cid), 0) < 30:
+        return None, None
+    _fb[str(cid)] = time.time()
     return await get_deriv_contract_live_profit(token, cid)
 
 
@@ -13508,6 +13513,9 @@ async def _dsc_price(symbol):
     hit = _DSC["px"].get(symbol)
     if hit and time.time() - hit[0] < 3:
         return hit[1]
+    if time.time() - _DSC.setdefault("px_try", {}).get(symbol, 0) < 15:
+        return None
+    _DSC["px_try"][symbol] = time.time()
     p = await deriv_get_latest_price(symbol)
     if p:
         _DSC["px"][symbol] = (time.time(), p)
@@ -13606,7 +13614,8 @@ async def _dsc_tick_one_inner(context, account):
                         print(f"[DSC] can't read trade {cid} on {index_key} right now (will retry)")
                     # Can't read it for a while: if Deriv's own open-trades list no longer has it, it is closed.
                     st.setdefault("unread_since", now)
-                    if now - st["unread_since"] > 45:
+                    if now - st["unread_since"] > 45 and now - st.get("snap_at", 0) > 40:
+                        st["snap_at"] = now
                         _snap = await deriv_fetch_account_snapshot(token)
                         if _snap and _snap.get("balance") is not None:
                             _ids = {str(c.get("contract_id")) for c in _snap.get("open_contracts", []) if c.get("contract_id")}

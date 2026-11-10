@@ -259,7 +259,7 @@ MT5_AUTOTRADE_BOTS = {
         "label": "🚀 Account Flip",
         "strategy_functions": [],
         "timeframe": "1h",
-        "description": "Trades support and resistance on the 1-hour chart with entries from the 30-minute chart, on gold and silver. When price respects a level it takes the first trade (50 pip stop on gold, 25 on silver). At +20 pips the stop moves to break-even and starts trailing, and it adds more trades every further 20 pips (up to 5), only once the earlier ones are protected. A setup might only happen about once a day.",
+        "description": "Trades support and resistance on the 1-hour chart with entries from the 30-minute chart, on gold and silver. When price respects a level it takes the first trade (100 pip stop on gold, 50 on silver). At +20 pips the stop moves to break-even and starts trailing, and it adds more trades every further 20 pips (up to 5), only once the earlier ones are protected. A setup might only happen about once a day.",
     },
     "conservative_structure": {
         "label": "🏛️ Conservative Structure",
@@ -3279,9 +3279,9 @@ SC_MODES = {
     "flip_fast": dict(SC_CFG, pending_pips=25, sl_pips=15, trail_activate_pips=15, trail_pips=8,
                       max_layers=5, add_pips=15, label="⚡ Account Flip (Fast)"),
     # Account Flip: support/resistance on the 1-hour chart, entry from the 30-minute chart.
-    # Stop 50 pips on gold, 25 on silver; at +20 pips break-even + trailing 10 behind;
+    # Stop 100 pips on gold, 50 on silver; at +20 pips break-even + trailing 10 behind;
     # one more trade every further 20 pips (max 5) once the earlier ones are protected.
-    "flip_sr": dict(SC_CFG, entry="sr", sl_pips=50, sl_pips_by_pair={"xauusd": 50, "xagusd": 25},
+    "flip_sr": dict(SC_CFG, entry="sr", sl_pips=100, sl_pips_by_pair={"xauusd": 100, "xagusd": 50},
                     trail_activate_pips=20, trail_pips=10, max_layers=5, add_pips=20,
                     label="🚀 Account Flip"),
 }

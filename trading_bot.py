@@ -13352,7 +13352,108 @@ DSC_MODES = {
     "flip_fast": {"pending_mult": 1.67, "activate_mult": 1.0, "trail_mult": 0.53,
                   "max_layers": 5, "add_mult": 1.0, "label": "⚡ Account Flip (Fast)"},
 }
-_DSC = {"subs": [], "subs_at": 0.0, "st": {}, "px": {}}
+_DSC = {"subs": [], "subs_at": 0.0, "st": {}, "px": {}, "locks": {}}
+
+
+class _DerivStream:
+    """One long-lived Deriv websocket that keeps live prices / contract profits in memory.
+    The scalper used to log in to Deriv on every check, which made Deriv answer 429 (rate limit)
+    for everything, including users tapping Connect Deriv."""
+
+    def __init__(self, token, name, url_fn=None):
+        self.token = token
+        self.name = name
+        self.url_fn = url_fn
+        self.reqs = []
+        self.data = {}
+        self.ws = None
+        self.task = None
+        self.last_use = time.time()
+
+    def ensure(self):
+        self.last_use = time.time()
+        if self.task is None or self.task.done():
+            self.task = asyncio.ensure_future(self._run())
+
+    async def subscribe(self, key, req):
+        if any(k == key for k, _ in self.reqs):
+            return
+        self.reqs.append((key, req))
+        _c = [r for r in self.reqs if r[0].startswith("c:")]
+        if len(_c) > 20:
+            self.reqs = [r for r in self.reqs if not r[0].startswith("c:")] + _c[-20:]
+        ws = self.ws
+        if ws is not None:
+            try:
+                await ws.send(json.dumps(req))
+            except Exception:
+                pass
+
+    def _handle(self, msg):
+        t = msg.get("tick")
+        if isinstance(t, dict) and t.get("symbol") and t.get("quote") is not None:
+            self.data["tick:" + str(t["symbol"])] = (time.time(), float(t["quote"]))
+        poc = msg.get("proposal_open_contract")
+        if isinstance(poc, dict) and poc.get("contract_id") and poc.get("profit") is not None:
+            self.data["c:" + str(poc["contract_id"])] = (time.time(), float(poc["profit"]), bool(poc.get("is_sold")))
+
+    async def _run(self):
+        backoff = 5
+        while time.time() - self.last_use < 600:
+            try:
+                url = await (self.url_fn() if self.url_fn else get_deriv_trading_ws_url(self.token))
+                if not url:
+                    await asyncio.sleep(backoff)
+                    backoff = min(backoff * 2, 60)
+                    continue
+                async with websockets.connect(url, open_timeout=10, close_timeout=5) as ws:
+                    self.ws = ws
+                    backoff = 5
+                    for _, req in list(self.reqs):
+                        await ws.send(json.dumps(req))
+                    while time.time() - self.last_use < 600:
+                        try:
+                            raw = await asyncio.wait_for(ws.recv(), timeout=25)
+                        except asyncio.TimeoutError:
+                            await ws.send(json.dumps({"ping": 1}))
+                            continue
+                        self._handle(json.loads(raw))
+            except asyncio.CancelledError:
+                raise
+            except Exception as e:
+                print(f"[DSC] stream {self.name} dropped: {type(e).__name__}")
+            finally:
+                self.ws = None
+            await asyncio.sleep(backoff)
+            backoff = min(backoff * 2, 60)
+
+
+_DSC_PRICE_STREAM = None
+_DSC_USER_STREAMS = {}
+
+
+async def _dsc_service_ws_url():
+    accounts_data = await deriv_get_options_accounts(DERIV_SERVICE_TOKEN)
+    lst = (accounts_data or {}).get("data")
+    if not isinstance(lst, list):
+        lst = (accounts_data or {}).get("accounts")
+    if not lst:
+        return None
+    account_id = lst[0].get("account_id") or lst[0].get("loginid") or lst[0].get("id")
+    return await deriv_get_otp_url(DERIV_SERVICE_TOKEN, account_id) if account_id else None
+
+
+async def _dsc_contract_profit(token, user_id, cid):
+    """(profit, is_sold) from the live stream; falls back to a one-off read."""
+    s = _DSC_USER_STREAMS.get(user_id)
+    if s is None or s.token != token:
+        s = _DSC_USER_STREAMS[user_id] = _DerivStream(token, f"user-{str(user_id)[-4:]}")
+    s.ensure()
+    await s.subscribe("c:" + str(cid), {"proposal_open_contract": 1, "contract_id": cid, "subscribe": 1})
+    hit = s.data.get("c:" + str(cid))
+    if hit and (hit[2] or time.time() - hit[0] < 12):
+        return hit[1], hit[2]
+    return await get_deriv_contract_live_profit(token, cid)
 
 
 async def deriv_get_latest_price(symbol):
@@ -13381,6 +13482,15 @@ async def deriv_get_latest_price(symbol):
 
 
 async def _dsc_price(symbol):
+    global _DSC_PRICE_STREAM
+    if DERIV_SERVICE_TOKEN:
+        if _DSC_PRICE_STREAM is None:
+            _DSC_PRICE_STREAM = _DerivStream(DERIV_SERVICE_TOKEN, "prices", url_fn=_dsc_service_ws_url)
+        _DSC_PRICE_STREAM.ensure()
+        await _DSC_PRICE_STREAM.subscribe("t:" + symbol, {"ticks": symbol, "subscribe": 1})
+        tick = _DSC_PRICE_STREAM.data.get("tick:" + symbol)
+        if tick and time.time() - tick[0] < 10:
+            return tick[1]
     hit = _DSC["px"].get(symbol)
     if hit and time.time() - hit[0] < 3:
         return hit[1]
@@ -13402,11 +13512,28 @@ async def _dsc_get_subscribers():
             and a.get("deriv_pair_choice") not in AUTO_COPY_EXCLUDED_INDICES
             and a.get("api_token") and a.get("deriv_bot_stake")
         ]
+        _seen, _uniq = set(), []
+        for a in _DSC["subs"]:
+            if str(a.get("user_id")) in _seen:
+                continue
+            _seen.add(str(a.get("user_id")))
+            _uniq.append(a)
+        _DSC["subs"] = _uniq
         _DSC["subs_at"] = time.time()
     return _DSC["subs"]
 
 
 async def _dsc_tick_one(context, account):
+    """One check per user at a time (two overlapping checks opened two trades)."""
+    lock_key = (str(account["user_id"]), account.get("deriv_pair_choice"))
+    lock = _DSC["locks"].setdefault(lock_key, asyncio.Lock())
+    if lock.locked():
+        return
+    async with lock:
+        await _dsc_tick_one_inner(context, account)
+
+
+async def _dsc_tick_one_inner(context, account):
     user_id = str(account["user_id"])
     token = account["api_token"]
     index_key = account["deriv_pair_choice"]
@@ -13434,7 +13561,7 @@ async def _dsc_tick_one(context, account):
         if st["phase"] == "open":
             total, open_n = 0.0, 0
             for cid in st["cids"]:
-                profit, sold = await get_deriv_contract_live_profit(token, cid)
+                profit, sold = await _dsc_contract_profit(token, user_id, cid)
                 if profit is None:
                     return
                 total += profit
@@ -21588,7 +21715,7 @@ def generate_signal_narrative(display_name, direction, winning_votes):
 # rare case where no usable candle data exists.
 # ============================================
 
-async def animate_analyzing_message(wait_message):
+async def animate_analyzing_message(wait_message, phrases=None):
     """
     Per explicit instruction - cycles through real process-step
     phrases (not just decorative moving dots) while the real signal
@@ -21619,11 +21746,12 @@ async def animate_analyzing_message(wait_message):
     the call sites via asyncio.wait_for), but this loop's own
     lifetime is no longer allowed to depend on that being fixed.
     """
-    phrases = [
-        "🧠 <b>Reading live price action...</b>",
-        "🧠 <b>Checking market conditions...</b>",
-        "🧠 <b>Finalizing your signal...</b>",
-    ]
+    if not phrases:
+        phrases = [
+            "🧠 <b>Reading live price action...</b>",
+            "🧠 <b>Checking market conditions...</b>",
+            "🧠 <b>Finalizing your signal...</b>",
+        ]
     i = 0
     first = True
     consecutive_failures = 0
@@ -26393,11 +26521,23 @@ async def handle_buttons(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if "deriv" in text:
         existing = get_deriv_account(user_id)
         if existing:
-            await update.message.reply_text(
+            _chk_msg = await update.message.reply_text(
                 "🔄 <b>Checking your linked Deriv account...</b>",
                 parse_mode=ParseMode.HTML
             )
-            snapshot = await deriv_fetch_account_snapshot_user(existing["api_token"])
+            _chk_anim = asyncio.create_task(animate_analyzing_message(_chk_msg, [
+                "🔄 <b>Checking your linked Deriv account.</b>",
+                "🔐 <b>Confirming your login with Deriv..</b>",
+                "📊 <b>Reading your balance and open trades...</b>",
+            ]))
+            try:
+                snapshot = await deriv_fetch_account_snapshot_user(existing["api_token"])
+            finally:
+                _chk_anim.cancel()
+                try:
+                    await _chk_msg.delete()
+                except Exception:
+                    pass
             if snapshot:
                 open_count = len(snapshot["open_contracts"])
 
@@ -34004,7 +34144,7 @@ def main():
     job_queue.run_repeating(manage_aggressive_positions, interval=5, first=55, name="aggressive_manager")
     job_queue.run_repeating(run_sc_tick, interval=5, first=58, name="aggressive_scalper_straddle")
     job_queue.run_repeating(run_bad_key_notify, interval=60, first=75, name="exness_bad_key_notify")
-    job_queue.run_repeating(run_dsc_tick, interval=4, first=62, name="deriv_scalper_straddle")
+    job_queue.run_repeating(run_dsc_tick, interval=3, first=62, name="deriv_scalper_straddle")
 
     # TP/SL monitor - checks every OPEN logged signal every 15 minutes
     job_queue.run_repeating(

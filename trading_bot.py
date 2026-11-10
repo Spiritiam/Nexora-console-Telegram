@@ -2397,6 +2397,53 @@ def _xc_daily_count_sync(user_id):
     return n
 
 
+_XC_BAD_KEYS = set()
+_XC_BAD_KEY_NOTIFIED = {}
+
+
+def _xc_flag_bad_key(account_ref, err):
+    """Remember accounts whose Exness API key Exness rejected, so the owner gets told."""
+    try:
+        if account_ref and "AUTH_INVALID_API_KEY" in str(err):
+            _XC_BAD_KEYS.add(str(account_ref))
+    except Exception:
+        pass
+
+
+async def run_bad_key_notify(context: ContextTypes.DEFAULT_TYPE):
+    """Tell users (once a day) when Exness says their API key no longer works."""
+    if not _XC_BAD_KEYS:
+        return
+    try:
+        accts = await asyncio.to_thread(get_all_active_mt5_autotrade_accounts)
+        if not isinstance(accts, list):
+            return
+        pending = set(_XC_BAD_KEYS)
+        _XC_BAD_KEYS.clear()
+        now = time.time()
+        for a in accts:
+            ref = str(a.get("metaapi_account_id") or "")
+            if ref not in pending:
+                continue
+            uid = a.get("user_id")
+            if not uid or now - _XC_BAD_KEY_NOTIFIED.get(ref, 0) < 86400:
+                continue
+            _XC_BAD_KEY_NOTIFIED[ref] = now
+            try:
+                await context.bot.send_message(
+                    chat_id=int(uid),
+                    text=("⚠️ <b>Your Exness API key stopped working</b>\n\n"
+                          "Exness says it is no longer valid, so Nexora AI can't trade or manage your open trades on that account.\n\n"
+                          "To fix it: log in to Exness, create a new API key with Trading access only, then open "
+                          "Exness Auto-Trade in Nexora AI and reconnect with the new key."),
+                    parse_mode=ParseMode.HTML)
+                print(f"[XC] told a user their Exness API key is invalid")
+            except Exception as e:
+                print(f"[XC] bad-key notice failed: {type(e).__name__}")
+    except Exception as e:
+        print(f"[XC] bad-key notifier error: {type(e).__name__}: {e}")
+
+
 async def _xc_get_positions(metaapi_account_id, mt5_symbol):
     """Open positions on this symbol, or None when the lookup FAILED (so callers
     can refuse to trade when unsure - never assume 'no position')."""
@@ -2417,6 +2464,7 @@ async def _xc_get_positions(metaapi_account_id, mt5_symbol):
         ]
     except Exception as e:
         print(f"[XC] position lookup failed for {metaapi_account_id}: {type(e).__name__} {e}")
+        _xc_flag_bad_key(metaapi_account_id, e)
         _reset_client_mt5_connection(metaapi_account_id)
         return None
 
@@ -2427,8 +2475,12 @@ def _xc_trade_action_sync(metaapi_account_id, payload):
         if broker is None:
             return False, "Exness credentials unavailable"
         try:
-            return broker.trade_action(payload)
+            ok, msg = broker.trade_action(payload)
+            if not ok:
+                _xc_flag_bad_key(metaapi_account_id, msg)
+            return ok, msg
         except Exception as e:
+            _xc_flag_bad_key(metaapi_account_id, e)
             return False, f"error: {e}"
     try:
         r = requests.post(
@@ -13295,7 +13347,7 @@ DSC_CFG = {
 # Scalper 15/20/10/10 pips -> 0.75 / 0.5 (break-even) / trail 1.0 behind peak.
 # Flip Fast 25/15/15/8 pips -> 1.67 / 1.0 / trail 0.53 behind peak, +1.0 per added trade.
 DSC_MODES = {
-    "aggressive": {"pending_mult": 0.75, "activate_mult": 0.5, "trail_mult": 1.0,
+    "aggressive": {"pending_mult": 0.75, "activate_mult": 0.5, "trail_mult": 0.5,
                    "max_layers": 1, "add_mult": 1.0, "label": "🐆 Aggressive Scalper"},
     "flip_fast": {"pending_mult": 1.67, "activate_mult": 1.0, "trail_mult": 0.53,
                   "max_layers": 5, "add_mult": 1.0, "label": "⚡ Account Flip (Fast)"},
@@ -13399,7 +13451,8 @@ async def _dsc_tick_one(context, account):
                 st["trailed"] = True
             if st.get("trailed"):
                 # stop level = peak - trail, but never below break-even
-                floor = max(0.0, st["peak"] - risk * mode["trail_mult"])
+                # lock a small profit (10% of risk) so a slow check can't turn a winner into a loss
+                floor = max(risk * 0.1, st["peak"] - risk * mode["trail_mult"])
                 if total <= floor:
                     for cid in st["cids"]:
                         await deriv_sell_contract(token, cid)
@@ -33950,7 +34003,8 @@ def main():
     job_queue.run_repeating(run_aggressive_entry_scan, interval=60, first=50, name="aggressive_entry_scan")
     job_queue.run_repeating(manage_aggressive_positions, interval=5, first=55, name="aggressive_manager")
     job_queue.run_repeating(run_sc_tick, interval=5, first=58, name="aggressive_scalper_straddle")
-    job_queue.run_repeating(run_dsc_tick, interval=10, first=62, name="deriv_scalper_straddle")
+    job_queue.run_repeating(run_bad_key_notify, interval=60, first=75, name="exness_bad_key_notify")
+    job_queue.run_repeating(run_dsc_tick, interval=4, first=62, name="deriv_scalper_straddle")
 
     # TP/SL monitor - checks every OPEN logged signal every 15 minutes
     job_queue.run_repeating(

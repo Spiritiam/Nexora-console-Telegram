@@ -3384,8 +3384,10 @@ def sr_flip_signal(h1_candles, fine_candles, now=None):
 async def get_sr_signal(kind, pair_key):
     """Cached per pair for 45s so many users on one pair cost one candle fetch."""
     hit = _SR_CACHE.get((kind, pair_key))
-    if hit and time.time() - hit[0] < 45:
+    if hit and time.time() - hit[0] < (150 if kind == "deriv" else 45):
         return hit[1]
+    if kind == "deriv" and _deriv_cooling_down():
+        return hit[1] if hit else None   # Deriv is rate limiting us: skip this check, try later
     sig = None
     try:
         if kind == "exness":
@@ -9455,7 +9457,7 @@ def _deriv_note_429():
     # logins / status checks never got through. Now the first 429 pauses
     # all background Deriv calls for 40 seconds so the limit can reset.
     global _DERIV_429_UNTIL
-    _DERIV_429_UNTIL = time.time() + 40
+    _DERIV_429_UNTIL = time.time() + 90
 
 async def deriv_get_options_accounts(token, priority=False):
     """
@@ -9562,6 +9564,10 @@ async def deriv_get_otp_url(token, account_id, priority=False):
                 _deriv_note_429()
                 if not priority:
                     print("[DERIV] OTP 429 - pausing background Deriv calls 40s")
+                    return None
+                if not _DERIV_PRIORITY_CTX.get():
+                    # Automatic trade-watching call: don't retry straight away (that keeps Deriv's
+                    # limit tripped); the caller tries again on its own schedule.
                     return None
             if response.status_code == 200:
                 data = response.json()
@@ -10947,7 +10953,7 @@ def match_synthetic_key(question):
                 return key
     return None
 
-SYNTHETIC_CANDLE_CACHE_SECONDS = {"1m": 30, "5m": 120, "30m": 120, "1h": 300, "4h": 14400}
+SYNTHETIC_CANDLE_CACHE_SECONDS = {"1m": 30, "5m": 120, "30m": 300, "1h": 900, "4h": 14400}
 synthetic_candle_cache = {}
 
 async def _deriv_get_candles_once(symbol, granularity, count):
@@ -16754,17 +16760,34 @@ def get_candles_exness(mt5_symbol, interval, outputsize):
     return None
 
 
+_EXQ = {}        # symbol -> (time, (bid, ask))
+_EXQ_BLOCK = {}  # symbol -> do not call Exness before this time (after a 429)
+
+
 def get_quote_exness(mt5_symbol):
-    """(bid, ask) or None."""
+    """(bid, ask) or None. Shared 2s cache so many users/jobs on one symbol cost one request,
+    and after a 429 the symbol rests for 8s (a recent quote, at most 8s old, is used meanwhile)."""
+    now = time.time()
+    hit = _EXQ.get(mt5_symbol)
+    if hit and now - hit[0] < 2:
+        return hit[1]
+    if now < _EXQ_BLOCK.get(mt5_symbol, 0):
+        return hit[1] if hit and now - hit[0] < 8 else None
     broker = _exness_md_broker()
     if broker is None:
         return None
     try:
         inst = _exness_md_instrument(broker, mt5_symbol)
-        return broker.quote(inst) if inst else None
+        q = broker.quote(inst) if inst else None
+        if q:
+            _EXQ[mt5_symbol] = (time.time(), q)
+        return q
     except Exception as e:
-        print(f"[EXNESS DATA] quote {mt5_symbol} failed: {type(e).__name__}: {str(e)[:120]}")
-        return None
+        msg = str(e)
+        if "429" in msg:
+            _EXQ_BLOCK[mt5_symbol] = time.time() + 8
+        print(f"[EXNESS DATA] quote {mt5_symbol} failed: {type(e).__name__}: {msg[:120]}")
+        return hit[1] if hit and time.time() - hit[0] < 8 else None
 
 
 def get_candles_metaapi(mt5_symbol, interval, outputsize):

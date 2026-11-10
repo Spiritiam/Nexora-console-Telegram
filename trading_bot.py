@@ -9134,6 +9134,7 @@ async def check_deriv_service_token_health(context: ContextTypes.DEFAULT_TYPE):
 
 
 _DERIV_SERVICE_ACCOUNTS_CACHE = {}
+_DERIV_USER_ACCOUNTS_CACHE = {}
 
 _DERIV_429_UNTIL = 0.0
 # Set while building a signal for people (scheduled channel post or a manual
@@ -9183,6 +9184,12 @@ async def deriv_get_options_accounts(token, priority=False):
         _hit = _DERIV_SERVICE_ACCOUNTS_CACHE.get("v")
         if _hit and _hit[0] > time.time():
             return _hit[1]
+    # User tokens: the account list barely changes, so reuse a successful lookup for 10 minutes.
+    # (The user-facing "Connect Deriv" check sets the priority context and always looks live.)
+    if token and token != DERIV_SERVICE_TOKEN and not _DERIV_PRIORITY_CTX.get():
+        _uhit = _DERIV_USER_ACCOUNTS_CACHE.get(token)
+        if _uhit and _uhit[0] > time.time():
+            return _uhit[1]
     priority = priority or _DERIV_PRIORITY_CTX.get()
     if not priority and _deriv_cooling_down():
         return None
@@ -9203,6 +9210,10 @@ async def deriv_get_options_accounts(token, priority=False):
                 _data = response.json()
                 if token and token == DERIV_SERVICE_TOKEN and _data:
                     _DERIV_SERVICE_ACCOUNTS_CACHE["v"] = (time.time() + 600, _data)
+                elif token and _data:
+                    _DERIV_USER_ACCOUNTS_CACHE[token] = (time.time() + 600, _data)
+                    if len(_DERIV_USER_ACCOUNTS_CACHE) > 500:
+                        _DERIV_USER_ACCOUNTS_CACHE.pop(next(iter(_DERIV_USER_ACCOUNTS_CACHE)))
                 return _data
             if response.status_code not in transient_statuses or attempt == max_attempts:
                 print(f"[DERIV] Accounts lookup failed {response.status_code}: {response.text}")
@@ -13395,6 +13406,8 @@ class _DerivStream:
             self.data["tick:" + str(t["symbol"])] = (time.time(), float(t["quote"]))
         poc = msg.get("proposal_open_contract")
         if isinstance(poc, dict) and poc.get("contract_id") and poc.get("profit") is not None:
+            if ("c:" + str(poc["contract_id"])) not in self.data:
+                print(f"[DSC] stream {self.name}: first reading for a contract (sold={bool(poc.get('is_sold'))})")
             self.data["c:" + str(poc["contract_id"])] = (time.time(), float(poc["profit"]), bool(poc.get("is_sold")))
 
     async def _run(self):
@@ -13403,6 +13416,7 @@ class _DerivStream:
             try:
                 url = await (self.url_fn() if self.url_fn else get_deriv_trading_ws_url(self.token))
                 if not url:
+                    print(f"[DSC] stream {self.name}: no connection URL (Deriv busy?), retry in {backoff}s")
                     await asyncio.sleep(backoff)
                     backoff = min(backoff * 2, 60)
                     continue
@@ -13587,6 +13601,9 @@ async def _dsc_tick_one_inner(context, account):
             for cid in st["cids"]:
                 profit, sold = await _dsc_contract_profit(token, user_id, cid)
                 if profit is None:
+                    if now - st.get("unread_logged", 0) > 120:
+                        st["unread_logged"] = now
+                        print(f"[DSC] can't read trade {cid} on {index_key} right now (will retry)")
                     return
                 total += profit
                 if not sold:

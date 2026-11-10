@@ -222,7 +222,7 @@ MT5_AUTOTRADE_BOTS = {
             "strategy_williams_r", "strategy_heikin_ashi_trend",
         ],
         "timeframe": "1min",
-        "description": "Buy Stop and Sell Stop 15 pips either side of price on the 1-minute chart. 20 pip stop loss; at +10 pips the stop moves to break-even, then trails 10 pips behind. Re-arms after every trade.",
+        "description": "Fast, short-term trades on US Oil and Bitcoin. Protects profit automatically and keeps watching for the next opportunity.",
     },
     "flip_fast": {
         "label": "⚡ Account Flip (Fast)",
@@ -259,7 +259,7 @@ MT5_AUTOTRADE_BOTS = {
         "label": "🚀 Account Flip",
         "strategy_functions": [],
         "timeframe": "1h",
-        "description": "Trades support and resistance on the 1-hour chart with entries from the 30-minute chart, on gold and silver. When price respects a level it takes the first trade (100 pip stop on gold, 50 on silver). At +20 pips the stop moves to break-even and starts trailing, and it adds more trades every further 20 pips (up to 5), only once the earlier ones are protected. A setup might only happen about once a day.",
+        "description": "Patient, selective trades on gold and silver at key market levels. Protects profit automatically and builds the position as the move develops. A trade might only come about once a day.",
     },
     "conservative_structure": {
         "label": "🏛️ Conservative Structure",
@@ -318,7 +318,7 @@ DERIV_AUTOTRADE_BOTS = {
     "aggressive": {
         "label": "🐆 Aggressive Scalper",
         "min_agree": 1,
-        "description": "Straddle: enters when price breaks out of a tight range either way. Your risk is the stop; at half your risk in profit the stop moves to break-even, then it trails. Re-arms after every trade.",
+        "description": "Fast, short-term trades. Protects profit automatically and keeps watching for the next opportunity.",
     },
     "conservative": {
         "label": "🛡️ Conservative Structure",
@@ -328,7 +328,7 @@ DERIV_AUTOTRADE_BOTS = {
     "flip_sr": {
         "label": "🚀 Account Flip",
         "min_agree": 1,
-        "description": "Trades support and resistance on the 1-hour chart with entries from the 30-minute chart. When price respects a level it takes the first trade. At 40% of your risk in profit the stop moves to break-even and starts trailing, and it adds more trades every further 40% (up to 5), only once the earlier ones are protected. A setup might only happen about once a day.",
+        "description": "Patient, selective trades at key market levels. Protects profit automatically and builds the position as the move develops. A trade might only come about once a day.",
     },
     "flip_fast": {
         "label": "⚡ Account Flip (Fast)",

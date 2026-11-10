@@ -255,6 +255,12 @@ MT5_AUTOTRADE_BOTS = {
         "timeframe": "15min",
         "description": "15-minute trend-following entries with a fixed stop loss and take profit.",
     },
+    "flip_sr": {
+        "label": "🚀 Account Flip",
+        "strategy_functions": [],
+        "timeframe": "1h",
+        "description": "Trades support and resistance on the 1-hour chart with entries from the 30-minute chart, on gold and silver. When price respects a level it takes the first trade (50 pip stop on gold, 25 on silver). At +20 pips the stop moves to break-even and starts trailing, and it adds more trades every further 20 pips (up to 5), only once the earlier ones are protected. A setup might only happen about once a day.",
+    },
     "conservative_structure": {
         "label": "🏛️ Conservative Structure",
         # EXPANDED per explicit instruction - core: Bollinger Squeeze
@@ -274,13 +280,27 @@ MT5_AUTOTRADE_BOTS = {
 # anyone already running one keeps working until they change bot.
 MT5_AUTOTRADE_BOTS_VISIBLE = {
     k: MT5_AUTOTRADE_BOTS[k]
-    for k in ("aggressive_scalper", "conservative_structure", "flip_fast")
+    for k in ("aggressive_scalper", "flip_sr")
 }
+# Which pairs each visible bot may trade (first = shown first).
+MT5_BOT_PAIRS = {
+    "aggressive_scalper": ["usoil", "btcusd"],
+    "flip_sr": ["xauusd", "xagusd"],
+}
+
+
+def mt5_pairs_for(bot_key):
+    return MT5_BOT_PAIRS.get(bot_key, MT5_AUTOTRADE_PAIRS)
+
+
+def mt5_bot_pair_ok(bot_key, pair_key):
+    """New selections: only the two visible bots, each on its own pairs."""
+    return bot_key in MT5_AUTOTRADE_BOTS_VISIBLE and pair_key in MT5_BOT_PAIRS.get(bot_key, [])
 
 # Curated subset of PAIR_CONFIG for bot trading - not all 12 pairs,
 # to keep the choice simple and recognizable.
 # Only the high-volatility instruments people actually trade: gold, bitcoin, oil, silver.
-MT5_AUTOTRADE_PAIRS = ["xauusd", "btcusd", "usoil", "xagusd"]
+MT5_AUTOTRADE_PAIRS = ["usoil", "btcusd", "xauusd", "xagusd"]
 
 # Deriv's mirror of MT5_AUTOTRADE_BOTS. IMPORTANT DIFFERENCE, stated
 # plainly rather than glossed over: synthetic indices already run
@@ -305,12 +325,19 @@ DERIV_AUTOTRADE_BOTS = {
         "min_agree": 3,
         "description": "Slower, higher-conviction entries - needs 3+ strategies to agree.",
     },
+    "flip_sr": {
+        "label": "🚀 Account Flip",
+        "min_agree": 1,
+        "description": "Trades support and resistance on the 1-hour chart with entries from the 30-minute chart. When price respects a level it takes the first trade. At 40% of your risk in profit the stop moves to break-even and starts trailing, and it adds more trades every further 40% (up to 5), only once the earlier ones are protected. A setup might only happen about once a day.",
+    },
     "flip_fast": {
         "label": "⚡ Account Flip (Fast)",
         "min_agree": 1,
         "description": "Same straddle entry, wider. Adds up to 4 more trades each time the move gains another stop-distance, only once earlier ones are protected, and closes them together on a pullback. Higher risk.",
     },
 }
+# Menus show only these two (the others stay defined for lookups on old rows).
+DERIV_AUTOTRADE_BOTS_VISIBLE = {k: DERIV_AUTOTRADE_BOTS[k] for k in ("aggressive", "flip_sr")}
 # DERIV_AUTOTRADE_PAIRS is defined further down, right after
 # SYNTHETIC_CONFIG/AUTO_COPY_EXCLUDED_INDICES exist - this dict here
 # doesn't depend on it, but that list does, and SYNTHETIC_CONFIG
@@ -1924,7 +1951,7 @@ async def run_mt5_autotrade_bot_scan(context: ContextTypes.DEFAULT_TYPE):
         combos.setdefault(key, []).append(account)
 
     for (bot_key, pair_key), subscribers in combos.items():
-        if bot_key in ("aggressive_scalper", "aggressive_breakout", "flip_fast"):
+        if bot_key in ("aggressive_scalper", "aggressive_breakout", "flip_fast", "flip_sr"):
             continue  # handled by the aggressive / straddle engines (run_aggressive_entry_scan)
         bot_info = MT5_AUTOTRADE_BOTS.get(bot_key)
         pair_config = PAIR_CONFIG.get(pair_key)
@@ -2409,6 +2436,105 @@ def _xc_flag_bad_key(account_ref, err):
             _XC_BAD_KEYS.add(str(account_ref))
     except Exception:
         pass
+
+
+
+# ---------------------------------------------------------------------------
+# One-off style migration (safe to repeat): only two bots are offered now.
+# Exness: anyone on a removed bot, or on the Aggressive Scalper with gold/silver,
+#   is moved to Aggressive Scalper on US Oil (lot / risk settings kept).
+# Deriv: Conservative -> Aggressive Scalper, Account Flip (old or Fast) -> Account Flip;
+#   the index they already trade is kept.
+# ---------------------------------------------------------------------------
+_MIG_OLD_EX = ("conservative_structure", "conservative_trend", "aggressive_breakout", "flip_fast", "account_flip")
+
+
+def _mig_exness_sync():
+    out = []
+    base = f"{SUPABASE_URL}/rest/v1/mt5_auto_trade_accounts"
+    sel = "select=user_id,bot_choice,pair_choice,risk_mode,lot_size,flip_base_lot"
+    rows = []
+    for q in (f"?bot_choice=in.({','.join(_MIG_OLD_EX)})&{sel}",
+              f"?bot_choice=eq.aggressive_scalper&pair_choice=in.(xauusd,xagusd)&{sel}"):
+        r = requests.get(base + q, headers=sb_headers(), timeout=15)
+        if r.status_code == 200 and isinstance(r.json(), list):
+            rows += r.json()
+    for row in rows:
+        uid = row.get("user_id")
+        if not uid:
+            continue
+        f = {"bot_choice": "aggressive_scalper", "pair_choice": "usoil"}
+        if row.get("risk_mode") == "account_flip":
+            f["risk_mode"] = "lot"
+            f["lot_size"] = row.get("flip_base_lot") or row.get("lot_size") or 0.01
+        r = requests.patch(f"{base}?user_id=eq.{uid}", headers=sb_headers(), json=f, timeout=15)
+        if r.status_code in (200, 204):
+            out.append((uid, row.get("bot_choice"), row.get("pair_choice")))
+        else:
+            print(f"[MIGRATE] Exness update failed: {r.status_code}")
+    return out
+
+
+def _mig_deriv_sync():
+    out = []
+    base = f"{SUPABASE_URL}/rest/v1/deriv_accounts"
+    r = requests.get(
+        base + "?deriv_bot_choice=in.(conservative,flip_fast,account_flip)"
+        "&select=user_id,deriv_bot_choice,deriv_bot_stake,deriv_flip_base_stake",
+        headers=sb_headers(), timeout=15)
+    rows = r.json() if r.status_code == 200 and isinstance(r.json(), list) else []
+    for row in rows:
+        uid = row.get("user_id")
+        old = row.get("deriv_bot_choice")
+        if not uid:
+            continue
+        f = {"deriv_bot_choice": "aggressive" if old == "conservative" else "flip_sr"}
+        if not row.get("deriv_bot_stake"):
+            want = float(row.get("deriv_flip_base_stake") or 0)
+            tier = max((t for t in STAKE_TIERS if t["stake"] <= want), key=lambda t: t["stake"], default=STAKE_TIERS[0])
+            f.update({"deriv_bot_stake": tier["stake"], "deriv_bot_risk": tier["risk"], "deriv_bot_win": tier["win"]})
+        r2 = requests.patch(f"{base}?user_id=eq.{uid}", headers=sb_headers(), json=f, timeout=15)
+        if r2.status_code in (200, 204):
+            out.append((uid, old))
+        else:
+            print(f"[MIGRATE] Deriv update failed: {r2.status_code}")
+    return out
+
+
+async def run_bot_migration(context: ContextTypes.DEFAULT_TYPE):
+    try:
+        moved_ex = await asyncio.to_thread(_mig_exness_sync)
+        moved_dv = await asyncio.to_thread(_mig_deriv_sync)
+        if moved_ex or moved_dv:
+            print(f"[MIGRATE] moved {len(moved_ex)} Exness and {len(moved_dv)} Deriv account(s) to the new bot lineup")
+            _SC["subs_at"] = 0.0
+            _DSC["subs_at"] = 0.0
+        for uid, old_bot, old_pair in moved_ex:
+            if old_bot == "aggressive_scalper":
+                text = ("🐆 <b>Aggressive Scalper now trades US Oil and Bitcoin</b>\n\n"
+                        "Gold and silver moved to the new 🚀 Account Flip bot. You've been switched to "
+                        "Aggressive Scalper on US Oil, with the same lot size. To change it, tap 🤖 Exness Auto-Trade.")
+            else:
+                text = ("🔄 <b>Your Exness bot was updated</b>\n\n"
+                        "We now offer two bots: 🐆 Aggressive Scalper (US Oil, Bitcoin) and 🚀 Account Flip (gold, silver). "
+                        "Your old bot is retired, so you've been moved to Aggressive Scalper on US Oil, with the same lot size. "
+                        "To change it, tap 🤖 Exness Auto-Trade.")
+            try:
+                await context.bot.send_message(chat_id=int(uid), text=text, parse_mode=ParseMode.HTML)
+            except Exception:
+                pass
+        for uid, old_bot in moved_dv:
+            new_label = "🐆 Aggressive Scalper" if old_bot == "conservative" else "🚀 Account Flip"
+            text = ("🔄 <b>Your Deriv bot was updated</b>\n\n"
+                    "We now offer two bots: 🐆 Aggressive Scalper and 🚀 Account Flip. "
+                    f"Your old bot is retired, so you've been moved to {new_label} on the same index, with the same stake. "
+                    "To change it, tap 🤖 Deriv Auto-Trade.")
+            try:
+                await context.bot.send_message(chat_id=int(uid), text=text, parse_mode=ParseMode.HTML)
+            except Exception:
+                pass
+    except Exception as e:
+        print(f"[MIGRATE] error: {type(e).__name__}: {str(e)[:120]}")
 
 
 async def run_bad_key_notify(context: ContextTypes.DEFAULT_TYPE):
@@ -3152,6 +3278,12 @@ SC_MODES = {
     "aggressive_scalper": SC_CFG,
     "flip_fast": dict(SC_CFG, pending_pips=25, sl_pips=15, trail_activate_pips=15, trail_pips=8,
                       max_layers=5, add_pips=15, label="⚡ Account Flip (Fast)"),
+    # Account Flip: support/resistance on the 1-hour chart, entry from the 30-minute chart.
+    # Stop 50 pips on gold, 25 on silver; at +20 pips break-even + trailing 10 behind;
+    # one more trade every further 20 pips (max 5) once the earlier ones are protected.
+    "flip_sr": dict(SC_CFG, entry="sr", sl_pips=50, sl_pips_by_pair={"xauusd": 50, "xagusd": 25},
+                    trail_activate_pips=20, trail_pips=10, max_layers=5, add_pips=20,
+                    label="🚀 Account Flip"),
 }
 SC_PAIR_CFG = {
     "xauusd": {"pip": 0.1,   "max_spread_pips": 4},
@@ -3160,6 +3292,133 @@ SC_PAIR_CFG = {
     "usoil":  {"pip": 0.01,  "max_spread_pips": 6},
 }
 _SC = {"subs": [], "subs_at": 0.0, "st": {}, "q": {}, "tick_n": 0}
+
+
+# ---------------------------------------------------------------------------
+# Support / resistance signal for Account Flip (Exness and Deriv).
+# Levels come from 1-hour swing highs/lows that price has respected at least
+# twice; the entry is a 30-minute candle that tests a level and closes back
+# away from it (bullish at support, bearish at resistance).
+# ---------------------------------------------------------------------------
+_SR_CACHE = {}
+
+
+def _sr_ts(t):
+    try:
+        if isinstance(t, (int, float)):
+            return float(t)
+        return datetime.fromisoformat(str(t).replace("Z", "+00:00")).timestamp()
+    except Exception:
+        return None
+
+
+def _sr_bars(candles, secs, now):
+    """Aggregate candles into `secs` bars and drop the one still forming."""
+    out, cur = [], None
+    for c in candles or []:
+        ts = _sr_ts(c.get("time"))
+        if ts is None:
+            return []
+        b = int(ts // secs) * secs
+        if cur is None or cur["t"] != b:
+            if cur:
+                out.append(cur)
+            cur = {"t": b, "open": float(c["open"]), "high": float(c["high"]),
+                   "low": float(c["low"]), "close": float(c["close"])}
+        else:
+            cur["high"] = max(cur["high"], float(c["high"]))
+            cur["low"] = min(cur["low"], float(c["low"]))
+            cur["close"] = float(c["close"])
+    if cur:
+        out.append(cur)
+    return [b for b in out if b["t"] + secs <= now]
+
+
+def sr_flip_signal(h1_candles, fine_candles, now=None):
+    """('BUY'|'SELL') setup at a respected 1-hour level, or None.
+    fine_candles can be 15-minute or 30-minute candles; they are grouped into 30-minute bars."""
+    now = now or time.time()
+    h1 = _sr_bars(h1_candles, 3600, now)
+    m30 = _sr_bars(fine_candles, 1800, now)
+    if len(h1) < 40 or len(m30) < 3:
+        return None
+    atr_series = calculate_atr_series(h1, 14)
+    if not atr_series:
+        return None
+    atr = atr_series[-1]
+    if atr <= 0:
+        return None
+    bar = m30[-1]
+    if bar["t"] + 1800 < now - 2700:
+        return None  # market closed / data stale: not a fresh candle
+    swings = find_swing_points(h1[-150:], strength=2)
+    tol = 0.35 * atr
+    levels = []
+    for kind, typ in (("support", "low"), ("resistance", "high")):
+        pts = sorted(sw["price"] for sw in swings if sw["type"] == typ)
+        cluster = []
+        for pr in pts + [None]:
+            if pr is not None and (not cluster or pr - cluster[-1] <= tol):
+                cluster.append(pr)
+                continue
+            if len(cluster) >= 2:
+                levels.append({"kind": kind, "price": sum(cluster) / len(cluster), "touches": len(cluster)})
+            cluster = [pr] if pr is not None else []
+    best = None
+    for lv in levels:
+        L = lv["price"]
+        if lv["kind"] == "support":
+            ok = (L - 0.6 * atr <= bar["low"] <= L + 0.2 * atr and bar["close"] > L
+                  and bar["close"] > bar["open"] and bar["close"] - L <= 1.2 * atr)
+            direction = "BUY"
+        else:
+            ok = (L - 0.2 * atr <= bar["high"] <= L + 0.6 * atr and bar["close"] < L
+                  and bar["close"] < bar["open"] and L - bar["close"] <= 1.2 * atr)
+            direction = "SELL"
+        if ok and (best is None or lv["touches"] > best["touches"]):
+            best = {"direction": direction, "level": L, "touches": lv["touches"],
+                    "bar_t": bar["t"], "atr": atr, "kind": lv["kind"]}
+    return best
+
+
+async def get_sr_signal(kind, pair_key):
+    """Cached per pair for 45s so many users on one pair cost one candle fetch."""
+    hit = _SR_CACHE.get((kind, pair_key))
+    if hit and time.time() - hit[0] < 45:
+        return hit[1]
+    sig = None
+    try:
+        if kind == "exness":
+            cfg = PAIR_CONFIG[pair_key]
+            h1 = await asyncio.to_thread(get_cached_candles, pair_key, cfg, "1h", 200, False, 600)
+            m15 = await asyncio.to_thread(get_cached_candles, pair_key, cfg, "15min", 120, False, 120)
+            if h1 and m15:
+                sig = sr_flip_signal(h1, m15)
+        else:
+            cfg = SYNTHETIC_CONFIG[pair_key]
+            h1 = await get_cached_synthetic_candles(pair_key, cfg["symbol"], "1h", 3600, 120)
+            m30 = await get_cached_synthetic_candles(pair_key, cfg["symbol"], "30m", 1800, 40)
+            if h1 and m30:
+                sig = sr_flip_signal(h1, m30)
+    except Exception as e:
+        print(f"[SR] signal error {kind} {pair_key}: {type(e).__name__}: {str(e)[:100]}")
+        return _SR_CACHE.get((kind, pair_key), (0, None))[1]
+    _SR_CACHE[(kind, pair_key)] = (time.time(), sig)
+    return sig
+
+
+def _sr_should_skip(st, sig, now):
+    """Same candle twice, or the same level again within 4 hours."""
+    if st.get("sr_bar") == sig["bar_t"]:
+        return True
+    lv = st.get("sr_level")
+    if lv is not None and abs(lv - sig["level"]) <= 0.35 * sig["atr"] and now - st.get("sr_level_at", 0) < 4 * 3600:
+        return True
+    return False
+
+
+def _sc_sl_pips(cfg, pair_key):
+    return (cfg.get("sl_pips_by_pair") or {}).get(pair_key, cfg["sl_pips"])
 
 
 async def _sc_get_subscribers():
@@ -3227,6 +3486,7 @@ async def _sc_tick_one(context, account):
     try:
         pc = SC_PAIR_CFG[pair_key]
         pip = pc["pip"]
+        sl_pips = _sc_sl_pips(cfg, pair_key)
         pair_config = PAIR_CONFIG[pair_key]
         decimals = pair_config["decimals"]
         now = time.time()
@@ -3285,8 +3545,8 @@ async def _sc_tick_one(context, account):
                     if moved >= cfg["add_pips"] * pip:
                         sls = [float(p["stopLoss"]) for p in mine if p.get("stopLoss")]
                         best = max(sls) if direction == "BUY" else min(sls)
-                        if abs(cur - best) < cfg["sl_pips"] * pip * 0.3:
-                            best = cur - cfg["sl_pips"] * pip * 0.5 if direction == "BUY" else cur + cfg["sl_pips"] * pip * 0.5
+                        if abs(cur - best) < sl_pips * pip * 0.3:
+                            best = cur - sl_pips * pip * 0.5 if direction == "BUY" else cur + sl_pips * pip * 0.5
                         vol = float(mine[0].get("volume") or account.get("lot_size") or 0.01)
                         st["last_add"] = now
                         oid = await place_client_mt5_trade(
@@ -3334,20 +3594,30 @@ async def _sc_tick_one(context, account):
         if (ask - bid) / pip > pc["max_spread_pips"]:
             return  # spread too wide: neither arm nor trigger
 
-        dist = cfg["pending_pips"] * pip
-        if st["phase"] in ("arm", None) or now - st.get("armed_at", 0) > cfg["pending_expiry_s"]:
-            st.update({"phase": "armed", "armed_at": now, "buy_lvl": ask + dist, "sell_lvl": bid - dist})
-            return
+        sig = None
+        if cfg.get("entry") == "sr":
+            # Account Flip: no straddle. Wait for a respected 1-hour level with a 30-minute rejection candle.
+            if st["phase"] in ("arm", None, "armed"):
+                st["phase"] = "armed"
+            sig = await get_sr_signal("exness", pair_key)
+            if not sig or _sr_should_skip(st, sig, now):
+                return
+            direction = sig["direction"]
+        else:
+            dist = cfg["pending_pips"] * pip
+            if st["phase"] in ("arm", None) or now - st.get("armed_at", 0) > cfg["pending_expiry_s"]:
+                st.update({"phase": "armed", "armed_at": now, "buy_lvl": ask + dist, "sell_lvl": bid - dist})
+                return
 
-        direction = None
-        if ask >= st["buy_lvl"]:
-            direction = "BUY"
-        elif bid <= st["sell_lvl"]:
-            direction = "SELL"
-        if not direction:
-            return
+            direction = None
+            if ask >= st["buy_lvl"]:
+                direction = "BUY"
+            elif bid <= st["sell_lvl"]:
+                direction = "SELL"
+            if not direction:
+                return
 
-        sl_dist = cfg["sl_pips"] * pip
+        sl_dist = sl_pips * pip
         fill = ask if direction == "BUY" else bid
         # Enter even if price already ran past the level: the stop loss is set from the real entry price.
         positions = await _xc_get_positions(acct_id, resolved)
@@ -3367,17 +3637,28 @@ async def _sc_tick_one(context, account):
             st["phase"] = "arm"
             return
         st.update({"phase": "open", "pids": [str(order_id)], "dir": direction, "trailed": False})
+        if sig:
+            st.update({"sr_bar": sig["bar_t"], "sr_level": sig["level"], "sr_level_at": now})
         st["trades"] += 1
         print(f"[SC] ✅ {account['bot_choice']} {direction} {resolved} user={user_id} vol={volume} entry~{fill} sl={sl} (trade {st['trades']} today)")
         if not st.get("told"):
             st["told"] = True
+            if sig:
+                await _sc_notify(
+                    context, user_id,
+                    f"{cfg['label']} <b>is trading</b>\n\n"
+                    f"{direction} {pair_config['display']} at a {sig['kind']} level — {volume} lots, {sl_pips} pip stop.\n"
+                    f"At +{cfg['trail_activate_pips']} pips the stop moves to break-even and trails, then it adds a trade every further "
+                    f"{cfg['add_pips']} pips (up to {cfg['max_layers']}) once the earlier ones are protected. "
+                    f"A setup may only come about once a day. I won't message you for each trade.")
+                return
             extra = (f"It adds up to {cfg['max_layers'] - 1} more trades while the move runs, only once the earlier ones are protected. "
                      if cfg["max_layers"] > 1 else "")
             await _sc_notify(
                 context, user_id,
                 f"{cfg['label']} <b>is trading</b>\n\n"
                 f"First trade: {direction} {pair_config['display']} — {volume} lots, "
-                f"{cfg['sl_pips']} pip stop, trailing stop on.\n"
+                f"{sl_pips} pip stop, trailing stop on.\n"
                 f"It keeps a Buy Stop and Sell Stop {cfg['pending_pips']} pips either side of price and "
                 f"re-arms after each trade. {extra}I won't message you for each one.")
     except Exception as e:
@@ -4804,7 +5085,7 @@ def _napp_deriv_options():
     return {
         "bots": [
             {"key": k, "label": _napp_clean_label(v["label"]), "description": v["description"]}
-            for k, v in DERIV_AUTOTRADE_BOTS.items()
+            for k, v in DERIV_AUTOTRADE_BOTS_VISIBLE.items()
         ],
         "pairs": [
             {"key": p, "display": SYNTHETIC_CONFIG[p]["display"]}
@@ -4984,7 +5265,7 @@ async def nexora_app_deriv_config_handler(request):
         except Exception:
             stake = None
         tier = next((t for t in STAKE_TIERS if stake is not None and t["stake"] == stake), None)
-        if bot_key not in DERIV_AUTOTRADE_BOTS or pair_key not in DERIV_AUTOTRADE_PAIRS or not tier:
+        if bot_key not in DERIV_AUTOTRADE_BOTS_VISIBLE or pair_key not in DERIV_AUTOTRADE_PAIRS or not tier:
             return _napp_json({"error": "bad_request", "message": "Pick a bot, an index and a stake."}, 400)
         fields = {
             "deriv_bot_choice": bot_key, "deriv_pair_choice": pair_key,
@@ -4993,6 +5274,7 @@ async def nexora_app_deriv_config_handler(request):
         }
         done_text = f"{_napp_clean_label(DERIV_AUTOTRADE_BOTS[bot_key]['label'])} is on."
     elif mode == "flip":
+        return _napp_json({"error": "bad_request", "message": "Account Flip has been updated. Pick it from the bot list."}, 400)
         pair_key = body.get("pair")
         try:
             base = float(body.get("base_stake"))
@@ -5331,7 +5613,8 @@ def _napp_exness_mask_number(number):
 def _napp_exness_options():
     return {
         "bots": [
-            {"key": k, "label": _napp_clean_label(v["label"]), "description": v["description"]}
+            {"key": k, "label": _napp_clean_label(v["label"]), "description": v["description"],
+             "pairs": mt5_pairs_for(k)}
             for k, v in MT5_AUTOTRADE_BOTS_VISIBLE.items()
         ],
         "pairs": [
@@ -6474,13 +6757,14 @@ async def nexora_app_exness_config_handler(request):
                 fields = {"bot_choice": mode, "pair_choice": None, **sz}
             elif mode == "bot":
                 bot_key = body.get("bot")
-                if bot_key not in MT5_AUTOTRADE_BOTS or pair not in MT5_AUTOTRADE_PAIRS:
-                    return bad("Pick a bot and a pair.")
+                if not mt5_bot_pair_ok(bot_key, pair):
+                    return bad("Pick a bot and one of its pairs.")
                 sz = _sizing(existing_ok=not cur_flip)
                 if not sz:
                     return bad("Set a valid lot size or risk %.")
                 fields = {"bot_choice": bot_key, "pair_choice": pair, **sz}
             elif mode == "account_flip":
+                return bad("Account Flip has been updated. Pick it from the bot list.")
                 if pair not in MT5_AUTOTRADE_PAIRS:
                     return bad("Pick the pair Account Flip should trade.")
                 if body.get("accepted") is not True:
@@ -6734,8 +7018,8 @@ async def nexora_app_prop_config_handler(request):
         fields = {"risk_mode": "lot", "lot_size": lot}
         if mode == "bot":
             bot_key, pair = body.get("bot"), body.get("pair")
-            if bot_key not in MT5_AUTOTRADE_BOTS or pair not in MT5_AUTOTRADE_PAIRS:
-                return bad("Pick a bot and a pair.")
+            if not mt5_bot_pair_ok(bot_key, pair):
+                return bad("Pick a bot and one of its pairs.")
             fields.update({"bot_choice": bot_key, "pair_choice": pair})
         elif mode in ("follow_channel", "copy_channel"):
             fields.update({"bot_choice": mode, "pair_choice": None})
@@ -10663,7 +10947,7 @@ def match_synthetic_key(question):
                 return key
     return None
 
-SYNTHETIC_CANDLE_CACHE_SECONDS = {"1m": 30, "5m": 120, "1h": 300, "4h": 14400}
+SYNTHETIC_CANDLE_CACHE_SECONDS = {"1m": 30, "5m": 120, "30m": 120, "1h": 300, "4h": 14400}
 synthetic_candle_cache = {}
 
 async def _deriv_get_candles_once(symbol, granularity, count):
@@ -13201,7 +13485,7 @@ async def run_deriv_autotrade_bot_scan(context: ContextTypes.DEFAULT_TYPE):
     bot_accounts = [
         a for a in accounts
         if a.get("deriv_autotrade_enabled") and a.get("deriv_bot_choice") in DERIV_AUTOTRADE_BOTS and a.get("deriv_pair_choice")
-        and a.get("deriv_bot_choice") not in ("aggressive", "flip_fast")  # served by the straddle engine (run_dsc_tick)
+        and a.get("deriv_bot_choice") not in ("aggressive", "flip_fast", "flip_sr")  # served by the straddle engine (run_dsc_tick)
     ]
     if not bot_accounts:
         return
@@ -13390,6 +13674,10 @@ DSC_MODES = {
                    "max_layers": 1, "add_mult": 1.0, "label": "🐆 Aggressive Scalper"},
     "flip_fast": {"pending_mult": 1.67, "activate_mult": 1.0, "trail_mult": 0.53,
                   "max_layers": 5, "add_mult": 1.0, "label": "⚡ Account Flip (Fast)"},
+    # Account Flip: support/resistance entry (1-hour levels, 30-minute candle). Stop = your risk;
+    # at 40% of risk in profit -> break-even + trail 20% of risk behind; adds a trade every further 40%.
+    "flip_sr": {"entry": "sr", "pending_mult": 0, "activate_mult": 0.4, "trail_mult": 0.2,
+                "max_layers": 5, "add_mult": 0.4, "label": "🚀 Account Flip"},
 }
 _DSC = {"subs": [], "subs_at": 0.0, "st": {}, "px": {}, "locks": {}}
 
@@ -13643,7 +13931,7 @@ async def _dsc_tick_one_inner(context, account):
         today = datetime.utcnow().strftime("%Y-%m-%d")
         st = _DSC["st"].setdefault(key, {"phase": "arm", "day": today, "losses": 0})
         if st.get("mode") != account["deriv_bot_choice"]:
-            st.update({"mode": account["deriv_bot_choice"], "phase": "arm", "cids": [], "losses": 0, "notified": False})
+            st.update({"mode": account["deriv_bot_choice"], "phase": "arm", "cids": [], "losses": 0, "notified": False, "adopted": False})
         if st["day"] != today:
             st.update({"day": today, "losses": 0, "notified": False})
 
@@ -13701,7 +13989,7 @@ async def _dsc_tick_one_inner(context, account):
                         await asyncio.to_thread(mark_auto_copy_trade_closed, _cid, total / max(1, len(st["cids"])))
                     except Exception:
                         pass
-                st.update({"phase": "arm", "cids": [], "trailed": False, "peak": 0.0, "last_layer_profit": 0.0})
+                st.update({"phase": "arm", "cids": [], "trailed": False, "peak": 0.0, "last_layer_profit": 0.0, "floor_hi": 0.0})
                 return
             st["peak"] = max(st.get("peak", 0.0), total)
             if st["peak"] >= risk * mode["activate_mult"]:
@@ -13722,7 +14010,11 @@ async def _dsc_tick_one_inner(context, account):
             if st.get("trailed"):
                 # stop level = peak - trail, but never below break-even
                 # lock a small profit (10% of risk) so a slow check can't turn a winner into a loss
-                floor = max(risk * 0.1, st["peak"] - risk * mode["trail_mult"])
+                _n = len(st["cids"]) if mode.get("entry") == "sr" else 1
+                floor = max(risk * 0.1 * _n, st["peak"] - risk * mode["trail_mult"] * _n)
+                if mode.get("entry") == "sr":
+                    floor = max(floor, st.get("floor_hi", 0.0))   # never loosens when a layer is added
+                    st["floor_hi"] = floor
                 if total <= floor:
                     for cid in st["cids"]:
                         await deriv_sell_contract(token, cid)
@@ -13730,7 +14022,7 @@ async def _dsc_tick_one_inner(context, account):
                     return
             # add another trade while the move runs (Account Flip Fast)
             if (mode["max_layers"] > 1 and len(st["cids"]) < mode["max_layers"] and st.get("trailed")
-                    and total - st.get("last_layer_profit", 0.0) >= risk * mode["add_mult"]
+                    and total - st.get("last_layer_profit", 0.0) >= risk * mode["add_mult"] * (len(st["cids"]) if mode.get("entry") == "sr" else 1)
                     and not account.get("trading_paused") and now - st.get("last_add", 0) > 15):
                 st["last_add"] = now
                 buy_data, error = await open_trade(st["dir"])
@@ -13758,17 +14050,26 @@ async def _dsc_tick_one_inner(context, account):
         if now < st.get("backoff_until", 0):
             return
 
-        price = await _dsc_price(symbol)  # one shared price connection for everyone
-        if not price:
-            return
-        sl_dist = price * risk / (stake * mult)
-        dist = sl_dist * mode["pending_mult"]
-        if st["phase"] == "arm" or now - st.get("armed_at", 0) > DSC_CFG["pending_expiry_s"]:
-            st.update({"phase": "armed", "armed_at": now, "buy_lvl": price + dist, "sell_lvl": price - dist})
-            return
-        direction = "BUY" if price >= st["buy_lvl"] else ("SELL" if price <= st["sell_lvl"] else None)
-        if not direction:
-            return
+        sig = None
+        if mode.get("entry") == "sr":
+            # Account Flip: no straddle. Wait for a respected 1-hour level with a 30-minute rejection candle.
+            st["phase"] = "armed"
+            sig = await get_sr_signal("deriv", index_key)
+            if not sig or _sr_should_skip(st, sig, now):
+                return
+            direction = sig["direction"]
+        else:
+            price = await _dsc_price(symbol)  # one shared price connection for everyone
+            if not price:
+                return
+            sl_dist = price * risk / (stake * mult)
+            dist = sl_dist * mode["pending_mult"]
+            if st["phase"] == "arm" or now - st.get("armed_at", 0) > DSC_CFG["pending_expiry_s"]:
+                st.update({"phase": "armed", "armed_at": now, "buy_lvl": price + dist, "sell_lvl": price - dist})
+                return
+            direction = "BUY" if price >= st["buy_lvl"] else ("SELL" if price <= st["sell_lvl"] else None)
+            if not direction:
+                return
         # Deriv stop loss is a fixed dollar amount, so a price that moved past the level
         # before we noticed does not raise the risk. Enter anyway.
         snapshot = await deriv_fetch_account_snapshot(token)
@@ -13803,12 +14104,25 @@ async def _dsc_tick_one_inner(context, account):
             return
         cid = buy_data.get("contract_id")
         log_auto_copy_trade(user_id, symbol, cid, direction, stake, risk, None)
-        st.update({"phase": "open", "cids": [cid], "dir": direction, "peak": 0.0, "trailed": False, "last_layer_profit": 0.0})
+        st.update({"phase": "open", "cids": [cid], "dir": direction, "peak": 0.0, "trailed": False, "last_layer_profit": 0.0, "floor_hi": 0.0})
+        if sig:
+            st.update({"sr_bar": sig["bar_t"], "sr_level": sig["level"], "sr_level_at": now})
         print(f"[DSC] ✅ {account['deriv_bot_choice']} {direction} {index_key} user={user_id} stake={stake} risk={risk}")
         if not st.get("told"):
             st["told"] = True
             extra = (f" It adds up to {mode['max_layers'] - 1} more trades while the move runs, only once the earlier ones are protected."
                      if mode["max_layers"] > 1 else "")
+            if sig:
+                try:
+                    await context.bot.send_message(
+                        chat_id=int(user_id),
+                        text=(f"{mode['label']} <b>is trading</b>\n\n{direction} {config['display']} at a {sig['kind']} level — "
+                              f"${stake} stake, ${risk} stop, trailing profit on.{extra}\n"
+                              f"A setup may only come about once a day. I won't message you for each trade."),
+                        parse_mode=ParseMode.HTML)
+                except Exception as e:
+                    print(f"[DSC] Couldn't notify {user_id}: {type(e).__name__}")
+                return
             try:
                 await context.bot.send_message(
                     chat_id=int(user_id),
@@ -16986,7 +17300,7 @@ METAAPI_FIRST_PAIRS = {
 }
 
 
-def get_cached_candles(pair_key, config, interval, outputsize=60, force_fresh=False):
+def get_cached_candles(pair_key, config, interval, outputsize=60, force_fresh=False, max_age=None):
     """
     CONFIRMED REAL BUG FIX: cache_key previously omitted outputsize
     entirely (f"{pair_key}_{interval}"), so whichever call happened
@@ -17017,7 +17331,7 @@ def get_cached_candles(pair_key, config, interval, outputsize=60, force_fresh=Fa
     """
     cache_key = f"{pair_key}_{interval}_{outputsize}"
     now = time.time()
-    ttl = CANDLE_CACHE_SECONDS.get(interval, 3600)
+    ttl = max_age if max_age else CANDLE_CACHE_SECONDS.get(interval, 3600)
     cached = candle_cache.get(cache_key)
     if not force_fresh and cached and (now - cached["timestamp"] < ttl):
         return cached["candles"]
@@ -27169,7 +27483,7 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if data.startswith("mt5auto_bot_"):
         user_id = str(query.from_user.id)
         bot_key = data.replace("mt5auto_bot_", "")
-        if bot_key not in MT5_AUTOTRADE_BOTS:
+        if bot_key not in MT5_AUTOTRADE_BOTS_VISIBLE:
             return
         if user_id not in mt5_signup_state:
             mt5_signup_state[user_id] = {"flow": "presetup"}
@@ -27177,7 +27491,7 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
         buttons = [
             [InlineKeyboardButton(PAIR_CONFIG[p]["display"], callback_data=f"mt5auto_pair_{p}")]
-            for p in MT5_AUTOTRADE_PAIRS
+            for p in mt5_pairs_for(bot_key)
         ]
         buttons.append([InlineKeyboardButton("⬅️ Back", callback_data="mt5auto_choose_bot")])
         await query.message.edit_text(
@@ -27195,6 +27509,8 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             return
         if user_id not in mt5_signup_state:
             mt5_signup_state[user_id] = {"flow": "presetup"}
+        if mt5_signup_state[user_id].get("bot_choice") in MT5_BOT_PAIRS and pair_key not in mt5_pairs_for(mt5_signup_state[user_id]["bot_choice"]):
+            return
         mt5_signup_state[user_id]["pair_choice"] = pair_key
         bot_choice = mt5_signup_state[user_id].get("bot_choice", "follow_channel")
         back_target = "mt5auto_start" if bot_choice in ("follow_channel", "copy_channel") else f"mt5auto_bot_{bot_choice}"
@@ -27665,11 +27981,11 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if data.startswith("mt5switch_bot_"):
         user_id = str(query.from_user.id)
         bot_key = data.replace("mt5switch_bot_", "")
-        if bot_key not in MT5_AUTOTRADE_BOTS:
+        if bot_key not in MT5_AUTOTRADE_BOTS_VISIBLE:
             return
         buttons = [
             [InlineKeyboardButton(PAIR_CONFIG[p]["display"], callback_data=f"mt5switch_pair_{bot_key}_{p}")]
-            for p in MT5_AUTOTRADE_PAIRS
+            for p in mt5_pairs_for(bot_key)
         ]
         buttons.append([InlineKeyboardButton("⬅️ Back", callback_data="mt5switch_choose_bot")])
         await query.message.edit_text(
@@ -27688,7 +28004,7 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         # match against the known bot keys directly instead.
         bot_key = next((k for k in MT5_AUTOTRADE_BOTS if remainder.startswith(k + "_")), None)
         pair_key = remainder[len(bot_key) + 1:] if bot_key else None
-        if not bot_key or pair_key not in MT5_AUTOTRADE_PAIRS:
+        if not bot_key or not mt5_bot_pair_ok(bot_key, pair_key):
             return
         upsert_mt5_autotrade_account(user_id, {"bot_choice": bot_key, "pair_choice": pair_key})
         await query.message.edit_text(
@@ -27949,12 +28265,12 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         user_id = str(query.from_user.id)
         buttons = [
             [InlineKeyboardButton(bot["label"], callback_data=f"derivauto_bot_{key}")]
-            for key, bot in DERIV_AUTOTRADE_BOTS.items()
+            for key, bot in DERIV_AUTOTRADE_BOTS_VISIBLE.items()
         ]
         buttons.append([InlineKeyboardButton("⬅️ Back", callback_data="derivauto_menu")])
         await query.message.edit_text(
             "🎯 <b>Choose a bot:</b>\n\n" + "\n\n".join(
-                f"{bot['label']} — {bot['description']}" for bot in DERIV_AUTOTRADE_BOTS.values()
+                f"{bot['label']} — {bot['description']}" for bot in DERIV_AUTOTRADE_BOTS_VISIBLE.values()
             ),
             parse_mode=ParseMode.HTML,
             reply_markup=InlineKeyboardMarkup(buttons)
@@ -27964,7 +28280,7 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if data.startswith("derivauto_bot_"):
         user_id = str(query.from_user.id)
         bot_key = data.replace("derivauto_bot_", "")
-        if bot_key not in DERIV_AUTOTRADE_BOTS:
+        if bot_key not in DERIV_AUTOTRADE_BOTS_VISIBLE:
             return
         buttons = [
             [InlineKeyboardButton(SYNTHETIC_CONFIG[p]["display"], callback_data=f"derivauto_pair_{bot_key}_{p}")]
@@ -34303,6 +34619,7 @@ def main():
     job_queue.run_repeating(run_sc_tick, interval=5, first=58, name="aggressive_scalper_straddle")
     job_queue.run_repeating(run_bad_key_notify, interval=60, first=75, name="exness_bad_key_notify")
     job_queue.run_repeating(run_dsc_tick, interval=3, first=62, name="deriv_scalper_straddle")
+    job_queue.run_repeating(run_bot_migration, interval=600, first=20, name="bot_lineup_migration")
 
     # TP/SL monitor - checks every OPEN logged signal every 15 minutes
     job_queue.run_repeating(

@@ -1,4 +1,5 @@
 import os
+import sys
 import io
 import asyncio
 import random
@@ -3400,6 +3401,12 @@ async def run_sc_tick(context: ContextTypes.DEFAULT_TYPE):
                 await _sc_tick_one(context, a)
 
         await asyncio.gather(*(one(a) for a in subs), return_exceptions=True)
+        if time.time() - _SC.get("hb", 0) > 300:
+            _SC["hb"] = time.time()
+            _ph = {}
+            for _k, _v in _SC["st"].items():
+                _ph[str(_v.get("phase"))] = _ph.get(str(_v.get("phase")), 0) + 1
+            print(f"[SC] watching {len(subs)} Exness account(s); phases={_ph}")
     except Exception as e:
         print(f"[SC] ❌ tick error: {type(e).__name__}: {e}")
 
@@ -9136,6 +9143,23 @@ async def check_deriv_service_token_health(context: ContextTypes.DEFAULT_TYPE):
 _DERIV_SERVICE_ACCOUNTS_CACHE = {}
 _DERIV_USER_ACCOUNTS_CACHE = {}
 _OTP_STATE = {"last": 0.0}
+_DERIV_CALLS = {}
+
+
+def _deriv_count_call(kind):
+    """Counts Deriv login/account requests by the function that asked (for the 5-minute stats line)."""
+    try:
+        f = sys._getframe(3)
+        names = []
+        for _ in range(4):
+            if f is None:
+                break
+            names.append(f.f_code.co_name)
+            f = f.f_back
+        key = kind + ":" + ">".join(names[:3])
+        _DERIV_CALLS[key] = _DERIV_CALLS.get(key, 0) + 1
+    except Exception:
+        pass
 
 _DERIV_429_UNTIL = 0.0
 # Set while building a signal for people (scheduled channel post or a manual
@@ -9199,7 +9223,8 @@ async def deriv_get_options_accounts(token, priority=False):
     max_attempts = 3
     for attempt in range(1, max_attempts + 1):
         try:
-            response = requests.get(url, headers=deriv_api_headers(token), timeout=10)
+            _deriv_count_call("accounts")
+            response = await asyncio.to_thread(requests.get, url, headers=deriv_api_headers(token), timeout=10)
             if response.status_code == 429:
                 _deriv_note_429()
                 if not priority:
@@ -9251,7 +9276,8 @@ async def deriv_get_otp_url(token, account_id, priority=False):
             if _gap > 0:
                 await asyncio.sleep(_gap)
             _OTP_STATE["last"] = time.time()
-            response = requests.post(url, headers=deriv_api_headers(token), timeout=10)
+            _deriv_count_call("otp")
+            response = await asyncio.to_thread(requests.post, url, headers=deriv_api_headers(token), timeout=10)
             if response.status_code == 429:
                 _deriv_note_429()
                 if not priority:
@@ -13813,6 +13839,14 @@ async def run_dsc_tick(context: ContextTypes.DEFAULT_TYPE):
                 await _dsc_tick_one(context, a)
 
         await asyncio.gather(*(one(a) for a in subs), return_exceptions=True)
+        if time.time() - _DSC.get("hb", 0) > 300:
+            _DSC["hb"] = time.time()
+            _ph = {}
+            for _k, _v in _DSC["st"].items():
+                _ph[str(_v.get("phase"))] = _ph.get(str(_v.get("phase")), 0) + 1
+            _top = sorted(_DERIV_CALLS.items(), key=lambda kv: -kv[1])[:8]
+            print(f"[DSC] watching {len(subs)} Deriv account(s); phases={_ph}; deriv calls last 5 min={_top}")
+            _DERIV_CALLS.clear()
     except Exception as e:
         print(f"[DSC] ❌ tick error: {type(e).__name__}: {e}")
 

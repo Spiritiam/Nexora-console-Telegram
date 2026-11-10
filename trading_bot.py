@@ -13604,12 +13604,26 @@ async def _dsc_tick_one_inner(context, account):
                     if now - st.get("unread_logged", 0) > 120:
                         st["unread_logged"] = now
                         print(f"[DSC] can't read trade {cid} on {index_key} right now (will retry)")
-                    return
+                    # Can't read it for a while: if Deriv's own open-trades list no longer has it, it is closed.
+                    st.setdefault("unread_since", now)
+                    if now - st["unread_since"] > 45:
+                        _snap = await deriv_fetch_account_snapshot(token)
+                        if _snap and _snap.get("balance") is not None:
+                            _ids = {str(c.get("contract_id")) for c in _snap.get("open_contracts", []) if c.get("contract_id")}
+                            if str(cid) not in _ids:
+                                profit, sold = 0.0, True
+                                st["forced"] = True
+                                print(f"[DSC] trade {cid} on {index_key} is no longer open on Deriv - treating as closed")
+                    if profit is None:
+                        return
+                else:
+                    st.pop("unread_since", None)
                 total += profit
                 if not sold:
                     open_n += 1
             if open_n == 0:
-                won = bool(st.get("trailed")) or total > 0
+                won = bool(st.get("trailed")) or total > 0 or bool(st.pop("forced", False))
+                st.pop("unread_since", None)
                 st["losses"] = 0 if won else st["losses"] + 1
                 print(f"[DSC] closed {index_key} user={user_id} {'win' if won else 'loss'} profit={total:.2f} consecutive_losses={st['losses']}")
                 for _cid in st["cids"]:

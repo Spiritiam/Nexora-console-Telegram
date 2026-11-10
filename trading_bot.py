@@ -13776,6 +13776,10 @@ class _DerivStream:
                 pass
 
     def _handle(self, msg):
+        _err = msg.get("error")
+        if isinstance(_err, dict) and time.time() - getattr(self, "_err_at", 0) > 120:
+            self._err_at = time.time()
+            print(f"[DSC] stream {self.name}: Deriv answered with an error ({msg.get('msg_type')}): {str(_err.get('code'))} {str(_err.get('message'))[:120]}")
         t = msg.get("tick")
         if isinstance(t, dict) and t.get("symbol") and t.get("quote") is not None:
             self.data["tick:" + str(t["symbol"])] = (time.time(), float(t["quote"]))
@@ -13799,6 +13803,7 @@ class _DerivStream:
                 async with websockets.connect(url, open_timeout=10, close_timeout=5) as ws:
                     self.ws = ws
                     backoff = 5
+                    print(f"[DSC] stream {self.name}: connected ({len(self.reqs)} subscription(s))")
                     for _, req in list(self.reqs):
                         await ws.send(json.dumps(req))
                     while time.time() - self.last_use < 600:

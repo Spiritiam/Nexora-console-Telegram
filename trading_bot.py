@@ -13358,7 +13358,7 @@ DSC_CFG = {
 # Scalper 15/20/10/10 pips -> 0.75 / 0.5 (break-even) / trail 1.0 behind peak.
 # Flip Fast 25/15/15/8 pips -> 1.67 / 1.0 / trail 0.53 behind peak, +1.0 per added trade.
 DSC_MODES = {
-    "aggressive": {"pending_mult": 0.75, "activate_mult": 0.5, "trail_mult": 0.5,
+    "aggressive": {"pending_mult": 0.75, "activate_mult": 0.5, "trail_mult": 0.15,
                    "max_layers": 1, "add_mult": 1.0, "label": "🐆 Aggressive Scalper"},
     "flip_fast": {"pending_mult": 1.67, "activate_mult": 1.0, "trail_mult": 0.53,
                   "max_layers": 5, "add_mult": 1.0, "label": "⚡ Account Flip (Fast)"},
@@ -13455,6 +13455,26 @@ async def _dsc_service_ws_url():
         return None
     account_id = lst[0].get("account_id") or lst[0].get("loginid") or lst[0].get("id")
     return await deriv_get_otp_url(DERIV_SERVICE_TOKEN, account_id) if account_id else None
+
+
+async def deriv_set_stop_loss(token, contract_id, amount):
+    """Move Deriv's own stop loss line on an open multiplier trade. Returns (ok, error_text)."""
+    try:
+        ws_url = await get_deriv_trading_ws_url(token)
+        if not ws_url:
+            return False, "no connection"
+        async with websockets.connect(ws_url, open_timeout=10, close_timeout=5) as ws:
+            await ws.send(json.dumps({"contract_update": 1, "contract_id": int(contract_id),
+                                      "limit_order": {"stop_loss": amount}}))
+            for _ in range(5):
+                resp = json.loads(await asyncio.wait_for(ws.recv(), timeout=10))
+                if resp.get("msg_type") == "contract_update" or "contract_update" in resp or "error" in resp:
+                    if resp.get("error"):
+                        return False, str(resp["error"].get("message", "error"))
+                    return True, ""
+        return False, "no answer"
+    except Exception as e:
+        return False, f"{type(e).__name__}"
 
 
 async def _dsc_contract_profit(token, user_id, cid):
@@ -13645,6 +13665,19 @@ async def _dsc_tick_one_inner(context, account):
             st["peak"] = max(st.get("peak", 0.0), total)
             if st["peak"] >= risk * mode["activate_mult"]:
                 st["trailed"] = True
+                # Show it on Deriv's chart too: pull the red stop-loss line right up next to the entry
+                # (Deriv only allows a stop loss as a loss amount, so the profit trail stays in the bot).
+                if mode is DSC_MODES["aggressive"]:
+                    _moved = st.setdefault("sl_moved", set())
+                    for _cid in st["cids"]:
+                        if _cid in _moved:
+                            continue
+                        _moved.add(_cid)
+                        for _amt in (0.05, 0.1):
+                            _ok, _err = await deriv_set_stop_loss(token, _cid, _amt)
+                            print(f"[DSC] moved stop loss line on {index_key} to ${_amt}: {'ok' if _ok else 'failed - ' + _err}")
+                            if _ok:
+                                break
             if st.get("trailed"):
                 # stop level = peak - trail, but never below break-even
                 # lock a small profit (10% of risk) so a slow check can't turn a winner into a loss

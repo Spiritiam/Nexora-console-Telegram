@@ -9459,6 +9459,33 @@ def _deriv_note_429():
     global _DERIV_429_UNTIL
     _DERIV_429_UNTIL = time.time() + 90
 
+# Cloudflare (error 1015) bans our server's address from api.derivws.com for a while when we ask too
+# often. Every extra request during the ban only extends it, so everything pauses - except an
+# occasional real trade/close action, which may try once every 30s.
+_DERIV_BAN = {"until": 0.0, "probe": 0.0}
+
+def _deriv_ban_blocks(critical):
+    now = time.time()
+    if now >= _DERIV_BAN["until"]:
+        return False
+    if critical and now - _DERIV_BAN["probe"] >= 30:
+        _DERIV_BAN["probe"] = now
+        return False
+    return True
+
+def _deriv_note_ban(text):
+    t = text or ""
+    if "1015" in t or "banned you temporarily" in t:
+        _first = time.time() >= _DERIV_BAN["until"]
+        _DERIV_BAN["until"] = time.time() + 180
+        if _first:
+            _m_ray = re.search(r"Ray ID: <strong[^>]*>([0-9a-f]+)</strong>", t)
+            _m_ip = re.search(r'id="cf-footer-ip">([0-9a-fA-F\.:]+)<', t)
+            print(f"[DERIV] Cloudflare ban (1015) from api.derivws.com - all Deriv calls paused 3 min. "
+                  f"Ray ID={_m_ray.group(1) if _m_ray else '?'} our IP={_m_ip.group(1) if _m_ip else '?'}")
+        return True
+    return False
+
 async def deriv_get_options_accounts(token, priority=False):
     """
     Step 1: lists every account (real and virtual) tied to this
@@ -9497,6 +9524,8 @@ async def deriv_get_options_accounts(token, priority=False):
         _uhit = _DERIV_USER_ACCOUNTS_CACHE.get(token)
         if _uhit and _uhit[0] > time.time():
             return _uhit[1]
+    if _deriv_ban_blocks(bool(priority) and not _DERIV_PRIORITY_CTX.get()):
+        return None
     priority = priority or _DERIV_PRIORITY_CTX.get()
     if not priority and _deriv_cooling_down():
         return None
@@ -9509,6 +9538,8 @@ async def deriv_get_options_accounts(token, priority=False):
             response = await asyncio.to_thread(requests.get, url, headers=deriv_api_headers(token), timeout=10)
             if response.status_code == 429:
                 _deriv_note_429()
+                if _deriv_note_ban(response.text):
+                    return None
                 if not priority:
                     print("[DERIV] Accounts lookup 429 - pausing background Deriv calls 40s")
                     return None
@@ -9524,7 +9555,7 @@ async def deriv_get_options_accounts(token, priority=False):
                         _DERIV_USER_ACCOUNTS_CACHE.pop(next(iter(_DERIV_USER_ACCOUNTS_CACHE)))
                 return _data
             if response.status_code not in transient_statuses or attempt == max_attempts:
-                print(f"[DERIV] Accounts lookup failed {response.status_code}: {response.text}")
+                print(f"[DERIV] Accounts lookup failed {response.status_code}: {response.text[:200]}")
                 if token == DERIV_SERVICE_TOKEN and response.status_code in (401, 403):
                     record_deriv_service_token_failure()
                 return None
@@ -9545,6 +9576,8 @@ async def deriv_get_otp_url(token, account_id, priority=False):
     Same retry fix as deriv_get_options_accounts above, for the same
     confirmed reason.
     """
+    if _deriv_ban_blocks(bool(priority) and not _DERIV_PRIORITY_CTX.get()):
+        return None
     priority = priority or _DERIV_PRIORITY_CTX.get()
     if not priority and _deriv_cooling_down():
         return None
@@ -9562,6 +9595,8 @@ async def deriv_get_otp_url(token, account_id, priority=False):
             response = await asyncio.to_thread(requests.post, url, headers=deriv_api_headers(token), timeout=10)
             if response.status_code == 429:
                 _deriv_note_429()
+                if _deriv_note_ban(response.text):
+                    return None
                 if not priority:
                     print("[DERIV] OTP 429 - pausing background Deriv calls 40s")
                     return None
@@ -9573,7 +9608,7 @@ async def deriv_get_otp_url(token, account_id, priority=False):
                 data = response.json()
                 return data.get("data", {}).get("url")
             if response.status_code not in transient_statuses or attempt == max_attempts:
-                print(f"[DERIV] OTP request failed {response.status_code}: {response.text}")
+                print(f"[DERIV] OTP request failed {response.status_code}: {response.text[:200]}")
                 return None
             print(f"[DERIV] OTP request got {response.status_code} (attempt {attempt}/{max_attempts}) - retrying...")
         except Exception as e:

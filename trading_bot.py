@@ -9426,6 +9426,11 @@ _DERIV_SERVICE_ACCOUNTS_CACHE = {}
 _DERIV_USER_ACCOUNTS_CACHE = {}
 _OTP_STATE = {"last": 0.0}
 _DERIV_CALLS = {}
+# Tokens Deriv said are invalid/expired: not asked again for 30 minutes (every check used to call Deriv
+# again, dozens of dead tokens every few seconds, which got our address banned). A user tapping
+# Connect Deriv always looks live, and a good answer clears the mark.
+_DERIV_DEAD_TOKENS = {}
+_ACC_STATE = {"next": 0.0}
 
 
 def _deriv_count_call(kind):
@@ -9524,6 +9529,9 @@ async def deriv_get_options_accounts(token, priority=False):
         _uhit = _DERIV_USER_ACCOUNTS_CACHE.get(token)
         if _uhit and _uhit[0] > time.time():
             return _uhit[1]
+    if token and token != DERIV_SERVICE_TOKEN and not _DERIV_PRIORITY_CTX.get():
+        if _DERIV_DEAD_TOKENS.get(token, 0) > time.time():
+            return None
     if _deriv_ban_blocks(bool(priority) and not _DERIV_PRIORITY_CTX.get()):
         return None
     priority = priority or _DERIV_PRIORITY_CTX.get()
@@ -9534,6 +9542,11 @@ async def deriv_get_options_accounts(token, priority=False):
     max_attempts = 3
     for attempt in range(1, max_attempts + 1):
         try:
+            # Space account lookups out too (a burst of them from many users at once trips Deriv's limit).
+            _slot = max(time.time(), _ACC_STATE["next"])
+            _ACC_STATE["next"] = _slot + 0.4
+            if _slot - time.time() > 0:
+                await asyncio.sleep(_slot - time.time())
             _deriv_count_call("accounts")
             response = await asyncio.to_thread(requests.get, url, headers=deriv_api_headers(token), timeout=10)
             if response.status_code == 429:
@@ -9543,7 +9556,12 @@ async def deriv_get_options_accounts(token, priority=False):
                 if not priority:
                     print("[DERIV] Accounts lookup 429 - pausing background Deriv calls 40s")
                     return None
+            if response.status_code in (401, 403) and token and token != DERIV_SERVICE_TOKEN:
+                _DERIV_DEAD_TOKENS[token] = time.time() + 1800
+                if len(_DERIV_DEAD_TOKENS) > 1000:
+                    _DERIV_DEAD_TOKENS.pop(next(iter(_DERIV_DEAD_TOKENS)))
             if response.status_code == 200:
+                _DERIV_DEAD_TOKENS.pop(token, None)
                 if token == DERIV_SERVICE_TOKEN:
                     record_deriv_service_token_success()
                 _data = response.json()

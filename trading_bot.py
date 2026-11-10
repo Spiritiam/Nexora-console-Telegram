@@ -26361,10 +26361,17 @@ async def build_exness_autotrade_dashboard(user_id, account, expiry, now):
         "🎯 <b>Auto-Trade:</b> OFF (paused - no new trades will open)" if trading_paused
         else "🎯 <b>Auto-Trade:</b> ON"
     )
+    try:
+        _linked_email = await asyncio.to_thread(get_verified_user_email, user_id)
+    except Exception:
+        _linked_email = None
+    _acct_no = account.get("account_number")
     text = (
         f"🤖 <b>Exness Auto-Trade — Active</b>\n\n"
-        f"Account: {account.get('account_name') or account.get('account_number', 'N/A')}\n"
+        f"Account: {account.get('account_name') or 'Exness'}\n"
+        + (f"Account number: {_acct_no}\n" if _acct_no else "")
         + (f"Connection: Exness API\n" if is_exn else f"Server: {account.get('server', 'N/A')}\n")
+        + (f"Email: {_linked_email}\n" if _linked_email else "")
         + f"Balance: {balance_display}\n\n"
         + ("Plan: Free\n" if is_exn else f"Subscription: {days_left} day(s) left\n")
         + f"Mode: {bot_label}"

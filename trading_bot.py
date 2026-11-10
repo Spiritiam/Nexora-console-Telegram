@@ -7926,7 +7926,7 @@ SL_HIT_IMAGE_FILE_ID = "AgACAgQAAxkBAAIBIWowI9Lxu93CIKFD5YSHFbJ8_MB-AAJBD2sbbT2B
 
 MORNING_PAIR_BY_WEEKDAY = {
     0: "xauusd",  # Monday
-    1: "xagusd",  # Tuesday
+    1: "btcusd",  # Tuesday (was XAGUSD, removed from scheduled signals)
     2: "usoil",   # Wednesday
     3: "usoil",   # Thursday
     4: "xauusd",  # Friday
@@ -7948,9 +7948,9 @@ MIDDAY_PAIR_BY_WEEKDAY = {
 EVENING_PAIR_BY_WEEKDAY = {
     0: "btcusd",  # Monday
     1: "xauusd",  # Tuesday
-    2: "xagusd",  # Wednesday
+    2: "xauusd",  # Wednesday (was XAGUSD, removed from scheduled signals)
     3: "btcusd",  # Thursday
-    4: "xagusd",  # Friday
+    4: "btcusd",  # Friday (was XAGUSD, removed from scheduled signals)
     5: "btcusd",  # Saturday - unchanged, per explicit instruction: synthetic in the
                   # morning, BTCUSD in the evening, no midday post.
     6: None,      # Sunday - unchanged, no posts at all

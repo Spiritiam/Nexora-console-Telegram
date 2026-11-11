@@ -82,7 +82,13 @@ async def _ensure_models():
         _STATE["loading"] = False
 
 
+# Markets that use the ML entry. Everything else keeps its old entry, whatever models exist in the store.
+ALLOWED = {"R_75", "R_100", "USOILm", "BTCUSDm"}
+
+
 def _pick_model(symbol, frac=None):
+    if symbol not in ALLOWED:
+        return None, None
     if frac is None:
         return MODELS.get(f"model:{symbol}:x20"), f"model:{symbol}:x20"
     best, bk, bd = None, None, 1e9

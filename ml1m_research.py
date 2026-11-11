@@ -643,7 +643,10 @@ EXNESS_SETUP = {
     # stop 20 pips; break-even at +10, then 10 pips behind (same as the live Aggressive Scalper). R = stop.
     "USOILm": {"pip": 0.01, "fallback_spread_pips": 3},
     "BTCUSDm": {"pip": 9.918, "fallback_spread_pips": 5},
+    "XAUUSDm": {"pip": 0.1, "fallback_spread_pips": 3},
 }
+EXNESS_TRAIN = ["XAUUSDm"]               # USOIL and BTCUSD models are already stored
+DERIV_RUN = ["R_10", "R_25", "R_50"]     # R_75 and R_100 are already trained and researched
 DERIV_SYMBOLS = ["R_75", "R_100"]
 EXN_CFG = lambda sl, spread: {"sl_mode": "price", "sl": sl, "spread": spread, "act": 0.5, "trail": 0.5, "floor_min": 0.0}
 DER_CFG = lambda frac: {"sl_mode": "frac", "sl": frac, "cost_R": DERIV_COST_R, "act": 0.5, "trail": 0.15, "floor_min": 0.1}
@@ -709,7 +712,7 @@ async def main():
     log("run started (read-only, no trades)")
     # ---- phase 1: quick history, train and store the live entry models --------------------------
     data = {}
-    for sym in DERIV_SYMBOLS:
+    for sym in DERIV_RUN:
         try:
             cs = await fetch_deriv_1m(sym, 120)
             if cs:
@@ -719,6 +722,8 @@ async def main():
             log(f"DERIV {sym}: failed {type(e).__name__}: {str(e)[:150]}")
         await asyncio.sleep(5)
     for sym, st in EXNESS_SETUP.items():
+        if sym not in EXNESS_TRAIN:
+            continue
         try:
             cs, spread = await asyncio.to_thread(fetch_exness_1m, sym, 60)
             if not spread:
@@ -731,7 +736,7 @@ async def main():
             log(f"EXNESS {sym}: failed {type(e).__name__}: {str(e)[:150]}")
     log("phase 1 done: live entry models stored")
     # ---- phase 2: all the history we can get, price-only research next to the indicator version ---
-    for sym in DERIV_SYMBOLS:
+    for sym in DERIV_RUN:
         try:
             cs = await fetch_deriv_1m(sym, 365)
             for frac in (0.008, 0.002):

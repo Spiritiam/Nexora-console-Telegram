@@ -112,7 +112,12 @@ def _decide(model, mkey, bars):
     o, h, l, c = (np.append(x, c[-1]) for x in (o, h, l, c))
     X, names = R.build_features(t, o, h, l, c, pure=False)
     x = X[-1]
-    theta = max(float(model["theta"]), 0.03)     # never enter on a prediction that is not clearly above zero after costs
+    # Default: no minimum edge - always take the better side, so a trade follows the last one within a minute.
+    # ML1M_MIN_EDGE (in units of the stop, e.g. 0.03) puts a floor back without a code change.
+    try:
+        theta = float(os.getenv("ML1M_MIN_EDGE", "-9"))
+    except ValueError:
+        theta = -9.0
     dec = {"ready": True, "dir": None, "bar_t": last_t, "sb": None, "ss": None, "theta": theta}
     if not np.isnan(x).any() and list(names) == list(model["names"]):
         sb = float(model["mb"].predict(x.reshape(1, -1))[0])

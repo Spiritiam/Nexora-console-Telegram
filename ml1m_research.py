@@ -31,7 +31,7 @@ CACHE_DIR = "/tmp/ml1m_cache"
 DERIV_PUBLIC_WS = "wss://api.derivws.com/trading/v1/options/ws/public"
 DERIV_FRACS = [0.001, 0.002, 0.004, 0.008, 0.016, 0.032]   # stop as a fraction of price (risk / (stake x multiplier))
 DERIV_COST_R = 0.055                                        # commission in units of the stop
-MODEL_VERSION = 1
+MODEL_VERSION = 2
 
 
 def log(msg):
@@ -411,7 +411,7 @@ def sim_all(o, h, l, c, t, d, sl, act, trail, floor_min, maxbars=120, gapmax=600
         st = np.maximum(st, newst)
         hit2 = cl <= st
         if hit2.any():
-            R[a[hit2]] = st[hit2]
+            R[a[hit2]] = cl[hit2]      # closed out at the bar's close (cautious when a bar is bigger than the stop)
             EX[a[hit2]] = k[hit2]
         alive = ~hit2
         a, e, s_, st, pk, cl, k = a[alive], e[alive], s_[alive], st[alive], pk[alive], cl[alive], k[alive]
@@ -440,7 +440,7 @@ def sim_one(o, h, l, c, t, i0, e, d, s, act, trail, floor_min, maxbars=120, gapm
         if pk >= act:
             st = max(st, max(floor_min, pk - trail))
         if cl <= st:
-            return st, k
+            return cl, k
         prev = cl
     return prev, last
 

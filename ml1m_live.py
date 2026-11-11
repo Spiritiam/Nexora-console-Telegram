@@ -52,7 +52,10 @@ def _load_models_sync():
             return
         for row in r.json():
             try:
-                out[row["key"]] = pickle.loads(zlib.decompress(base64.b64decode(row["data"])))
+                m = pickle.loads(zlib.decompress(base64.b64decode(row["data"])))
+                if m.get("ver") != R.MODEL_VERSION:
+                    continue          # older model trained with a less cautious exit simulation
+                out[row["key"]] = m
             except Exception as e:
                 _log(f"live: could not read {row.get('key')}: {type(e).__name__}")
     except Exception as e:

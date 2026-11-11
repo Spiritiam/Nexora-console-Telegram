@@ -3613,7 +3613,7 @@ async def _sc_tick_one(context, account):
             _ml = None
             if ML1M_LIVE and account["bot_choice"] == "aggressive_scalper":
                 try:
-                    _ml = await ml1m_live.exness_decision(pair_key, pair_config["mt5_symbol"], get_candles_exness)
+                    _ml = await ml1m_live.exness_decision(pair_key, pair_config["mt5_symbol"], _ml1m_candles)
                 except Exception as _e:
                     print(f"[ML1M] Exness entry check failed {pair_key}: {type(_e).__name__}: {str(_e)[:100]}")
                     return
@@ -16858,6 +16858,11 @@ def get_candles_exness(mt5_symbol, interval, outputsize):
     except Exception as e:
         print(f"[EXNESS DATA] candles {mt5_symbol} failed: {type(e).__name__}: {str(e)[:120]}")
     return None
+
+
+def _ml1m_candles(mt5_symbol, interval, outputsize):
+    """1-minute candles for the ML entry: Exness market data, then MetaAPI, then the backup account."""
+    return get_candles_metaapi(mt5_symbol, interval, outputsize) or get_candles_metaapi_backup(mt5_symbol, interval, outputsize)
 
 
 _EXQ = {}        # symbol -> (time, (bid, ask))

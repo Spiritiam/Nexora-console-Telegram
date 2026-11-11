@@ -202,7 +202,7 @@ async def deriv_decision(symbol, sl_frac, blocked=None):
                     b["fail_until"] = time.time() + 45
         bars = b["bars"]
         if len(bars) < 120 or now - bars[-1][0] > 240:
-            return {"ready": True, "dir": None, "bar_t": 0}
+            return {"ready": False}     # no fresh candles: caller keeps trading with its previous entry
         return _decide(model, mkey, bars)
 
 
@@ -236,8 +236,8 @@ async def exness_decision(pair_key, mt5_symbol, candle_fn):
             if got:
                 b["bars"] = _closed(got, time.time())
             else:
-                b["fail_until"] = time.time() + 30
+                b["fail_until"] = time.time() + 10
         bars = b["bars"]
-        if len(bars) < 120 or now - bars[-1][0] > 300:
-            return {"ready": True, "dir": None, "bar_t": 0}
+        if len(bars) < 120 or now - bars[-1][0] > 200:
+            return {"ready": False}     # no fresh candles: caller keeps trading with its previous entry
         return _decide(model, mkey, bars)

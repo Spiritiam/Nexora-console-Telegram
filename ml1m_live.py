@@ -112,12 +112,13 @@ def _decide(model, mkey, bars):
     o, h, l, c = (np.append(x, c[-1]) for x in (o, h, l, c))
     X, names = R.build_features(t, o, h, l, c, pure=False)
     x = X[-1]
-    dec = {"ready": True, "dir": None, "bar_t": last_t, "sb": None, "ss": None, "theta": model["theta"]}
+    theta = max(float(model["theta"]), 0.03)     # never enter on a prediction that is not clearly above zero after costs
+    dec = {"ready": True, "dir": None, "bar_t": last_t, "sb": None, "ss": None, "theta": theta}
     if not np.isnan(x).any() and list(names) == list(model["names"]):
         sb = float(model["mb"].predict(x.reshape(1, -1))[0])
         ss = float(model["ms"].predict(x.reshape(1, -1))[0])
         dec.update({"sb": round(sb, 3), "ss": round(ss, 3)})
-        if max(sb, ss) > model["theta"]:
+        if max(sb, ss) > theta:
             dec["dir"] = "BUY" if sb >= ss else "SELL"
     if len(_DECISION) > 400:
         for k in list(_DECISION)[:200]:
@@ -125,7 +126,7 @@ def _decide(model, mkey, bars):
     _DECISION[ck] = dec
     _STATE["n_dec"] = _STATE.get("n_dec", 0) + 1
     if dec["dir"]:
-        _log(f"live: {mkey} -> {dec['dir']} (buy {dec['sb']}, sell {dec['ss']}, threshold {model['theta']})")
+        _log(f"live: {mkey} -> {dec['dir']} (buy {dec['sb']}, sell {dec['ss']}, threshold {theta})")
     return dec
 
 

@@ -34354,6 +34354,16 @@ def main():
     load_ml_ev_model()
     load_ml_ev_model_synthetic()
 
+    # One-off offline research (1-minute ML entry test). Read-only, no trades; runs as a
+    # separate low-priority process only while ML1M_RUN=1 is set.
+    if os.getenv("ML1M_RUN") == "1":
+        try:
+            import subprocess as _sp
+            _sp.Popen([sys.executable, os.path.join(os.path.dirname(os.path.abspath(__file__)), "ml1m_research.py")])
+            print("[ML1M] research process started")
+        except Exception as _e:
+            print(f"[ML1M] could not start: {type(_e).__name__}: {_e}")
+
     try:
         _napp_install_push_bridge()
     except Exception as _e:

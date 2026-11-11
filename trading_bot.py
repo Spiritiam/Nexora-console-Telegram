@@ -3258,6 +3258,9 @@ async def manage_aggressive_positions(context: ContextTypes.DEFAULT_TYPE):
 # Trade ids are remembered (and re-adopted after a restart) because the Exness
 # API does not return trade comments. Edit the numbers below to tune.
 # ============================================
+import ml1m_live
+# 1-minute ML entry for the Aggressive Scalper (Exness and Deriv). ML1M_LIVE=0 switches back to the old entry.
+ML1M_LIVE = os.getenv("ML1M_LIVE", "1") == "1"
 SC_CFG = {
     "pending_pips": 15,
     "sl_pips": 20,
@@ -3597,6 +3600,7 @@ async def _sc_tick_one(context, account):
             return  # spread too wide: neither arm nor trigger
 
         sig = None
+        ml_used = False
         if cfg.get("entry") == "sr":
             # Account Flip: no straddle. Wait for a respected 1-hour level with a 30-minute rejection candle.
             if st["phase"] in ("arm", None, "armed"):
@@ -3606,18 +3610,34 @@ async def _sc_tick_one(context, account):
                 return
             direction = sig["direction"]
         else:
-            dist = cfg["pending_pips"] * pip
-            if st["phase"] in ("arm", None) or now - st.get("armed_at", 0) > cfg["pending_expiry_s"]:
-                st.update({"phase": "armed", "armed_at": now, "buy_lvl": ask + dist, "sell_lvl": bid - dist})
-                return
+            _ml = None
+            if ML1M_LIVE and account["bot_choice"] == "aggressive_scalper":
+                try:
+                    _ml = await ml1m_live.exness_decision(pair_key, pair_config["mt5_symbol"], get_candles_exness)
+                except Exception as _e:
+                    print(f"[ML1M] Exness entry check failed {pair_key}: {type(_e).__name__}: {str(_e)[:100]}")
+                    return
+            if _ml and _ml.get("ready"):
+                # 1-minute ML entry: enter at once on the model's side, one look per closed minute
+                st["phase"] = "armed"
+                if not _ml.get("dir") or st.get("ml_bar") == _ml["bar_t"]:
+                    return
+                direction = _ml["dir"]
+                st["ml_bar"] = _ml["bar_t"]
+                ml_used = True
+            else:
+                dist = cfg["pending_pips"] * pip
+                if st["phase"] in ("arm", None) or now - st.get("armed_at", 0) > cfg["pending_expiry_s"]:
+                    st.update({"phase": "armed", "armed_at": now, "buy_lvl": ask + dist, "sell_lvl": bid - dist})
+                    return
 
-            direction = None
-            if ask >= st["buy_lvl"]:
-                direction = "BUY"
-            elif bid <= st["sell_lvl"]:
-                direction = "SELL"
-            if not direction:
-                return
+                direction = None
+                if ask >= st["buy_lvl"]:
+                    direction = "BUY"
+                elif bid <= st["sell_lvl"]:
+                    direction = "SELL"
+                if not direction:
+                    return
 
         sl_dist = sl_pips * pip
         fill = ask if direction == "BUY" else bid
@@ -3653,6 +3673,13 @@ async def _sc_tick_one(context, account):
                     f"At +{cfg['trail_activate_pips']} pips the stop moves to break-even and trails, then it adds a trade every further "
                     f"{cfg['add_pips']} pips (up to {cfg['max_layers']}) once the earlier ones are protected. "
                     f"A setup may only come about once a day. I won't message you for each trade.")
+                return
+            if ml_used:
+                await _sc_notify(
+                    context, user_id,
+                    f"{cfg['label']} <b>is trading</b>\n\n"
+                    f"First trade: {direction} {pair_config['display']} — {volume} lots, protected by a stop loss "
+                    f"and a trailing stop. I won't message you for each one.")
                 return
             extra = (f"It adds up to {cfg['max_layers'] - 1} more trades while the move runs, only once the earlier ones are protected. "
                      if cfg["max_layers"] > 1 else "")
@@ -14123,17 +14150,32 @@ async def _dsc_tick_one_inner(context, account):
                 return
             direction = sig["direction"]
         else:
-            price = await _dsc_price(symbol)  # one shared price connection for everyone
-            if not price:
-                return
-            sl_dist = price * risk / (stake * mult)
-            dist = sl_dist * mode["pending_mult"]
-            if st["phase"] == "arm" or now - st.get("armed_at", 0) > DSC_CFG["pending_expiry_s"]:
-                st.update({"phase": "armed", "armed_at": now, "buy_lvl": price + dist, "sell_lvl": price - dist})
-                return
-            direction = "BUY" if price >= st["buy_lvl"] else ("SELL" if price <= st["sell_lvl"] else None)
-            if not direction:
-                return
+            _ml = None
+            if ML1M_LIVE and mode is DSC_MODES["aggressive"]:
+                try:
+                    _ml = await ml1m_live.deriv_decision(symbol, risk / (stake * mult), _deriv_cooling_down)
+                except Exception as _e:
+                    print(f"[ML1M] Deriv entry check failed {index_key}: {type(_e).__name__}: {str(_e)[:100]}")
+                    return
+            if _ml and _ml.get("ready"):
+                # 1-minute ML entry: enter at once on the model's side, one look per closed minute
+                st["phase"] = "armed"
+                if not _ml.get("dir") or st.get("ml_bar") == _ml["bar_t"]:
+                    return
+                direction = _ml["dir"]
+                st["ml_bar"] = _ml["bar_t"]
+            else:
+                price = await _dsc_price(symbol)  # one shared price connection for everyone
+                if not price:
+                    return
+                sl_dist = price * risk / (stake * mult)
+                dist = sl_dist * mode["pending_mult"]
+                if st["phase"] == "arm" or now - st.get("armed_at", 0) > DSC_CFG["pending_expiry_s"]:
+                    st.update({"phase": "armed", "armed_at": now, "buy_lvl": price + dist, "sell_lvl": price - dist})
+                    return
+                direction = "BUY" if price >= st["buy_lvl"] else ("SELL" if price <= st["sell_lvl"] else None)
+                if not direction:
+                    return
         # Deriv stop loss is a fixed dollar amount, so a price that moved past the level
         # before we noticed does not raise the risk. Enter anyway.
         snapshot = await deriv_fetch_account_snapshot(token)
@@ -34356,7 +34398,7 @@ def main():
 
     # One-off offline research (1-minute ML entry test). Read-only, no trades; runs as a
     # separate low-priority process only while ML1M_RUN=1 is set.
-    if os.getenv("ML1M_RUN") == "1":
+    if os.getenv("ML1M_RUN") == "train":
         try:
             import subprocess as _sp
             _sp.Popen([sys.executable, os.path.join(os.path.dirname(os.path.abspath(__file__)), "ml1m_research.py")])

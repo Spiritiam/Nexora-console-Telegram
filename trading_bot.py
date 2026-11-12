@@ -1623,6 +1623,49 @@ def resolve_trade_symbol(symbol_map, pair_config):
     return symbol_map.get(pair_config["pair_name"], pair_config["mt5_symbol"])
 
 
+_LAST_TRADE_FAIL = {}   # account ref -> reason text of its most recent failed order
+_FAIL_NOTIFIED = {}     # (user_id, kind) -> when the user was last told a trade wasn't opened
+FAIL_NOTICE_COOLDOWN_SECONDS = 6 * 3600
+
+
+def _note_trade_fail(account_ref, reason):
+    _LAST_TRADE_FAIL[str(account_ref)] = str(reason)[:300]
+
+
+async def notify_trade_not_opened(bot, user_id, account_ref, display):
+    """Tell a subscriber why a signal wasn't opened on their account, so they
+    don't think the system is broken. At most one message per user per kind
+    every 6 hours (a burst of manual signals must not spam them)."""
+    reason = (_LAST_TRADE_FAIL.pop(str(account_ref), "") or "").upper()
+    if "INSUFFICIENT_MARGIN" in reason or "NO_MONEY" in reason or "NOT ENOUGH MONEY" in reason or "MARGIN" in reason:
+        kind = "margin"
+        text = (
+            "⚠️ <b>Trade not opened</b>\n\n"
+            f"The {display} signal was not placed on your account because it doesn't have enough free margin. "
+            "Nexora AI is working normally.\n\n"
+            "To fix this, add funds to your account or close some open trades to free up margin. "
+            "Your next signals will be taken automatically once there is enough margin."
+        )
+    else:
+        kind = "other"
+        text = (
+            "⚠️ <b>Trade not opened</b>\n\n"
+            f"The {display} signal could not be placed on your account this time. "
+            "This is usually a short broker or connection problem, not a fault with your setup. "
+            "Nexora AI will try again on the next signal.\n\n"
+            "If you keep seeing this message, please contact support."
+        )
+    key = (str(user_id), kind)
+    now = time.time()
+    if now - _FAIL_NOTIFIED.get(key, 0) < FAIL_NOTICE_COOLDOWN_SECONDS:
+        return
+    _FAIL_NOTIFIED[key] = now
+    try:
+        await bot.send_message(chat_id=int(user_id), text=text, parse_mode=ParseMode.HTML)
+    except Exception as e:
+        print(f"[MT5 AUTOTRADE FOLLOW] Couldn't send the trade-not-opened notice to {user_id}: {e}")
+
+
 async def place_client_mt5_trade(metaapi_account_id, mt5_symbol, direction, volume, stop_loss, take_profit, trade_comment=None):
     """
     Generalizes place_mt5_trade for an arbitrary CLIENT account
@@ -1667,11 +1710,13 @@ async def place_client_mt5_trade(metaapi_account_id, mt5_symbol, direction, volu
                 stop_loss, take_profit, (trade_comment or "Nexora AI")[:30])
         except Exception as e:
             print(f"[EXNESS] ❌ Exception placing trade for {metaapi_account_id}: {e}")
+            _note_trade_fail(metaapi_account_id, e)
             return None
         if pid:
             print(f"[EXNESS] ✅ Trade placed for {metaapi_account_id} - position {pid}")
             return pid
         print(f"[EXNESS] ❌ Trade failed for {metaapi_account_id}: {detail}")
+        _note_trade_fail(metaapi_account_id, detail)
         return None
     if not METAAPI_TOKEN:
         # FIX: CONFIRMED REAL GAP - this was the ONLY return in the
@@ -1775,13 +1820,16 @@ async def place_client_mt5_trade(metaapi_account_id, mt5_symbol, direction, volu
                 # required.
                 broker_reason = result.get("message") or result.get("stringCode") or "unknown reason"
                 print(f"[MT5 AUTOTRADE] ⚠️ Trade REJECTED by broker for {metaapi_account_id}: {broker_reason} (full response: {result!r})")
+                _note_trade_fail(metaapi_account_id, broker_reason)
                 return None
             print(f"[MT5 AUTOTRADE] ✅ Trade placed for {metaapi_account_id} — Order ID: {order_id}")
             return order_id
         print(f"[MT5 AUTOTRADE] ❌ Trade failed for {metaapi_account_id} after {max_attempts} attempt(s): {response.status_code} {response.text}")
+        _note_trade_fail(metaapi_account_id, response.text)
         return None
     except Exception as e:
         print(f"[MT5 AUTOTRADE] ❌ Exception placing trade for {metaapi_account_id}: {e}")
+        _note_trade_fail(metaapi_account_id, e)
         return None
 
 
@@ -3877,6 +3925,7 @@ async def run_mt5_autotrade_follow_channel_scan(context: ContextTypes.DEFAULT_TY
                 # just makes clear, at the point a failure actually
                 # happened, which signal/user it was for.
                 print(f"[MT5 AUTOTRADE FOLLOW] ❌ Copy failed for signal {signal_id} ({pair_name} {direction}), user {user_id} - see place_client_mt5_trade's own log line above for the real reason. NOT retried - marked as handled either way.")
+                await notify_trade_not_opened(context.bot, user_id, metaapi_account_id, pair_config["display"])
 
 
 async def run_account_flip_entry_scan(context: ContextTypes.DEFAULT_TYPE):

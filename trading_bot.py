@@ -21259,6 +21259,73 @@ def format_inner_circle_card(index):
     )
 
 
+# ---- 3D picture cards (Saturday education on all channels, daily news) ----
+_ASSET_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "assets3d")
+_KP_IMAGE = ["risk", "risk", "stop", "stop", "coins", "scale", "scale", "bolt", "chart", "chart",
+             "bolt", "chart", "stop", "clock", "news", "scale", "bolt", "stop", "coins", "journal",
+             "risk", "coins", "clock", "journal", "risk", "coins"]
+
+
+def _font(size):
+    try:
+        import matplotlib
+        from PIL import ImageFont
+        return ImageFont.truetype(os.path.join(matplotlib.get_data_path(), "fonts", "ttf", "DejaVuSans-Bold.ttf"), size)
+    except Exception:
+        return None
+
+
+def _render_3d_card(image_key, label, title=None):
+    """3D picture with a small label (and optional big title) on top. Returns JPEG bytes or None."""
+    try:
+        import io
+        import textwrap
+        from PIL import Image, ImageDraw
+        im = Image.open(os.path.join(_ASSET_DIR, f"{image_key}.jpg")).convert("RGB")
+        d = ImageDraw.Draw(im, "RGBA")
+        _h = 360 if title else 130
+        for _y in range(_h):
+            d.line([(0, _y), (1080, _y)], fill=(4, 10, 34, int(215 * (1 - _y / _h) ** 1.3)))
+        d.text((54, 44), label, font=_font(34), fill=(125, 211, 252))
+        if title:
+            y = 110
+            for line in textwrap.wrap(title, 22)[:3]:
+                d.text((54, y), line, font=_font(70), fill=(255, 255, 255))
+                y += 88
+        buf = io.BytesIO()
+        im.save(buf, "JPEG", quality=88)
+        return buf.getvalue()
+    except Exception as e:
+        print(f"[3D CARD] render failed: {e}")
+        return None
+
+
+def get_saturday_card_index(now=None):
+    now = now or datetime.utcnow()
+    weeks = (now.date() - INNER_CIRCLE_CARD_EPOCH.date()).days // 7
+    return (13 + weeks) % len(INNER_CIRCLE_KEY_POINTS)
+
+
+async def post_weekend_lesson(context: ContextTypes.DEFAULT_TYPE):
+    """Saturday: one short education card with a 3D picture to all three channels."""
+    idx = get_saturday_card_index()
+    title, bullets = INNER_CIRCLE_KEY_POINTS[idx]
+    img = _render_3d_card(_KP_IMAGE[idx % len(_KP_IMAGE)], f"NEXORA AI  ·  TRADING LESSON {idx + 1:02d}", title)
+    caption = (f"📘 <b>{_esc(title)}</b>\n\n"
+               + "\n".join(f"▫️ {_esc(b)}" for b in bullets[:3])
+               + "\n\n<i>Education, not financial advice</i>")
+    for ch in [CHANNEL_1_ID, CHANNEL_2_ID, CHANNEL_3_ID]:
+        try:
+            if img and len(caption) <= 1000:
+                await context.bot.send_photo(chat_id=ch, photo=img, caption=caption, parse_mode=ParseMode.HTML,
+                                             read_timeout=60, write_timeout=60)
+            else:
+                await context.bot.send_message(chat_id=ch, text=caption, parse_mode=ParseMode.HTML)
+            print(f"[LESSON] ✅ #{idx + 1} posted to {ch}")
+        except Exception as e:
+            print(f"[LESSON] ❌ {ch}: {e}")
+
+
 async def post_inner_circle_key_point(context: ContextTypes.DEFAULT_TYPE):
     """Scheduled job: one short education card to the Inner Circle only."""
     today = datetime.utcnow().date()
@@ -25087,7 +25154,7 @@ PAIRS: [comma-separated list, e.g. XAUUSD=SELL, USDJPY=SELL]
 
 STRICT RULES:
 - Maximum 2 bullet points ONLY
-- Each bullet point MAX 25 words INCLUDING the sentiment tag and BUY/SELL read
+- Each bullet point MAX 16 words INCLUDING the sentiment tag and BUY/SELL read
 - [instrument] MUST be one of exactly these - never anything else,
   never a minor/exotic currency (e.g. Rupee, Rand, Lira, Naira),
   never a vague phrase like "global markets" or "risk sentiment":
@@ -25273,7 +25340,8 @@ async def post_news(context: ContextTypes.DEFAULT_TYPE):
     # high-impact events today post exactly as before (calendar is
     # None in that case, nothing gets appended).
     if session_type == "morning" and calendar:
-        summary += calendar
+        _cl = str(calendar).strip().split("\n")
+        summary += "\n" + "\n".join(_cl[:5])
 
     # FIX: per explicit instruction, after a direct report that the
     # morning briefing posted without its picture - confirmed live in
@@ -25309,6 +25377,7 @@ async def post_news(context: ContextTypes.DEFAULT_TYPE):
             summary_lines[0] = f"<b>{summary_lines[0]}</b>"
             summary = "\n".join(summary_lines)
 
+    _news_3d = _render_3d_card("news", {"morning": "NEXORA AI  ·  MORNING BRIEF", "midday": "NEXORA AI  ·  MIDDAY UPDATE"}.get(session_type, "NEXORA AI  ·  MARKET BRIEF"))
     for channel_id in [CHANNEL_1_ID, CHANNEL_2_ID, CHANNEL_3_ID]:
         photo_sent = False
         # FIX: extended from 2 to 3 attempts with escalating waits
@@ -25321,7 +25390,7 @@ async def post_news(context: ContextTypes.DEFAULT_TYPE):
             try:
                 await context.bot.send_photo(
                     chat_id=channel_id,
-                    photo=image_url,
+                    photo=(_news_3d or image_url),
                     caption=summary,
                     parse_mode=ParseMode.HTML,
                     read_timeout=60,
@@ -35445,6 +35514,15 @@ def main():
         time=parse_time("10:00"),
         name="inner_circle_key_point",
         days=INNER_CIRCLE_CARD_DAYS,
+        job_kwargs={"misfire_grace_time": 300}
+    )
+
+    # Saturday lesson (3D picture) to all three channels, 10:00 UTC.
+    job_queue.run_daily(
+        post_weekend_lesson,
+        time=parse_time("10:00"),
+        name="weekend_lesson",
+        days=(6,),
         job_kwargs={"misfire_grace_time": 300}
     )
 

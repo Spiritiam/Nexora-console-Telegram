@@ -7984,13 +7984,26 @@ SIGNAL_QUOTE_SYNTH = f'<blockquote>🔗 <a href="{DERIV_SIGNUP_LINK}">Sign up to
 SIGNAL_QUOTE_FOREX = f'<blockquote>🔗 <a href="{EXNESS_LINK}">Open a free Exness account to trade this</a></blockquote>'
 
 
+def _backed_by(reason, direction, model_direction, p_buy, p_sell):
+    """Rewrites the ML reason line so it says which model(s) back the signal.
+    Both: ML model + simulation model; ML only; simulation only (override)."""
+    try:
+        if direction != model_direction:
+            return f"Backed by: simulation model \u2192 {direction}."
+        sim_side = "BUY" if p_buy > p_sell else ("SELL" if p_sell > p_buy else None)
+        who = "ML model + simulation model" if sim_side == direction else "ML model"
+        return re.sub(r"^ML model favors (BUY|SELL)", f"Backed by: {who} \u2192 \\1", str(reason).strip(), count=1)
+    except Exception:
+        return reason
+
+
 def _short_ml_reason(reason):
     """'ML model favors BUY (predicted edge -20.39%) - 2 strategies leaning buy
     (A, B).'  ->  'ML model favors BUY + A, B'  (no edge percentage)."""
     try:
-        m = re.match(r"^ML model favors (BUY|SELL) \(predicted edge [^)]*\)(?: - \d+ strateg(?:y|ies) leaning \w+ \((.*)\))?\.?$", str(reason).strip())
+        m = re.match(r"^(?:ML model favors|Backed by: [^\u2192]+\u2192) (BUY|SELL) \(predicted edge [^)]*\)(?: - \d+ strateg(?:y|ies) leaning \w+ \((.*)\))?\.?$", str(reason).strip())
         if m:
-            return f"ML model favors {m.group(1)}" + (f" + {m.group(2)}" if m.group(2) else "")
+            return f"{str(reason).strip().split(chr(32)+chr(40),1)[0].rstrip(chr(46))}" + (f" + {m.group(2)}" if m.group(2) else "")
     except Exception:
         pass
     return reason
@@ -12421,11 +12434,12 @@ async def _build_synthetic_signal_response_inner(index_key, min_agree=2, manual=
                 if _dec:
                     print(f"[ODDS] {index_key}: sim BUY {_dec[1]*100:.1f}% / SELL {_dec[2]*100:.1f}% -> {_dec[0]} "
                           f"(model said {direction})", flush=True)
+                    _model_dir = direction
                     if _dec[0] != direction:
                         direction = _dec[0]
                         agreeing_strategies = []
                         winning_votes = []
-                        reason = f"Our AI engine's latest read of recent {config['display']} price behaviour favours a {direction} here."
+                    reason = _backed_by(reason, direction, _model_dir, _dec[1], _dec[2])
       except Exception as _e:
         print(f"[ODDS] {index_key} decision skipped: {type(_e).__name__}: {str(_e)[:100]}", flush=True)
     _DERIV_LAST_SIG[index_key] = (direction, time.time())
@@ -23114,10 +23128,11 @@ async def build_signal_response(question, user_id=None, retry_mismatch=False):
                 _sim_dir, _pb, _ps = _dec
                 print(f"[ODDS] {pair_name}: sim BUY {_pb*100:.1f}% / SELL {_ps*100:.1f}% -> {_sim_dir} "
                       f"(model said {direction})", flush=True)
+                _model_dir = direction
                 if _sim_dir != direction:
                     direction = _sim_dir
                     agreeing_strategies = []
-                    reason = f"Our AI engine's latest read of recent {display} price behaviour favours a {direction} here."
+                reason = _backed_by(reason, direction, _model_dir, _pb, _ps)
         except Exception as _e:
             print(f"[ODDS] decision skipped: {type(_e).__name__}: {str(_e)[:100]}", flush=True)
 

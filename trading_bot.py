@@ -12392,6 +12392,29 @@ async def _build_synthetic_signal_response_inner(index_key, min_agree=2):
         winning_votes = []
     else:
         direction, confidence, reason, agreeing_strategies, winning_votes = result
+    # SIMULATION DECIDES THE SIDE (same rule as forex signals): 10,000 simulated futures for BUY and SELL
+    # with this signal's own stop/target distances (1.5x / 3x hourly range). Used only when it leads by
+    # the margin; if it can't run, the model's side stands. Never blocks a signal.
+    try:
+        import signal_odds
+        if h1_candles and len(h1_candles) >= 15:
+            _px = h1_candles[-1]["close"]
+            _atr = sum(c["high"] - c["low"] for c in h1_candles[-14:]) / 14
+            if _px and _atr > 0:
+                _dec = await asyncio.wait_for(asyncio.to_thread(
+                    signal_odds.decide_direction, config["symbol"], signal_odds.deriv_candles,
+                    _atr * 1.5 / _px, _atr * 3.0 / _px, "D" + index_key, direction), timeout=15)
+                if _dec:
+                    print(f"[ODDS] {index_key}: sim BUY {_dec[1]*100:.1f}% / SELL {_dec[2]*100:.1f}% -> {_dec[0]} "
+                          f"(model said {direction})", flush=True)
+                    if _dec[0] != direction:
+                        direction = _dec[0]
+                        agreeing_strategies = []
+                        winning_votes = []
+                        reason = ("Our market simulation, which replays thousands of possible price paths from "
+                                  f"recent {config['display']} behaviour, favours a {direction} here.")
+    except Exception as _e:
+        print(f"[ODDS] {index_key} decision skipped: {type(_e).__name__}: {str(_e)[:100]}", flush=True)
     contract_type = "MULTUP" if direction == "BUY" else "MULTDOWN"
 
     # Strategies in SYNTHETIC_STRATEGY_BANK vote on EITHER h1_candles
@@ -13900,7 +13923,7 @@ DSC_MODES = {
                   "max_layers": 5, "add_mult": 1.0, "label": "⚡ Account Flip (Fast)"},
     # Account Flip: support/resistance entry (1-hour levels, 30-minute candle). Stop = your risk;
     # at 40% of risk in profit -> break-even + trail 20% of risk behind; adds a trade every further 40%.
-    "flip_sr": {"entry": "sr", "pending_mult": 0, "activate_mult": 0.4, "trail_mult": 0.2,
+    "flip_sr": {"entry": "sr", "signal": "mlsim", "pending_mult": 0, "activate_mult": 0.4, "trail_mult": 0.2,
                 "max_layers": 5, "add_mult": 0.4, "label": "🚀 Account Flip"},
 }
 _DSC = {"subs": [], "subs_at": 0.0, "st": {}, "px": {}, "locks": {}}
@@ -14144,6 +14167,49 @@ async def _dsc_tick_one(context, account):
         await _dsc_tick_one_inner(context, account)
 
 
+_DFLIP_DEC = {}
+_DFLIP_LOCKS = {}
+
+
+async def _deriv_flip_ml_sim_direction(index_key, config, sl_frac):
+    """Deriv Account Flip entry: the normal hourly ML model decides, then the 10,000-path simulation
+    (stop = the flip stop, target = 2x stop) chooses the side. One decision per index per 15 minutes."""
+    slot = int(time.time() // 900)
+    hit = _DFLIP_DEC.get(index_key)
+    if hit and hit[0] == slot:
+        return hit[1]
+    lock = _DFLIP_LOCKS.setdefault(index_key, asyncio.Lock())
+    async with lock:
+        hit = _DFLIP_DEC.get(index_key)
+        if hit and hit[0] == slot:
+            return hit[1]
+        res = None
+        try:
+            sym = config["symbol"]
+            h1 = await get_cached_synthetic_candles(index_key, sym, "1h", 3600, 210)
+            h4 = await get_cached_synthetic_candles(index_key, sym, "4h", 14400, 60)
+            d1 = await get_cached_synthetic_candles(index_key, sym, "1day", 86400, 10)
+            if h1 and len(h1) >= 60:
+                ml = await run_ml_driven_decision_synthetic(index_key, config, h1, h4, d1)
+                if ml:
+                    res = ml[0]
+                    try:
+                        import signal_odds
+                        dec = await asyncio.wait_for(asyncio.to_thread(
+                            signal_odds.decide_direction, sym, signal_odds.deriv_candles,
+                            sl_frac, 2 * sl_frac, "DFLIP" + index_key, res), timeout=15)
+                        if dec:
+                            print(f"[ODDS] Deriv Account Flip {index_key}: sim BUY {dec[1]*100:.1f}% / SELL {dec[2]*100:.1f}% "
+                                  f"-> {dec[0]} (model said {res})", flush=True)
+                            res = dec[0]
+                    except Exception as _e:
+                        print(f"[ODDS] Deriv Account Flip sim skipped {index_key}: {type(_e).__name__}: {str(_e)[:100]}", flush=True)
+        except Exception as e:
+            print(f"[DSC] flip ML decision failed {index_key}: {type(e).__name__}: {str(e)[:100]}", flush=True)
+        _DFLIP_DEC[index_key] = (slot, res)
+        return res
+
+
 async def _dsc_tick_one_inner(context, account):
     user_id = str(account["user_id"])
     token = account["api_token"]
@@ -14280,7 +14346,18 @@ async def _dsc_tick_one_inner(context, account):
             return
 
         sig = None
-        if mode.get("entry") == "sr":
+        if mode.get("signal") == "mlsim":
+            # Account Flip: hourly ML model + 10,000-path simulation choose the side; stops, trailing and
+            # layers are unchanged.
+            st["phase"] = "armed"
+            _slot = int(now // 900)
+            if st.get("flip_slot") == _slot:
+                return
+            direction = await _deriv_flip_ml_sim_direction(index_key, config, risk / (stake * mult))
+            if not direction:
+                return
+            st["flip_slot"] = _slot
+        elif mode.get("entry") == "sr":
             # Account Flip: no straddle. Wait for a respected 1-hour level with a 30-minute rejection candle.
             st["phase"] = "armed"
             sig = await get_sr_signal("deriv", index_key)
@@ -14302,6 +14379,19 @@ async def _dsc_tick_one_inner(context, account):
                     return
                 direction = _ml["dir"]
                 st["ml_bar"] = _ml["bar_t"]
+                # 10,000-path simulation picks the side (stop = this scalper's stop, target = 2x stop).
+                try:
+                    import signal_odds
+                    _sl_f = risk / (stake * mult)
+                    _dec = await asyncio.wait_for(asyncio.to_thread(
+                        signal_odds.decide_direction, symbol, signal_odds.deriv_candles,
+                        _sl_f, 2 * _sl_f, "DSC" + index_key, direction), timeout=15)
+                    if _dec and _dec[0] != direction:
+                        print(f"[ODDS] Deriv scalper {index_key}: sim BUY {_dec[1]*100:.1f}% / SELL {_dec[2]*100:.1f}% "
+                              f"-> {_dec[0]} (model said {direction})", flush=True)
+                        direction = _dec[0]
+                except Exception as _e:
+                    print(f"[ODDS] Deriv scalper sim skipped {index_key}: {type(_e).__name__}: {str(_e)[:100]}", flush=True)
             else:
                 price = await _dsc_price(symbol)  # one shared price connection for everyone
                 if not price:

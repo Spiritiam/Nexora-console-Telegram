@@ -193,6 +193,28 @@ def decide_direction(symbol, candle_fn, sl_f, tp_f, pair="", fallback="BUY", mar
         return None
 
 
+def deriv_candles(symbol, interval, n):
+    """15-minute candles for a Deriv synthetic index from Deriv's public data socket (no login).
+    Same row shape as the Exness helper. Returns [] on any failure."""
+    try:
+        import asyncio
+        import json
+        import websockets
+        from ml1m_live import DERIV_PUBLIC_WS
+
+        async def go():
+            async with websockets.connect(DERIV_PUBLIC_WS, open_timeout=10, close_timeout=3) as ws:
+                await ws.send(json.dumps({"ticks_history": symbol, "style": "candles", "granularity": 900,
+                                          "count": int(n), "end": "latest"}))
+                r = json.loads(await asyncio.wait_for(ws.recv(), timeout=15))
+                return [{"time": int(c["epoch"]), "open": float(c["open"]), "high": float(c["high"]),
+                         "low": float(c["low"]), "close": float(c["close"])} for c in (r.get("candles") or [])]
+        return asyncio.run(go())
+    except Exception as e:
+        _log(f"deriv candles failed {symbol}: {type(e).__name__}: {str(e)[:80]}")
+        return []
+
+
 if __name__ == "__main__":
     # self-test on synthetic data: a driftless random walk with a 1:3 stop/target should hit the target ~25%
     rng = np.random.default_rng(1)

@@ -21261,11 +21261,11 @@ def format_inner_circle_card(index):
 
 # ---- 3D picture cards (Saturday education on all channels, daily news) ----
 _ASSET_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "assets3d")
-_KP_IMAGE = ["risk_shield", "risk_coins", "stop_sign", "stop", "risk", "chart_lens", "journal_graph", "stop_bars",
-             "chart", "chart_candles", "chart_lens", "chart", "stop_sign", "news_globe", "news", "risk_coins",
-             "risk", "stop", "journal", "journal_pen", "risk_shield", "risk_coins", "news_bell", "journal_graph",
-             "journal_pen", "risk"]
-_NEWS_IMAGES = ["news", "news_bell", "news_mega", "news_globe"]
+_KP_IMAGE = ["risk", "risk", "stop", "stop", "risk", "chart", "journal", "stop",
+             "chart", "chart", "chart", "chart", "stop", "news", "news", "risk",
+             "risk", "stop", "journal", "journal", "risk", "risk", "news", "journal",
+             "journal", "risk"]
+_NEWS_IMAGES = ["news", "chart", "risk", "journal", "stop"]
 
 
 def _font(size):
@@ -21277,31 +21277,13 @@ def _font(size):
         return None
 
 
-def _render_3d_card(image_key, label, title=None):
-    """3D picture with a small label (and optional big title) on top. Returns JPEG bytes or None."""
+def _render_3d_card(image_key, label=None, title=None):
+    """Returns the clean picture as JPEG bytes (no text on it); all wording goes in the caption."""
     try:
-        import io
-        import textwrap
-        from PIL import Image, ImageDraw
-        im = Image.open(os.path.join(_ASSET_DIR, f"{image_key}.jpg")).convert("RGB")
-        d = ImageDraw.Draw(im, "RGBA")
-        for _y in range(130):
-            d.line([(0, _y), (1080, _y)], fill=(4, 10, 34, int(200 * (1 - _y / 130) ** 1.3)))
-        d.text((54, 40), label, font=_font(34), fill=(125, 211, 252))
-        if title:
-            lines = textwrap.wrap(title, 24)[:3]
-            _h = 120 + 84 * len(lines)
-            for _y in range(_h):
-                d.line([(0, 1080 - _h + _y), (1080, 1080 - _h + _y)], fill=(4, 10, 34, int(225 * (_y / _h) ** 1.2)))
-            y = 1080 - 60 - 84 * len(lines)
-            for line in lines:
-                d.text((54, y), line, font=_font(66), fill=(255, 255, 255))
-                y += 84
-        buf = io.BytesIO()
-        im.save(buf, "JPEG", quality=88)
-        return buf.getvalue()
+        with open(os.path.join(_ASSET_DIR, f"{image_key}.jpg"), "rb") as f:
+            return f.read()
     except Exception as e:
-        print(f"[3D CARD] render failed: {e}")
+        print(f"[3D CARD] read failed: {e}")
         return None
 
 

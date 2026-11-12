@@ -22953,7 +22953,9 @@ async def build_signal_response(question, user_id=None, retry_mismatch=False):
     # front and only writes a supporting/caveat sentence for the
     # separate Fundamental Analysis row below.
     fundamental_reason = None
-    if user_id is not None and can_use_ai_bias(user_id):
+    # Fundamental Analysis row removed from manual signals (per explicit instruction: too long).
+    # Set MANUAL_FUNDAMENTAL=1 in Railway to bring it back.
+    if user_id is not None and os.getenv("MANUAL_FUNDAMENTAL", "0") == "1" and can_use_ai_bias(user_id):
         fundamental_reason = await generate_fundamental_context(pair_name, direction)
         if fundamental_reason:
             record_ai_bias_usage(user_id)

@@ -12310,15 +12310,18 @@ async def analyze_synthetic_structure(index_key, config):
     )
     return direction, confidence, reason
 
-async def build_synthetic_signal_response(index_key, min_agree=2):
+_DERIV_LAST_SIG = {}
+
+
+async def build_synthetic_signal_response(index_key, min_agree=2, manual=False):
     _tok = _DERIV_PRIORITY_CTX.set(True)
     try:
-        return await _build_synthetic_signal_response_inner(index_key, min_agree)
+        return await _build_synthetic_signal_response_inner(index_key, min_agree, manual)
     finally:
         _DERIV_PRIORITY_CTX.reset(_tok)
 
 
-async def _build_synthetic_signal_response_inner(index_key, min_agree=2):
+async def _build_synthetic_signal_response_inner(index_key, min_agree=2, manual=False):
     """
     Builds the signal message, image, and the trade context that
     gets stored for if/when the user taps "Trade This Signal".
@@ -12395,7 +12398,18 @@ async def _build_synthetic_signal_response_inner(index_key, min_agree=2):
     # SIMULATION DECIDES THE SIDE (same rule as forex signals): 10,000 simulated futures for BUY and SELL
     # with this signal's own stop/target distances (1.5x / 3x hourly range). Used only when it leads by
     # the margin; if it can't run, the model's side stands. Never blocks a signal.
-    try:
+    # CONSISTENCY: a manual request within an hour of the last signal for this index repeats its direction.
+    _prev = _DERIV_LAST_SIG.get(index_key)
+    _reuse = _prev[0] if (manual and _prev and time.time() - _prev[1] < SIGNAL_CONSISTENCY_SECONDS) else None
+    if _reuse:
+        if _reuse != direction:
+            print(f"[SIGNAL] {index_key}: keeping recent {_reuse} for consistency (fresh read said {direction})", flush=True)
+            direction = _reuse
+            agreeing_strategies = []
+            winning_votes = []
+            reason = "Market conditions continue to favor " + ("buyers" if direction == "BUY" else "sellers") + " here."
+    else:
+      try:
         import signal_odds
         if h1_candles and len(h1_candles) >= 15:
             _px = h1_candles[-1]["close"]
@@ -12412,8 +12426,9 @@ async def _build_synthetic_signal_response_inner(index_key, min_agree=2):
                         agreeing_strategies = []
                         winning_votes = []
                         reason = f"Our AI engine's latest read of recent {config['display']} price behaviour favours a {direction} here."
-    except Exception as _e:
+      except Exception as _e:
         print(f"[ODDS] {index_key} decision skipped: {type(_e).__name__}: {str(_e)[:100]}", flush=True)
+    _DERIV_LAST_SIG[index_key] = (direction, time.time())
     contract_type = "MULTUP" if direction == "BUY" else "MULTDOWN"
 
     # Strategies in SYNTHETIC_STRATEGY_BANK vote on EITHER h1_candles
@@ -30064,7 +30079,7 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 # silence, and the animation task above is guaranteed
                 # to actually get cancelled.
                 result = await asyncio.wait_for(
-                    build_synthetic_signal_response(synthetic_key, min_agree=2),
+                    build_synthetic_signal_response(synthetic_key, min_agree=2, manual=True),
                     timeout=90
                 )
             except asyncio.TimeoutError:

@@ -3828,12 +3828,20 @@ async def run_sc_tick(context: ContextTypes.DEFAULT_TYPE):
         if not subs:
             return
         sem = asyncio.Semaphore(6)
+        _t_all = time.time()
+        _slow = []
 
         async def one(a):
             async with sem:
+                _t0 = time.time()
                 await _sc_tick_one(context, a)
+                _d = time.time() - _t0
+                if _d > 3:
+                    _slow.append(f"{a.get('pair_choice')}/{(_SC['st'].get((str(a['user_id']), a.get('pair_choice'))) or {}).get('phase')}={_d:.1f}s")
 
         await asyncio.gather(*(one(a) for a in subs), return_exceptions=True)
+        if time.time() - _t_all > 6:
+            print(f"[SC] slow tick {time.time() - _t_all:.1f}s over {len(subs)} account(s); slow: {_slow[:6]}", flush=True)
         if time.time() - _SC.get("hb", 0) > 300:
             _SC["hb"] = time.time()
             _ph = {}
@@ -14529,12 +14537,20 @@ async def run_dsc_tick(context: ContextTypes.DEFAULT_TYPE):
         if not subs:
             return
         sem = asyncio.Semaphore(4)
+        _t_all = time.time()
+        _slow = []
 
         async def one(a):
             async with sem:
+                _t0 = time.time()
                 await _dsc_tick_one(context, a)
+                _d = time.time() - _t0
+                if _d > 3:
+                    _slow.append(f"{a.get('deriv_pair_choice')}={_d:.1f}s")
 
         await asyncio.gather(*(one(a) for a in subs), return_exceptions=True)
+        if time.time() - _t_all > 6:
+            print(f"[DSC] slow tick {time.time() - _t_all:.1f}s over {len(subs)} account(s); slow: {_slow[:6]}", flush=True)
         if time.time() - _DSC.get("hb", 0) > 300:
             _DSC["hb"] = time.time()
             _ph = {}

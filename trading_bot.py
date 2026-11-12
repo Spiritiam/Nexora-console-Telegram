@@ -12411,8 +12411,7 @@ async def _build_synthetic_signal_response_inner(index_key, min_agree=2):
                         direction = _dec[0]
                         agreeing_strategies = []
                         winning_votes = []
-                        reason = ("Our market simulation, which replays thousands of possible price paths from "
-                                  f"recent {config['display']} behaviour, favours a {direction} here.")
+                        reason = f"Our AI engine's latest read of recent {config['display']} price behaviour favours a {direction} here."
     except Exception as _e:
         print(f"[ODDS] {index_key} decision skipped: {type(_e).__name__}: {str(_e)[:100]}", flush=True)
     contract_type = "MULTUP" if direction == "BUY" else "MULTDOWN"
@@ -22603,6 +22602,21 @@ async def animate_analyzing_message(wait_message, phrases=None):
         pass  # expected, real work finished - not an error
 
 
+def _recent_signal_direction(pair_name):
+    """Direction of the latest signal for this pair (scheduled or manual) within the consistency window, or None."""
+    try:
+        cutoff = (datetime.utcnow() - timedelta(seconds=SIGNAL_CONSISTENCY_SECONDS)).strftime("%Y-%m-%dT%H:%M:%S")
+        r = requests.get(
+            f"{SUPABASE_URL}/rest/v1/signal_log?pair_name=eq.{pair_name}&posted_at=gte.{cutoff}"
+            f"&select=direction&order=id.desc&limit=1", headers=sb_headers(), timeout=8)
+        if r.status_code == 200 and r.json():
+            d = r.json()[0].get("direction")
+            return d if d in ("BUY", "SELL") else None
+    except Exception as e:
+        print(f"[SIGNAL] consistency lookup failed: {type(e).__name__}")
+    return None
+
+
 async def build_signal_response(question, user_id=None, retry_mismatch=False):
     matched_key = match_pair_key(question)
 
@@ -23002,28 +23016,39 @@ async def build_signal_response(question, user_id=None, retry_mismatch=False):
     sl_multiplier, tp_multiplier = get_sl_tp_multipliers(matched_key, live_price)
     tp1_multiplier = get_tp1_multiplier(matched_key, live_price)
 
-    # SIMULATION DECIDES THE DIRECTION (per explicit instruction): 10,000 simulated futures for
-    # BUY and for SELL with this signal's own stop/target distances; the side with the better
-    # chance of hitting its target first is the signal. Never blocks: if the simulation can't run
-    # (no data / error / timeout) the model's own direction stands and the signal goes out as before.
-    try:
-        import signal_odds
-        _sl_f = pip_size * sl_multiplier / live_price
-        _tp_f = pip_size * tp_multiplier / live_price
-        _dec = await asyncio.wait_for(asyncio.to_thread(
-            signal_odds.decide_direction, config.get("mt5_symbol"), get_candles_exness,
-            _sl_f, _tp_f, pair_name, direction), timeout=10)
-        if _dec:
-            _sim_dir, _pb, _ps = _dec
-            print(f"[ODDS] {pair_name}: sim BUY {_pb*100:.1f}% / SELL {_ps*100:.1f}% -> {_sim_dir} "
-                  f"(model said {direction})", flush=True)
-            if _sim_dir != direction:
-                direction = _sim_dir
-                agreeing_strategies = []
-                reason = ("Our market simulation, which replays thousands of possible price paths from "
-                          f"recent {display} behaviour, favours a {direction} here.")
-    except Exception as _e:
-        print(f"[ODDS] decision skipped: {type(_e).__name__}: {str(_e)[:100]}", flush=True)
+    # CONSISTENCY: a manual request within an hour of the last signal for this pair (scheduled or
+    # manual) repeats that signal's direction, so people never see BUY and SELL for the same pair.
+    _reuse = None
+    if user_id is not None:
+        _reuse = await asyncio.to_thread(_recent_signal_direction, pair_name)
+    if _reuse:
+        if _reuse != direction:
+            print(f"[SIGNAL] {pair_name}: keeping recent {_reuse} for consistency (fresh read said {direction})", flush=True)
+            direction = _reuse
+            agreeing_strategies = []
+            reason = ("Market conditions continue to favor " + ("buyers" if direction == "BUY" else "sellers") + " here.")
+    else:
+        # SIMULATION DECIDES THE DIRECTION (per explicit instruction): 10,000 simulated futures for
+        # BUY and for SELL with this signal's own stop/target distances; the side with the better
+        # chance of hitting its target first is the signal. Never blocks: if the simulation can't run
+        # (no data / error / timeout) the model's own direction stands and the signal goes out as before.
+        try:
+            import signal_odds
+            _sl_f = pip_size * sl_multiplier / live_price
+            _tp_f = pip_size * tp_multiplier / live_price
+            _dec = await asyncio.wait_for(asyncio.to_thread(
+                signal_odds.decide_direction, config.get("mt5_symbol"), get_candles_exness,
+                _sl_f, _tp_f, pair_name, direction), timeout=10)
+            if _dec:
+                _sim_dir, _pb, _ps = _dec
+                print(f"[ODDS] {pair_name}: sim BUY {_pb*100:.1f}% / SELL {_ps*100:.1f}% -> {_sim_dir} "
+                      f"(model said {direction})", flush=True)
+                if _sim_dir != direction:
+                    direction = _sim_dir
+                    agreeing_strategies = []
+                    reason = f"Our AI engine's latest read of recent {display} price behaviour favours a {direction} here."
+        except Exception as _e:
+            print(f"[ODDS] decision skipped: {type(_e).__name__}: {str(_e)[:100]}", flush=True)
 
     if direction == "BUY":
         entry_price = round(live_price, decimals)

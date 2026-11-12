@@ -12421,6 +12421,22 @@ async def _build_synthetic_signal_response_inner(index_key, min_agree=2, manual=
             agreeing_strategies = []
             winning_votes = []
             reason = "Market conditions continue to favor " + ("buyers" if direction == "BUY" else "sellers") + " here."
+        else:
+            try:
+                import signal_odds
+                if h1_candles and len(h1_candles) >= 15:
+                    _px = h1_candles[-1]["close"]
+                    _atr = sum(c["high"] - c["low"] for c in h1_candles[-14:]) / 14
+                    if _px and _atr > 0:
+                        _dec = await asyncio.wait_for(asyncio.to_thread(
+                            signal_odds.decide_direction, config["symbol"], signal_odds.deriv_candles,
+                            _atr * 1.5 / _px, _atr * 3.0 / _px, "D" + index_key, direction), timeout=15)
+                        if _dec:
+                            print(f"[ODDS] {index_key} (repeat): sim BUY {_dec[1]*100:.1f}% / SELL {_dec[2]*100:.1f}% "
+                                  f"(kept {direction})", flush=True)
+                            reason = _backed_by(reason, direction, direction, _dec[1], _dec[2])
+            except Exception as _e:
+                print(f"[ODDS] {index_key} repeat label skipped: {type(_e).__name__}: {str(_e)[:100]}", flush=True)
     else:
       try:
         import signal_odds
@@ -23112,6 +23128,22 @@ async def build_signal_response(question, user_id=None, retry_mismatch=False):
             direction = _reuse
             agreeing_strategies = []
             reason = ("Market conditions continue to favor " + ("buyers" if direction == "BUY" else "sellers") + " here.")
+        else:
+            # Same direction as the recent signal: the direction is kept, but the simulation is still
+            # consulted so the wording says honestly whether it also backs this side.
+            try:
+                import signal_odds
+                _sl_f = pip_size * sl_multiplier / live_price
+                _tp_f = pip_size * tp_multiplier / live_price
+                _dec = await asyncio.wait_for(asyncio.to_thread(
+                    signal_odds.decide_direction, config.get("mt5_symbol"), get_candles_exness,
+                    _sl_f, _tp_f, pair_name, direction), timeout=10)
+                if _dec:
+                    print(f"[ODDS] {pair_name} (repeat): sim BUY {_dec[1]*100:.1f}% / SELL {_dec[2]*100:.1f}% "
+                          f"(kept {direction})", flush=True)
+                    reason = _backed_by(reason, direction, direction, _dec[1], _dec[2])
+            except Exception as _e:
+                print(f"[ODDS] repeat label skipped: {type(_e).__name__}: {str(_e)[:100]}", flush=True)
     else:
         # SIMULATION DECIDES THE DIRECTION (per explicit instruction): 10,000 simulated futures for
         # BUY and for SELL with this signal's own stop/target distances; the side with the better

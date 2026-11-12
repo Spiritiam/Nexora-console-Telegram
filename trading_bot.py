@@ -21261,9 +21261,9 @@ def format_inner_circle_card(index):
 
 # ---- 3D picture cards (Saturday education on all channels, daily news) ----
 _ASSET_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "assets3d")
-_KP_IMAGE = ["risk", "risk", "stop", "stop", "coins", "scale", "scale", "bolt", "chart", "chart",
-             "bolt", "chart", "stop", "clock", "news", "scale", "bolt", "stop", "coins", "journal",
-             "risk", "coins", "clock", "journal", "risk", "coins"]
+_KP_IMAGE = ["risk", "risk", "stop", "stop", "risk", "chart", "journal", "stop", "chart", "chart",
+             "chart", "chart", "stop", "news", "news", "risk", "risk", "stop", "journal", "journal",
+             "risk", "risk", "news", "journal", "journal", "risk"]
 
 
 def _font(size):
@@ -21283,15 +21283,18 @@ def _render_3d_card(image_key, label, title=None):
         from PIL import Image, ImageDraw
         im = Image.open(os.path.join(_ASSET_DIR, f"{image_key}.jpg")).convert("RGB")
         d = ImageDraw.Draw(im, "RGBA")
-        _h = 360 if title else 130
-        for _y in range(_h):
-            d.line([(0, _y), (1080, _y)], fill=(4, 10, 34, int(215 * (1 - _y / _h) ** 1.3)))
-        d.text((54, 44), label, font=_font(34), fill=(125, 211, 252))
+        for _y in range(130):
+            d.line([(0, _y), (1080, _y)], fill=(4, 10, 34, int(200 * (1 - _y / 130) ** 1.3)))
+        d.text((54, 40), label, font=_font(34), fill=(125, 211, 252))
         if title:
-            y = 110
-            for line in textwrap.wrap(title, 22)[:3]:
-                d.text((54, y), line, font=_font(70), fill=(255, 255, 255))
-                y += 88
+            lines = textwrap.wrap(title, 24)[:3]
+            _h = 120 + 84 * len(lines)
+            for _y in range(_h):
+                d.line([(0, 1080 - _h + _y), (1080, 1080 - _h + _y)], fill=(4, 10, 34, int(225 * (_y / _h) ** 1.2)))
+            y = 1080 - 60 - 84 * len(lines)
+            for line in lines:
+                d.text((54, y), line, font=_font(66), fill=(255, 255, 255))
+                y += 84
         buf = io.BytesIO()
         im.save(buf, "JPEG", quality=88)
         return buf.getvalue()

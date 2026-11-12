@@ -485,7 +485,7 @@ def _client_candles(self, instrument, timeframe, count):
     now = datetime.now(timezone.utc)
     for factor in (1.3, 3.0, 8.0):
         span = int(count * tf * factor)
-        span = min(span, 1000 * tf)
+        span = min(span, 990 * tf)
         q = urlencode({
             "instrument": instrument, "price_type": "bid", "timeframe": timeframe,
             "from": (now - timedelta(seconds=span)).strftime("%Y-%m-%dT%H:%M:%SZ"),
@@ -495,7 +495,7 @@ def _client_candles(self, instrument, timeframe, count):
         if code != 200:
             raise RuntimeError(f"candles {instrument} {timeframe}: HTTP {code} {str(d)[:160]}")
         rows = d.get("candles") or []
-        if len(rows) >= count * 0.9 or span >= 1000 * tf:
+        if len(rows) >= count * 0.9 or span >= 990 * tf:
             return rows[-count:]
     return rows[-count:]
 

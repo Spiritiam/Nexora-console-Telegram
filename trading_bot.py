@@ -3332,7 +3332,7 @@ SC_MODES = {
     # Account Flip: support/resistance on the 1-hour chart, entry from the 30-minute chart.
     # Stop 100 pips on gold, 50 on silver; at +20 pips break-even + trailing 10 behind;
     # one more trade every further 20 pips (max 5) once the earlier ones are protected.
-    "flip_sr": dict(SC_CFG, entry="sr", sl_pips=100, sl_pips_by_pair={"xauusd": 100, "xagusd": 50},
+    "flip_sr": dict(SC_CFG, entry="mlsim", sl_pips=100, sl_pips_by_pair={"xauusd": 100, "xagusd": 50},
                     trail_activate_pips=20, trail_pips=10, max_layers=5, add_pips=20,
                     label="🚀 Account Flip"),
 }
@@ -3530,6 +3530,50 @@ async def _sc_notify(context, user_id, text):
         print(f"[SC] Couldn't notify {user_id}: {type(e).__name__}")
 
 
+_FLIP_DEC = {}
+_FLIP_LOCKS = {}
+
+
+async def _flip_ml_sim_direction(pair_key, pair_config, sl_dist):
+    """Account Flip entry: the normal hourly ML model decides, then the 10,000-path simulation
+    (stop = the flip stop, target = 2x stop) chooses the side. One decision per pair per 15 minutes,
+    shared by all users. Returns "BUY"/"SELL" or None (no decision - nothing is opened)."""
+    slot = int(time.time() // 900)
+    hit = _FLIP_DEC.get(pair_key)
+    if hit and hit[0] == slot:
+        return hit[1]
+    lock = _FLIP_LOCKS.setdefault(pair_key, asyncio.Lock())
+    async with lock:
+        hit = _FLIP_DEC.get(pair_key)
+        if hit and hit[0] == slot:
+            return hit[1]
+        res = None
+        try:
+            h1 = await asyncio.to_thread(get_cached_candles, pair_key, pair_config, "1h", outputsize=210)
+            h4 = await asyncio.to_thread(get_cached_candles, pair_key, pair_config, "4h", outputsize=60)
+            d1 = await asyncio.to_thread(get_cached_candles, pair_key, pair_config, "1day", outputsize=10)
+            if h1 and len(h1) >= 100:
+                ml = await asyncio.to_thread(run_ml_driven_decision, pair_key, pair_config, h1, h4, d1)
+                if ml:
+                    res = ml[0]
+                    try:
+                        import signal_odds
+                        price = float(h1[-1]["close"])
+                        dec = await asyncio.wait_for(asyncio.to_thread(
+                            signal_odds.decide_direction, pair_config["mt5_symbol"], get_candles_exness,
+                            sl_dist / price, 2 * sl_dist / price, "FLIP" + pair_key, res), timeout=10)
+                        if dec:
+                            print(f"[ODDS] Account Flip {pair_key}: sim BUY {dec[1]*100:.1f}% / SELL {dec[2]*100:.1f}% "
+                                  f"-> {dec[0]} (model said {res})", flush=True)
+                            res = dec[0]
+                    except Exception as _e:
+                        print(f"[ODDS] Account Flip sim skipped {pair_key}: {type(_e).__name__}: {str(_e)[:100]}", flush=True)
+        except Exception as e:
+            print(f"[ACCOUNT FLIP] ML decision failed {pair_key}: {type(e).__name__}: {str(e)[:100]}", flush=True)
+        _FLIP_DEC[pair_key] = (slot, res)
+        return res
+
+
 async def _sc_tick_one(context, account):
     user_id = str(account["user_id"])
     acct_id = account["metaapi_account_id"]
@@ -3649,7 +3693,20 @@ async def _sc_tick_one(context, account):
 
         sig = None
         ml_used = False
-        if cfg.get("entry") == "sr":
+        if cfg.get("entry") == "mlsim":
+            # Account Flip: hourly ML model + 10,000-path simulation choose the side; stops, trailing
+            # and layers below are unchanged.
+            if st["phase"] in ("arm", None, "armed"):
+                st["phase"] = "armed"
+            _slot = int(now // 900)
+            if st.get("flip_slot") == _slot:
+                return
+            direction = await _flip_ml_sim_direction(pair_key, pair_config, sl_pips * pip)
+            if not direction:
+                return
+            st["flip_slot"] = _slot
+            ml_used = True
+        elif cfg.get("entry") == "sr":
             # Account Flip: no straddle. Wait for a respected 1-hour level with a 30-minute rejection candle.
             if st["phase"] in ("arm", None, "armed"):
                 st["phase"] = "armed"
@@ -3673,6 +3730,20 @@ async def _sc_tick_one(context, account):
                 direction = _ml["dir"]
                 st["ml_bar"] = _ml["bar_t"]
                 ml_used = True
+                # 10,000-path simulation picks the side (stop = this scalper's stop, target = 2x stop).
+                # If it can't run, the model's side stands.
+                try:
+                    import signal_odds
+                    _mid = (bid + ask) / 2.0
+                    _dec = await asyncio.wait_for(asyncio.to_thread(
+                        signal_odds.decide_direction, pair_config["mt5_symbol"], get_candles_exness,
+                        sl_pips * pip / _mid, 2 * sl_pips * pip / _mid, "SC" + pair_key, direction), timeout=10)
+                    if _dec and _dec[0] != direction:
+                        print(f"[ODDS] Scalper {pair_key}: sim BUY {_dec[1]*100:.1f}% / SELL {_dec[2]*100:.1f}% "
+                              f"-> {_dec[0]} (model said {direction})", flush=True)
+                        direction = _dec[0]
+                except Exception as _e:
+                    print(f"[ODDS] Scalper sim skipped {pair_key}: {type(_e).__name__}: {str(_e)[:100]}", flush=True)
             else:
                 dist = cfg["pending_pips"] * pip
                 if st["phase"] in ("arm", None) or now - st.get("armed_at", 0) > cfg["pending_expiry_s"]:

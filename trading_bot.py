@@ -21261,9 +21261,11 @@ def format_inner_circle_card(index):
 
 # ---- 3D picture cards (Saturday education on all channels, daily news) ----
 _ASSET_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "assets3d")
-_KP_IMAGE = ["risk", "risk", "stop", "stop", "risk", "chart", "journal", "stop", "chart", "chart",
-             "chart", "chart", "stop", "news", "news", "risk", "risk", "stop", "journal", "journal",
-             "risk", "risk", "news", "journal", "journal", "risk"]
+_KP_IMAGE = ["risk_shield", "risk_coins", "stop_sign", "stop", "risk", "chart_lens", "journal_graph", "stop_bars",
+             "chart", "chart_candles", "chart_lens", "chart", "stop_sign", "news_globe", "news", "risk_coins",
+             "risk", "stop", "journal", "journal_pen", "risk_shield", "risk_coins", "news_bell", "journal_graph",
+             "journal_pen", "risk"]
+_NEWS_IMAGES = ["news", "news_bell", "news_mega", "news_globe"]
 
 
 def _font(size):
@@ -25380,7 +25382,7 @@ async def post_news(context: ContextTypes.DEFAULT_TYPE):
             summary_lines[0] = f"<b>{summary_lines[0]}</b>"
             summary = "\n".join(summary_lines)
 
-    _news_3d = _render_3d_card("news", {"morning": "NEXORA AI  ·  MORNING BRIEF", "midday": "NEXORA AI  ·  MIDDAY UPDATE"}.get(session_type, "NEXORA AI  ·  MARKET BRIEF"))
+    _news_3d = _render_3d_card(_NEWS_IMAGES[datetime.utcnow().timetuple().tm_yday % len(_NEWS_IMAGES)], {"morning": "NEXORA AI  ·  MORNING BRIEF", "midday": "NEXORA AI  ·  MIDDAY UPDATE"}.get(session_type, "NEXORA AI  ·  MARKET BRIEF"))
     for channel_id in [CHANNEL_1_ID, CHANNEL_2_ID, CHANNEL_3_ID]:
         photo_sent = False
         # FIX: extended from 2 to 3 attempts with escalating waits

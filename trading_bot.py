@@ -21298,7 +21298,7 @@ async def post_weekend_lesson(context: ContextTypes.DEFAULT_TYPE):
     idx = get_saturday_card_index()
     title, bullets = INNER_CIRCLE_KEY_POINTS[idx]
     img = _render_3d_card(_KP_IMAGE[idx % len(_KP_IMAGE)], f"NEXORA AI  ·  TRADING LESSON {idx + 1:02d}", title)
-    caption = (f"📘 <b>{_esc(title)}</b>\n\n"
+    caption = (f"📘 <b>Nexora AI · Trading Lesson {idx + 1:02d}</b>\n<b>{_esc(title)}</b>\n\n"
                + "\n".join(f"▫️ {_esc(b)}" for b in bullets[:3])
                + "\n\n<i>Education, not financial advice</i>")
     for ch in [CHANNEL_1_ID, CHANNEL_2_ID, CHANNEL_3_ID]:

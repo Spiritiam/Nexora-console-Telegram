@@ -9130,6 +9130,9 @@ def get_open_signals():
         print(f"[SIGNAL LOG] get_open_signals error: {e}")
         return []
 
+STALE_OPEN_SIGNAL_HOURS = 24
+
+
 def has_open_signal_for_pair(pair_name):
     """
     True if this pair already has a SCHEDULED signal sitting OPEN in
@@ -9146,9 +9149,15 @@ def has_open_signal_for_pair(pair_name):
     posting behavior, not just added tracking.
     """
     try:
+        # A signal still marked OPEN after STALE_OPEN_SIGNAL_HOURS no longer blocks
+        # the next scheduled signal (a record that never closed used to block its
+        # pair for days). The real-position check in _post_signal_for_pair still
+        # protects against stacking on a genuinely live trade.
+        cutoff = (datetime.utcnow() - timedelta(hours=STALE_OPEN_SIGNAL_HOURS)).strftime("%Y-%m-%dT%H:%M:%S")
         url = (
             f"{SUPABASE_URL}/rest/v1/signal_log"
-            f"?status=eq.OPEN&pair_name=eq.{pair_name}&source=eq.scheduled&select=id&limit=1"
+            f"?status=eq.OPEN&pair_name=eq.{pair_name}&source=eq.scheduled"
+            f"&posted_at=gte.{cutoff}&select=id&limit=1"
         )
         response = requests.get(url, headers=sb_headers(), timeout=10)
         data = response.json()
@@ -33359,6 +33368,14 @@ async def check_open_signals(context: ContextTypes.DEFAULT_TYPE):
         return
 
     for sig in open_signals:
+        # The break-even handler already worked out how this signal really ended
+        # (both legs closed). Use that result instead of looking the trade up
+        # again, so a failed or empty lookup can't leave the signal OPEN.
+        detail = sig.get("tp_detail")
+        if detail in ("TP1", "TP2", "SL"):
+            update_signal_status(sig["id"], "SL_HIT" if detail == "SL" else "TP_HIT", sig.get("source"))
+            continue
+
         mt5_order_id = sig.get("mt5_order_id")
 
         if mt5_order_id:

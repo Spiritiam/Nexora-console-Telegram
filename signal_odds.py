@@ -157,6 +157,36 @@ def submit(signal_id, payload, symbol, candle_fn, sb_url, sb_headers, source="sc
         pass
 
 
+def decide_direction(symbol, candle_fn, sl_f, tp_f, pair="", fallback="BUY"):
+    """Run the simulation for BUY and SELL with the signal's own stop/target distances and return
+    (direction, p_buy, p_sell), where p is the chance the target is hit before the stop.
+    Returns None if the simulation can't run (no data etc.) - caller keeps its own direction.
+    Never raises."""
+    try:
+        if os.getenv("SIGNAL_ODDS_DECIDE", "1") != "1" or not symbol or sl_f <= 0 or tp_f <= 0 \
+                or sl_f > 0.05 or tp_f > 0.1:
+            return None
+        arr = _bars(symbol, candle_fn)
+        if arr is None:
+            return None
+        res = {}
+        for d in ("BUY", "SELL"):
+            key = (pair, d, round(sl_f, 4), round(tp_f, 4), int(arr[-1][0]))
+            r = _RES.get(key)
+            if r is None:
+                r = simulate(arr[-LOOKBACK:], sl_f, tp_f, d)
+                if len(_RES) > 500:
+                    _RES.clear()
+                _RES[key] = r
+            res[d] = r[0] / (r[0] + r[1]) if (r[0] + r[1]) > 0 else 0.0
+        if abs(res["BUY"] - res["SELL"]) < 1e-9:
+            return fallback, res["BUY"], res["SELL"]
+        return ("BUY" if res["BUY"] > res["SELL"] else "SELL"), res["BUY"], res["SELL"]
+    except Exception as e:
+        _log(f"decide failed: {type(e).__name__}: {str(e)[:100]}")
+        return None
+
+
 if __name__ == "__main__":
     # self-test on synthetic data: a driftless random walk with a 1:3 stop/target should hit the target ~25%
     rng = np.random.default_rng(1)

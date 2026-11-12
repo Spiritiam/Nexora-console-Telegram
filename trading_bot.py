@@ -22841,6 +22841,29 @@ async def build_signal_response(question, user_id=None, retry_mismatch=False):
     sl_multiplier, tp_multiplier = get_sl_tp_multipliers(matched_key, live_price)
     tp1_multiplier = get_tp1_multiplier(matched_key, live_price)
 
+    # SIMULATION DECIDES THE DIRECTION (per explicit instruction): 10,000 simulated futures for
+    # BUY and for SELL with this signal's own stop/target distances; the side with the better
+    # chance of hitting its target first is the signal. Never blocks: if the simulation can't run
+    # (no data / error / timeout) the model's own direction stands and the signal goes out as before.
+    try:
+        import signal_odds
+        _sl_f = pip_size * sl_multiplier / live_price
+        _tp_f = pip_size * tp_multiplier / live_price
+        _dec = await asyncio.wait_for(asyncio.to_thread(
+            signal_odds.decide_direction, config.get("mt5_symbol"), get_candles_exness,
+            _sl_f, _tp_f, pair_name, direction), timeout=10)
+        if _dec:
+            _sim_dir, _pb, _ps = _dec
+            print(f"[ODDS] {pair_name}: sim BUY {_pb*100:.1f}% / SELL {_ps*100:.1f}% -> {_sim_dir} "
+                  f"(model said {direction})", flush=True)
+            if _sim_dir != direction:
+                direction = _sim_dir
+                agreeing_strategies = []
+                reason = ("Our market simulation, which replays thousands of possible price paths from "
+                          f"recent {display} behaviour, favours a {direction} here.")
+    except Exception as _e:
+        print(f"[ODDS] decision skipped: {type(_e).__name__}: {str(_e)[:100]}", flush=True)
+
     if direction == "BUY":
         entry_price = round(live_price, decimals)
         stop_loss = round(live_price - (pip_size * sl_multiplier), decimals)

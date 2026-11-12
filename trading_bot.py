@@ -8814,6 +8814,15 @@ def log_signal(signal_data, source="scheduled"):
                     "posted_at": payload["posted_at"],
                     "source": source,
                 })
+                # Odds check (record-only, background): never delays or blocks a signal.
+                try:
+                    import signal_odds
+                    _sym = next((c.get("mt5_symbol") for c in PAIR_CONFIG.values()
+                                 if c.get("pair_name") == payload["pair_name"]), None)
+                    signal_odds.submit(signal_id, payload, _sym, get_candles_exness,
+                                       SUPABASE_URL, sb_headers, source)
+                except Exception:
+                    pass
             return signal_id
         else:
             print(

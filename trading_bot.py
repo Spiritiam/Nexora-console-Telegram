@@ -3496,17 +3496,36 @@ async def _sc_quote(resolved):
     # A failed lookup (Exness 429 -> slow MetaAPI fallbacks) must not be repeated by every account
     # every tick: that is what made the 5s scalper job overrun. Retry at most once per 4s per symbol.
     _qf = _SC.setdefault("qfail", {})
+    _stale = hit[1] if hit and time.time() - hit[0] < 12 else None
     if time.time() - _qf.get(resolved, 0) < 4:
-        return hit[1] if hit and time.time() - hit[0] < 10 else None
-    q = await asyncio.to_thread(_xc_fetch_quote, resolved)
-    if q:
-        _SC["q"][resolved] = (time.time(), q)
-        if len(_SC["q"]) > 200:
-            _SC["q"].pop(next(iter(_SC["q"])))
-    else:
-        _qf[resolved] = time.time()
-        return hit[1] if hit and time.time() - hit[0] < 10 else None
-    return q
+        return _stale
+    # One lookup per symbol at a time: accounts on the same symbol wait for it instead of each
+    # running their own slow fallback.
+    _lk = _SC.setdefault("qlock", {}).setdefault(resolved, asyncio.Lock())
+    async with _lk:
+        hit = _SC["q"].get(resolved)
+        if hit and time.time() - hit[0] < 3:
+            return hit[1]
+        if time.time() - _qf.get(resolved, 0) < 4:
+            return _stale
+        # Fast path: Exness quote only (in-memory while it is resting after a 429).
+        q = await asyncio.to_thread(get_quote_exness, resolved)
+        if q:
+            q = (float(q[0]), float(q[1]))
+        elif _stale:
+            # Exness is resting: keep working from the last good quote (at most 12s old) instead of
+            # waiting on the slow MetaAPI fallbacks.
+            _qf[resolved] = time.time() - 2
+            return _stale
+        else:
+            q = await asyncio.to_thread(_xc_fetch_quote, resolved)
+        if q:
+            _SC["q"][resolved] = (time.time(), q)
+            if len(_SC["q"]) > 200:
+                _SC["q"].pop(next(iter(_SC["q"])))
+        else:
+            _qf[resolved] = time.time()
+        return q
 
 
 def sc_trail_target(direction, entry, cur, cur_sl, pip, cfg=None):
@@ -17196,7 +17215,7 @@ def get_quote_exness(mt5_symbol):
     if hit and now - hit[0] < 2:
         return hit[1]
     if now < _EXQ_BLOCK.get(mt5_symbol, 0):
-        return hit[1] if hit and now - hit[0] < 8 else None
+        return hit[1] if hit and now - hit[0] < 12 else None
     broker = _exness_md_broker()
     if broker is None:
         return None
@@ -17211,7 +17230,7 @@ def get_quote_exness(mt5_symbol):
         if "429" in msg:
             _EXQ_BLOCK[mt5_symbol] = time.time() + 8
         print(f"[EXNESS DATA] quote {mt5_symbol} failed: {type(e).__name__}: {msg[:120]}")
-        return hit[1] if hit and time.time() - hit[0] < 8 else None
+        return hit[1] if hit and time.time() - hit[0] < 12 else None
 
 
 def get_candles_metaapi(mt5_symbol, interval, outputsize):

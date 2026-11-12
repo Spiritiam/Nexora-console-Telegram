@@ -17110,25 +17110,48 @@ def _exness_md_instrument(broker, mt5_symbol):
     return pick
 
 
+_EXC = {}        # (symbol, tf, n) -> (time, rows)
+_EXC_BLOCK = {}  # symbol -> do not call Exness candles before this time (after a 429)
+_EXC_TTL = {"M1": 15, "M5": 45, "M15": 120, "H1": 300, "H4": 900, "D1": 900}
+
+
 def get_candles_exness(mt5_symbol, interval, outputsize):
-    """Same return shape as get_candles_metaapi, or None (caller falls back)."""
+    """Same return shape as get_candles_metaapi, or None (caller falls back).
+    Shared short cache (so many users/jobs on one symbol cost one request) and, after a 429,
+    the symbol rests for 10s (a recent copy, at most 90s old, is used meanwhile)."""
     tf = {"1min": "M1", "5min": "M5", "15min": "M15", "1h": "H1", "4h": "H4", "1day": "D1"}.get(interval)
     broker = _exness_md_broker()
     if not tf or broker is None:
         return None
+    n = min(int(outputsize), 1000)
+    key = (mt5_symbol, tf, n)
+    now = time.time()
+    hit = _EXC.get(key)
+    if hit and now - hit[0] < _EXC_TTL.get(tf, 60):
+        return [dict(r) for r in hit[1]]
+    if now < _EXC_BLOCK.get(mt5_symbol, 0):
+        return [dict(r) for r in hit[1]] if hit and now - hit[0] < 90 else None
     try:
         inst = _exness_md_instrument(broker, mt5_symbol)
         if not inst:
             return None
-        rows = broker.candles(inst, tf, min(int(outputsize), 1000))
+        rows = broker.candles(inst, tf, n)
         out = [{"time": r.get("time"), "open": float(r["open"]), "high": float(r["high"]),
                 "low": float(r["low"]), "close": float(r["close"]),
                 "volume": float(r.get("volume") or 0)} for r in rows]
         if out:
+            if len(_EXC) > 200:
+                _EXC.clear()
+            _EXC[key] = (time.time(), out)
             print(f"[EXNESS DATA] ✅ {mt5_symbol} {tf} - {len(out)} candles")
-            return out
+            return [dict(r) for r in out]
     except Exception as e:
-        print(f"[EXNESS DATA] candles {mt5_symbol} failed: {type(e).__name__}: {str(e)[:120]}")
+        msg = str(e)
+        if "429" in msg:
+            _EXC_BLOCK[mt5_symbol] = time.time() + 10
+        print(f"[EXNESS DATA] candles {mt5_symbol} failed: {type(e).__name__}: {msg[:120]}")
+        if hit and time.time() - hit[0] < 90:
+            return [dict(r) for r in hit[1]]
     return None
 
 

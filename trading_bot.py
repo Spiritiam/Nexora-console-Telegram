@@ -25364,7 +25364,7 @@ async def post_news(context: ContextTypes.DEFAULT_TYPE):
             summary_lines[0] = f"<b>{summary_lines[0]}</b>"
             summary = "\n".join(summary_lines)
 
-    _news_3d = _render_3d_card(_NEWS_IMAGES[datetime.utcnow().timetuple().tm_yday % len(_NEWS_IMAGES)], {"morning": "NEXORA AI  ·  MORNING BRIEF", "midday": "NEXORA AI  ·  MIDDAY UPDATE"}.get(session_type, "NEXORA AI  ·  MARKET BRIEF"))
+    _news_3d = None  # daily news keeps its own picture; the 5 Canva images are for the Saturday lesson only
     for channel_id in [CHANNEL_1_ID, CHANNEL_2_ID, CHANNEL_3_ID]:
         photo_sent = False
         # FIX: extended from 2 to 3 attempts with escalating waits

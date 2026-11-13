@@ -35566,13 +35566,15 @@ def main():
     # `days` param (0=Sunday ... 6=Saturday), NOT Python's
     # datetime.weekday() convention (0=Monday ... 6=Sunday). days=(6,)
     # was firing Saturday, not Sunday - days=(0,) is correct here.
-    job_queue.run_daily(
-        post_weekly_report,
-        time=parse_time("23:00"),
-        name="weekly_report",
-        days=(0,),
-        job_kwargs={"misfire_grace_time": 300}
-    )
+    # Weekly report is switched OFF per explicit instruction; set WEEKLY_REPORT=1 on Railway to bring it back.
+    if os.getenv("WEEKLY_REPORT", "0") == "1":
+        job_queue.run_daily(
+            post_weekly_report,
+            time=parse_time("23:00"),
+            name="weekly_report",
+            days=(0,),
+            job_kwargs={"misfire_grace_time": 300}
+        )
 
     # Daily signal report - DISABLED per explicit instruction. Only the
     # weekly report (Sunday 23:00 UTC) is posted now. post_daily_report

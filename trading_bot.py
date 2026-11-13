@@ -32713,7 +32713,7 @@ async def accountpnl_command(update: Update, context: ContextTypes.DEFAULT_TYPE)
         if broker is None:
             return "Could not load that account's Exness credentials."
         info = broker.account_info()
-        start = datetime.now(timezone.utc) - timedelta(days=45)
+        start = datetime.now(timezone.utc) - timedelta(days=29)
         end = datetime.now(timezone.utc) + timedelta(minutes=1)
         deals, truncated, step = [], 0, timedelta(days=3)
         cur = start
@@ -32756,7 +32756,7 @@ async def accountpnl_command(update: Update, context: ContextTypes.DEFAULT_TYPE)
             f"Account {row.get('account_number')} ({row.get('bot_choice')}, lot {row.get('lot_size')})",
             f"Balance now: {bal}",
             f"Equity now: {info.get('equity')}",
-            f"Trading result (profit+commission+swap, last 45d): {trade_total:.2f}",
+            f"Trading result (profit+commission+swap, last 29d): {trade_total:.2f}",
             f"Closed trades: {closes}, profitable: {wins}",
             f"Deposits/withdrawals in window: {funding:.2f}",
             f"Deal types seen: {types}",

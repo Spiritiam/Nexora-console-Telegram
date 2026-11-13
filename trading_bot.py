@@ -32738,8 +32738,18 @@ async def accountpnl_command(update: Update, context: ContextTypes.DEFAULT_TYPE)
         types = {}
         trade_total = funding = 0.0
         closes = wins = 0
+        _flat = []
         for x in deals:
-            t = str(x.get("type")).lower()
+            inner = x.get("deal") if isinstance(x.get("deal"), dict) else {}
+            y = dict(inner)
+            y["event_time"] = x.get("event_time")
+            for k, v in x.items():
+                if k != "deal" and k not in y:
+                    y[k] = v
+            _flat.append(y)
+        deals = _flat
+        for x in deals:
+            t = str(x.get("type") or x.get("deal_type") or x.get("entry") or x.get("action") or "none").lower()
             types[t] = types.get(t, 0) + 1
             amt = num(x, "profit") + num(x, "commission") + num(x, "swap")
             if t in ("balance", "deposit", "withdrawal", "credit", "correction", "bonus"):
@@ -32753,7 +32763,10 @@ async def accountpnl_command(update: Update, context: ContextTypes.DEFAULT_TYPE)
         first = ""
         sample = ""
         if deals:
-            sample = "Sample deal: " + str({k: (str(v)[:40]) for k, v in list(deals[0].items())[:25]})[:700]
+            sample = "Sample deal: " + str(deals[0])[:700]
+            nz = next((d for d in deals if num(d, "profit") != 0), None)
+            if nz:
+                sample += "\nSample with profit: " + str(nz)[:700]
         bal = info.get("balance")
         lines = [
             f"Account {row.get('account_number')} ({row.get('bot_choice')}, lot {row.get('lot_size')})",

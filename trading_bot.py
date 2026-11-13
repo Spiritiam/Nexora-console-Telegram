@@ -222,7 +222,7 @@ MT5_AUTOTRADE_BOTS = {
             "strategy_williams_r", "strategy_heikin_ashi_trend",
         ],
         "timeframe": "1min",
-        "description": "Fast, short-term trades on US Oil and Bitcoin. Protects profit automatically and keeps watching for the next opportunity.",
+        "description": "Fast, short-term trades on Gold, US Oil and Bitcoin. Protects profit automatically and keeps watching for the next opportunity.",
     },
     "flip_fast": {
         "label": "⚡ Account Flip (Fast)",
@@ -284,7 +284,7 @@ MT5_AUTOTRADE_BOTS_VISIBLE = {
 }
 # Which pairs each visible bot may trade (first = shown first).
 MT5_BOT_PAIRS = {
-    "aggressive_scalper": ["usoil", "btcusd"],
+    "aggressive_scalper": ["xauusd", "usoil", "btcusd"],
     "flip_sr": ["xauusd", "xagusd"],
 }
 
@@ -2503,7 +2503,7 @@ def _mig_exness_sync():
     sel = "select=user_id,bot_choice,pair_choice,risk_mode,lot_size,flip_base_lot"
     rows = []
     for q in (f"?bot_choice=in.({','.join(_MIG_OLD_EX)})&{sel}",
-              f"?bot_choice=eq.aggressive_scalper&pair_choice=in.(xauusd,xagusd)&{sel}"):
+              f"?bot_choice=eq.aggressive_scalper&pair_choice=eq.xagusd&{sel}"):
         r = requests.get(base + q, headers=sb_headers(), timeout=15)
         if r.status_code == 200 and isinstance(r.json(), list):
             rows += r.json()

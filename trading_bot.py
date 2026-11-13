@@ -32715,7 +32715,7 @@ async def accountpnl_command(update: Update, context: ContextTypes.DEFAULT_TYPE)
         info = broker.account_info()
         start = datetime.now(timezone.utc) - timedelta(days=29)
         end = datetime.now(timezone.utc) + timedelta(minutes=1)
-        deals, truncated, step = [], 0, timedelta(days=3)
+        deals, truncated, step = [], 0, timedelta(days=1)
         cur = start
         while cur < end:
             nxt = min(cur + step, end)
@@ -32750,7 +32750,10 @@ async def accountpnl_command(update: Update, context: ContextTypes.DEFAULT_TYPE)
                     closes += 1
                     if amt > 0:
                         wins += 1
-        first = min((str(x.get("time") or x.get("created_at") or "") for x in deals), default="")
+        first = ""
+        sample = ""
+        if deals:
+            sample = "Sample deal: " + str({k: (str(v)[:40]) for k, v in list(deals[0].items())[:25]})[:700]
         bal = info.get("balance")
         lines = [
             f"Account {row.get('account_number')} ({row.get('bot_choice')}, lot {row.get('lot_size')})",
@@ -32760,7 +32763,8 @@ async def accountpnl_command(update: Update, context: ContextTypes.DEFAULT_TYPE)
             f"Closed trades: {closes}, profitable: {wins}",
             f"Deposits/withdrawals in window: {funding:.2f}",
             f"Deal types seen: {types}",
-            f"Earliest deal in window: {first}",
+            f"Deals fetched: {len(deals)}",
+            sample,
         ]
         if bal is not None:
             lines.append(f"Balance minus trading result (implied start): {bal - trade_total:.2f}")

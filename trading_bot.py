@@ -32714,8 +32714,17 @@ async def accountpnl_command(update: Update, context: ContextTypes.DEFAULT_TYPE)
             return "Could not load that account's Exness credentials."
         info = broker.account_info()
         start = datetime.now(timezone.utc) - timedelta(days=29)
+        try:
+            _c = str(row.get("created_at")).replace(" ", "T")
+            if _c.endswith("+00"):
+                _c += ":00"
+            _cd = datetime.fromisoformat(_c) - timedelta(days=1)
+            if _cd > start:
+                start = _cd
+        except Exception:
+            pass
         end = datetime.now(timezone.utc) + timedelta(minutes=1)
-        deals, truncated, step = [], 0, timedelta(days=1)
+        deals, truncated, step = [], 0, timedelta(hours=6)
         cur = start
         while cur < end:
             nxt = min(cur + step, end)
@@ -32731,8 +32740,11 @@ async def accountpnl_command(update: Update, context: ContextTypes.DEFAULT_TYPE)
             cur = nxt
             time.sleep(0.3)
         def num(x, k):
+            v = x.get(k)
+            if isinstance(v, dict):
+                v = v.get("amount")
             try:
-                return float(x.get(k) or 0)
+                return float(v or 0)
             except (TypeError, ValueError):
                 return 0.0
         types = {}

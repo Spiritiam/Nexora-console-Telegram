@@ -32684,6 +32684,97 @@ async def exnesscheck_command(update: Update, context: ContextTypes.DEFAULT_TYPE
     await update.message.reply_text("\n".join(lines))
 
 
+async def accountpnl_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Admin-only: real balance / equity / closed-trade profit of a client Exness
+    account, read from Exness deal history. Usage: /accountpnl <telegram user id>"""
+    user_id = str(update.message.from_user.id)
+    if not ADMIN_USER_ID or user_id != str(ADMIN_USER_ID):
+        return
+    if not context.args:
+        await update.message.reply_text("Usage: /accountpnl <telegram user id>")
+        return
+    target = context.args[0].strip()
+
+    def _work():
+        from datetime import datetime, timedelta, timezone
+        from urllib.parse import urlencode
+        r = requests.get(
+            f"{SUPABASE_URL}/rest/v1/mt5_auto_trade_accounts?user_id=eq.{target}"
+            f"&select=account_number,metaapi_account_id,bot_choice,lot_size,created_at",
+            headers=sb_headers(), timeout=10)
+        rows = r.json() if r.status_code == 200 else []
+        if not rows:
+            return "No auto trading account for that user."
+        row = rows[0]
+        ref = row.get("metaapi_account_id")
+        if not _is_exness_ref(ref):
+            return "That account is not an Exness API account."
+        broker = _exness_broker_sync(ref)
+        if broker is None:
+            return "Could not load that account's Exness credentials."
+        info = broker.account_info()
+        start = datetime.now(timezone.utc) - timedelta(days=45)
+        end = datetime.now(timezone.utc) + timedelta(minutes=1)
+        deals, truncated, step = [], 0, timedelta(days=3)
+        cur = start
+        while cur < end:
+            nxt = min(cur + step, end)
+            q = urlencode({"from": cur.strftime("%Y-%m-%dT%H:%M:%SZ"),
+                           "to": nxt.strftime("%Y-%m-%dT%H:%M:%SZ"), "limit": 200})
+            code, d = broker._call("GET", f"/v1/history/accounts/{broker.account_id}/deals?{q}")
+            if code != 200:
+                return f"Deal history failed: HTTP {code} {str(d)[:150]}"
+            items = d.get("items") or d.get("deals") or []
+            if len(items) >= 200:
+                truncated += 1
+            deals.extend(items)
+            cur = nxt
+            time.sleep(0.3)
+        def num(x, k):
+            try:
+                return float(x.get(k) or 0)
+            except (TypeError, ValueError):
+                return 0.0
+        types = {}
+        trade_total = funding = 0.0
+        closes = wins = 0
+        for x in deals:
+            t = str(x.get("type")).lower()
+            types[t] = types.get(t, 0) + 1
+            amt = num(x, "profit") + num(x, "commission") + num(x, "swap")
+            if t in ("balance", "deposit", "withdrawal", "credit", "correction", "bonus"):
+                funding += amt
+            else:
+                trade_total += amt
+                if t == "close":
+                    closes += 1
+                    if amt > 0:
+                        wins += 1
+        first = min((str(x.get("time") or x.get("created_at") or "") for x in deals), default="")
+        bal = info.get("balance")
+        lines = [
+            f"Account {row.get('account_number')} ({row.get('bot_choice')}, lot {row.get('lot_size')})",
+            f"Balance now: {bal}",
+            f"Equity now: {info.get('equity')}",
+            f"Trading result (profit+commission+swap, last 45d): {trade_total:.2f}",
+            f"Closed trades: {closes}, profitable: {wins}",
+            f"Deposits/withdrawals in window: {funding:.2f}",
+            f"Deal types seen: {types}",
+            f"Earliest deal in window: {first}",
+        ]
+        if bal is not None:
+            lines.append(f"Balance minus trading result (implied start): {bal - trade_total:.2f}")
+        if truncated:
+            lines.append(f"WARNING: {truncated} window(s) hit the 200-deal cap, totals may be low")
+        return "\n".join(lines)
+
+    try:
+        text = await asyncio.to_thread(_work)
+    except Exception as e:
+        text = f"Failed: {type(e).__name__}: {str(e)[:200]}"
+    await update.message.reply_text(text)
+
+
 async def unlinkappemail_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Admin-only: unlink an Exness email that is linked inside the SpiritFX
     Trading Academy app (same full steps as the in-app Unlink: credentials
@@ -35059,6 +35150,7 @@ def main():
     app.add_handler(CommandHandler("exnesslinkreport", exnesslinkreport_command))
     app.add_handler(CommandHandler("exnesslinkremove", exnesslinkremove_command))
     app.add_handler(CommandHandler("exnesscheck", exnesscheck_command))
+    app.add_handler(CommandHandler("accountpnl", accountpnl_command))
     app.add_handler(CommandHandler("unlinkappemail", unlinkappemail_command))
     app.add_handler(CommandHandler("inactivityrun", inactivityrun_command))
     app.add_handler(CommandHandler("testsynth", testsynth_command))

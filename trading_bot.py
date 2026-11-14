@@ -16517,13 +16517,43 @@ def _backup_price_one(account_id, mt5_symbol):
     return None
 
 
+# MetaAPI circuit breaker: after 3 failures in a row, a MetaAPI path is skipped for 10 minutes so
+# every price/candle request doesn't sit waiting on a dead service (Exness and the other free
+# sources answer instead). One success clears it. The first call after the pause is the probe.
+_MA_BRK = {}
+_MA_BRK_FAILS, _MA_BRK_PAUSE_S = 3, 600
+
+
+def _ma_blocked(key):
+    return time.time() < _MA_BRK.get(key, {}).get("until", 0)
+
+
+def _ma_ok(key):
+    if key in _MA_BRK:
+        _MA_BRK.pop(key, None)
+
+
+def _ma_fail(key):
+    d = _MA_BRK.setdefault(key, {"fails": 0, "until": 0})
+    d["fails"] += 1
+    if d["fails"] >= _MA_BRK_FAILS:
+        d["until"] = time.time() + _MA_BRK_PAUSE_S
+        d["fails"] = 0
+        print(f"[METAAPI] {key} failed {_MA_BRK_FAILS}x in a row - skipping it for {_MA_BRK_PAUSE_S // 60} min "
+              f"(Exness and other sources keep serving)", flush=True)
+
+
 def get_price_metaapi_backup(mt5_symbol):
     if not METAAPI_TOKEN or not mt5_symbol:
+        return None
+    if _ma_blocked("price_backup"):
         return None
     for account_id in _backup_account_ids():
         price = _backup_price_one(account_id, mt5_symbol)
         if price is not None:
+            _ma_ok("price_backup")
             return price
+    _ma_fail("price_backup")
     return None
 
 
@@ -16570,10 +16600,14 @@ def get_candles_metaapi_backup(mt5_symbol, interval, outputsize):
     timeframe = {"1min": "1m", "5min": "5m", "15min": "15m", "1h": "1h", "4h": "4h", "1day": "1d"}.get(interval)
     if not timeframe:
         return None
+    if _ma_blocked("candles_backup"):
+        return None
     for account_id in _backup_account_ids():
         candles = _backup_candles_one(account_id, mt5_symbol, timeframe, outputsize)
         if candles:
+            _ma_ok("candles_backup")
             return candles
+    _ma_fail("candles_backup")
     return None
 
 
@@ -16759,6 +16793,8 @@ def get_price_metaapi(mt5_symbol):
         return (_q[0] + _q[1]) / 2
     if not METAAPI_TOKEN or not METAAPI_ACCOUNT_ID:
         return None
+    if _ma_blocked("price"):
+        return None
     url = (
         f"https://mt-client-api-v1.london.agiliumtrade.ai"
         f"/users/current/accounts/{METAAPI_ACCOUNT_ID}/symbols/{mt5_symbol}/current-price"
@@ -16772,19 +16808,24 @@ def get_price_metaapi(mt5_symbol):
             if bid is not None and ask is not None:
                 record_metaapi_candles_success()
                 _selfheal_note_price_ok()
+                _ma_ok("price")
                 return (bid + ask) / 2
             print(f"[METAAPI PRICE] {mt5_symbol} response missing bid/ask: {data}")
             return None
         if response.status_code in (401, 403):
             print(f"[METAAPI PRICE] {mt5_symbol} failed {response.status_code}: {response.text[:300]}")
             record_metaapi_candles_failure()
+            _ma_fail("price")
             return None
         print(f"[METAAPI PRICE] {mt5_symbol} failed {response.status_code}: {response.text[:300]}")
+        if response.status_code in (429, 500, 502, 503, 504):
+            _ma_fail("price")
         if response.status_code in (500, 502, 503, 504):
             _selfheal_note_price_failure()
         return None
     except Exception as e:
         print(f"[METAAPI PRICE] {mt5_symbol} error: {e}")
+        _ma_fail("price")
         if isinstance(e, requests.exceptions.Timeout):
             _selfheal_note_price_failure()
         return None
@@ -17212,10 +17253,10 @@ def get_quote_exness(mt5_symbol):
     and after a 429 the symbol rests for 8s (a recent quote, at most 8s old, is used meanwhile)."""
     now = time.time()
     hit = _EXQ.get(mt5_symbol)
-    if hit and now - hit[0] < 2:
+    if hit and now - hit[0] < 3:
         return hit[1]
     if now < _EXQ_BLOCK.get(mt5_symbol, 0):
-        return hit[1] if hit and now - hit[0] < 12 else None
+        return hit[1] if hit and now - hit[0] < 10 else None
     broker = _exness_md_broker()
     if broker is None:
         return None
@@ -17228,9 +17269,9 @@ def get_quote_exness(mt5_symbol):
     except Exception as e:
         msg = str(e)
         if "429" in msg:
-            _EXQ_BLOCK[mt5_symbol] = time.time() + 8
+            _EXQ_BLOCK[mt5_symbol] = time.time() + 10
         print(f"[EXNESS DATA] quote {mt5_symbol} failed: {type(e).__name__}: {msg[:120]}")
-        return hit[1] if hit and time.time() - hit[0] < 12 else None
+        return hit[1] if hit and time.time() - hit[0] < 10 else None
 
 
 def get_candles_metaapi(mt5_symbol, interval, outputsize):
@@ -17265,6 +17306,8 @@ def get_candles_metaapi(mt5_symbol, interval, outputsize):
         print("[METAAPI CANDLES] Credentials not set")
         record_metaapi_candles_failure()
         return None
+    if _ma_blocked("candles"):
+        return None
 
     timeframe_map = {"1min": "1m", "5min": "5m", "15min": "15m", "1h": "1h", "4h": "4h", "1day": "1d"}
     mt5_timeframe = timeframe_map.get(interval)
@@ -17292,6 +17335,7 @@ def get_candles_metaapi(mt5_symbol, interval, outputsize):
                 # connection itself is healthy - clears any failure
                 # flag, regardless of which specific symbol asked.
                 record_metaapi_candles_success()
+                _ma_ok("candles")
                 print(f"[METAAPI CANDLES] ✅ {mt5_symbol} {mt5_timeframe} - {len(raw)} candles")
                 # FIX: CONFIRMED via live chart evidence - candles were
                 # showing newest-date-on-the-left (backwards from every
@@ -17324,6 +17368,7 @@ def get_candles_metaapi(mt5_symbol, interval, outputsize):
                 # really just one instrument's normal data gap.
                 print(f"[METAAPI CANDLES] {mt5_symbol} {mt5_timeframe} failed {response.status_code}: {response.text[:300]}")
                 record_metaapi_candles_failure()
+                _ma_fail("candles")
                 return None
             if response.status_code in (429, 502, 503, 504) and attempt == 1:
                 print(f"[METAAPI CANDLES] {mt5_symbol} got {response.status_code}, retrying...")
@@ -17335,6 +17380,7 @@ def get_candles_metaapi(mt5_symbol, interval, outputsize):
                 print(f"[METAAPI CANDLES] {mt5_symbol} attempt 1 error: {e} - retrying with longer timeout...")
                 continue
             print(f"[METAAPI CANDLES] {mt5_symbol} error: {e}")
+            _ma_fail("candles")
             return None
     return None
 

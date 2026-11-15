@@ -5419,14 +5419,20 @@ def _napp_news_fetch_sync():
     raw = []
     rss_n = 0
     for feed_url, feed_name in (
+        ("https://news.google.com/rss/search?q=forex+OR+%22EUR%2FUSD%22+OR+%22USD%2FJPY%22+OR+%22GBP%2FUSD%22+when%3A3d&hl=en-US&gl=US&ceid=US:en", "Forex"),
+        ("https://news.google.com/rss/search?q=gold+price+OR+XAUUSD+when%3A3d&hl=en-US&gl=US&ceid=US:en", "Gold"),
+        ("https://news.google.com/rss/search?q=oil+price+OR+bitcoin+OR+%22Federal+Reserve%22+when%3A3d&hl=en-US&gl=US&ceid=US:en", "Markets"),
         ("https://www.fxstreet.com/rss/news", "FXStreet"),
-        ("https://www.forexlive.com/feed/news", "ForexLive"),
     ):
         try:
             import xml.etree.ElementTree as _ET
             r = requests.get(feed_url, timeout=10, headers={"User-Agent": "Mozilla/5.0"})
-            root = _ET.fromstring(r.content)
-            for it in root.iter("item"):
+            try:
+                root = _ET.fromstring(r.content)
+            except Exception:
+                print(f"[APP NEWS] rss {feed_name}: HTTP {r.status_code}, not XML: {r.text[:80]!r}")
+                continue
+            for it in list(root.iter("item"))[:12]:
                 img = ""
                 for ch in it:
                     tag = ch.tag.split("}")[-1]
@@ -5439,7 +5445,11 @@ def _napp_news_fetch_sync():
                     when = parsedate_to_datetime(pub).astimezone(timezone.utc).isoformat()
                 except Exception:
                     when = None
-                raw.append((it.findtext("title"), "forex", img, feed_name,
+                ttl = it.findtext("title") or ""
+                srcname = it.findtext("source") or feed_name
+                if " - " in ttl and it.findtext("source"):
+                    ttl = ttl.rsplit(" - ", 1)[0]
+                raw.append((ttl, "forex", img, srcname,
                             it.findtext("link"), when, True))
                 rss_n += 1
         except Exception as e:

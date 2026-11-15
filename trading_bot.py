@@ -6107,6 +6107,9 @@ async def _napp_exness_status_build(synth):
         "verified": verified,
         "email": _napp_exness_mask_email(email) if email else None,
         "exness_email": _napp_exness_mask_email2(email) if email else None,
+        # Full values for the signed-in user's own account, shown on the app's connected
+        # card. The masked keys stay so older app builds keep working.
+        "email_full": email or None,
         "unlinks_left": max(0, NAPP_EXNESS_UNLINKS_PER_MONTH - used) if uok else None,
         "subscription": {
             "active": active_sub,
@@ -6116,6 +6119,7 @@ async def _napp_exness_status_build(synth):
         "account": {
             "connected": connected and active_sub,
             "number": _napp_exness_mask_number(row.get("account_number")) if row else None,
+            "number_full": (str(row["account_number"]) if row and row.get("account_number") else None),
             "server": row.get("server") if row else None,
             "name": row.get("account_name") if row else None,
             "balance": balance,
@@ -7060,6 +7064,7 @@ async def nexora_app_prop_status_handler(request):
         "account": {
             "connected": connected and active_sub,
             "number": _napp_exness_mask_number(row.get("account_number")) if row else None,
+            "number_full": (str(row["account_number"]) if row and row.get("account_number") else None),
             "server": row.get("server") if row else None,
             "name": row.get("account_name") if row else None,
             "balance": balance,

@@ -12,7 +12,8 @@ import time
 from datetime import datetime
 
 FAST, MID, SLOW = 25, 50, 100
-HOLD_BARS = 12        # lines must stay in order for this many closed bars (1 hour on M5)
+import os
+HOLD_BARS = int(os.getenv("EMA_HOLD_BARS", "3"))  # lines must stay in order for this many closed bars (3 = 15 min on M5); no wait for a fresh flip to age
 SLOPE_BARS = 6        # the 100 EMA must be sloping the trend's way over this many bars
 MIN_GAP_SLOW_ATR = 0.40   # distance 50 <-> 100, in ATR(14)
 MIN_GAP_FAST_ATR = 0.10   # distance 25 <-> 50, in ATR(14)

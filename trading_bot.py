@@ -284,8 +284,8 @@ MT5_AUTOTRADE_BOTS_VISIBLE = {
 }
 # Which pairs each visible bot may trade (first = shown first).
 MT5_BOT_PAIRS = {
-    "aggressive_scalper": ["xauusd", "xauusd247", "usoil", "btcusd"],
-    "flip_sr": ["xauusd", "xauusd247", "xagusd"],
+    "aggressive_scalper": ["xauusd", "usoil", "btcusd", "xauusd247"],
+    "flip_sr": ["xauusd", "xagusd", "xauusd247"],
 }
 
 
@@ -311,7 +311,7 @@ def base_pair(pair_key):
 # Curated subset of PAIR_CONFIG for bot trading - not all 12 pairs,
 # to keep the choice simple and recognizable.
 # Only the high-volatility instruments people actually trade: gold, bitcoin, oil, silver.
-MT5_AUTOTRADE_PAIRS = ["usoil", "btcusd", "xauusd", "xauusd247", "xagusd"]
+MT5_AUTOTRADE_PAIRS = ["usoil", "btcusd", "xauusd", "xagusd", "xauusd247"]
 
 # Deriv's mirror of MT5_AUTOTRADE_BOTS. IMPORTANT DIFFERENCE, stated
 # plainly rather than glossed over: synthetic indices already run
@@ -15505,7 +15505,7 @@ PAIR_CONFIG = {
         "pip_label": "pips",
         "decimals": 2,
         "mt5_symbol": "XAUUSD247m",
-        "display": "XAU/USD 24/7 🥇",
+        "display": "XAU/USD 24/7 (incl. Weekends) 🥇",
         "av_symbol": "XAU",
         "av_type": "forex",
         "td_symbol": "XAU/USD",

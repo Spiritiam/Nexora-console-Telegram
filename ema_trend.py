@@ -15,7 +15,7 @@ FAST, MID, SLOW = 25, 50, 100
 import os
 HOLD_BARS = int(os.getenv("EMA_HOLD_BARS", "3"))  # lines must stay in order for this many closed bars (3 = 15 min on M5); no wait for a fresh flip to age
 SLOPE_BARS = 6        # the 100 EMA must be sloping the trend's way over this many bars
-MIN_GAP_SLOW_ATR = 0.40   # distance 50 <-> 100, in ATR(14)
+MIN_GAP_SLOW_ATR = 0.30   # distance 50 <-> 100, in ATR(14)
 MIN_GAP_FAST_ATR = 0.10   # distance 25 <-> 50, in ATR(14)
 TOUCH_ATR = 0.15          # how close to the EMA counts as a touch
 MIN_CANDLES = 220

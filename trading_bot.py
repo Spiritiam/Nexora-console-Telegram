@@ -284,8 +284,8 @@ MT5_AUTOTRADE_BOTS_VISIBLE = {
 }
 # Which pairs each visible bot may trade (first = shown first).
 MT5_BOT_PAIRS = {
-    "aggressive_scalper": ["auto", "xauusd", "usoil", "btcusd", "xauusd247"],
-    "flip_sr": ["auto", "xauusd", "xagusd", "xauusd247"],
+    "aggressive_scalper": ["auto"],
+    "flip_sr": ["auto"],
 }
 # "auto": no pair chosen - the bot watches these four and fires on the first EMA bounce (one trade at a time).
 SC_AUTO_PAIRS = ["xauusd", "btcusd", "usoil", "xagusd"]
@@ -3622,7 +3622,10 @@ async def _sc_get_subscribers():
     accts = await asyncio.to_thread(get_all_active_mt5_autotrade_accounts)
     if isinstance(accts, list):
         _SC["subs"] = [
-            a for a in accts
+            ({**a, "pair_choice": "auto"}
+             if a.get("bot_choice") in ("aggressive_scalper", "flip_sr")
+             and a.get("pair_choice") in ("auto", *SC_AUTO_PAIRS) else a)
+            for a in accts
             if a.get("bot_choice") in SC_MODES
             and (a.get("pair_choice") in SC_PAIR_CFG
                  or (a.get("pair_choice") == "auto" and a.get("bot_choice") in ("aggressive_scalper", "flip_sr")))
@@ -11257,7 +11260,7 @@ AUTO_COPY_EXCLUDED_INDICES = set()
 # Deriv "Choose a Bot" / Account Flip pair pickers, mirroring
 # MT5_AUTOTRADE_PAIRS's role for the Exness side.
 DERIV_AUTOTRADE_PAIRS = [k for k in SYNTHETIC_CONFIG if k not in AUTO_COPY_EXCLUDED_INDICES]
-DERIV_PAIR_OPTS = ["auto"] + DERIV_AUTOTRADE_PAIRS
+DERIV_PAIR_OPTS = ["auto"]
 
 
 def deriv_pair_display(pair_key):
@@ -14520,7 +14523,7 @@ async def _dsc_get_subscribers():
     accts = await asyncio.to_thread(get_all_deriv_accounts_with_token)
     if isinstance(accts, list):
         _DSC["subs"] = [
-            a for a in accts
+            {**a, "deriv_pair_choice": "auto"} for a in accts
             if a.get("deriv_autotrade_enabled") and a.get("deriv_bot_choice") in DSC_MODES
             and (a.get("deriv_pair_choice") == "auto"
                  or (a.get("deriv_pair_choice") in SYNTHETIC_CONFIG

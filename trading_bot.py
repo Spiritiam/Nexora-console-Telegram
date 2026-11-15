@@ -5384,6 +5384,113 @@ async def nexora_app_deriv_oauth_start_handler(request):
 _NAPP_DERIV_SNAP_CACHE = {}
 
 
+# ---- Market news for the SpiritFX Academy app (own feed, no spiritfx.org) ----
+_NAPP_NEWS_CACHE = {"exp": 0.0, "items": []}
+
+
+def _napp_news_ago(dt):
+    try:
+        secs = max(0, int((datetime.now(timezone.utc) - dt).total_seconds()))
+    except Exception:
+        return ""
+    if secs < 3600:
+        return f"{max(1, secs // 60)} min ago"
+    if secs < 86400:
+        return f"{secs // 3600} hr ago"
+    return f"{secs // 86400} d ago"
+
+
+def _napp_news_parse_dt(val):
+    if not val:
+        return None
+    try:
+        v = str(val).strip()
+        if len(v) >= 15 and "T" in v and "-" not in v:  # Alpha Vantage 20261115T101500
+            return datetime.strptime(v[:15], "%Y%m%dT%H%M%S").replace(tzinfo=timezone.utc)
+        dt = datetime.fromisoformat(v.replace("Z", "+00:00"))
+        return dt if dt.tzinfo else dt.replace(tzinfo=timezone.utc)
+    except Exception:
+        return None
+
+
+def _napp_news_fetch_sync():
+    """Headlines from GNews, TheNewsAPI and Alpha Vantage, filtered to forex /
+    gold / oil / crypto / macro, newest first. Each source fails on its own."""
+    raw = []
+    try:
+        if GNEWS_API_KEY:
+            r = requests.get(
+                "https://gnews.io/api/v4/top-headlines"
+                f"?category=business&lang=en&max=10&apikey={GNEWS_API_KEY}", timeout=10)
+            for a in (r.json().get("articles") or []):
+                raw.append((a.get("title"), a.get("description"), a.get("image"),
+                            (a.get("source") or {}).get("name", ""), a.get("url"), a.get("publishedAt")))
+    except Exception as e:
+        print(f"[APP NEWS] gnews: {type(e).__name__}")
+    try:
+        if THENEWS_API_KEY:
+            r = requests.get(
+                "https://api.thenewsapi.com/v1/news/top"
+                f"?api_token={THENEWS_API_KEY}&categories=business,finance&language=en&limit=10", timeout=10)
+            for a in (r.json().get("data") or []):
+                raw.append((a.get("title"), a.get("description"), a.get("image_url"),
+                            a.get("source", ""), a.get("url"), a.get("published_at")))
+    except Exception as e:
+        print(f"[APP NEWS] thenewsapi: {type(e).__name__}")
+    try:
+        if ALPHA_VANTAGE_API_KEY:
+            r = requests.get(
+                "https://www.alphavantage.co/query?function=NEWS_SENTIMENT"
+                f"&topics=forex,economy_macro,blockchain&limit=30&apikey={ALPHA_VANTAGE_API_KEY}", timeout=12)
+            for a in (r.json().get("feed") or []):
+                raw.append((a.get("title"), a.get("summary"), a.get("banner_image"),
+                            a.get("source", ""), a.get("url"), a.get("time_published")))
+    except Exception as e:
+        print(f"[APP NEWS] alphavantage: {type(e).__name__}")
+
+    out, seen = [], set()
+    for title, desc, img, src, url, when in raw:
+        title = (title or "").strip()
+        if not title or not url:
+            continue
+        key = re.sub(r"\W+", "", title.lower())[:60]
+        if key in seen:
+            continue
+        try:
+            if not is_news_relevant(title, desc or ""):
+                continue
+        except Exception:
+            pass
+        dt = _napp_news_parse_dt(when)
+        if dt is None or dt < datetime.now(timezone.utc) - timedelta(days=7):
+            continue
+        seen.add(key)
+        out.append({
+            "img": img or "", "title": title, "author": "", "source": src or "",
+            "url": url, "datetime": dt.isoformat(), "timePublished": _napp_news_ago(dt),
+            "_dt": dt,
+        })
+    out.sort(key=lambda x: x["_dt"], reverse=True)
+    for o in out:
+        o.pop("_dt", None)
+    return out[:15]
+
+
+async def nexora_app_news_handler(request):
+    now = time.time()
+    if _NAPP_NEWS_CACHE["exp"] > now:
+        return _napp_json(_NAPP_NEWS_CACHE["items"])
+    try:
+        items = await asyncio.to_thread(_napp_news_fetch_sync)
+    except Exception as e:
+        print(f"[APP NEWS] {type(e).__name__}: {e}")
+        items = None
+    if items:
+        _NAPP_NEWS_CACHE["items"] = items
+        _NAPP_NEWS_CACHE["exp"] = now + 900
+    return _napp_json(items if items is not None else _NAPP_NEWS_CACHE["items"])
+
+
 async def nexora_app_deriv_status_handler(request):
     synth, err = await _napp_deriv_auth(request)
     if err:
@@ -7505,6 +7612,7 @@ def run_korapay_webhook_server():
     webhook_app.router.add_post("/api/nexora/chat", nexora_app_chat_handler)
     webhook_app.router.add_get("/api/nexora/chart/{cid}", nexora_app_chart_handler)
     webhook_app.router.add_post("/api/nexora/deriv/oauth-start", nexora_app_deriv_oauth_start_handler)
+    webhook_app.router.add_get("/api/nexora/news", nexora_app_news_handler)
     webhook_app.router.add_get("/api/nexora/deriv/status", nexora_app_deriv_status_handler)
     webhook_app.router.add_post("/api/nexora/deriv/config", nexora_app_deriv_config_handler)
     webhook_app.router.add_post("/api/nexora/deriv/disconnect", nexora_app_deriv_disconnect_handler)

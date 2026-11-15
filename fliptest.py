@@ -79,6 +79,7 @@ async def _deriv_paths(requests_list):
     import websockets
     from ml1m_live import DERIV_PUBLIC_WS
     res = {}
+    n = 0
     async with websockets.connect(DERIV_PUBLIC_WS, open_timeout=15, close_timeout=3) as ws:
         for key, sym, posted in requests_list:
             end = min(posted + timedelta(hours=WINDOW_H), datetime.now(timezone.utc))
@@ -90,6 +91,9 @@ async def _deriv_paths(requests_list):
                              "h": float(c["high"]), "l": float(c["low"])} for c in (r.get("candles") or [])]
             except Exception as e:
                 print(f"[FLIPTEST] deriv path failed {sym}: {type(e).__name__}: {str(e)[:80]}", flush=True)
+            n += 1
+            if n % 100 == 0:
+                print(f"[FLIPTEST] deriv paths {n}/{len(requests_list)}", flush=True)
             await asyncio.sleep(0.15)
     return res
 
@@ -124,8 +128,9 @@ def _summ(rows, label):
             f"{agree}/{ok}.")
 
 
-def run(supabase_url, sb_headers, metaapi_token, metaapi_acct, pair_symbols, fx_n=400, dv_n=600):
-    """Blocking: call via asyncio.to_thread. pair_symbols: {PAIR_NAME: mt5_symbol}. Returns summary text."""
+def run(supabase_url, sb_headers, path_fn, pair_symbols, fx_n=400):
+    """Blocking: call via asyncio.to_thread. pair_symbols: {PAIR_NAME: mt5_symbol};
+    path_fn(mt5_symbol, posted) -> [{t,h,l}] after `posted` or None. Returns summary text."""
     random.seed(7)
     since = (datetime.utcnow() - timedelta(days=45)).strftime("%Y-%m-%dT%H:%M:%S")
     out = []
@@ -149,8 +154,8 @@ def run(supabase_url, sb_headers, metaapi_token, metaapi_acct, pair_symbols, fx_
         posted = _ts(r["posted_at"])
         if datetime.now(timezone.utc) - posted < timedelta(hours=WINDOW_H):
             continue
-        path = _metaapi_path(metaapi_token, metaapi_acct, pair_symbols[r["pair_name"]], posted)
-        time.sleep(0.6)
+        path = path_fn(pair_symbols[r["pair_name"]], posted)
+        time.sleep(0.5)
         if not path or len(path) < 20:
             continue
         o, p = simulate(path, r["direction"], float(r["entry_price"]), float(r["stop_loss"]), float(r["take_profit"]))

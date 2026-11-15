@@ -18040,8 +18040,30 @@ async def fliptest_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
             import fliptest
             pairs = {c["pair_name"]: c["mt5_symbol"] for k, c in PAIR_CONFIG.items()
                      if k in FX_SCAN_KEYS and c.get("mt5_symbol")}
-            fx_txt = await asyncio.to_thread(fliptest.run, SUPABASE_URL, sb_headers, METAAPI_TOKEN,
-                                             METAAPI_ACCOUNT_ID, pairs)
+            def _path(sym, posted):
+                from urllib.parse import urlencode
+                broker = _exness_md_broker()
+                inst = broker and _exness_md_instrument(broker, sym)
+                if not inst:
+                    return None
+                end = min(posted + timedelta(hours=24), datetime.now(timezone.utc))
+                q = urlencode({"instrument": inst, "price_type": "bid", "timeframe": "M5",
+                               "from": posted.strftime("%Y-%m-%dT%H:%M:%SZ"), "to": end.strftime("%Y-%m-%dT%H:%M:%SZ")})
+                for i in range(4):
+                    code, d = broker._call("GET", f"/v1/market-data/accounts/{broker.account_id}/candles?{q}")
+                    if code == 429:
+                        time.sleep(4 * (i + 1))
+                        continue
+                    if code != 200:
+                        print(f"[FLIPTEST] exness candles {sym}: HTTP {code} {str(d)[:100]}", flush=True)
+                        return None
+                    out = []
+                    for c in d.get("candles") or []:
+                        out.append({"t": fliptest._ts(c["time"]), "h": float(c["high"]), "l": float(c["low"])})
+                    out.sort(key=lambda x: x["t"])
+                    return out
+                return None
+            fx_txt = await asyncio.to_thread(fliptest.run, SUPABASE_URL, sb_headers, _path, pairs)
             idx = {k: c["symbol"] for k, c in SYNTHETIC_CONFIG.items()}
             dv_txt = await asyncio.to_thread(fliptest.run_deriv, SUPABASE_URL, sb_headers, idx)
             await context.bot.send_message(chat_id=int(ADMIN_USER_ID), text=f"Flip test done.\n{fx_txt}\n{dv_txt}")

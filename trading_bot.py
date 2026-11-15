@@ -5417,6 +5417,34 @@ def _napp_news_fetch_sync():
     """Headlines from GNews, TheNewsAPI and Alpha Vantage, filtered to forex /
     gold / oil / crypto / macro, newest first. Each source fails on its own."""
     raw = []
+    rss_n = 0
+    for feed_url, feed_name in (
+        ("https://www.fxstreet.com/rss/news", "FXStreet"),
+        ("https://www.forexlive.com/feed/news", "ForexLive"),
+    ):
+        try:
+            import xml.etree.ElementTree as _ET
+            r = requests.get(feed_url, timeout=10, headers={"User-Agent": "Mozilla/5.0"})
+            root = _ET.fromstring(r.content)
+            for it in root.iter("item"):
+                img = ""
+                for ch in it:
+                    tag = ch.tag.split("}")[-1]
+                    if tag in ("enclosure", "content", "thumbnail") and ch.get("url"):
+                        img = ch.get("url")
+                        break
+                pub = it.findtext("pubDate") or ""
+                try:
+                    from email.utils import parsedate_to_datetime
+                    when = parsedate_to_datetime(pub).astimezone(timezone.utc).isoformat()
+                except Exception:
+                    when = None
+                raw.append((it.findtext("title"), "forex", img, feed_name,
+                            it.findtext("link"), when, True))
+                rss_n += 1
+        except Exception as e:
+            print(f"[APP NEWS] rss {feed_name}: {type(e).__name__}")
+    print(f"[APP NEWS] rss articles: {rss_n}")
     try:
         if GNEWS_API_KEY:
             r = requests.get(
@@ -5450,7 +5478,9 @@ def _napp_news_fetch_sync():
 
     print(f"[APP NEWS] fetched {len(raw)} raw articles")
     out, seen, loose = [], set(), []
-    for title, desc, img, src, url, when in raw:
+    for rec in raw:
+        title, desc, img, src, url, when = rec[:6]
+        trusted = len(rec) > 6 and rec[6]
         title = (title or "").strip()
         if not title or not url:
             continue
@@ -5463,7 +5493,7 @@ def _napp_news_fetch_sync():
         item = {"img": img or "", "title": title, "author": "", "source": src or "",
                 "url": url, "datetime": dt.isoformat(), "timePublished": _napp_news_ago(dt), "_dt": dt}
         try:
-            relevant = is_news_relevant(title, desc or "")
+            relevant = True if trusted else is_news_relevant(title, desc or "")
         except Exception:
             relevant = True
         if not relevant:

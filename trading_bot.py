@@ -284,9 +284,18 @@ MT5_AUTOTRADE_BOTS_VISIBLE = {
 }
 # Which pairs each visible bot may trade (first = shown first).
 MT5_BOT_PAIRS = {
-    "aggressive_scalper": ["xauusd", "usoil", "btcusd", "xauusd247"],
-    "flip_sr": ["xauusd", "xagusd", "xauusd247"],
+    "aggressive_scalper": ["auto", "xauusd", "usoil", "btcusd", "xauusd247"],
+    "flip_sr": ["auto", "xauusd", "xagusd", "xauusd247"],
 }
+# "auto": no pair chosen - the bot watches these four and fires on the first EMA bounce (one trade at a time).
+SC_AUTO_PAIRS = ["xauusd", "btcusd", "usoil", "xagusd"]
+AUTO_LABEL = "\U0001F500 Auto (all pairs)"
+
+
+def pair_display(pair_key):
+    if pair_key == "auto":
+        return AUTO_LABEL
+    return PAIR_CONFIG[pair_key]["display"]
 
 
 def mt5_pairs_for(bot_key):
@@ -3615,7 +3624,8 @@ async def _sc_get_subscribers():
         _SC["subs"] = [
             a for a in accts
             if a.get("bot_choice") in SC_MODES
-            and a.get("pair_choice") in SC_PAIR_CFG
+            and (a.get("pair_choice") in SC_PAIR_CFG
+                 or (a.get("pair_choice") == "auto" and a.get("bot_choice") in ("aggressive_scalper", "flip_sr")))
             and a.get("metaapi_account_id")
         ]
         _SC["subs_at"] = time.time()
@@ -3965,6 +3975,40 @@ async def _sc_tick_one(context, account):
         print(f"[SC] ❌ error for {user_id}: {type(e).__name__}: {e}")
 
 
+_SC_AUTO_ADOPTED = set()
+
+
+async def _sc_auto_targets(a):
+    """Auto accounts: stay on the pair with a live trade; otherwise fire the first of the four pairs
+    that shows an EMA bounce on the last closed 5-minute bar. One trade at a time."""
+    uid, mode = str(a["user_id"]), a["bot_choice"]
+    for p in SC_AUTO_PAIRS:
+        st = _SC["st"].get((uid, p))
+        if st and st.get("mode") == mode and st.get("phase") in ("open", "cool"):
+            return [p]
+    if uid not in _SC_AUTO_ADOPTED:      # after a restart: let the normal code adopt any live position
+        _SC_AUTO_ADOPTED.add(uid)
+        return list(SC_AUTO_PAIRS)
+    closed = _xc_market_closed()
+    for p in SC_AUTO_PAIRS:
+        if closed and p not in WEEKEND_PAIRS:
+            continue
+        e = await _ema5_exness(p, PAIR_CONFIG[p])
+        if e and e.get("direction"):
+            st = _SC["st"].get((uid, p)) or {}
+            if st.get("ema_bar") != e.get("bar_t"):
+                return [p]
+    return []
+
+
+async def _sc_tick_auto(context, a):
+    uid = str(a["user_id"])
+    for p in await _sc_auto_targets(a):
+        await _sc_tick_one(context, dict(a, pair_choice=p))
+        if (_SC["st"].get((uid, p)) or {}).get("phase") == "open":
+            break
+
+
 async def run_sc_tick(context: ContextTypes.DEFAULT_TYPE):
     """Every 5s: arm/trigger the straddle and trail running trades."""
     try:
@@ -3978,7 +4022,10 @@ async def run_sc_tick(context: ContextTypes.DEFAULT_TYPE):
         async def one(a):
             async with sem:
                 _t0 = time.time()
-                await _sc_tick_one(context, a)
+                if a.get("pair_choice") == "auto":
+                    await _sc_tick_auto(context, a)
+                else:
+                    await _sc_tick_one(context, a)
                 _d = time.time() - _t0
                 if _d > 3:
                     _slow.append(f"{a.get('pair_choice')}/{(_SC['st'].get((str(a['user_id']), a.get('pair_choice'))) or {}).get('phase')}={_d:.1f}s")
@@ -5396,7 +5443,7 @@ def _napp_deriv_options():
             {"key": k, "label": _napp_clean_label(v["label"]), "description": v["description"]}
             for k, v in DERIV_AUTOTRADE_BOTS_VISIBLE.items()
         ],
-        "pairs": [
+        "pairs": [{"key": "auto", "display": "Auto (all indices)"}] + [
             {"key": p, "display": SYNTHETIC_CONFIG[p]["display"]}
             for p in DERIV_AUTOTRADE_PAIRS
         ],
@@ -5448,7 +5495,7 @@ def _napp_deriv_has_open_sync(synth):
 def _napp_deriv_mode_summary(acct):
     choice = acct.get("deriv_bot_choice")
     pair = acct.get("deriv_pair_choice")
-    pair_disp = SYNTHETIC_CONFIG.get(pair, {}).get("display") if pair else None
+    pair_disp = ("Auto (all indices)" if pair == "auto" else SYNTHETIC_CONFIG.get(pair, {}).get("display")) if pair else None
     out = {
         "enabled": bool(acct.get("deriv_autotrade_enabled")),
         "mode": None, "pair": pair, "pair_display": pair_disp,
@@ -5732,7 +5779,7 @@ async def nexora_app_deriv_config_handler(request):
         except Exception:
             stake = None
         tier = next((t for t in STAKE_TIERS if stake is not None and t["stake"] == stake), None)
-        if bot_key not in DERIV_AUTOTRADE_BOTS_VISIBLE or pair_key not in DERIV_AUTOTRADE_PAIRS or not tier:
+        if bot_key not in DERIV_AUTOTRADE_BOTS_VISIBLE or pair_key not in DERIV_PAIR_OPTS or not tier:
             return _napp_json({"error": "bad_request", "message": "Pick a bot, an index and a stake."}, 400)
         fields = {
             "deriv_bot_choice": bot_key, "deriv_pair_choice": pair_key,
@@ -6088,7 +6135,7 @@ def _napp_exness_options():
             {"key": p, "display": _napp_clean_label(PAIR_CONFIG[p]["display"]),
              "pip": SLTP_OVERRIDE_PIP_SIZE.get(p)}
             for p in MT5_AUTOTRADE_PAIRS
-        ],
+        ] + [{"key": "auto", "display": "Auto (all pairs)", "pip": None}],
         "price": {"ngn": MT5_AUTOTRADE_MONTHLY_FEE, "usd": MT5_AUTOTRADE_MONTHLY_FEE_USD,
                   "days": MT5_SUBSCRIPTION_DAYS},
         "limits": {
@@ -11210,6 +11257,11 @@ AUTO_COPY_EXCLUDED_INDICES = set()
 # Deriv "Choose a Bot" / Account Flip pair pickers, mirroring
 # MT5_AUTOTRADE_PAIRS's role for the Exness side.
 DERIV_AUTOTRADE_PAIRS = [k for k in SYNTHETIC_CONFIG if k not in AUTO_COPY_EXCLUDED_INDICES]
+DERIV_PAIR_OPTS = ["auto"] + DERIV_AUTOTRADE_PAIRS
+
+
+def deriv_pair_display(pair_key):
+    return AUTO_LABEL if pair_key == "auto" else SYNTHETIC_CONFIG[pair_key]["display"]
 
 SYNTHETIC_ALIASES = {
     "r10": ["r10", "r_10", "r 10", "volatility 10", "volatility10", "vol 10", "vol10", "v10"],
@@ -14470,8 +14522,9 @@ async def _dsc_get_subscribers():
         _DSC["subs"] = [
             a for a in accts
             if a.get("deriv_autotrade_enabled") and a.get("deriv_bot_choice") in DSC_MODES
-            and a.get("deriv_pair_choice") in SYNTHETIC_CONFIG
-            and a.get("deriv_pair_choice") not in AUTO_COPY_EXCLUDED_INDICES
+            and (a.get("deriv_pair_choice") == "auto"
+                 or (a.get("deriv_pair_choice") in SYNTHETIC_CONFIG
+                     and a.get("deriv_pair_choice") not in AUTO_COPY_EXCLUDED_INDICES))
             and a.get("api_token") and a.get("deriv_bot_stake")
         ]
         _seen, _uniq = set(), []
@@ -14799,6 +14852,37 @@ async def _dsc_tick_one_inner(context, account):
         print(f"[DSC] ❌ error for {user_id}: {type(e).__name__}: {e}")
 
 
+_DSC_AUTO_ADOPTED = set()
+
+
+async def _dsc_auto_targets(a):
+    """Auto accounts: stay on the index with a live trade; otherwise fire the first index showing an
+    EMA bounce on the last closed 5-minute bar. One trade at a time."""
+    uid, mode = str(a["user_id"]), a["deriv_bot_choice"]
+    for p in DERIV_AUTOTRADE_PAIRS:
+        st = _DSC["st"].get((uid, p))
+        if st and st.get("mode") == mode and st.get("phase") == "open":
+            return [p]
+    if uid not in _DSC_AUTO_ADOPTED:     # after a restart: let the normal code adopt any live contract
+        _DSC_AUTO_ADOPTED.add(uid)
+        return list(DERIV_AUTOTRADE_PAIRS)
+    for p in DERIV_AUTOTRADE_PAIRS:
+        e = await _ema5_deriv(p, SYNTHETIC_CONFIG[p])
+        if e and e.get("direction"):
+            st = _DSC["st"].get((uid, p)) or {}
+            if st.get("ema_bar") != e.get("bar_t"):
+                return [p]
+    return []
+
+
+async def _dsc_tick_auto(context, a):
+    uid = str(a["user_id"])
+    for p in await _dsc_auto_targets(a):
+        await _dsc_tick_one(context, dict(a, deriv_pair_choice=p))
+        if (_DSC["st"].get((uid, p)) or {}).get("phase") == "open":
+            break
+
+
 async def run_dsc_tick(context: ContextTypes.DEFAULT_TYPE):
     """Every 10s: arm/trigger the Deriv straddle and trail running trades."""
     try:
@@ -14812,7 +14896,10 @@ async def run_dsc_tick(context: ContextTypes.DEFAULT_TYPE):
         async def one(a):
             async with sem:
                 _t0 = time.time()
-                await _dsc_tick_one(context, a)
+                if a.get("deriv_pair_choice") == "auto":
+                    await _dsc_tick_auto(context, a)
+                else:
+                    await _dsc_tick_one(context, a)
                 _d = time.time() - _t0
                 if _d > 3:
                     _slow.append(f"{a.get('deriv_pair_choice')}={_d:.1f}s")
@@ -27781,7 +27868,7 @@ async def build_exness_autotrade_dashboard(user_id, account, expiry, now):
         + f"Balance: {balance_display}\n\n"
         + ("Plan: Free\n" if is_exn else f"Subscription: {days_left} day(s) left\n")
         + f"Mode: {bot_label}"
-        + (f" on {account.get('pair_choice', '').upper()}" if account.get("pair_choice") else "")
+        + (f" on {AUTO_LABEL if account.get('pair_choice') == 'auto' else account.get('pair_choice', '').upper()}" if account.get("pair_choice") else "")
         + f"\nRisk: {risk_display}\n\n"
         + autotrade_status_line
     )
@@ -28431,7 +28518,7 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         mt5_signup_state[user_id]["bot_choice"] = bot_key
 
         buttons = [
-            [InlineKeyboardButton(PAIR_CONFIG[p]["display"], callback_data=f"mt5auto_pair_{p}")]
+            [InlineKeyboardButton(pair_display(p), callback_data=f"mt5auto_pair_{p}")]
             for p in mt5_pairs_for(bot_key)
         ]
         buttons.append([InlineKeyboardButton("⬅️ Back", callback_data="mt5auto_choose_bot")])
@@ -28446,7 +28533,7 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if data.startswith("mt5auto_pair_"):
         user_id = str(query.from_user.id)
         pair_key = data.replace("mt5auto_pair_", "")
-        if pair_key not in MT5_AUTOTRADE_PAIRS:
+        if pair_key not in MT5_AUTOTRADE_PAIRS and pair_key != "auto":
             return
         if user_id not in mt5_signup_state:
             mt5_signup_state[user_id] = {"flow": "presetup"}
@@ -28456,7 +28543,7 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         bot_choice = mt5_signup_state[user_id].get("bot_choice", "follow_channel")
         back_target = "mt5auto_start" if bot_choice in ("follow_channel", "copy_channel") else f"mt5auto_bot_{bot_choice}"
         await query.message.edit_text(
-            f"✅ {PAIR_CONFIG[pair_key]['display']} selected.\n\n"
+            f"✅ {pair_display(pair_key)} selected.\n\n"
             f"📏 <b>Choose how trades should be sized:</b>",
             parse_mode=ParseMode.HTML,
             reply_markup=InlineKeyboardMarkup([
@@ -28925,7 +29012,7 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if bot_key not in MT5_AUTOTRADE_BOTS_VISIBLE:
             return
         buttons = [
-            [InlineKeyboardButton(PAIR_CONFIG[p]["display"], callback_data=f"mt5switch_pair_{bot_key}_{p}")]
+            [InlineKeyboardButton(pair_display(p), callback_data=f"mt5switch_pair_{bot_key}_{p}")]
             for p in mt5_pairs_for(bot_key)
         ]
         buttons.append([InlineKeyboardButton("⬅️ Back", callback_data="mt5switch_choose_bot")])
@@ -28950,7 +29037,7 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         upsert_mt5_autotrade_account(user_id, {"bot_choice": bot_key, "pair_choice": pair_key})
         await query.message.edit_text(
             f"✅ <b>Switched to {MT5_AUTOTRADE_BOTS[bot_key]['label']} on "
-            f"{PAIR_CONFIG[pair_key]['display']}.</b>\n\n"
+            f"{pair_display(pair_key)}.</b>\n\n"
             f"Tap 🤖 Exness Auto-Trade anytime to check your status or switch again.",
             parse_mode=ParseMode.HTML
         )
@@ -29224,8 +29311,8 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if bot_key not in DERIV_AUTOTRADE_BOTS_VISIBLE:
             return
         buttons = [
-            [InlineKeyboardButton(SYNTHETIC_CONFIG[p]["display"], callback_data=f"derivauto_pair_{bot_key}_{p}")]
-            for p in DERIV_AUTOTRADE_PAIRS
+            [InlineKeyboardButton(deriv_pair_display(p), callback_data=f"derivauto_pair_{bot_key}_{p}")]
+            for p in DERIV_PAIR_OPTS
         ]
         buttons.append([InlineKeyboardButton("⬅️ Back", callback_data="derivauto_choose_bot")])
         await query.message.edit_text(
@@ -29241,7 +29328,7 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         remainder = data.replace("derivauto_pair_", "")
         bot_key = next((k for k in DERIV_AUTOTRADE_BOTS if remainder.startswith(k + "_")), None)
         pair_key = remainder[len(bot_key) + 1:] if bot_key else None
-        if not bot_key or pair_key not in DERIV_AUTOTRADE_PAIRS:
+        if not bot_key or pair_key not in DERIV_PAIR_OPTS:
             return
         tier_buttons = [
             [InlineKeyboardButton(
@@ -29253,7 +29340,7 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         tier_buttons.append([InlineKeyboardButton("⬅️ Back", callback_data=f"derivauto_bot_{bot_key}")])
         await query.message.edit_text(
             f"✅ {DERIV_AUTOTRADE_BOTS[bot_key]['label']} on "
-            f"{SYNTHETIC_CONFIG[pair_key]['display']} selected.\n\n"
+            f"{deriv_pair_display(pair_key)} selected.\n\n"
             f"📌 <b>Now choose the stake to use on every trade:</b>",
             parse_mode=ParseMode.HTML,
             reply_markup=InlineKeyboardMarkup(tier_buttons)
@@ -29266,7 +29353,7 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         bot_key = next((k for k in DERIV_AUTOTRADE_BOTS if remainder.startswith(k + "_")), None)
         rest = remainder[len(bot_key) + 1:] if bot_key else None
         pair_key, stake_str = rest.rsplit("_", 1) if rest else (None, None)
-        if not bot_key or pair_key not in DERIV_AUTOTRADE_PAIRS:
+        if not bot_key or pair_key not in DERIV_PAIR_OPTS:
             return
         tier = next((t for t in STAKE_TIERS if t["stake"] == float(stake_str)), None)
         if not tier:
@@ -29290,7 +29377,7 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await query.message.edit_text(
             f"✅ <b>Auto-Trade connected successfully.</b>\n\n"
             f"Mode: {DERIV_AUTOTRADE_BOTS[bot_key]['label']}\n"
-            f"Index: {SYNTHETIC_CONFIG[pair_key]['display']}\n"
+            f"Index: {deriv_pair_display(pair_key)}\n"
             f"Stake: ${tier['stake']} | Risk: ${tier['risk']} → Win: ${tier['win']}\n\n"
             f"Check status or switch modes anytime from 🔗 Connect Deriv.",
             parse_mode=ParseMode.HTML
@@ -31227,7 +31314,7 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
             summary = (
                 "📡 Full Signal Coverage" if bot_choice == "follow_channel"
                 else "📻 Channel Signals Only" if bot_choice == "copy_channel"
-                else f"{MT5_AUTOTRADE_BOTS[bot_choice]['label']} on {PAIR_CONFIG[signup['pair_choice']]['display']}"
+                else f"{MT5_AUTOTRADE_BOTS[bot_choice]['label']} on {pair_display(signup['pair_choice'])}"
             )
             sent_ready = await update.message.reply_text(
                 f"✅ <b>Setup complete:</b>\n\n"
@@ -31378,7 +31465,7 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
             summary = (
                 "📡 Full Signal Coverage" if bot_choice == "follow_channel"
                 else "📻 Channel Signals Only" if bot_choice == "copy_channel"
-                else f"{MT5_AUTOTRADE_BOTS[bot_choice]['label']} on {PAIR_CONFIG[signup['pair_choice']]['display']}"
+                else f"{MT5_AUTOTRADE_BOTS[bot_choice]['label']} on {pair_display(signup['pair_choice'])}"
             )
             sent_ready = await update.message.reply_text(
                 f"✅ <b>Setup complete:</b>\n\n"

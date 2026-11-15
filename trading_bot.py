@@ -3367,6 +3367,80 @@ async def _ema5_deriv(index_key, config):
         return await get_cached_synthetic_candles(index_key, config["symbol"], "5m", 300, 300)
     return await _ema5_decision("deriv", index_key, fetch)
 
+
+# Pairs the scheduled/manual signal scan may swap in (one market group: metals, oil, BTC, forex).
+FX_SCAN_KEYS = ["xauusd", "xagusd", "usoil", "btcusd", "gbpjpy", "eurjpy", "usdjpy", "gbpusd",
+                "eurusd", "audusd", "usdcad", "usdchf", "nzdusd"]
+DERIV_SCAN_KEYS = []  # filled from SYNTHETIC_CONFIG at use time
+
+
+def _has_open_signal_any(pair_name):
+    """True if the pair has a signal (scheduled or manual) still OPEN in signal_log."""
+    try:
+        cutoff = (datetime.utcnow() - timedelta(hours=STALE_OPEN_SIGNAL_HOURS)).strftime("%Y-%m-%dT%H:%M:%S")
+        r = requests.get(f"{SUPABASE_URL}/rest/v1/signal_log?status=eq.OPEN&pair_name=eq.{pair_name}"
+                         f"&posted_at=gte.{cutoff}&select=id&limit=1", headers=sb_headers(), timeout=8)
+        return r.status_code == 200 and len(r.json()) > 0
+    except Exception:
+        return False
+
+
+async def _pair_busy(pair_key, scheduled):
+    """No double entries: a pair is busy while its previous signal is still open
+    (scheduled: also while the account holds a live position on it)."""
+    cfg = PAIR_CONFIG.get(pair_key) or {}
+    name = cfg.get("pair_name", pair_key.upper())
+    if scheduled:
+        if await asyncio.to_thread(has_open_signal_for_pair, name):
+            return True
+        sym = cfg.get("mt5_symbol")
+        return bool(sym and await has_real_open_mt5_position(sym))
+    return await asyncio.to_thread(_has_open_signal_any, name)
+
+
+def _ema_trend_dir(e):
+    """BUY/SELL from the trend itself (bounce or not), None when ranging / no data."""
+    if not e:
+        return None
+    return {"up": "BUY", "down": "SELL"}.get(e.get("state"))
+
+
+async def _ema5_pick_pair(origin_key, scheduled=True, origin_busy=False):
+    """Best trending FREE pair in the SAME market group as origin_key (never crosses groups).
+    A pair with a bounce right now beats one that is only trending. If none trends but the origin
+    is busy, returns any free pair (the ML fallback then decides its side). None if nothing is free."""
+    if origin_key not in FX_SCAN_KEYS:
+        return None
+    closed = is_forex_market_closed()
+    keys = [k for k in FX_SCAN_KEYS if k != origin_key and (k == "btcusd" or not closed)]
+    res = await asyncio.gather(*[_ema5_exness(k, PAIR_CONFIG[k]) for k in keys], return_exceptions=True)
+    busy = await asyncio.gather(*[_pair_busy(k, scheduled) for k in keys], return_exceptions=True)
+    best, best_rank, any_free = None, -1, None
+    for k, e, b in zip(keys, res, busy):
+        if b is True or isinstance(b, Exception):
+            continue
+        any_free = any_free or k
+        if isinstance(e, Exception) or not _ema_trend_dir(e):
+            continue
+        rank = 2 if e.get("trigger") else 1
+        if rank > best_rank:
+            best, best_rank = k, rank
+    return best or (any_free if origin_busy else None)
+
+
+async def _ema5_pick_deriv(origin_key):
+    """Same idea for Volatility/Deriv indices: best trending index other than origin_key."""
+    keys = [k for k in SYNTHETIC_CONFIG if k != origin_key]
+    res = await asyncio.gather(*[_ema5_deriv(k, SYNTHETIC_CONFIG[k]) for k in keys], return_exceptions=True)
+    best, best_rank = None, -1
+    for k, e in zip(keys, res):
+        if isinstance(e, Exception) or not _ema_trend_dir(e):
+            continue
+        rank = 2 if e.get("trigger") else 1
+        if rank > best_rank:
+            best, best_rank = k, rank
+    return best
+
 SC_CFG = {
     "pending_pips": 15,
     "sl_pips": 20,
@@ -3642,18 +3716,6 @@ async def _flip_ml_sim_direction(pair_key, pair_config, sl_dist):
                 ml = await asyncio.to_thread(run_ml_driven_decision, pair_key, pair_config, h1, h4, d1)
                 if ml:
                     res = ml[0]
-                    try:
-                        import signal_odds
-                        price = float(h1[-1]["close"])
-                        dec = await asyncio.wait_for(asyncio.to_thread(
-                            signal_odds.decide_direction, pair_config["mt5_symbol"], get_candles_exness,
-                            sl_dist / price, 2 * sl_dist / price, "FLIP" + pair_key, res), timeout=10)
-                        if dec:
-                            print(f"[ODDS] Account Flip {pair_key}: sim BUY {dec[1]*100:.1f}% / SELL {dec[2]*100:.1f}% "
-                                  f"-> {dec[0]} (model said {res})", flush=True)
-                            res = dec[0]
-                    except Exception as _e:
-                        print(f"[ODDS] Account Flip sim skipped {pair_key}: {type(_e).__name__}: {str(_e)[:100]}", flush=True)
         except Exception as e:
             print(f"[ACCOUNT FLIP] ML decision failed {pair_key}: {type(e).__name__}: {str(e)[:100]}", flush=True)
         _FLIP_DEC[pair_key] = (slot, res)
@@ -3834,20 +3896,6 @@ async def _sc_tick_one(context, account):
                 direction = _ml["dir"]
                 st["ml_bar"] = _ml["bar_t"]
                 ml_used = True
-                # 10,000-path simulation picks the side (stop = this scalper's stop, target = 2x stop).
-                # If it can't run, the model's side stands.
-                try:
-                    import signal_odds
-                    _mid = (bid + ask) / 2.0
-                    _dec = await asyncio.wait_for(asyncio.to_thread(
-                        signal_odds.decide_direction, pair_config["mt5_symbol"], get_candles_exness,
-                        sl_pips * pip / _mid, 2 * sl_pips * pip / _mid, "SC" + pair_key, direction), timeout=10)
-                    if _dec and _dec[0] != direction:
-                        print(f"[ODDS] Scalper {pair_key}: sim BUY {_dec[1]*100:.1f}% / SELL {_dec[2]*100:.1f}% "
-                              f"-> {_dec[0]} (model said {direction})", flush=True)
-                        direction = _dec[0]
-                except Exception as _e:
-                    print(f"[ODDS] Scalper sim skipped {pair_key}: {type(_e).__name__}: {str(_e)[:100]}", flush=True)
             else:
                 dist = cfg["pending_pips"] * pip
                 if st["phase"] in ("arm", None) or now - st.get("armed_at", 0) > cfg["pending_expiry_s"]:
@@ -8260,15 +8308,10 @@ SIGNAL_QUOTE_SYNTH = f'<blockquote>🔗 <a href="{DERIV_SIGNUP_LINK}">Sign up to
 SIGNAL_QUOTE_FOREX = f'<blockquote>🔗 <a href="{EXNESS_LINK}">Open a free Exness account to trade this</a></blockquote>'
 
 
-def _backed_by(reason, direction, model_direction, p_buy, p_sell):
-    """Rewrites the ML reason line so it says which model(s) back the signal.
-    Both: ML model + simulation model; ML only; simulation only (override)."""
+def _backed_by(reason, direction, *_ignored):
+    """ML reason line -> 'Backed by: ML model -> BUY ...' (no simulation anymore)."""
     try:
-        if direction != model_direction:
-            return f"Backed by: simulation model \u2192 {direction}."
-        sim_side = "BUY" if p_buy > p_sell else ("SELL" if p_sell > p_buy else None)
-        who = "ML model + simulation model" if sim_side == direction else "ML model"
-        return re.sub(r"^ML model favors (BUY|SELL)", f"Backed by: {who} \u2192 \\1", str(reason).strip(), count=1)
+        return re.sub(r"^ML model favors (BUY|SELL)", "Backed by: ML model \u2192 \\1", str(reason).strip(), count=1)
     except Exception:
         return reason
 
@@ -9174,15 +9217,6 @@ def log_signal(signal_data, source="scheduled"):
                     "posted_at": payload["posted_at"],
                     "source": source,
                 })
-                # Odds check (record-only, background): never delays or blocks a signal.
-                try:
-                    import signal_odds
-                    _sym = next((c.get("mt5_symbol") for c in PAIR_CONFIG.values()
-                                 if c.get("pair_name") == payload["pair_name"]), None)
-                    signal_odds.submit(signal_id, payload, _sym, get_candles_exness,
-                                       SUPABASE_URL, sb_headers, source)
-                except Exception:
-                    pass
             return signal_id
         else:
             print(
@@ -12605,12 +12639,25 @@ _DERIV_LAST_SIG = {}
 async def build_synthetic_signal_response(index_key, min_agree=2, manual=False):
     _tok = _DERIV_PRIORITY_CTX.set(True)
     try:
+        _from = None
+        if EMA5_LIVE and index_key in SYNTHETIC_CONFIG:
+            try:
+                _e5 = await _ema5_deriv(index_key, SYNTHETIC_CONFIG[index_key])
+                if not _ema_trend_dir(_e5):
+                    _alt = await _ema5_pick_deriv(index_key)
+                    if _alt:
+                        print(f"[SIGNAL] {index_key} is ranging -> using {_alt} (trending)", flush=True)
+                        _res = await _build_synthetic_signal_response_inner(_alt, min_agree, manual, _swapped_from=index_key)
+                        if _res:
+                            return _res
+            except Exception as _e:
+                print(f"[SIGNAL] Deriv EMA scan skipped: {type(_e).__name__}: {str(_e)[:100]}", flush=True)
         return await _build_synthetic_signal_response_inner(index_key, min_agree, manual)
     finally:
         _DERIV_PRIORITY_CTX.reset(_tok)
 
 
-async def _build_synthetic_signal_response_inner(index_key, min_agree=2, manual=False):
+async def _build_synthetic_signal_response_inner(index_key, min_agree=2, manual=False, _swapped_from=None):
     """
     Builds the signal message, image, and the trade context that
     gets stored for if/when the user taps "Trade This Signal".
@@ -12684,56 +12731,28 @@ async def _build_synthetic_signal_response_inner(index_key, min_agree=2, manual=
         winning_votes = []
     else:
         direction, confidence, reason, agreeing_strategies, winning_votes = result
-    # SIMULATION DECIDES THE SIDE (same rule as forex signals): 10,000 simulated futures for BUY and SELL
-    # with this signal's own stop/target distances (1.5x / 3x hourly range). Used only when it leads by
-    # the margin; if it can't run, the model's side stands. Never blocks a signal.
-    # CONSISTENCY: a manual request within an hour of the last signal for this index repeats its direction.
-    _prev = _DERIV_LAST_SIG.get(index_key)
-    _reuse = _prev[0] if (manual and _prev and time.time() - _prev[1] < SIGNAL_CONSISTENCY_SECONDS) else None
-    if _reuse:
-        if _reuse != direction:
-            print(f"[SIGNAL] {index_key}: keeping recent {_reuse} for consistency (fresh read said {direction})", flush=True)
+    # DIRECTION: the EMA trend wins (also over a recent signal on this index). With no trend the
+    # ML model's side stands (with the consistency rule for manual requests). No simulation.
+    _e5 = await _ema5_deriv(index_key, config) if EMA5_LIVE else None
+    _tdir = _ema_trend_dir(_e5)
+    if _tdir:
+        if _tdir != direction:
+            direction = _tdir
+            agreeing_strategies = []
+            winning_votes = []
+        reason = f"Backed by: trend model \u2192 {direction}."
+    else:
+        _prev = _DERIV_LAST_SIG.get(index_key)
+        _reuse = _prev[0] if (manual and _prev and time.time() - _prev[1] < SIGNAL_CONSISTENCY_SECONDS) else None
+        if _reuse and _reuse != direction:
             direction = _reuse
             agreeing_strategies = []
             winning_votes = []
             reason = "Market conditions continue to favor " + ("buyers" if direction == "BUY" else "sellers") + " here."
         else:
-            try:
-                import signal_odds
-                if h1_candles and len(h1_candles) >= 15:
-                    _px = h1_candles[-1]["close"]
-                    _atr = sum(c["high"] - c["low"] for c in h1_candles[-14:]) / 14
-                    if _px and _atr > 0:
-                        _dec = await asyncio.wait_for(asyncio.to_thread(
-                            signal_odds.decide_direction, config["symbol"], signal_odds.deriv_candles,
-                            _atr * 1.5 / _px, _atr * 3.0 / _px, "D" + index_key, direction), timeout=15)
-                        if _dec:
-                            print(f"[ODDS] {index_key} (repeat): sim BUY {_dec[1]*100:.1f}% / SELL {_dec[2]*100:.1f}% "
-                                  f"(kept {direction})", flush=True)
-                            reason = _backed_by(reason, direction, direction, _dec[1], _dec[2])
-            except Exception as _e:
-                print(f"[ODDS] {index_key} repeat label skipped: {type(_e).__name__}: {str(_e)[:100]}", flush=True)
-    else:
-      try:
-        import signal_odds
-        if h1_candles and len(h1_candles) >= 15:
-            _px = h1_candles[-1]["close"]
-            _atr = sum(c["high"] - c["low"] for c in h1_candles[-14:]) / 14
-            if _px and _atr > 0:
-                _dec = await asyncio.wait_for(asyncio.to_thread(
-                    signal_odds.decide_direction, config["symbol"], signal_odds.deriv_candles,
-                    _atr * 1.5 / _px, _atr * 3.0 / _px, "D" + index_key, direction), timeout=15)
-                if _dec:
-                    print(f"[ODDS] {index_key}: sim BUY {_dec[1]*100:.1f}% / SELL {_dec[2]*100:.1f}% -> {_dec[0]} "
-                          f"(model said {direction})", flush=True)
-                    _model_dir = direction
-                    if _dec[0] != direction:
-                        direction = _dec[0]
-                        agreeing_strategies = []
-                        winning_votes = []
-                    reason = _backed_by(reason, direction, _model_dir, _dec[1], _dec[2])
-      except Exception as _e:
-        print(f"[ODDS] {index_key} decision skipped: {type(_e).__name__}: {str(_e)[:100]}", flush=True)
+            reason = _backed_by(reason, direction)
+    if _swapped_from:
+        reason = f"{_swapped_from} is ranging right now, so this is the cleaner setup. " + reason
     _DERIV_LAST_SIG[index_key] = (direction, time.time())
     contract_type = "MULTUP" if direction == "BUY" else "MULTDOWN"
 
@@ -14513,17 +14532,6 @@ async def _deriv_flip_ml_sim_direction(index_key, config, sl_frac):
                 ml = await run_ml_driven_decision_synthetic(index_key, config, h1, h4, d1)
                 if ml:
                     res = ml[0]
-                    try:
-                        import signal_odds
-                        dec = await asyncio.wait_for(asyncio.to_thread(
-                            signal_odds.decide_direction, sym, signal_odds.deriv_candles,
-                            sl_frac, 2 * sl_frac, "DFLIP" + index_key, res), timeout=15)
-                        if dec:
-                            print(f"[ODDS] Deriv Account Flip {index_key}: sim BUY {dec[1]*100:.1f}% / SELL {dec[2]*100:.1f}% "
-                                  f"-> {dec[0]} (model said {res})", flush=True)
-                            res = dec[0]
-                    except Exception as _e:
-                        print(f"[ODDS] Deriv Account Flip sim skipped {index_key}: {type(_e).__name__}: {str(_e)[:100]}", flush=True)
         except Exception as e:
             print(f"[DSC] flip ML decision failed {index_key}: {type(e).__name__}: {str(e)[:100]}", flush=True)
         _DFLIP_DEC[index_key] = (slot, res)
@@ -14713,19 +14721,6 @@ async def _dsc_tick_one_inner(context, account):
                     return
                 direction = _ml["dir"]
                 st["ml_bar"] = _ml["bar_t"]
-                # 10,000-path simulation picks the side (stop = this scalper's stop, target = 2x stop).
-                try:
-                    import signal_odds
-                    _sl_f = risk / (stake * mult)
-                    _dec = await asyncio.wait_for(asyncio.to_thread(
-                        signal_odds.decide_direction, symbol, signal_odds.deriv_candles,
-                        _sl_f, 2 * _sl_f, "DSC" + index_key, direction), timeout=15)
-                    if _dec and _dec[0] != direction:
-                        print(f"[ODDS] Deriv scalper {index_key}: sim BUY {_dec[1]*100:.1f}% / SELL {_dec[2]*100:.1f}% "
-                              f"-> {_dec[0]} (model said {direction})", flush=True)
-                        direction = _dec[0]
-                except Exception as _e:
-                    print(f"[ODDS] Deriv scalper sim skipped {index_key}: {type(_e).__name__}: {str(_e)[:100]}", flush=True)
             else:
                 price = await _dsc_price(symbol)  # one shared price connection for everyone
                 if not price:
@@ -23101,7 +23096,7 @@ def _recent_signal_direction(pair_name):
     return None
 
 
-async def build_signal_response(question, user_id=None, retry_mismatch=False):
+async def build_signal_response(question, user_id=None, retry_mismatch=False, _swapped_from=None):
     matched_key = match_pair_key(question)
 
     if matched_key is None:
@@ -23129,6 +23124,29 @@ async def build_signal_response(question, user_id=None, retry_mismatch=False):
     pip_size = config["pip_size"]
     display = config["display"]
     decimals = config.get("decimals", 2)
+
+    # EMA TREND FIRST: if this pair is ranging, hand the signal to the best trending pair in the
+    # same market group (metals/oil/BTC/forex). If nothing trends, this pair gets the ML fallback.
+    _ema = None
+    if EMA5_LIVE and matched_key in FX_SCAN_KEYS:
+        try:
+            _ema = await _ema5_exness(matched_key, config)
+            _sched = user_id is None
+            _busy = await _pair_busy(matched_key, _sched)
+            if _busy:
+                print(f"[SIGNAL] {pair_name}: previous signal still open - no double entry", flush=True)
+            if (not _ema_trend_dir(_ema) or _busy) and not _swapped_from:
+                _alt = await _ema5_pick_pair(matched_key, _sched, _busy)
+                if _alt:
+                    print(f"[SIGNAL] {pair_name} is {'busy' if _busy else 'ranging'} -> using {_alt.upper()}", flush=True)
+                    _res = await build_signal_response(_alt, user_id=user_id, retry_mismatch=retry_mismatch,
+                                                       _swapped_from=pair_name)
+                    if _res and _res[3] is not None:
+                        return _res
+            if _busy and _sched:
+                return None, None, "PAIR_BUSY", None
+        except Exception as _e:
+            print(f"[SIGNAL] EMA scan skipped: {type(_e).__name__}: {str(_e)[:100]}", flush=True)
 
     # CAREFUL FIX, per explicit instruction - both of these make real,
     # BLOCKING requests calls internally (get_cached_price_data ->
@@ -23502,56 +23520,25 @@ async def build_signal_response(question, user_id=None, retry_mismatch=False):
     sl_multiplier, tp_multiplier = get_sl_tp_multipliers(matched_key, live_price)
     tp1_multiplier = get_tp1_multiplier(matched_key, live_price)
 
-    # CONSISTENCY: a manual request within an hour of the last signal for this pair (scheduled or
-    # manual) repeats that signal's direction, so people never see BUY and SELL for the same pair.
-    _reuse = None
-    if user_id is not None:
-        _reuse = await asyncio.to_thread(_recent_signal_direction, pair_name)
-    if _reuse:
-        if _reuse != direction:
-            print(f"[SIGNAL] {pair_name}: keeping recent {_reuse} for consistency (fresh read said {direction})", flush=True)
+    # DIRECTION: the EMA trend wins (also over an earlier signal on this pair). With no trend the
+    # ML model's direction stands. No simulation.
+    _tdir = _ema_trend_dir(_ema) if EMA5_LIVE else None
+    if _tdir:
+        if _tdir != direction:
+            direction = _tdir
+            agreeing_strategies = []
+        reason = f"Backed by: trend model \u2192 {direction}."
+    else:
+        # No trend: ML fallback; a manual request keeps the pair's recent signal direction (consistency).
+        _reuse = await asyncio.to_thread(_recent_signal_direction, pair_name) if user_id is not None else None
+        if _reuse and _reuse != direction:
             direction = _reuse
             agreeing_strategies = []
             reason = ("Market conditions continue to favor " + ("buyers" if direction == "BUY" else "sellers") + " here.")
         else:
-            # Same direction as the recent signal: the direction is kept, but the simulation is still
-            # consulted so the wording says honestly whether it also backs this side.
-            try:
-                import signal_odds
-                _sl_f = pip_size * sl_multiplier / live_price
-                _tp_f = pip_size * tp_multiplier / live_price
-                _dec = await asyncio.wait_for(asyncio.to_thread(
-                    signal_odds.decide_direction, config.get("mt5_symbol"), get_candles_exness,
-                    _sl_f, _tp_f, pair_name, direction), timeout=10)
-                if _dec:
-                    print(f"[ODDS] {pair_name} (repeat): sim BUY {_dec[1]*100:.1f}% / SELL {_dec[2]*100:.1f}% "
-                          f"(kept {direction})", flush=True)
-                    reason = _backed_by(reason, direction, direction, _dec[1], _dec[2])
-            except Exception as _e:
-                print(f"[ODDS] repeat label skipped: {type(_e).__name__}: {str(_e)[:100]}", flush=True)
-    else:
-        # SIMULATION DECIDES THE DIRECTION (per explicit instruction): 10,000 simulated futures for
-        # BUY and for SELL with this signal's own stop/target distances; the side with the better
-        # chance of hitting its target first is the signal. Never blocks: if the simulation can't run
-        # (no data / error / timeout) the model's own direction stands and the signal goes out as before.
-        try:
-            import signal_odds
-            _sl_f = pip_size * sl_multiplier / live_price
-            _tp_f = pip_size * tp_multiplier / live_price
-            _dec = await asyncio.wait_for(asyncio.to_thread(
-                signal_odds.decide_direction, config.get("mt5_symbol"), get_candles_exness,
-                _sl_f, _tp_f, pair_name, direction), timeout=10)
-            if _dec:
-                _sim_dir, _pb, _ps = _dec
-                print(f"[ODDS] {pair_name}: sim BUY {_pb*100:.1f}% / SELL {_ps*100:.1f}% -> {_sim_dir} "
-                      f"(model said {direction})", flush=True)
-                _model_dir = direction
-                if _sim_dir != direction:
-                    direction = _sim_dir
-                    agreeing_strategies = []
-                reason = _backed_by(reason, direction, _model_dir, _pb, _ps)
-        except Exception as _e:
-            print(f"[ODDS] decision skipped: {type(_e).__name__}: {str(_e)[:100]}", flush=True)
+            reason = _backed_by(reason, direction)
+    if _swapped_from:
+        reason = f"{_swapped_from} is ranging right now, so this is the cleaner setup. " + reason
 
     if direction == "BUY":
         entry_price = round(live_price, decimals)
@@ -31520,12 +31507,8 @@ async def _post_signal_for_pair(bot, pair_keyword):
 
     try:
         pair_name = PAIR_CONFIG.get(pair_keyword, {}).get("pair_name", pair_keyword.upper())
-        if has_open_signal_for_pair(pair_name):
-            print(
-                f"[AUTO SIGNAL] ⏸️ {pair_keyword.upper()} skipped — a "
-                f"previous {pair_name} signal hasn't closed yet."
-            )
-            return
+        # An open previous signal / live position on this pair no longer skips the slot:
+        # build_signal_response hands the slot to a free pair in the same group (no double entries).
 
         # Catches a position REGARDLESS of who opened it - the bot's own
         # prior signal (already covered above via signal_log) OR a trade
@@ -31533,21 +31516,15 @@ async def _post_signal_for_pair(bot, pair_keyword):
         # explicit instruction, after a real confirmed regression where a
         # manually-placed BTCUSD trade didn't stop the bot's own scheduled
         # BTCUSD signal from firing on top of it.
-        mt5_symbol = PAIR_CONFIG.get(pair_keyword, {}).get("mt5_symbol")
-        if mt5_symbol and await has_real_open_mt5_position(mt5_symbol):
-            print(
-                f"[AUTO SIGNAL] ⏸️ {pair_keyword.upper()} skipped — the "
-                f"account already has a live {mt5_symbol} position open "
-                f"(placed manually or otherwise), regardless of signal_log."
-            )
-            return
 
         image_file_id, direction, signal, signal_data = (
             await build_signal_response(pair_keyword, user_id=None, retry_mismatch=True)
         )
 
         if signal_data is None:
-            if signal == "MARKET_CLOSED":
+            if signal == "PAIR_BUSY":
+                print(f"[AUTO SIGNAL] ⏸️ {pair_keyword.upper()} held — its previous trade is still open and no free pair in the group.")
+            elif signal == "MARKET_CLOSED":
                 print(f"[AUTO SIGNAL] ⏸️ {pair_keyword.upper()} skipped — forex market closed.")
             elif signal == "NO_DATA_AVAILABLE":
                 print(f"[AUTO SIGNAL] ⏸️ {pair_keyword.upper()} skipped — no real data source available (should not be scheduled).")

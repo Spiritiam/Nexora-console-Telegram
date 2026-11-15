@@ -18029,6 +18029,29 @@ async def exnessapitrade_command(update: Update, context: ContextTypes.DEFAULT_T
         await update.message.reply_text(f"Exness test trade error: {str(e)[:500]}")
 
 
+async def fliptest_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Admin-only: runs the opposite-side test on past closed signals in the background (see fliptest.py)."""
+    if not ADMIN_USER_ID or str(update.message.from_user.id) != ADMIN_USER_ID:
+        return
+    await update.message.reply_text("Flip test started in the background. I'll message you when it finishes.")
+
+    async def _job():
+        try:
+            import fliptest
+            pairs = {c["pair_name"]: c["mt5_symbol"] for k, c in PAIR_CONFIG.items()
+                     if k in FX_SCAN_KEYS and c.get("mt5_symbol")}
+            fx_txt = await asyncio.to_thread(fliptest.run, SUPABASE_URL, sb_headers, METAAPI_TOKEN,
+                                             METAAPI_ACCOUNT_ID, pairs)
+            idx = {k: c["symbol"] for k, c in SYNTHETIC_CONFIG.items()}
+            dv_txt = await asyncio.to_thread(fliptest.run_deriv, SUPABASE_URL, sb_headers, idx)
+            await context.bot.send_message(chat_id=int(ADMIN_USER_ID), text=f"Flip test done.\n{fx_txt}\n{dv_txt}")
+        except Exception as e:
+            print(f"[FLIPTEST] failed: {type(e).__name__}: {str(e)[:200]}", flush=True)
+            await context.bot.send_message(chat_id=int(ADMIN_USER_ID), text=f"Flip test failed: {type(e).__name__}")
+
+    asyncio.create_task(_job())
+
+
 async def backfillmlfeatures_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """
     Admin-only, one-off command that runs backfill_signal_ml_features
@@ -35463,6 +35486,7 @@ def main():
     app.add_handler(CallbackQueryHandler(channels_callback, pattern=r"^chsw_"))
     app.add_handler(CommandHandler("broadcastchannels", broadcastchannels_command))
     app.add_handler(CommandHandler("backfillmlfeatures", backfillmlfeatures_command))
+    app.add_handler(CommandHandler("fliptest", fliptest_command))
     app.add_handler(CommandHandler("exnessapitest", exnessapitest_command))
     app.add_handler(CommandHandler("exnessapitrade", exnessapitrade_command))
     app.add_handler(CommandHandler("backtestderivbot", backtestderivbot_command))

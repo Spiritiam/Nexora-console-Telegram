@@ -3321,6 +3321,52 @@ async def manage_aggressive_positions(context: ContextTypes.DEFAULT_TYPE):
 import ml1m_live
 # 1-minute ML entry for the Aggressive Scalper (Exness and Deriv). ML1M_LIVE=0 switches back to the old entry.
 ML1M_LIVE = os.getenv("ML1M_LIVE", "1") == "1"
+# 5-minute EMA trend-bounce entry (25/50/100 EMA) for the Aggressive Scalper and Account Flip on Exness and Deriv.
+# EMA5_LIVE=0 switches both back to their previous entries.
+EMA5_LIVE = os.getenv("EMA5_LIVE", "1") == "1"
+_EMA5_DEC = {}
+_EMA5_LOCKS = {}
+_EMA5_LOGGED = {}
+
+
+async def _ema5_decision(kind, key, fetch):
+    """One EMA evaluation per instrument per closed 5-minute bar, shared by every user.
+    fetch() -> list of M5 candles (oldest first). Returns evaluate()'s dict, or None."""
+    import ema_trend
+    slot = int(time.time() // 300)
+    hit = _EMA5_DEC.get((kind, key))
+    if hit and hit[0] == slot:
+        return hit[1]
+    lock = _EMA5_LOCKS.setdefault((kind, key), asyncio.Lock())
+    async with lock:
+        hit = _EMA5_DEC.get((kind, key))
+        if hit and hit[0] == slot:
+            return hit[1]
+        res = None
+        try:
+            candles = await fetch()
+            if candles:
+                res = await asyncio.to_thread(ema_trend.evaluate, candles)
+        except Exception as e:
+            print(f"[EMA5] {kind} {key} failed: {type(e).__name__}: {str(e)[:100]}", flush=True)
+        _EMA5_DEC[(kind, key)] = (slot, res)
+        if res and (res["trigger"] or time.time() - _EMA5_LOGGED.get((kind, key), 0) > 900):
+            _EMA5_LOGGED[(kind, key)] = time.time()
+            print(f"[EMA5] {kind} {key}: {res['state']} {res['direction'] or '-'} ({res['why']})", flush=True)
+        return res
+
+
+async def _ema5_exness(pair_key, pair_config):
+    async def fetch():
+        return await asyncio.to_thread(get_cached_candles, pair_key, pair_config, "5min", outputsize=300, max_age=45)
+    return await _ema5_decision("exness", pair_key, fetch)
+
+
+async def _ema5_deriv(index_key, config):
+    async def fetch():
+        return await get_cached_synthetic_candles(index_key, config["symbol"], "5m", 300, 300)
+    return await _ema5_decision("deriv", index_key, fetch)
+
 SC_CFG = {
     "pending_pips": 15,
     "sl_pips": 20,
@@ -3738,14 +3784,23 @@ async def _sc_tick_one(context, account):
             # and layers below are unchanged.
             if st["phase"] in ("arm", None, "armed"):
                 st["phase"] = "armed"
-            _slot = int(now // 900)
-            if st.get("flip_slot") == _slot:
-                return
-            direction = await _flip_ml_sim_direction(pair_key, pair_config, sl_pips * pip)
-            if not direction:
-                return
-            st["flip_slot"] = _slot
-            ml_used = True
+            if EMA5_LIVE:
+                # 5-minute EMA trend bounce replaces the model entry (stops, trailing and layers unchanged)
+                _e = await _ema5_exness(pair_key, pair_config)
+                if not _e or not _e.get("direction") or st.get("ema_bar") == _e["bar_t"]:
+                    return
+                direction = _e["direction"]
+                st["ema_bar"] = _e["bar_t"]
+                ml_used = True
+            else:
+                _slot = int(now // 900)
+                if st.get("flip_slot") == _slot:
+                    return
+                direction = await _flip_ml_sim_direction(pair_key, pair_config, sl_pips * pip)
+                if not direction:
+                    return
+                st["flip_slot"] = _slot
+                ml_used = True
         elif cfg.get("entry") == "sr":
             # Account Flip: no straddle. Wait for a respected 1-hour level with a 30-minute rejection candle.
             if st["phase"] in ("arm", None, "armed"):
@@ -3754,6 +3809,15 @@ async def _sc_tick_one(context, account):
             if not sig or _sr_should_skip(st, sig, now):
                 return
             direction = sig["direction"]
+        elif EMA5_LIVE and account["bot_choice"] == "aggressive_scalper":
+            # 5-minute EMA trend bounce: enter on the trend side only while the 25/50/100 EMAs are fanned out
+            st["phase"] = "armed"
+            _e = await _ema5_exness(pair_key, pair_config)
+            if not _e or not _e.get("direction") or st.get("ema_bar") == _e["bar_t"]:
+                return
+            direction = _e["direction"]
+            st["ema_bar"] = _e["bar_t"]
+            ml_used = True
         else:
             _ml = None
             if ML1M_LIVE and account["bot_choice"] == "aggressive_scalper":
@@ -14606,13 +14670,20 @@ async def _dsc_tick_one_inner(context, account):
             # Account Flip: hourly ML model + 10,000-path simulation choose the side; stops, trailing and
             # layers are unchanged.
             st["phase"] = "armed"
-            _slot = int(now // 900)
-            if st.get("flip_slot") == _slot:
-                return
-            direction = await _deriv_flip_ml_sim_direction(index_key, config, risk / (stake * mult))
-            if not direction:
-                return
-            st["flip_slot"] = _slot
+            if EMA5_LIVE:
+                _e = await _ema5_deriv(index_key, config)
+                if not _e or not _e.get("direction") or st.get("ema_bar") == _e["bar_t"]:
+                    return
+                direction = _e["direction"]
+                st["ema_bar"] = _e["bar_t"]
+            else:
+                _slot = int(now // 900)
+                if st.get("flip_slot") == _slot:
+                    return
+                direction = await _deriv_flip_ml_sim_direction(index_key, config, risk / (stake * mult))
+                if not direction:
+                    return
+                st["flip_slot"] = _slot
         elif mode.get("entry") == "sr":
             # Account Flip: no straddle. Wait for a respected 1-hour level with a 30-minute rejection candle.
             st["phase"] = "armed"
@@ -14620,6 +14691,13 @@ async def _dsc_tick_one_inner(context, account):
             if not sig or _sr_should_skip(st, sig, now):
                 return
             direction = sig["direction"]
+        elif EMA5_LIVE and mode is DSC_MODES["aggressive"]:
+            st["phase"] = "armed"
+            _e = await _ema5_deriv(index_key, config)
+            if not _e or not _e.get("direction") or st.get("ema_bar") == _e["bar_t"]:
+                return
+            direction = _e["direction"]
+            st["ema_bar"] = _e["bar_t"]
         else:
             _ml = None
             if ML1M_LIVE and mode is DSC_MODES["aggressive"]:

@@ -284,8 +284,8 @@ MT5_AUTOTRADE_BOTS_VISIBLE = {
 }
 # Which pairs each visible bot may trade (first = shown first).
 MT5_BOT_PAIRS = {
-    "aggressive_scalper": ["xauusd", "usoil", "btcusd"],
-    "flip_sr": ["xauusd", "xagusd"],
+    "aggressive_scalper": ["xauusd", "xauusd247", "usoil", "btcusd"],
+    "flip_sr": ["xauusd", "xauusd247", "xagusd"],
 }
 
 
@@ -297,10 +297,21 @@ def mt5_bot_pair_ok(bot_key, pair_key):
     """New selections: only the two visible bots, each on its own pairs."""
     return bot_key in MT5_AUTOTRADE_BOTS_VISIBLE and pair_key in MT5_BOT_PAIRS.get(bot_key, [])
 
+
+# Gold 24/7 (Exness XAUUSD247) is the same asset as gold, so it trades with gold's
+# exact settings and the ML model sees it as gold. Only the instrument differs.
+# It is also the one metal that trades on weekends.
+PAIR_ALIAS = {"xauusd247": "xauusd"}
+WEEKEND_PAIRS = ("btcusd", "xauusd247")
+
+
+def base_pair(pair_key):
+    return PAIR_ALIAS.get(pair_key, pair_key)
+
 # Curated subset of PAIR_CONFIG for bot trading - not all 12 pairs,
 # to keep the choice simple and recognizable.
 # Only the high-volatility instruments people actually trade: gold, bitcoin, oil, silver.
-MT5_AUTOTRADE_PAIRS = ["usoil", "btcusd", "xauusd", "xagusd"]
+MT5_AUTOTRADE_PAIRS = ["usoil", "btcusd", "xauusd", "xauusd247", "xagusd"]
 
 # Deriv's mirror of MT5_AUTOTRADE_BOTS. IMPORTANT DIFFERENCE, stated
 # plainly rather than glossed over: synthetic indices already run
@@ -1384,7 +1395,7 @@ async def has_client_open_mt5_position(metaapi_account_id, mt5_symbol):
 # oil 0.01, BTC 1.0). Accounts without an override (everyone on Telegram) are
 # left exactly as before - the signal's own SL/TP is used.
 SLTP_OVERRIDE_PIP_SIZE = {
-    "xauusd": 0.1, "btcusd": 1.0, "xagusd": 0.01, "usoil": 0.01,
+    "xauusd": 0.1, "xauusd247": 0.1, "btcusd": 1.0, "xagusd": 0.01, "usoil": 0.01,
     "eurusd": 0.0001, "gbpusd": 0.0001, "audusd": 0.0001, "usdcad": 0.0001,
     "nzdusd": 0.0001, "usdchf": 0.0001,
     "usdjpy": 0.01, "gbpjpy": 0.01, "eurjpy": 0.01,
@@ -2996,6 +3007,7 @@ AGG_CFG = {
 }
 AGG_PAIR_CFG = {
     "xauusd": {"sl_min": 0.0005, "sl_max": 0.0015, "max_spread": 0.0002},
+    "xauusd247": {"sl_min": 0.0005, "sl_max": 0.0015, "max_spread": 0.0002},
     "xagusd": {"sl_min": 0.0012, "sl_max": 0.0030, "max_spread": 0.0006},
     "btcusd": {"sl_min": 0.0008, "sl_max": 0.0025, "max_spread": 0.0006},
     "usoil":  {"sl_min": 0.0015, "sl_max": 0.0040, "max_spread": 0.0012},
@@ -3061,7 +3073,7 @@ async def run_aggressive_entry_scan(context: ContextTypes.DEFAULT_TYPE):
         for a in subs:
             combos.setdefault((a["bot_choice"], a["pair_choice"]), []).append(a)
         for (bot_key, pair_key), accounts in combos.items():
-            if pair_key != "btcusd" and _xc_market_closed():
+            if pair_key not in WEEKEND_PAIRS and _xc_market_closed():
                 continue
             pair_config = PAIR_CONFIG.get(pair_key)
             bot_info = MT5_AUTOTRADE_BOTS.get(bot_key)
@@ -3332,12 +3344,13 @@ SC_MODES = {
     # Account Flip: support/resistance on the 1-hour chart, entry from the 30-minute chart.
     # Stop 100 pips on gold, 50 on silver; at +20 pips break-even + trailing 10 behind;
     # one more trade every further 20 pips (max 5) once the earlier ones are protected.
-    "flip_sr": dict(SC_CFG, entry="mlsim", sl_pips=100, sl_pips_by_pair={"xauusd": 100, "xagusd": 50},
+    "flip_sr": dict(SC_CFG, entry="mlsim", sl_pips=100, sl_pips_by_pair={"xauusd": 100, "xauusd247": 100, "xagusd": 50},
                     trail_activate_pips=20, trail_pips=10, max_layers=5, add_pips=20,
                     label="🚀 Account Flip"),
 }
 SC_PAIR_CFG = {
     "xauusd": {"pip": 0.1,   "max_spread_pips": 4},
+    "xauusd247": {"pip": 0.1, "max_spread_pips": 4},
     "xagusd": {"pip": 0.01,  "max_spread_pips": 6},
     "btcusd": {"pip": 9.918, "max_spread_pips": 8},
     "usoil":  {"pip": 0.01,  "max_spread_pips": 6},
@@ -3705,7 +3718,7 @@ async def _sc_tick_one(context, account):
             if now < st.get("cool_until", 0):
                 return
             st["phase"] = "arm"
-        if pair_key != "btcusd" and _xc_market_closed():
+        if pair_key not in WEEKEND_PAIRS and _xc_market_closed():
             st["phase"] = "arm"
             return
         if now < st.get("backoff_until", 0):
@@ -4058,7 +4071,7 @@ async def run_account_flip_entry_scan(context: ContextTypes.DEFAULT_TYPE):
         pair_config = PAIR_CONFIG.get(pair_key)
         if not pair_config:
             continue
-        if pair_key != "btcusd" and _xc_market_closed():
+        if pair_key not in WEEKEND_PAIRS and _xc_market_closed():
             continue
         try:
             # ML + 1-minute entry (same data the Aggressive bots use)
@@ -15484,6 +15497,19 @@ PAIR_CONFIG = {
         "pip_label": "pips", "decimals": 2, "mt5_symbol": "TSLAm",
         "display": "Tesla (TSLA) 🚗", "av_symbol": "TSLA", "av_type": "stock", "td_symbol": "TSLA",
     },
+    "xauusd247": {
+        "symbol": "XAUUSD247",
+        "pair_name": "XAUUSD247",
+        "pip_size": 5.0,
+        "pip_value": 0.01,
+        "pip_label": "pips",
+        "decimals": 2,
+        "mt5_symbol": "XAUUSD247m",
+        "display": "XAU/USD 24/7 🥇",
+        "av_symbol": "XAU",
+        "av_type": "forex",
+        "td_symbol": "XAU/USD",
+    },
 }
 
 # Per explicit instruction - identifies which PAIR_CONFIG keys are
@@ -17188,6 +17214,8 @@ def _exness_md_instrument(broker, mt5_symbol):
     pick = names.get(want)
     if not pick:
         best = [n for u, n in names.items() if want.startswith(u) or u.startswith(want)]
+        if "247" in want:
+            best = [n for n in best if "247" in n]
         pick = max(best, key=len) if best else None
     if pick:
         _EXNESS_MD["map"][mt5_symbol] = pick
@@ -17806,7 +17834,7 @@ async def backfillmlfeatures_command(update: Update, context: ContextTypes.DEFAU
 
 
 METAAPI_FIRST_PAIRS = {
-    "xauusd", "btcusd", "xagusd", "usoil",
+    "xauusd", "xauusd247", "btcusd", "xagusd", "usoil",
     "gbpusd", "gbpjpy", "eurusd", "usdjpy",
     "audusd", "usdcad", "eurjpy", "usdchf", "nzdusd",
 }
@@ -17858,6 +17886,8 @@ def get_cached_candles(pair_key, config, interval, outputsize=60, force_fresh=Fa
         if candles:
             candle_cache[cache_key] = {"candles": candles, "timestamp": now}
             return candles
+        if pair_key == "xauusd247":
+            return None  # spot-gold feeds close on weekends: no stand-in data for the 24/7 instrument
         candles = get_candles_fallbacks(config, interval, outputsize, providers=("oanda", "yahoo"))
         if candles:
             candle_cache[cache_key] = {"candles": candles, "timestamp": now}
@@ -20472,7 +20502,7 @@ def compute_ml_signal_features(pair_key, direction, agreeing_strategies, entry_p
     }
     for col in ML_EV_FEATURE_COLS:
         if col.startswith("pair_"):
-            row[col] = 1 if col == f"pair_{pair_key}" else 0
+            row[col] = 1 if col == f"pair_{base_pair(pair_key)}" else 0
         elif col.startswith("strat_"):
             strat_display_names = {
                 "strat_Support_Resistance_Bounce": "Support/Resistance Bounce",
@@ -21825,6 +21855,7 @@ def get_sl_tp_multipliers(pair_key, entry_price=None):
     which stock it is. Falls back to a flat, real dollar amount only
     if entry_price genuinely isn't available at the call site.
     """
+    pair_key = base_pair(pair_key)
     if pair_key in STOCK_TICKERS:
         if entry_price:
             sl_mult = (entry_price * 0.015) / 0.1

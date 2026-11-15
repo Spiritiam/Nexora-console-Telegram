@@ -5448,7 +5448,8 @@ def _napp_news_fetch_sync():
     except Exception as e:
         print(f"[APP NEWS] alphavantage: {type(e).__name__}")
 
-    out, seen = [], set()
+    print(f"[APP NEWS] fetched {len(raw)} raw articles")
+    out, seen, loose = [], set(), []
     for title, desc, img, src, url, when in raw:
         title = (title or "").strip()
         if not title or not url:
@@ -5456,13 +5457,17 @@ def _napp_news_fetch_sync():
         key = re.sub(r"\W+", "", title.lower())[:60]
         if key in seen:
             continue
-        try:
-            if not is_news_relevant(title, desc or ""):
-                continue
-        except Exception:
-            pass
         dt = _napp_news_parse_dt(when)
         if dt is None or dt < datetime.now(timezone.utc) - timedelta(days=7):
+            continue
+        item = {"img": img or "", "title": title, "author": "", "source": src or "",
+                "url": url, "datetime": dt.isoformat(), "timePublished": _napp_news_ago(dt), "_dt": dt}
+        try:
+            relevant = is_news_relevant(title, desc or "")
+        except Exception:
+            relevant = True
+        if not relevant:
+            loose.append(item)
             continue
         seen.add(key)
         out.append({
@@ -5470,6 +5475,12 @@ def _napp_news_fetch_sync():
             "url": url, "datetime": dt.isoformat(), "timePublished": _napp_news_ago(dt),
             "_dt": dt,
         })
+    # If the forex/gold/crypto filter leaves too little, top up with the newest
+    # general business headlines so the section is never empty.
+    if len(out) < 5:
+        loose.sort(key=lambda x: x["_dt"], reverse=True)
+        out.extend(loose[: 8 - len(out)])
+    print(f"[APP NEWS] returning {len(out)} (relevant kept, {len(loose)} other)")
     out.sort(key=lambda x: x["_dt"], reverse=True)
     for o in out:
         o.pop("_dt", None)

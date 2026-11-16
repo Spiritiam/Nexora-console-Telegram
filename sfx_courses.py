@@ -67,6 +67,23 @@ async def videos_handler(request):
     return _j([{"sn": str(r["sn"]), "courseId": cid, "title": r["title"], "videoId": r["video_id"], "datetime": ""} for r in rows])
 
 
+async def status_handler(request):
+    st, rows = await asyncio.to_thread(_sb, "sfx_status?active=eq.true&select=*&order=sort.asc,created_at.asc")
+    if st != 200 or not isinstance(rows, list):
+        return _j([])
+    return _j([{"statusId": str(r["id"]), "seen": "false", "mediaType": r["media_type"], "url": r["url"],
+                "caption": r["caption"], "duration": int(r["duration"]), "datetime": r.get("created_at") or ""} for r in rows])
+
+
+async def status_image_handler(request):
+    name = request.match_info["name"]
+    base = os.path.join(os.path.dirname(os.path.abspath(__file__)), "sfx_status_assets")
+    path = os.path.join(base, os.path.basename(name))
+    if not name.endswith(".png") or not os.path.isfile(path):
+        return web.Response(status=404)
+    return web.FileResponse(path, headers={"Cache-Control": "public, max-age=3600"})
+
+
 # ------------------------------------------------------------------ YouTube sync
 
 def _yt(endpoint, **params):
@@ -189,6 +206,8 @@ async def _on_cleanup(app):
 def register(app, sb_headers, supabase_url):
     _deps.update(sb_headers=sb_headers, supabase_url=supabase_url)
     app.router.add_get("/api/public/courses", courses_handler)
+    app.router.add_get("/api/public/status", status_handler)
+    app.router.add_get("/status-img/{name}", status_image_handler)
     app.router.add_get("/api/public/courses/{cid}/videos", videos_handler)
     app.on_startup.append(_on_start)
     app.on_cleanup.append(_on_cleanup)

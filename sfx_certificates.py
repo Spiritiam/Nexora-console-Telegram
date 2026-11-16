@@ -270,55 +270,88 @@ def _font(size, serif=False, bold=False):
 
 
 def render_certificate_png(cert):
+    """Matches the approved SFXACADEMY mock-up: cream paper, double gold border, faint emblem watermark,
+    logo on top, signature left, emblem seal centre, QR right."""
     from PIL import Image, ImageDraw
     import qrcode
-    W, H = 1754, 1240
-    img = Image.new("RGB", (W, H), (252, 250, 245))
-    d = ImageDraw.Draw(img)
-    green, ink, grey = (14, 94, 74), (28, 32, 38), (110, 116, 124)
-    d.rectangle([30, 30, W - 30, H - 30], outline=green, width=6)
-    d.rectangle([52, 52, W - 52, H - 52], outline=(196, 170, 100), width=2)
+    W, H = 2000, 1414
+    cream, gold, gold_l, ink, grey, gold_d = (251, 247, 236), (184, 146, 58), (217, 196, 138), (27, 34, 48), (91, 100, 117), (138, 109, 36)
+    img = Image.new("RGB", (W, H), cream)
 
-    def center(text, y, font, fill=ink):
-        w = d.textlength(text, font=font)
-        d.text(((W - w) / 2, y), text, font=font, fill=fill)
+    emblem = Image.open(os.path.join(ASSETS, "spiritfx_emblem.png")).convert("RGBA")
+    wm = emblem.copy()
+    wm.thumbnail((860, 860))
+    alpha = wm.split()[3].point(lambda v: int(v * 0.07))
+    wm.putalpha(alpha)
+    img.paste(wm, ((W - wm.width) // 2, (H - wm.height) // 2 - 20), wm)
+
+    d = ImageDraw.Draw(img)
+    d.rectangle([56, 56, W - 56, H - 56], outline=gold, width=6)
+    d.rectangle([80, 80, W - 80, H - 80], outline=gold_l, width=2)
+
+    def center(text, y, font, fill=ink, spacing=0):
+        if spacing:
+            total = sum(d.textlength(c, font=font) for c in text) + spacing * (len(text) - 1)
+            x = (W - total) / 2
+            for c in text:
+                d.text((x, y), c, font=font, fill=fill)
+                x += d.textlength(c, font=font) + spacing
+        else:
+            w = d.textlength(text, font=font)
+            d.text(((W - w) / 2, y), text, font=font, fill=fill)
 
     logo = Image.open(os.path.join(ASSETS, "spiritfx_logo.png")).convert("RGBA")
-    logo.thumbnail((260, 260))
-    img.paste(logo, ((W - logo.width) // 2, 85), logo)
-    center("CERTIFICATE OF COMPLETION", 370, _font(60, serif=True, bold=True), green)
-    center("This is to certify that", 470, _font(30, serif=True), grey)
+    logo.thumbnail((300, 190))
+    img.paste(logo, ((W - logo.width) // 2, 110), logo)
+    center("TRADING ACADEMY", 312, _font(24, bold=True), gold_d, spacing=9)
+    center("Certificate of Completion", 372, _font(112, serif=True, bold=True), ink)
+    center("This certifies that", 520, _font(30), grey)
     name = cert["holder_name"]
-    size = 84
+    size = 100
     f = _font(size, serif=True, bold=True)
-    while d.textlength(name, font=f) > W - 300 and size > 36:
+    while d.textlength(name, font=f) > W - 420 and size > 40:
         size -= 4
         f = _font(size, serif=True, bold=True)
-    center(name, 535, f, ink)
-    d.line([(W // 2 - 420, 650), (W // 2 + 420, 650)], fill=(196, 170, 100), width=2)
-    center("has successfully completed the Beginner and Advanced courses and passed the final exam of the", 690, _font(28, serif=True), grey)
-    center(PROGRAMME, 745, _font(52, serif=True, bold=True), green)
+    center(name, 575, f, ink)
+    nw = d.textlength(name, font=f)
+    lw = max(nw + 100, 700)
+    d.line([((W - lw) / 2, 700), ((W + lw) / 2, 700)], fill=gold, width=3)
+    center("has successfully completed the Beginner and Advanced courses and passed the final exam of the", 742, _font(30), grey)
+    center(PROGRAMME, 796, _font(52, bold=True), ink)
 
+    # bottom row: signature | seal | QR
+    base = H - 300
     sig = Image.open(os.path.join(ASSETS, "ceo_signature.png")).convert("RGBA")
-    sig.thumbnail((300, 170))
-    img.paste(sig, (190, 880), sig)
-    d.line([(160, 1050), (560, 1050)], fill=ink, width=2)
-    d.text((160, 1062), SIGNER_NAME, font=_font(26, serif=True, bold=True), fill=ink)
-    d.text((160, 1100), SIGNER_TITLE, font=_font(22), fill=grey)
+    sig.thumbnail((340, 150))
+    img.paste(sig, (260 + (300 - sig.width) // 2, base - 150 + 40), sig)
+    d.line([(240, base + 50), (580, base + 50)], fill=ink, width=2)
+    sw = d.textlength(SIGNER_NAME, font=_font(26, bold=True))
+    d.text((410 - sw / 2, base + 62), SIGNER_NAME, font=_font(26, bold=True), fill=ink)
+    tw = d.textlength(SIGNER_TITLE, font=_font(23))
+    d.text((410 - tw / 2, base + 100), SIGNER_TITLE, font=_font(23), fill=grey)
 
+    cx, cy, r = W // 2, base - 10, 92
+    d.ellipse([cx - r, cy - r, cx + r, cy + r], fill=(255, 255, 255), outline=gold, width=6)
+    em = emblem.copy()
+    em.thumbnail((140, 140))
+    img.paste(em, (cx - em.width // 2, cy - em.height // 2), em)
     try:
         issued = datetime.fromisoformat(str(cert["issued_at"]).replace("Z", "+00:00")).strftime("%d %B %Y")
     except Exception:
         issued = ""
-    center(f"Issued {issued}", 1000, _font(28, serif=True), ink)
-    center(f"Certificate No. {cert['cert_no']}", 1045, _font(30, bold=True), green)
-    center("Scan the QR code to verify this certificate", 1100, _font(22), grey)
+    center(f"Issued {issued}", cy + r + 22, _font(26), grey)
 
     qr = qrcode.QRCode(box_size=8, border=2)
     qr.add_data(f"{PUBLIC_BASE}/verify/{cert['cert_no']}")
     qr.make(fit=True)
-    qimg = qr.make_image(fill_color="black", back_color="white").convert("RGB").resize((230, 230))
-    img.paste(qimg, (W - 190 - 230, 880))
+    qimg = qr.make_image(fill_color=(27, 34, 48), back_color="white").convert("RGB").resize((200, 200))
+    qx = W - 240 - 200
+    img.paste(qimg, (qx, base - 120))
+    cn = cert["cert_no"]
+    cw = d.textlength(cn, font=_font(28, bold=True))
+    d.text((qx + 100 - cw / 2, base + 92), cn, font=_font(28, bold=True), fill=ink)
+    sc = d.textlength("Scan to verify", font=_font(22))
+    d.text((qx + 100 - sc / 2, base + 132), "Scan to verify", font=_font(22), fill=grey)
     buf = io.BytesIO()
     img.save(buf, "PNG", optimize=True)
     return buf.getvalue()

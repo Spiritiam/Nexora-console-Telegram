@@ -73,28 +73,55 @@ def _find(obj, key, depth=0):
     return None
 
 
+AVATARS = ("fox", "panda", "lion", "tiger", "frog", "monkey", "owl", "wolf",
+           "robot", "alien", "rocket", "diamond", "unicorn", "dragon", "shark", "whale")
+
+
+def _q(v):
+    return requests.utils.quote(str(v), safe="")
+
+
+def _overlay(user_key):
+    code, rows = _sb(f"sfx_profiles?user_key=eq.{_q(user_key)}&select=*")
+    return rows[0] if code == 200 and isinstance(rows, list) and rows else None
+
+
 def _profile_sync(token):
-    """(user_key, name, eligible) for a spiritfx.org token, or (None, None, False)."""
+    """Dict (key, name, uname, since, avatar, eligible) for a spiritfx.org token, or None.
+    name/uname are the student's own edits when they made any, else the spiritfx.org values."""
     user_key = _deps["validate_token"](token)
     if not user_key:
-        return None, None, False
+        return None
+    base_name, base_uname, since, cert = "", "", "", ""
     try:
         r = requests.get(_deps["user_url"], headers={"Authorization": f"Bearer {token}", "Accept": "application/json"}, timeout=10)
         body = r.json()
+        base_name = str(_find(body, "funame") or _find(body, "name") or "").strip()
+        base_uname = str(_find(body, "uname") or "").strip()
+        since = str(_find(body, "datetime") or "").strip()
+        c = _find(body, "certificate")
+        cert = str(c) if c is not None else ""
     except Exception:
-        return user_key, None, False
-    name = str(_find(body, "funame") or _find(body, "name") or "").strip()
-    cert = str(_find(body, "certificate") if _find(body, "certificate") is not None else "")
-    return user_key, name, cert == "1"
+        pass
+    ov = _overlay(user_key)
+    if ov is None and base_uname:
+        _sb("sfx_profiles", "POST", {"user_key": user_key, "orig_uname": base_uname,
+                                     "orig_uname_lower": base_uname.lower()}, prefer="resolution=ignore-duplicates")
+    ov = ov or {}
+    return {"key": user_key,
+            "name": (ov.get("display_name") or base_name or "").strip(),
+            "uname": (ov.get("username") or base_uname or "").strip(),
+            "since": since, "avatar": ov.get("avatar") or "",
+            "eligible": cert == "1"}
 
 
 async def _auth(request):
     auth = request.headers.get("Authorization", "")
     token = auth[7:].strip() if auth.lower().startswith("bearer ") else ""
-    user_key, name, eligible = await asyncio.to_thread(_profile_sync, token)
-    if not user_key:
+    me = await asyncio.to_thread(_profile_sync, token)
+    if not me:
         return None, _j({"error": "auth", "message": "Please log in again."}, 401)
-    return {"key": user_key, "name": name, "eligible": eligible}, None
+    return me, None
 
 
 def _existing_cert(user_key):
@@ -120,12 +147,12 @@ def _cert_public(c):
 def _status_sync(me):
     c = _existing_cert(me["key"])
     if c:
-        return {"eligible": True, "issued": _cert_public(c), "can_start": False, "wait_seconds": 0}
+        return {"eligible": True, "issued": _cert_public(c), "can_start": False, "wait_seconds": 0, "name": c["holder_name"]}
     wait = 0
     last = _last_attempt(me["key"])
     if last and last.get("submitted_at"):
         wait = max(0, int(_ts(last["submitted_at"]) + RETRY_WAIT_SECONDS - time.time()))
-    return {"eligible": bool(me["eligible"]), "issued": None,
+    return {"eligible": bool(me["eligible"]), "issued": None, "name": me["name"],
             "can_start": bool(me["eligible"]) and wait == 0, "wait_seconds": wait,
             "pass_percent": PASS_PERCENT, "questions": EXAM_BASIC + EXAM_ADVANCED}
 
@@ -137,12 +164,16 @@ async def status_handler(request):
     return _j(await asyncio.to_thread(_status_sync, me))
 
 
-def _start_sync(me):
+def _start_sync(me, confirmed):
     st = _status_sync(me)
     if st["issued"]:
         return {"error": "done", "message": "You already have your certificate."}, 409
     if not st["eligible"]:
         return {"error": "not_eligible", "message": "Finish the Beginner and Advanced courses first."}, 403
+    if not confirmed:
+        return {"error": "confirm", "message": "Please confirm the name that will be printed on your certificate."}, 400
+    if not me["name"]:
+        return {"error": "no_name", "message": "Add your full name in Edit profile first."}, 400
     if st["wait_seconds"] > 0:
         return {"error": "wait", "message": "Please wait before trying the exam again.", "wait_seconds": st["wait_seconds"]}, 429
     bank = _load_bank()
@@ -162,7 +193,11 @@ async def start_handler(request):
     me, err = await _auth(request)
     if err:
         return err
-    body, status = await asyncio.to_thread(_start_sync, me)
+    try:
+        data = await request.json()
+    except Exception:
+        data = {}
+    body, status = await asyncio.to_thread(_start_sync, me, bool(data.get("confirmed_name")))
     return _j(body, status)
 
 
@@ -347,10 +382,71 @@ async def verify_handler(request):
                         content_type="text/html")
 
 
+def _profile_public(me):
+    return {"name": me["name"], "username": me["uname"], "avatar": me["avatar"], "since": me["since"]}
+
+
+async def profile_get_handler(request):
+    me, err = await _auth(request)
+    if err:
+        return err
+    return _j(_profile_public(me))
+
+
+def _clean_name(raw):
+    name = " ".join(str(raw or "").split())
+    if len(name) < 2 or len(name) > 60:
+        return None
+    if not all(ch.isalpha() or ch in " .'-" for ch in name) or not any(ch.isalpha() for ch in name):
+        return None
+    return name
+
+
+def _profile_save_sync(me, data):
+    import re
+    name = _clean_name(data.get("name")) if data.get("name") is not None else me["name"]
+    if not name:
+        return {"error": "name", "message": "Enter your full name (letters only, 2 to 60 characters)."}, 400
+    uname = str(data.get("username") if data.get("username") is not None else me["uname"]).strip()
+    if not re.fullmatch(r"[A-Za-z0-9_]{3,20}", uname):
+        return {"error": "username", "message": "Username must be 3 to 20 letters, numbers or _."}, 400
+    avatar = data.get("avatar") if data.get("avatar") is not None else me["avatar"]
+    if avatar and avatar not in AVATARS:
+        return {"error": "avatar", "message": "Pick one of the icons."}, 400
+    if _existing_cert(me["key"]) and name != me["name"]:
+        return {"error": "locked", "message": "Your certificate is already issued, so your name can no longer be changed."}, 409
+    low = uname.lower()
+    code, rows = _sb(f"sfx_profiles?or=(username_lower.eq.{_q(low)},orig_uname_lower.eq.{_q(low)})&user_key=neq.{_q(me['key'])}&select=user_key&limit=1")
+    if code == 200 and isinstance(rows, list) and rows:
+        return {"error": "taken", "message": "That username is already taken."}, 409
+    row = {"user_key": me["key"], "display_name": name, "username": uname, "username_lower": low,
+           "avatar": avatar or None, "updated_at": datetime.now(timezone.utc).isoformat()}
+    code, _r = _sb("sfx_profiles?on_conflict=user_key", "POST", row, prefer="resolution=merge-duplicates,return=minimal")
+    if code == 409:
+        return {"error": "taken", "message": "That username is already taken."}, 409
+    if code not in (200, 201, 204):
+        return {"error": "server", "message": "Could not save. Try again."}, 503
+    return {"name": name, "username": uname, "avatar": avatar or "", "since": me["since"]}, 200
+
+
+async def profile_save_handler(request):
+    me, err = await _auth(request)
+    if err:
+        return err
+    try:
+        data = await request.json()
+    except Exception:
+        data = {}
+    body, status = await asyncio.to_thread(_profile_save_sync, me, data if isinstance(data, dict) else {})
+    return _j(body, status)
+
+
 def register(app, sb_headers, supabase_url, validate_token, user_url):
     _deps.update(sb_headers=sb_headers, supabase_url=supabase_url, validate_token=validate_token, user_url=user_url)
     app.router.add_get("/api/nexora/cert/status", status_handler)
     app.router.add_post("/api/nexora/cert/exam/start", start_handler)
     app.router.add_post("/api/nexora/cert/exam/submit", submit_handler)
+    app.router.add_get("/api/nexora/profile", profile_get_handler)
+    app.router.add_post("/api/nexora/profile", profile_save_handler)
     app.router.add_get("/cert/{no}", image_handler)
     app.router.add_get("/verify/{no}", verify_handler)

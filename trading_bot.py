@@ -3535,6 +3535,10 @@ async def _ema5_pick_deriv(origin_key):
 # gold 100 ($10), oil 50 ($0.50), BTC 50 (~$496). Silver is no longer traded by these bots.
 SC_SIGNAL_SL_PIPS = {"xauusd": 100, "xauusd247": 100, "btcusd": 50, "usoil": 50, "xagusd": 50}
 SC_CFG = {
+    # Trailing starts once the trade is as far in profit as the stop is away (100 pips on gold): the stop moves to
+    # break-even, then follows price at half the stop distance. 0/None = use the fixed pips below instead.
+    "trail_from_stop": 1.0,
+    "trail_behind_stop": 0.5,
     "pending_pips": 15,
     "sl_pips": 20,
     "sl_pips_by_pair": SC_SIGNAL_SL_PIPS,
@@ -3553,7 +3557,7 @@ SC_CFG = {
 }
 SC_MODES = {
     "aggressive_scalper": SC_CFG,
-    "flip_fast": dict(SC_CFG, pending_pips=25, sl_pips=15, sl_pips_by_pair={}, trail_activate_pips=15, trail_pips=8,
+    "flip_fast": dict(SC_CFG, trail_from_stop=None, pending_pips=25, sl_pips=15, sl_pips_by_pair={}, trail_activate_pips=15, trail_pips=8,
                       max_layers=5, add_pips=15, label="⚡ Account Flip (Fast)"),
     # Account Flip: support/resistance on the 1-hour chart, entry from the 30-minute chart.
     # Stop 100 pips on gold, 50 on silver; at +20 pips break-even + trailing 10 behind;
@@ -3868,7 +3872,11 @@ async def _sc_tick_one(context, account):
                         st["trailed"] = True
                     if not entry or not cur:
                         continue
-                    new_sl = sc_trail_target(direction, entry, cur, sl, pip, cfg)
+                    _tcfg = cfg
+                    if cfg.get("trail_from_stop"):
+                        _tcfg = dict(cfg, trail_activate_pips=sl_pips * cfg["trail_from_stop"],
+                                     trail_pips=sl_pips * cfg.get("trail_behind_stop", 0.5))
+                    new_sl = sc_trail_target(direction, entry, cur, sl, pip, _tcfg)
                     if new_sl is not None:
                         new_sl = round(new_sl, decimals)
                         payload = {"actionType": "POSITION_MODIFY", "positionId": str(p.get("id")), "stopLoss": new_sl}
@@ -4038,10 +4046,8 @@ async def _sc_tick_one(context, account):
                 await _sc_notify(
                     context, user_id,
                     f"{cfg['label']} <b>is trading</b>\n\n"
-                    f"{direction} {pair_config['display']} at a {sig['kind']} level — {volume} lots, {sl_pips} pip stop.\n"
-                    f"At +{cfg['trail_activate_pips']} pips the stop moves to break-even and trails, then it adds a trade every further "
-                    f"{cfg['add_pips']} pips (up to {cfg['max_layers']}) once the earlier ones are protected. "
-                    f"A setup may only come about once a day. I won't message you for each trade.")
+                    f"First trade: {direction} {pair_config['display']} — {volume} lots, protected by a stop loss "
+                    f"and a trailing stop. I won't message you for each one.")
                 return
             if ml_used:
                 await _sc_notify(
@@ -4050,15 +4056,11 @@ async def _sc_tick_one(context, account):
                     f"First trade: {direction} {pair_config['display']} — {volume} lots, protected by a stop loss "
                     f"and a trailing stop. I won't message you for each one.")
                 return
-            extra = (f"It adds up to {cfg['max_layers'] - 1} more trades while the move runs, only once the earlier ones are protected. "
-                     if cfg["max_layers"] > 1 else "")
             await _sc_notify(
                 context, user_id,
                 f"{cfg['label']} <b>is trading</b>\n\n"
-                f"First trade: {direction} {pair_config['display']} — {volume} lots, "
-                f"{sl_pips} pip stop, trailing stop on.\n"
-                f"It keeps a Buy Stop and Sell Stop {cfg['pending_pips']} pips either side of price and "
-                f"re-arms after each trade. {extra}I won't message you for each one.")
+                f"First trade: {direction} {pair_config['display']} — {volume} lots, protected by a stop loss "
+                f"and a trailing stop. I won't message you for each one.")
     except Exception as e:
         print(f"[SC] ❌ error for {user_id}: {type(e).__name__}: {e}")
 

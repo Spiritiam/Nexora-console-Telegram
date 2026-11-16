@@ -3380,6 +3380,8 @@ async def _ema5_deriv(index_key, config):
 # Pairs the scheduled/manual signal scan may swap in (one market group: metals, oil, BTC, forex).
 FX_SCAN_KEYS = ["xauusd", "xagusd", "usoil", "btcusd", "gbpjpy", "eurjpy", "usdjpy", "gbpusd",
                 "eurusd", "audusd", "usdcad", "usdchf", "nzdusd"]
+# Scheduled signals: when a core pair (gold, oil, BTC) is busy, the replacement comes from these.
+SCHED_SWAP_KEYS = ["xauusd", "usoil", "btcusd", "gbpjpy", "gbpusd", "usdchf"]
 DERIV_SCAN_KEYS = []  # filled from SYNTHETIC_CONFIG at use time
 
 
@@ -3397,14 +3399,14 @@ def _has_open_signal_any(pair_name):
 async def _pair_busy(pair_key, scheduled):
     """No double entries: a pair is busy while its previous signal is still open
     (scheduled: also while the account holds a live position on it)."""
+    if not scheduled:
+        return False   # manual requests are never blocked by open signals or trades
     cfg = PAIR_CONFIG.get(pair_key) or {}
     name = cfg.get("pair_name", pair_key.upper())
-    if scheduled:
-        if await asyncio.to_thread(has_open_signal_for_pair, name):
-            return True
-        sym = cfg.get("mt5_symbol")
-        return bool(sym and await has_real_open_mt5_position(sym))
-    return await asyncio.to_thread(_has_open_signal_any, name)
+    if await asyncio.to_thread(has_open_signal_for_pair, name):
+        return True
+    sym = cfg.get("mt5_symbol")
+    return bool(sym and await has_real_open_mt5_position(sym))
 
 
 def _ema_trend_dir(e):
@@ -3421,7 +3423,8 @@ async def _ema5_pick_pair(origin_key, scheduled=True, origin_busy=False):
     if origin_key not in FX_SCAN_KEYS:
         return None
     closed = is_forex_market_closed()
-    keys = [k for k in FX_SCAN_KEYS if k != origin_key and (k == "btcusd" or not closed)]
+    pool = SCHED_SWAP_KEYS if scheduled else FX_SCAN_KEYS
+    keys = [k for k in pool if k != origin_key and (k == "btcusd" or not closed)]
     res = await asyncio.gather(*[_ema5_exness(k, PAIR_CONFIG[k]) for k in keys], return_exceptions=True)
     busy = await asyncio.gather(*[_pair_busy(k, scheduled) for k in keys], return_exceptions=True)
     best, best_rank, any_free = None, -1, None

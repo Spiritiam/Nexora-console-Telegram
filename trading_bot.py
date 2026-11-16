@@ -35666,6 +35666,16 @@ def main():
         except Exception as _e:
             print(f"[ML1M] could not start: {type(_e).__name__}: {_e}")
 
+    # One-off strategy research on MT5 price history. Read-only, no trades; separate low-priority
+    # process, only while RESEARCH_RUN=1 is set.
+    if os.getenv("RESEARCH_RUN") == "1":
+        try:
+            import subprocess as _sp
+            _sp.Popen([sys.executable, os.path.join(os.path.dirname(os.path.abspath(__file__)), "strategy_research.py")])
+            print("[RESEARCH] process started")
+        except Exception as _e:
+            print(f"[RESEARCH] could not start: {type(_e).__name__}: {_e}")
+
     try:
         _napp_install_push_bridge()
     except Exception as _e:

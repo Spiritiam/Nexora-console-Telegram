@@ -3367,7 +3367,7 @@ async def _ema5_decision(kind, key, fetch):
 
 async def _ema5_exness(pair_key, pair_config):
     async def fetch():
-        return await asyncio.to_thread(get_cached_candles, pair_key, pair_config, "5min", outputsize=300, max_age=45)
+        return await asyncio.to_thread(get_cached_candles, pair_key, pair_config, "5min", outputsize=300, max_age=(time.time() % 300) + 3)
     return await _ema5_decision("exness", pair_key, fetch)
 
 
@@ -3416,28 +3416,28 @@ def _ema_trend_dir(e):
     return {"up": "BUY", "down": "SELL"}.get(e.get("state"))
 
 
-async def _ema5_pick_pair(origin_key, scheduled=True, origin_busy=False):
-    """Best trending FREE pair in the SAME market group as origin_key (never crosses groups).
-    A pair with a bounce right now beats one that is only trending. If none trends but the origin
-    is busy, returns any free pair (the ML fallback then decides its side). None if nothing is free."""
+async def _ema5_pick_pairs(origin_key, scheduled=True, origin_busy=False):
+    """Trending FREE pairs in the SAME market group as origin_key, best first (never crosses groups).
+    A pair with a bounce right now ranks above one that is only trending. If none trends but the origin
+    is busy, falls back to the free pairs (the ML fallback then decides their side). [] if nothing is free."""
     if origin_key not in FX_SCAN_KEYS:
-        return None
+        return []
     closed = is_forex_market_closed()
     pool = SCHED_SWAP_KEYS if scheduled else FX_SCAN_KEYS
     keys = [k for k in pool if k != origin_key and (k == "btcusd" or not closed)]
     res = await asyncio.gather(*[_ema5_exness(k, PAIR_CONFIG[k]) for k in keys], return_exceptions=True)
     busy = await asyncio.gather(*[_pair_busy(k, scheduled) for k in keys], return_exceptions=True)
-    best, best_rank, any_free = None, -1, None
+    ranked, free = [], []
     for k, e, b in zip(keys, res, busy):
         if b is True or isinstance(b, Exception):
             continue
-        any_free = any_free or k
+        free.append(k)
         if isinstance(e, Exception) or not _ema_trend_dir(e):
             continue
-        rank = 2 if e.get("trigger") else 1
-        if rank > best_rank:
-            best, best_rank = k, rank
-    return best or (any_free if origin_busy else None)
+        ranked.append((2 if e.get("trigger") else 1, k))
+    ranked.sort(key=lambda t: -t[0])
+    out = [k for _, k in ranked]
+    return out or (free if origin_busy else [])
 
 
 async def _ema5_pick_deriv(origin_key):
@@ -17552,6 +17552,35 @@ def _exness_md_instrument(broker, mt5_symbol):
     return pick
 
 
+_EXMD_G = {"lock": threading.Lock(), "next": 0.0, "pause_until": 0.0, "strikes": 0}
+
+
+def _exmd_gate():
+    """One shared pace for every market-data call on the master Exness key (~5 per second at most).
+    False = Exness asked us to slow down recently: the caller serves its cached copy instead."""
+    now = time.time()
+    if now < _EXMD_G["pause_until"]:
+        return False
+    with _EXMD_G["lock"]:
+        now = time.time()
+        wait = _EXMD_G["next"] - now
+        if wait > 1.5:
+            return False
+        if wait > 0:
+            time.sleep(wait)
+        _EXMD_G["next"] = max(now, _EXMD_G["next"]) + 0.2
+    return True
+
+
+def _exmd_429():
+    _EXMD_G["strikes"] = min(_EXMD_G["strikes"] + 1, 6)
+    _EXMD_G["pause_until"] = time.time() + min(4 * _EXMD_G["strikes"], 20)
+
+
+def _exmd_ok():
+    _EXMD_G["strikes"] = max(_EXMD_G["strikes"] - 1, 0)
+
+
 _EXC = {}        # (symbol, tf, n) -> (time, rows)
 _EXC_BLOCK = {}  # symbol -> do not call Exness candles before this time (after a 429)
 _EXC_TTL = {"M1": 15, "M5": 45, "M15": 120, "H1": 300, "H4": 900, "D1": 900}
@@ -17569,10 +17598,13 @@ def get_candles_exness(mt5_symbol, interval, outputsize):
     key = (mt5_symbol, tf, n)
     now = time.time()
     hit = _EXC.get(key)
-    if hit and now - hit[0] < _EXC_TTL.get(tf, 60):
+    ttl = _EXC_TTL.get(tf, 60)
+    if tf == "M5":
+        ttl = min(ttl, (now % 300) + 3)   # a copy from before the latest 5-minute close is never reused
+    if hit and now - hit[0] < ttl:
         return [dict(r) for r in hit[1]]
-    if now < _EXC_BLOCK.get(mt5_symbol, 0):
-        return [dict(r) for r in hit[1]] if hit and now - hit[0] < 90 else None
+    if now < _EXC_BLOCK.get(mt5_symbol, 0) or not _exmd_gate():
+        return [dict(r) for r in hit[1]] if hit and now - hit[0] < 240 else None
     try:
         inst = _exness_md_instrument(broker, mt5_symbol)
         if not inst:
@@ -17585,14 +17617,16 @@ def get_candles_exness(mt5_symbol, interval, outputsize):
             if len(_EXC) > 200:
                 _EXC.clear()
             _EXC[key] = (time.time(), out)
+            _exmd_ok()
             print(f"[EXNESS DATA] ✅ {mt5_symbol} {tf} - {len(out)} candles")
             return [dict(r) for r in out]
     except Exception as e:
         msg = str(e)
         if "429" in msg:
             _EXC_BLOCK[mt5_symbol] = time.time() + 10
+            _exmd_429()
         print(f"[EXNESS DATA] candles {mt5_symbol} failed: {type(e).__name__}: {msg[:120]}")
-        if hit and time.time() - hit[0] < 90:
+        if hit and time.time() - hit[0] < 240:
             return [dict(r) for r in hit[1]]
     return None
 
@@ -17611,10 +17645,10 @@ def get_quote_exness(mt5_symbol):
     and after a 429 the symbol rests for 8s (a recent quote, at most 8s old, is used meanwhile)."""
     now = time.time()
     hit = _EXQ.get(mt5_symbol)
-    if hit and now - hit[0] < 3:
+    if hit and now - hit[0] < 4:
         return hit[1]
-    if now < _EXQ_BLOCK.get(mt5_symbol, 0):
-        return hit[1] if hit and now - hit[0] < 10 else None
+    if now < _EXQ_BLOCK.get(mt5_symbol, 0) or not _exmd_gate():
+        return hit[1] if hit and now - hit[0] < 20 else None
     broker = _exness_md_broker()
     if broker is None:
         return None
@@ -17623,13 +17657,15 @@ def get_quote_exness(mt5_symbol):
         q = broker.quote(inst) if inst else None
         if q:
             _EXQ[mt5_symbol] = (time.time(), q)
+            _exmd_ok()
         return q
     except Exception as e:
         msg = str(e)
         if "429" in msg:
             _EXQ_BLOCK[mt5_symbol] = time.time() + 10
+            _exmd_429()
         print(f"[EXNESS DATA] quote {mt5_symbol} failed: {type(e).__name__}: {msg[:120]}")
-        return hit[1] if hit and time.time() - hit[0] < 10 else None
+        return hit[1] if hit and time.time() - hit[0] < 20 else None
 
 
 def get_candles_metaapi(mt5_symbol, interval, outputsize):
@@ -23274,13 +23310,13 @@ async def build_signal_response(question, user_id=None, retry_mismatch=False, _s
             if _busy:
                 print(f"[SIGNAL] {pair_name}: previous signal still open - no double entry", flush=True)
             if (not _ema_trend_dir(_ema) or _busy) and not _swapped_from:
-                _alt = await _ema5_pick_pair(matched_key, _sched, _busy)
-                if _alt:
-                    print(f"[SIGNAL] {pair_name} is {'busy' if _busy else 'ranging'} -> using {_alt.upper()}", flush=True)
+                for _alt in (await _ema5_pick_pairs(matched_key, _sched, _busy))[:4]:
+                    print(f"[SIGNAL] {pair_name} is {'busy' if _busy else 'ranging'} -> trying {_alt.upper()}", flush=True)
                     _res = await build_signal_response(_alt, user_id=user_id, retry_mismatch=retry_mismatch,
                                                        _swapped_from=pair_name)
                     if _res and _res[3] is not None:
                         return _res
+                    print(f"[SIGNAL] {_alt.upper()} could not be built - trying the next trending pair", flush=True)
             if _busy and _sched:
                 return None, None, "PAIR_BUSY", None
         except Exception as _e:

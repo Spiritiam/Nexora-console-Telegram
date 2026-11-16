@@ -12931,7 +12931,8 @@ async def _build_synthetic_signal_response_inner(index_key, min_agree=2, manual=
             reason = "Market conditions continue to favor " + ("buyers" if direction == "BUY" else "sellers") + " here."
         else:
             reason = _backed_by(reason, direction)
-    if _swapped_from:
+    if _swapped_from and manual:
+        # Only a manual (DM) request is told about the swap; scheduled signals just replace the pair silently.
         reason = f"{_swapped_from} is ranging right now, so it's not a good time to trade it. Suggested instead: {index_key}."
     _DERIV_LAST_SIG[index_key] = (direction, time.time())
     contract_type = "MULTUP" if direction == "BUY" else "MULTDOWN"
@@ -23865,7 +23866,8 @@ async def build_signal_response(question, user_id=None, retry_mismatch=False, _s
             reason = ("Market conditions continue to favor " + ("buyers" if direction == "BUY" else "sellers") + " here.")
         else:
             reason = _backed_by(reason, direction)
-    if _swapped_from:
+    if _swapped_from and user_id is not None:
+        # Only a manual (DM) request is told about the swap; scheduled signals just replace the pair silently.
         reason = f"{_swapped_from} is ranging right now, so it's not a good time to trade it. Suggested instead: {pair_name}."
         _origin_key = _pair_key_from_name(_swapped_from)
         if user_id is not None and _origin_key:

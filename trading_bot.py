@@ -10048,6 +10048,25 @@ _DERIV_CALLS = {}
 # Connect Deriv always looks live, and a good answer clears the mark.
 _DERIV_DEAD_TOKENS = {}
 _ACC_STATE = {"next": 0.0}
+# ONE shared pace for every Deriv REST call (account lookups AND login links): the bans came from bursts of
+# both together (59 accounts refreshing at once). Background callers wait about 1s between calls, and 3s for
+# 15 minutes after a ban; user-facing (priority) calls only ~0.3s.
+_DERIV_PACE = {"next": 0.0}
+
+def _deriv_pace_gap(priority):
+    if priority:
+        return 0.3
+    return 3.0 if time.time() < _DERIV_BAN.get("until", 0.0) + 900 else 1.0
+
+async def _deriv_pace(priority):
+    _slot = max(time.time(), _DERIV_PACE["next"])
+    if not priority and _slot - time.time() > 30:
+        return False   # backlog: this background call is skipped and retried on its own schedule
+    _DERIV_PACE["next"] = _slot + _deriv_pace_gap(priority)
+    _wait = _slot - time.time()
+    if _wait > 0:
+        await asyncio.sleep(_wait)
+    return True
 
 
 def _deriv_count_call(kind):
@@ -10160,10 +10179,8 @@ async def deriv_get_options_accounts(token, priority=False):
     for attempt in range(1, max_attempts + 1):
         try:
             # Space account lookups out too (a burst of them from many users at once trips Deriv's limit).
-            _slot = max(time.time(), _ACC_STATE["next"])
-            _ACC_STATE["next"] = _slot + 0.4
-            if _slot - time.time() > 0:
-                await asyncio.sleep(_slot - time.time())
+            if not await _deriv_pace(priority):
+                return None
             _deriv_count_call("accounts")
             response = await asyncio.to_thread(requests.get, url, headers=deriv_api_headers(token), timeout=10)
             if response.status_code == 429:
@@ -10185,7 +10202,8 @@ async def deriv_get_options_accounts(token, priority=False):
                 if token and token == DERIV_SERVICE_TOKEN and _data:
                     _DERIV_SERVICE_ACCOUNTS_CACHE["v"] = (time.time() + 600, _data)
                 elif token and _data:
-                    _DERIV_USER_ACCOUNTS_CACHE[token] = (time.time() + 600, _data)
+                    # 1 hour (+-20% so 59 accounts never all expire in the same minute): the list barely changes.
+                    _DERIV_USER_ACCOUNTS_CACHE[token] = (time.time() + 3600 * random.uniform(0.8, 1.2), _data)
                     if len(_DERIV_USER_ACCOUNTS_CACHE) > 500:
                         _DERIV_USER_ACCOUNTS_CACHE.pop(next(iter(_DERIV_USER_ACCOUNTS_CACHE)))
                 return _data
@@ -10222,10 +10240,8 @@ async def deriv_get_otp_url(token, account_id, priority=False):
     for attempt in range(1, max_attempts + 1):
         try:
             # Space out login-link requests so Deriv doesn't rate-limit (429) a burst of them.
-            _gap = _OTP_STATE["last"] + 1.2 - time.time()
-            if _gap > 0:
-                await asyncio.sleep(_gap)
-            _OTP_STATE["last"] = time.time()
+            if not await _deriv_pace(priority):
+                return None
             _deriv_count_call("otp")
             response = await asyncio.to_thread(requests.post, url, headers=deriv_api_headers(token), timeout=10)
             if response.status_code == 429:

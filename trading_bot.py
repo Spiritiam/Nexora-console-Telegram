@@ -7930,6 +7930,11 @@ def run_korapay_webhook_server():
         sfx_certificates.register(webhook_app, sb_headers, SUPABASE_URL, _napp_validate_token_sync, NEXORA_APP_USER_URL)
     except Exception as _ce:
         print(f"[CERT] could not register: {type(_ce).__name__}: {_ce}")
+    try:
+        import sfx_courses
+        sfx_courses.register(webhook_app, sb_headers, SUPABASE_URL)
+    except Exception as _ce:
+        print(f"[COURSES] could not register: {type(_ce).__name__}: {_ce}")
     webhook_app.router.add_get("/api/nexora/deriv/status", nexora_app_deriv_status_handler)
     webhook_app.router.add_post("/api/nexora/deriv/config", nexora_app_deriv_config_handler)
     webhook_app.router.add_post("/api/nexora/deriv/disconnect", nexora_app_deriv_disconnect_handler)

@@ -1,4 +1,4 @@
-"""SpiritFX Trading Program certificates: exam, issue, certificate image with QR, public verify page.
+"""SpiritFX Trading Academy Program certificates: exam, issue, certificate image with QR, public verify page.
 
 Wired into the web server by register(app, deps). Eligibility comes from spiritfx.org's user_data
 (`certificate` == "1" means the student finished Beginner and Advanced).
@@ -18,7 +18,7 @@ from aiohttp import web
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 ASSETS = os.path.join(HERE, "sfx_cert_assets")
-PROGRAMME = "SpiritFX Trading Program"
+PROGRAMME = "SpiritFX Trading Academy Program"
 SIGNER_NAME = "Henry Onyefunuwe Smith"
 SIGNER_TITLE = "CEO, SpiritFX Trading Academy"
 EXAM_BASIC = 8

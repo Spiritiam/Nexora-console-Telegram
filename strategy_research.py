@@ -52,8 +52,8 @@ def _ts(t):
     return datetime.fromisoformat(str(t).replace("Z", "+00:00")).timestamp()
 
 
-def fetch_h1(symbol, days):
-    path = os.path.join(CACHE_DIR, f"{symbol}_h1.json")
+def fetch_h1(symbol, days, tf="1h"):
+    path = os.path.join(CACHE_DIR, f"{symbol}_{tf}.json")
     os.makedirs(CACHE_DIR, exist_ok=True)
     rows = {}
     try:
@@ -63,7 +63,7 @@ def fetch_h1(symbol, days):
     except Exception:
         pass
     target = time.time() - days * 86400
-    if rows and min(rows) <= target + 7 * 86400:
+    if rows and min(rows) <= target + 7 * 86400:  # cache already deep enough
         return [rows[k] for k in sorted(rows)]
     token, acct = os.getenv("METAAPI_TOKEN"), os.getenv("METAAPI_ACCOUNT_ID")
     if not token or not acct:
@@ -72,9 +72,9 @@ def fetch_h1(symbol, days):
     cur = datetime.fromtimestamp(min(rows) - 1, tz=timezone.utc) if rows else datetime.now(timezone.utc)
     fails = 0
     pages = 0
-    while cur.timestamp() > target and pages < 60:
+    while cur.timestamp() > target and pages < 400:
         url = (f"{MD_HOST}/users/current/accounts/{acct}/historical-market-data/symbols/{symbol}"
-               f"/timeframes/1h/candles?startTime={cur.strftime('%Y-%m-%dT%H:%M:%S.000Z')}&limit=1000")
+               f"/timeframes/{tf}/candles?startTime={cur.strftime('%Y-%m-%dT%H:%M:%S.000Z')}&limit=1000")
         try:
             r = requests.get(url, headers=headers, timeout=60)
         except Exception as e:
@@ -197,10 +197,10 @@ def sig_ema_stack(o, h, l, c, a):
         if gap_slow < 0.30 or gap_fast < 0.10:
             continue
         tol = 0.15 * a[i]
-        if up and slope > 0 and c[i] > o[i]:
+        if up and slope > 0 and c[i] > o[i] and l[i] > e100[i]:
             if (l[i] <= e25[i] + tol and c[i] > e25[i]) or (l[i] <= e50[i] + tol and c[i] > e50[i]):
                 s[i] = 1
-        elif dn and slope < 0 and c[i] < o[i]:
+        elif dn and slope < 0 and c[i] < o[i] and h[i] < e100[i]:
             if (h[i] >= e25[i] - tol and c[i] < e25[i]) or (h[i] >= e50[i] - tol and c[i] < e50[i]):
                 s[i] = -1
     return s
@@ -404,15 +404,83 @@ def run_symbol(sym, rows):
     return out
 
 
+# ----------------------------------------------------------------------------------------------
+# M5 TEST OF THE LIVE EMA RULES, with the real fixed stop / target distances of the live signals
+# ----------------------------------------------------------------------------------------------
+# price distances: (stop, target, round-trip cost). Gold $10/$30, BTC ~$496/$992, GBPUSD 30/60 pips.
+# cost = typical spread + slippage, a stated assumption.
+LIVE_EXITS = {
+    "XAUUSDm": (10.0, 30.0, 0.35),
+    "BTCUSDm": (495.9, 991.8, 25.0),
+    "GBPUSDm": (0.0030, 0.0060, 0.00015),
+}
+M5_HORIZON = 288          # 24 hours, then closed at market
+
+
+def simulate_abs(o, h, l, c, sig, sl_d, tp_d, cost_d, start=0):
+    N = len(c)
+    trades = []
+    i = max(start, 1)
+    while i < N - 1:
+        d = sig[i]
+        if d == 0:
+            i += 1
+            continue
+        entry = o[i + 1]
+        sl, tp = entry - d * sl_d, entry + d * tp_d
+        r = None
+        j = i + 1
+        last = min(N - 1, i + 1 + M5_HORIZON)
+        while j <= last:
+            hit_sl = (l[j] <= sl) if d == 1 else (h[j] >= sl)
+            hit_tp = (h[j] >= tp) if d == 1 else (l[j] <= tp)
+            if hit_sl:
+                r = -1.0
+                break
+            if hit_tp:
+                r = tp_d / sl_d
+                break
+            j += 1
+        if r is None:
+            j = min(last, N - 1)
+            r = d * (c[j] - entry) / sl_d
+        r -= cost_d / sl_d
+        trades.append((i, r))
+        i = j + 1
+    return trades
+
+
+def run_m5(sym, rows):
+    arr = np.array(rows, dtype=float)
+    ts, o, h, l, c = arr[:, 0], arr[:, 1], arr[:, 2], arr[:, 3], arr[:, 4]
+    N = len(c)
+    span = (ts[-1] - ts[0]) / 86400
+    log(f"{sym}: {N} M5 bars, {span:.0f} days ({datetime.fromtimestamp(ts[0], tz=timezone.utc):%Y-%m-%d} to "
+        f"{datetime.fromtimestamp(ts[-1], tz=timezone.utc):%Y-%m-%d})")
+    a = atr(h, l, c)
+    sig = sig_ema_stack(o, h, l, c, a)
+    sl_d, tp_d, cost_d = LIVE_EXITS[sym]
+    out = []
+    for label, cost in (("with_costs", cost_d), ("zero_cost", 0.0)):
+        tr = simulate_abs(o, h, l, c, sig, sl_d, tp_d, cost)
+        r = report(f"m5_ema_{label}", sym, tr, N)
+        r["rr"] = round(tp_d / sl_d, 2)
+        r["breakeven_win_pct"] = round(100 / (1 + tp_d / sl_d), 1)
+        out.append(r)
+    log(f"{sym}: reward:risk {tp_d / sl_d:.1f}, break-even win rate {100 / (1 + tp_d / sl_d):.1f}%")
+    return out
+
+
 def store_report(obj):
     url, key = os.getenv("SUPABASE_URL"), os.getenv("SUPABASE_KEY")
     if not url or not key:
         return
+    rkey = "research_report_m5" if os.getenv("RESEARCH_MODE") == "m5ema" else "research_report"
     h = {"apikey": key, "Authorization": f"Bearer {key}", "Content-Type": "application/json",
          "Prefer": "resolution=merge-duplicates,return=minimal"}
     blob = base64.b64encode(zlib.compress(pickle.dumps(obj), 6)).decode()
     r = requests.post(f"{url}/rest/v1/ml1m_store?on_conflict=key", headers=h, timeout=60,
-                      data=json.dumps({"key": "research_report", "data": blob, "meta": obj,
+                      data=json.dumps({"key": rkey, "data": blob, "meta": obj,
                                        "updated_at": datetime.now(timezone.utc).isoformat()}))
     log(f"report stored (HTTP {r.status_code})")
 
@@ -422,16 +490,17 @@ def main():
         os.nice(10)
     except Exception:
         pass
-    log(f"start: {SYMBOLS}, {DAYS} days")
+    m5 = os.getenv("RESEARCH_MODE") == "m5ema"
+    log(f"start: {SYMBOLS}, {DAYS} days, mode {'m5ema' if m5 else 'h1'}")
     results, depth = [], {}
     for sym in SYMBOLS:
         try:
-            rows = fetch_h1(sym, DAYS)
+            rows = fetch_h1(sym, DAYS, "5m" if m5 else "1h")
             depth[sym] = len(rows)
             if len(rows) < 2000:
                 log(f"{sym}: only {len(rows)} bars, skipped")
                 continue
-            results += run_symbol(sym, rows)
+            results += run_m5(sym, rows) if m5 else run_symbol(sym, rows)
         except Exception as e:
             log(f"{sym} failed: {type(e).__name__}: {e}")
     store_report({"when": datetime.now(timezone.utc).isoformat(), "bars": depth, "results": results,

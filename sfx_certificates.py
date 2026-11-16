@@ -112,7 +112,7 @@ def _profile_sync(token):
             "name": (ov.get("display_name") or base_name or "").strip(),
             "uname": (ov.get("username") or base_uname or "").strip(),
             "since": since, "avatar": ov.get("avatar") or "",
-            "eligible": cert == "1"}
+            "eligible": cert == "1", "token": token}
 
 
 async def _auth(request):
@@ -144,6 +144,48 @@ def _cert_public(c):
             "image_url": f"{PUBLIC_BASE}/cert/{c['cert_no']}.png?v=2"}
 
 
+BEGINNER_TOTAL = 12
+ADVANCED_TOTAL = 13
+
+
+def _to_int(v):
+    try:
+        return int(str(v).strip())
+    except Exception:
+        return 0
+
+
+def _class_counts(me):
+    """Lessons finished per level, read from the student's own Forex class progress."""
+    try:
+        url = _deps["user_url"].replace("user_data", "forex_class_data")
+        r = requests.get(url, headers={"Authorization": f"Bearer {me['token']}", "Accept": "application/json"}, timeout=10)
+        b = r.json()
+        return {"beginner": _to_int(_find(b, "beginner_completed")),
+                "intermediate": _to_int(_find(b, "intermediate_completed")),
+                "advanced": _to_int(_find(b, "advanced_completed"))}
+    except Exception:
+        return None
+
+
+def _eligibility(me):
+    """(eligible, source, counts). Eligible when spiritfx.org marks the student eligible,
+    or when the Beginner and Advanced lessons are all finished."""
+    counts = _class_counts(me)
+    by_progress = bool(counts) and counts["beginner"] >= BEGINNER_TOTAL and counts["advanced"] >= ADVANCED_TOTAL
+    ok = bool(me["eligible"]) or by_progress
+    source = "flag" if me["eligible"] else ("progress" if by_progress else None)
+    try:
+        row = {"user_key": me["key"], "name": me["name"], "uname": me["uname"], "eligible": ok,
+               "eligible_source": source, "updated_at": datetime.now(timezone.utc).isoformat()}
+        if counts:
+            row.update(counts)
+        _sb("sfx_progress", "POST", row, prefer="resolution=merge-duplicates")
+    except Exception:
+        pass
+    return ok, source, counts
+
+
 def _status_sync(me):
     c = _existing_cert(me["key"])
     if c:
@@ -152,9 +194,12 @@ def _status_sync(me):
     last = _last_attempt(me["key"])
     if last and last.get("submitted_at"):
         wait = max(0, int(_ts(last["submitted_at"]) + RETRY_WAIT_SECONDS - time.time()))
-    return {"eligible": bool(me["eligible"]), "issued": None, "name": me["name"],
-            "can_start": bool(me["eligible"]) and wait == 0, "wait_seconds": wait,
-            "pass_percent": PASS_PERCENT, "questions": EXAM_BASIC + EXAM_ADVANCED}
+    ok, _src, counts = _eligibility(me)
+    return {"eligible": ok, "issued": None, "name": me["name"],
+            "can_start": ok and wait == 0, "wait_seconds": wait,
+            "pass_percent": PASS_PERCENT, "questions": EXAM_BASIC + EXAM_ADVANCED,
+            "progress": {"beginner": (counts or {}).get("beginner", 0), "beginner_total": BEGINNER_TOTAL,
+                         "advanced": (counts or {}).get("advanced", 0), "advanced_total": ADVANCED_TOTAL}}
 
 
 async def status_handler(request):
@@ -212,7 +257,7 @@ def _submit_sync(me, attempt_id, answers):
         return {"error": "bad_attempt", "message": "This exam was already submitted."}, 409
     if time.time() - _ts(at["created_at"]) > EXAM_MAX_AGE_SECONDS:
         return {"error": "expired", "message": "This exam expired. Start a new one."}, 410
-    if not me["eligible"] and not _existing_cert(me["key"]):
+    if not _existing_cert(me["key"]) and not _eligibility(me)[0]:
         return {"error": "not_eligible", "message": "Finish the Beginner and Advanced courses first."}, 403
     bank = _load_bank()
     ids = at["question_ids"]
@@ -488,11 +533,34 @@ async def profile_save_handler(request):
     return _j(body, status)
 
 
+def _video_event_sync(me, data):
+    cid = str(data.get("course_id") or "").strip()[:80]
+    vid = str(data.get("video_id") or "").strip()[:80]
+    if not cid or not vid:
+        return {"error": "bad_request", "message": "Missing course or video."}, 400
+    _sb("sfx_video_events", "POST", {"user_key": me["key"], "course_id": cid, "video_id": vid},
+        prefer="resolution=ignore-duplicates")
+    return {"ok": True}, 200
+
+
+async def progress_event_handler(request):
+    me, err = await _auth(request)
+    if err:
+        return err
+    try:
+        data = await request.json()
+    except Exception:
+        data = {}
+    body, status = await asyncio.to_thread(_video_event_sync, me, data if isinstance(data, dict) else {})
+    return _j(body, status)
+
+
 def register(app, sb_headers, supabase_url, validate_token, user_url):
     _deps.update(sb_headers=sb_headers, supabase_url=supabase_url, validate_token=validate_token, user_url=user_url)
     app.router.add_get("/api/nexora/cert/status", status_handler)
     app.router.add_post("/api/nexora/cert/exam/start", start_handler)
     app.router.add_post("/api/nexora/cert/exam/submit", submit_handler)
+    app.router.add_post("/api/nexora/progress", progress_event_handler)
     app.router.add_get("/api/nexora/profile", profile_get_handler)
     app.router.add_post("/api/nexora/profile", profile_save_handler)
     app.router.add_get("/cert/{no}", image_handler)

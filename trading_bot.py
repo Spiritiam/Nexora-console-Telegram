@@ -23095,7 +23095,7 @@ def _generate_signal_chart_unlocked(display_name, strategy_name, direction, cand
         ax.set_facecolor("#0f1115")
 
         x = _chart_draw_candles(ax, candles, times)
-        title_suffix = f"{display_name} — {strategy_name} — {direction}"
+        title_suffix = f"{display_name} — {direction}"
 
         if ma20 is not None:
             ax.plot(x, ma20, color="#60a5fa", linewidth=1.6, label="MA20", zorder=4)

@@ -32,8 +32,8 @@ def _sb(path, method="GET", body=None, prefer=None):
         return r.status_code, None
 
 
-def _j(data, status=200):
-    return web.json_response(data, status=status, headers={"Access-Control-Allow-Origin": "*", "Cache-Control": "public, max-age=60"})
+def _j(data, status=200, max_age=60):
+    return web.json_response(data, status=status, headers={"Access-Control-Allow-Origin": "*", "Cache-Control": f"public, max-age={max_age}"})
 
 
 async def courses_handler(request):
@@ -82,6 +82,62 @@ async def status_image_handler(request):
     if not name.endswith(".png") or not os.path.isfile(path):
         return web.Response(status=404)
     return web.FileResponse(path, headers={"Cache-Control": "public, max-age=3600"})
+
+
+# ------------------------------------------------------------------ Signals (from our own signal_log)
+
+SIGNAL_WINDOW_DAYS = 30
+_SIG_STAT = {"OPEN": "ACTIVE", "TP_HIT": "TP HIT", "SL_HIT": "SL HIT"}
+
+
+def _signal_rows():
+    since = (datetime.utcnow() - timedelta(days=SIGNAL_WINDOW_DAYS)).isoformat()
+    st, rows = _sb("signal_log?source=eq.scheduled&posted_at=gte." + since +
+                   "&select=id,pair_name,direction,entry_price,stop_loss,take_profit,posted_at,status&order=id.desc&limit=200")
+    return rows if st == 200 and isinstance(rows, list) else []
+
+
+def _fmt_price(v):
+    s = f"{float(v):.5f}".rstrip("0").rstrip(".")
+    return s
+
+
+def _rr(r):
+    try:
+        risk = abs(float(r["entry_price"]) - float(r["stop_loss"]))
+        reward = abs(float(r["take_profit"]) - float(r["entry_price"]))
+        x = reward / risk if risk else 0
+        return "1:" + (str(int(round(x))) if abs(x - round(x)) < 0.15 else f"{x:.1f}")
+    except Exception:
+        return "1:2"
+
+
+def _ms(iso):
+    try:
+        return str(int(datetime.fromisoformat(iso).replace(tzinfo=timezone.utc).timestamp() * 1000))
+    except Exception:
+        return "0"
+
+
+async def signals_handler(request):
+    rows = await asyncio.to_thread(_signal_rows)
+    out = []
+    for r in rows:
+        out.append({"id": str(r["id"]), "pair": r["pair_name"], "type": (r["direction"] or "").upper(),
+                    "entry": _fmt_price(r["entry_price"]), "sl": _fmt_price(r["stop_loss"]),
+                    "tp": _fmt_price(r["take_profit"]), "lots": "0.01", "rr": _rr(r),
+                    "stat": _SIG_STAT.get(r["status"], "ACTIVE"), "datetime": _ms(r["posted_at"])})
+    return _j(out, max_age=10)
+
+
+async def signal_stats_handler(request):
+    rows = await asyncio.to_thread(_signal_rows)
+    active = sum(1 for r in rows if r["status"] == "OPEN")
+    wins = sum(1 for r in rows if r["status"] == "TP_HIT")
+    losses = sum(1 for r in rows if r["status"] == "SL_HIT")
+    closed = wins + losses
+    rate = f"{wins / closed * 100:.1f}%" if closed else "0%"
+    return _j({"active": str(active), "wins": str(wins), "losses": str(losses), "winrate": rate}, max_age=10)
 
 
 # ------------------------------------------------------------------ YouTube sync
@@ -207,6 +263,8 @@ def register(app, sb_headers, supabase_url):
     _deps.update(sb_headers=sb_headers, supabase_url=supabase_url)
     app.router.add_get("/api/public/courses", courses_handler)
     app.router.add_get("/api/public/status", status_handler)
+    app.router.add_get("/api/public/signals", signals_handler)
+    app.router.add_get("/api/public/signals/stats", signal_stats_handler)
     app.router.add_get("/status-img/{name}", status_image_handler)
     app.router.add_get("/api/public/courses/{cid}/videos", videos_handler)
     app.on_startup.append(_on_start)

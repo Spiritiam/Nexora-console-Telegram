@@ -415,6 +415,20 @@ async def verify_handler(request):
                         content_type="text/html")
 
 
+async def verify_json_handler(request):
+    """Public JSON lookup used by the SpiritFX website's verify page."""
+    cors = {"Access-Control-Allow-Origin": "*"}
+    cert_no = request.match_info["no"].upper()
+    c = await asyncio.to_thread(_public_cert_sync, cert_no)
+    if not c:
+        return web.json_response({"valid": False, "cert_no": cert_no}, status=404, headers=cors)
+    return web.json_response({
+        "valid": True, "cert_no": c["cert_no"], "holder_name": c["holder_name"],
+        "programme": c["programme"], "issued_at": c["issued_at"],
+        "issued_by": "SpiritFX Trading Academy",
+        "image_url": f"{PUBLIC_BASE}/cert/{c['cert_no']}.png"}, headers=cors)
+
+
 def _profile_public(me):
     return {"name": me["name"], "username": me["uname"], "avatar": me["avatar"], "since": me["since"]}
 
@@ -483,3 +497,4 @@ def register(app, sb_headers, supabase_url, validate_token, user_url):
     app.router.add_post("/api/nexora/profile", profile_save_handler)
     app.router.add_get("/cert/{no}", image_handler)
     app.router.add_get("/verify/{no}", verify_handler)
+    app.router.add_get("/api/public/cert/{no}", verify_json_handler)

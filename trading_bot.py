@@ -288,7 +288,9 @@ MT5_BOT_PAIRS = {
     "flip_sr": ["auto"],
 }
 # "auto": no pair chosen - the bot watches these four and fires on the first EMA bounce (one trade at a time).
-SC_AUTO_PAIRS = ["xauusd", "btcusd", "usoil", "xagusd"]
+SC_AUTO_PAIRS = ["xauusd", "btcusd", "usoil"]
+# Silver is no longer traded by the auto bots; it is only looked at so a position opened earlier is still managed to its close.
+SC_LEGACY_PAIRS = ["xagusd"]
 AUTO_LABEL = "\U0001F500 Auto (all pairs)"
 
 
@@ -4064,13 +4066,13 @@ async def _sc_auto_targets(a):
     """Auto accounts: stay on the pair with a live trade; otherwise fire the first of the four pairs
     that shows an EMA bounce on the last closed 5-minute bar. One trade at a time."""
     uid, mode = str(a["user_id"]), a["bot_choice"]
-    for p in SC_AUTO_PAIRS:
+    for p in SC_AUTO_PAIRS + SC_LEGACY_PAIRS:
         st = _SC["st"].get((uid, p))
         if st and st.get("mode") == mode and st.get("phase") in ("open", "cool"):
             return [p]
     if uid not in _SC_AUTO_ADOPTED:      # after a restart: let the normal code adopt any live position
         _SC_AUTO_ADOPTED.add(uid)
-        return list(SC_AUTO_PAIRS)
+        return list(SC_AUTO_PAIRS) + list(SC_LEGACY_PAIRS)
     closed = _xc_market_closed()
     for p in SC_AUTO_PAIRS:
         if closed and p not in WEEKEND_PAIRS:
@@ -4086,6 +4088,15 @@ async def _sc_auto_targets(a):
 async def _sc_tick_auto(context, a):
     uid = str(a["user_id"])
     for p in await _sc_auto_targets(a):
+        if p in SC_LEGACY_PAIRS and (_SC["st"].get((uid, p)) or {}).get("phase") not in ("open", "cool"):
+            # silver: only to adopt/manage a position that is already running - never a new entry
+            try:
+                _sm = await get_client_symbol_map(a)
+                _pos = await _xc_get_positions(a["metaapi_account_id"], resolve_trade_symbol(_sm, PAIR_CONFIG[p]))
+            except Exception:
+                _pos = None
+            if not _pos:
+                continue
         await _sc_tick_one(context, dict(a, pair_choice=p))
         if (_SC["st"].get((uid, p)) or {}).get("phase") == "open":
             break

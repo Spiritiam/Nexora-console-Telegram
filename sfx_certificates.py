@@ -141,7 +141,7 @@ def _ts(s):
 def _cert_public(c):
     return {"cert_no": c["cert_no"], "name": c["holder_name"], "programme": c["programme"],
             "issued_at": c["issued_at"], "verify_url": f"{PUBLIC_BASE}/verify/{c['cert_no']}",
-            "image_url": f"{PUBLIC_BASE}/cert/{c['cert_no']}.png"}
+            "image_url": f"{PUBLIC_BASE}/cert/{c['cert_no']}.png?v=2"}
 
 
 def _status_sync(me):
@@ -375,7 +375,7 @@ async def image_handler(request):
         if len(_png_cache) > 200:
             _png_cache.clear()
         _png_cache[cert_no] = png
-    return web.Response(body=png, content_type="image/png", headers={"Cache-Control": "public, max-age=3600"})
+    return web.Response(body=png, content_type="image/png", headers={"Cache-Control": "public, max-age=300"})
 
 
 PAGE = """<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
@@ -426,7 +426,7 @@ async def verify_json_handler(request):
         "valid": True, "cert_no": c["cert_no"], "holder_name": c["holder_name"],
         "programme": c["programme"], "issued_at": c["issued_at"],
         "issued_by": "SpiritFX Trading Academy",
-        "image_url": f"{PUBLIC_BASE}/cert/{c['cert_no']}.png"}, headers=cors)
+        "image_url": f"{PUBLIC_BASE}/cert/{c['cert_no']}.png?v=2"}, headers=cors)
 
 
 def _profile_public(me):

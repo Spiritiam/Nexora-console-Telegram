@@ -144,8 +144,28 @@ def sync_all(force=False):
             print(f"[COURSES] sync failed for {r['course_id']}: {type(e).__name__}: {e}")
 
 
+def discover(queries):
+    """Log candidate playlists for each search (set YT_DISCOVER="query one|query two"). Read from the Railway logs."""
+    for q in queries:
+        try:
+            d = _yt("search", part="snippet", type="playlist", q=q, maxResults=15, relevanceLanguage="en")
+            ids = [it["id"]["playlistId"] for it in d.get("items", [])]
+            if not ids:
+                continue
+            det = _yt("playlists", part="snippet,contentDetails", id=",".join(ids), maxResults=15)
+            print(f"[DISCOVER] === {q}")
+            for it in det.get("items", []):
+                sn = it["snippet"]
+                print(f"[DISCOVER] {it['id']} | {it['contentDetails']['itemCount']} videos | {sn['channelTitle']} | {sn['title'][:90]} | lang={sn.get('defaultLanguage','')}")
+        except Exception as e:
+            print(f"[DISCOVER] failed for {q}: {e}")
+
+
 async def _loop(app):
     await asyncio.sleep(25)
+    qs = [x.strip() for x in os.getenv("YT_DISCOVER", "").split("|") if x.strip()]
+    if qs and YT_KEY:
+        await asyncio.to_thread(discover, qs)
     while True:
         try:
             await asyncio.to_thread(sync_all)

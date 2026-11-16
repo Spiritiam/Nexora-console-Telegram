@@ -5681,6 +5681,8 @@ def _napp_news_fetch_sync():
         ("https://news.google.com/rss/search?q=gold+price+OR+XAUUSD+when%3A3d&hl=en-US&gl=US&ceid=US:en", "Gold"),
         ("https://news.google.com/rss/search?q=oil+price+OR+bitcoin+OR+%22Federal+Reserve%22+when%3A3d&hl=en-US&gl=US&ceid=US:en", "Markets"),
         ("https://www.fxstreet.com/rss/news", "FXStreet"),
+        ("https://www.coindesk.com/arc/outboundfeeds/rss/", "CoinDesk"),
+        ("https://cointelegraph.com/rss", "Cointelegraph"),
     ):
         try:
             import xml.etree.ElementTree as _ET
@@ -5761,7 +5763,7 @@ def _napp_news_fetch_sync():
         item = {"img": img or "", "title": title, "author": "", "source": src or "",
                 "url": url, "datetime": dt.isoformat(), "timePublished": _napp_news_ago(dt), "_dt": dt}
         try:
-            relevant = True if trusted else is_news_relevant(title, desc or "")
+            relevant = is_news_relevant(title, desc or "")
         except Exception:
             relevant = True
         if not relevant:
@@ -5775,11 +5777,12 @@ def _napp_news_fetch_sync():
         })
     # If the forex/gold/crypto filter leaves too little, top up with the newest
     # general business headlines so the section is never empty.
-    if len(out) < 5:
-        loose.sort(key=lambda x: x["_dt"], reverse=True)
-        out.extend(loose[: 8 - len(out)])
+    # Only forex / gold / USD / crypto headlines are shown; no general business top-up.
     print(f"[APP NEWS] returning {len(out)} (relevant kept, {len(loose)} other)")
-    out.sort(key=lambda x: x["_dt"], reverse=True)
+    # Newest first, but a fresh headline that has a picture goes ahead of one without.
+    _now = datetime.now(timezone.utc)
+    out.sort(key=lambda x: (0 if (x["img"] and (_now - x["_dt"]) < timedelta(hours=24)) else 1,
+                            -x["_dt"].timestamp()))
     for o in out:
         o.pop("_dt", None)
     return out[:15]

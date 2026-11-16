@@ -22831,8 +22831,18 @@ def _generate_signal_chart_unlocked(display_name, strategy_name, direction, cand
                   f"(range {real_range} across {len(candles)} candles) - falling back to static image")
             return False
 
+        # Market-closed placeholder bars (open = high = low = close, e.g. over the weekend) draw as flat dashes
+        # and open a visible gap in the chart: leave them out (the live last candle is always kept).
+        _real = [c for c in candles[:-1] if c["high"] > c["low"]] + [candles[-1]]
+        if len(_real) >= 30:
+            candles = _real
+
         needs_subpanel = strategy_name in ("RSI Extreme Reversal", "Bollinger+RSI Mean Reversion", "Momentum (MACD)")
         closes = [c["close"] for c in candles]
+
+        # 25 / 50 / 100 EMA (the lines the entry is built on), computed on the full list like every other indicator.
+        import ema_trend as _et
+        _emas = {n: _et.ema(closes, n) for n in (25, 50, 100)}
 
         # Compute every indicator on the FULL candle list first - the
         # math must never be affected by how much we later display.
@@ -22966,6 +22976,7 @@ def _generate_signal_chart_unlocked(display_name, strategy_name, direction, cand
         if bb_upper is not None:
             bb_upper, bb_middle, bb_lower = bb_upper[-window:], bb_middle[-window:], bb_lower[-window:]
 
+        _emas = {n: (v[-window:] if v else None) for n, v in _emas.items()}
         times = _chart_to_mpl_time(candles)
         if needs_subpanel:
             fig, (ax, sub_ax) = plt.subplots(
@@ -23039,6 +23050,11 @@ def _generate_signal_chart_unlocked(display_name, strategy_name, direction, cand
             sub_ax.fill_between(x, 75, 100, color="#ef4444", alpha=0.06, zorder=0)
             sub_ax.fill_between(x, 0, 25, color="#22c55e", alpha=0.06, zorder=0)
             sub_ax.set_ylim(0, 100)
+
+        for _n, _col in ((25, "#facc15"), (50, "#38bdf8"), (100, "#e879f9")):
+            _v = _emas.get(_n)
+            if _v and len(_v) == len(x) and any(t is not None for t in _v):
+                ax.plot(x, _v, color=_col, linewidth=1.2, alpha=0.95, label=f"EMA {_n}", zorder=4)
 
         _chart_finish(fig, ax, x, times, candles, entry, sl, tp, title_suffix, save_path, sub_ax=sub_ax, tp1=tp1)
         return True

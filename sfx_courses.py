@@ -50,7 +50,7 @@ async def courses_handler(request):
             "courseId": r["course_id"], "title": r["title"], "creatorId": r["course_id"],
             "tutor": r["tutor"], "videoCount": str(r["video_count"]), "lvl": r["lvl"],
             "playlistId": r["playlist_id"], "language": r["language"], "descr": r["descr"],
-            "img": r["img"], "telegram": "", "youtube": "", "x": "", "instagram": "",
+            "img": r["img"], "telegram": "", "youtube": r.get("channel_url") or "", "x": "", "instagram": "",
             "datetime": r.get("created_at") or "", "region": r.get("region") or "",
         })
     return _j(out)
@@ -117,6 +117,8 @@ def sync_course(row):
         chunk = [{"course_id": cid, "sn": i + j + 1, "title": t[:200], "video_id": v} for j, (t, v) in enumerate(vids[i:i + 100])]
         _sb("sfx_course_videos", "POST", chunk)
     patch = {"video_count": len(vids), "synced_at": datetime.now(timezone.utc).isoformat()}
+    if channel_id:
+        patch["channel_url"] = f"https://www.youtube.com/channel/{channel_id}"
     if not row.get("tutor"):
         patch["tutor"] = channel_title
     if not row.get("img") and avatar:

@@ -140,6 +140,15 @@ class ExnessClient:
             data = r.json() if r.text else {}
         except ValueError:
             data = {"raw": r.text[:300]}
+        if r.status_code == 429:
+            try:
+                hdr = {k: v for k, v in r.headers.items()
+                       if k.lower() == "retry-after" or "rate" in k.lower() or "limit" in k.lower()}
+                if time.time() - getattr(ExnessClient, "_hdr_logged", 0) > 120:
+                    ExnessClient._hdr_logged = time.time()
+                    print(f"[EXNESS 429] {method} {path.split('?')[0]} headers={hdr} body={str(data)[:200]}", flush=True)
+            except Exception:
+                pass
         return r.status_code, data
 
     def instruments(self):

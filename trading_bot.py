@@ -17555,6 +17555,20 @@ def _exness_md_instrument(broker, mt5_symbol):
 _EXMD_G = {"lock": threading.Lock(), "next": 0.0, "pause_until": 0.0, "strikes": 0}
 
 
+_EXMD_STAT = {"t": 0.0, "calls": 0, "r429": 0}
+
+
+def _exmd_stat(is429=False):
+    now = time.time()
+    if now - _EXMD_STAT["t"] > 60:
+        if _EXMD_STAT["t"]:
+            print(f"[EXNESS DATA] last minute: {_EXMD_STAT['calls']} calls, {_EXMD_STAT['r429']} rate-limited", flush=True)
+        _EXMD_STAT.update({"t": now, "calls": 0, "r429": 0})
+    _EXMD_STAT["calls"] += 1
+    if is429:
+        _EXMD_STAT["r429"] += 1
+
+
 def _exmd_gate():
     """One shared pace for every market-data call on the master Exness key (~5 per second at most).
     False = Exness asked us to slow down recently: the caller serves its cached copy instead."""
@@ -17569,10 +17583,12 @@ def _exmd_gate():
         if wait > 0:
             time.sleep(wait)
         _EXMD_G["next"] = max(now, _EXMD_G["next"]) + 0.2
+    _exmd_stat()
     return True
 
 
 def _exmd_429():
+    _exmd_stat(True)
     _EXMD_G["strikes"] = min(_EXMD_G["strikes"] + 1, 6)
     _EXMD_G["pause_until"] = time.time() + min(4 * _EXMD_G["strikes"], 20)
 

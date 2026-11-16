@@ -3409,6 +3409,82 @@ async def _pair_busy(pair_key, scheduled):
     return bool(sym and await has_real_open_mt5_position(sym))
 
 
+# ---------------------------------------------------------------------------
+# "I'll message you when it's on a clean trend": a manual request for a pair that is ranging gets another
+# pair's signal; the requester (only) is told when the requested pair starts trending.
+# Stored in public.trend_alerts so a redeploy does not lose them.
+# ---------------------------------------------------------------------------
+TREND_ALERT_MAX_HOURS = 12
+
+
+def _pair_key_from_name(pair_name):
+    return next((k for k, v in PAIR_CONFIG.items() if v.get("pair_name") == pair_name), None)
+
+
+def _trend_alert_register(user_id, pair_key):
+    try:
+        h = sb_headers()
+        r = requests.get(f"{SUPABASE_URL}/rest/v1/trend_alerts?user_id=eq.{user_id}&pair_key=eq.{pair_key}"
+                         f"&notified_at=is.null&select=id&limit=1", headers=h, timeout=8)
+        if r.status_code == 200 and r.json():
+            return
+        requests.post(f"{SUPABASE_URL}/rest/v1/trend_alerts", headers=h,
+                      json={"user_id": str(user_id), "pair_key": pair_key}, timeout=8)
+    except Exception as e:
+        print(f"[TREND ALERT] could not save alert: {type(e).__name__}: {str(e)[:80]}", flush=True)
+
+
+async def run_trend_alerts(context):
+    """Every 2 min: for each pending alert, tell the person once the pair is trending."""
+    try:
+        h = sb_headers()
+        r = await asyncio.to_thread(lambda: requests.get(
+            f"{SUPABASE_URL}/rest/v1/trend_alerts?notified_at=is.null&select=id,user_id,pair_key,created_at&limit=500",
+            headers=h, timeout=10))
+        rows = r.json() if r.status_code == 200 else []
+        if not rows:
+            return
+        closed = is_forex_market_closed()
+        now_utc = datetime.now(timezone.utc)
+        state = {}
+        for row in rows:
+            k = row["pair_key"]
+            cfg = PAIR_CONFIG.get(k)
+            if not cfg:
+                continue
+            try:
+                age_h = (now_utc - datetime.fromisoformat(str(row["created_at"]).replace("Z", "+00:00"))).total_seconds() / 3600
+            except Exception:
+                age_h = 0
+            done = False
+            if age_h > TREND_ALERT_MAX_HOURS:
+                done = True   # too old: drop it quietly
+            elif k == "btcusd" or not closed:
+                if k not in state:
+                    try:
+                        state[k] = _ema_trend_dir(await _ema5_exness(k, cfg))
+                    except Exception:
+                        state[k] = None
+                d = state[k]
+                if d:
+                    try:
+                        await context.bot.send_message(
+                            chat_id=int(row["user_id"]),
+                            text=(f"✅ <b>{cfg['display']}</b> is on a clean trend now.\n\n"
+                                  f"Send <b>{cfg['pair_name']}</b> to get your signal."),
+                            parse_mode=ParseMode.HTML)
+                    except Exception as e:
+                        print(f"[TREND ALERT] could not message {row['user_id']}: {type(e).__name__}", flush=True)
+                    done = True
+            if done:
+                await asyncio.to_thread(lambda i=row["id"]: requests.patch(
+                    f"{SUPABASE_URL}/rest/v1/trend_alerts?id=eq.{i}", headers=h,
+                    json={"notified_at": now_utc.isoformat()}, timeout=8))
+    except Exception as e:
+        print(f"[TREND ALERT] check failed: {type(e).__name__}: {str(e)[:100]}", flush=True)
+
+
+
 def _ema_trend_dir(e):
     """BUY/SELL from the trend itself (bounce or not), None when ranging / no data."""
     if not e:
@@ -23745,6 +23821,10 @@ async def build_signal_response(question, user_id=None, retry_mismatch=False, _s
             reason = _backed_by(reason, direction)
     if _swapped_from:
         reason = f"{_swapped_from} is ranging right now, so this is the cleaner setup. " + reason
+        _origin_key = _pair_key_from_name(_swapped_from)
+        if user_id is not None and _origin_key:
+            await asyncio.to_thread(_trend_alert_register, user_id, _origin_key)
+            reason += f" I'll message you when {_swapped_from} is on a clean trend."
 
     if direction == "BUY":
         entry_price = round(live_price, decimals)
@@ -27942,7 +28022,7 @@ async def build_exness_autotrade_dashboard(user_id, account, expiry, now):
         + f"Balance: {balance_display}\n\n"
         + ("Plan: Free\n" if is_exn else f"Subscription: {days_left} day(s) left\n")
         + f"Mode: {bot_label}"
-        + (f" on {AUTO_LABEL if account.get('pair_choice') == 'auto' else account.get('pair_choice', '').upper()}" if account.get("pair_choice") else "")
+        + (f" on {account.get('pair_choice', '').upper()}" if account.get("pair_choice") and account.get("pair_choice") != "auto" else "")
         + f"\nRisk: {risk_display}\n\n"
         + autotrade_status_line
     )
@@ -28591,6 +28671,21 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             mt5_signup_state[user_id] = {"flow": "presetup"}
         mt5_signup_state[user_id]["bot_choice"] = bot_key
 
+        if mt5_pairs_for(bot_key) == ["auto"]:
+            # No pair to choose: the bot picks the pair itself, so go straight to sizing.
+            mt5_signup_state[user_id]["pair_choice"] = "auto"
+            await query.message.edit_text(
+                f"✅ {MT5_AUTOTRADE_BOTS[bot_key]['label']} selected.\n\n"
+                f"📏 <b>Choose how trades should be sized:</b>",
+                parse_mode=ParseMode.HTML,
+                reply_markup=InlineKeyboardMarkup([
+                    [InlineKeyboardButton("📏 Fixed lot size", callback_data="mt5auto_mode_lot")],
+                    [InlineKeyboardButton("📊 Risk %", callback_data="mt5auto_mode_risk")],
+                    [InlineKeyboardButton("⬅️ Back", callback_data="mt5auto_choose_bot")],
+                ])
+            )
+            return
+
         buttons = [
             [InlineKeyboardButton(pair_display(p), callback_data=f"mt5auto_pair_{p}")]
             for p in mt5_pairs_for(bot_key)
@@ -29085,6 +29180,14 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         bot_key = data.replace("mt5switch_bot_", "")
         if bot_key not in MT5_AUTOTRADE_BOTS_VISIBLE:
             return
+        if mt5_pairs_for(bot_key) == ["auto"]:
+            upsert_mt5_autotrade_account(user_id, {"bot_choice": bot_key, "pair_choice": "auto"})
+            await query.message.edit_text(
+                f"✅ <b>Switched to {MT5_AUTOTRADE_BOTS[bot_key]['label']}.</b>\n\n"
+                f"Tap 🤖 Exness Auto-Trade anytime to check your status or switch again.",
+                parse_mode=ParseMode.HTML
+            )
+            return
         buttons = [
             [InlineKeyboardButton(pair_display(p), callback_data=f"mt5switch_pair_{bot_key}_{p}")]
             for p in mt5_pairs_for(bot_key)
@@ -29384,6 +29487,22 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         bot_key = data.replace("derivauto_bot_", "")
         if bot_key not in DERIV_AUTOTRADE_BOTS_VISIBLE:
             return
+        if DERIV_PAIR_OPTS == ["auto"]:
+            tier_buttons = [
+                [InlineKeyboardButton(
+                    f"${t['stake']} | Risk ${t['risk']} → Win ${t['win']}",
+                    callback_data=f"derivbotstake_{bot_key}_auto_{t['stake']}"
+                )]
+                for t in STAKE_TIERS
+            ]
+            tier_buttons.append([InlineKeyboardButton("⬅️ Back", callback_data="derivauto_choose_bot")])
+            await query.message.edit_text(
+                f"✅ {DERIV_AUTOTRADE_BOTS[bot_key]['label']} selected.\n\n"
+                f"📌 <b>Now choose the stake to use on every trade:</b>",
+                parse_mode=ParseMode.HTML,
+                reply_markup=InlineKeyboardMarkup(tier_buttons)
+            )
+            return
         buttons = [
             [InlineKeyboardButton(deriv_pair_display(p), callback_data=f"derivauto_pair_{bot_key}_{p}")]
             for p in DERIV_PAIR_OPTS
@@ -29451,8 +29570,8 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await query.message.edit_text(
             f"✅ <b>Auto-Trade connected successfully.</b>\n\n"
             f"Mode: {DERIV_AUTOTRADE_BOTS[bot_key]['label']}\n"
-            f"Index: {deriv_pair_display(pair_key)}\n"
-            f"Stake: ${tier['stake']} | Risk: ${tier['risk']} → Win: ${tier['win']}\n\n"
+            + (f"Index: {deriv_pair_display(pair_key)}\n" if pair_key != "auto" else "")
+            + f"Stake: ${tier['stake']} | Risk: ${tier['risk']} → Win: ${tier['win']}\n\n"
             f"Check status or switch modes anytime from 🔗 Connect Deriv.",
             parse_mode=ParseMode.HTML
         )
@@ -34767,10 +34886,6 @@ async def check_mt5_autotrade_closed_orders(context: ContextTypes.DEFAULT_TYPE):
             continue  # still open, or lookup failed - retry next sweep
 
         mark_mt5_autotrade_order_closed(order_id, profit)
-        try:
-            await update_flip_lot_after_close(user_id, profit)
-        except Exception as e:
-            print(f"[MT5 AUTOTRADE] Account Flip lot update failed for {user_id}: {e}")
 
 # ============================================
 # AUTO-COPY TRADE MONITOR (NEW)
@@ -35859,6 +35974,7 @@ def main():
     job_queue.run_repeating(run_bad_key_notify, interval=60, first=75, name="exness_bad_key_notify")
     job_queue.run_repeating(run_dsc_tick, interval=3, first=62, name="deriv_scalper_straddle")
     job_queue.run_repeating(run_bot_migration, interval=600, first=20, name="bot_lineup_migration")
+    job_queue.run_repeating(run_trend_alerts, interval=120, first=90, name="trend_alerts")
 
     # TP/SL monitor - checks every OPEN logged signal every 15 minutes
     job_queue.run_repeating(

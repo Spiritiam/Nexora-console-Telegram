@@ -12919,7 +12919,7 @@ async def _build_synthetic_signal_response_inner(index_key, min_agree=2, manual=
         else:
             reason = _backed_by(reason, direction)
     if _swapped_from:
-        reason = f"{_swapped_from} is ranging right now, so this is the cleaner setup. " + reason
+        reason = f"{_swapped_from} is ranging right now, so it's not a good time to trade it. Suggested instead: {index_key}."
     _DERIV_LAST_SIG[index_key] = (direction, time.time())
     contract_type = "MULTUP" if direction == "BUY" else "MULTDOWN"
 
@@ -23853,11 +23853,11 @@ async def build_signal_response(question, user_id=None, retry_mismatch=False, _s
         else:
             reason = _backed_by(reason, direction)
     if _swapped_from:
-        reason = f"{_swapped_from} is ranging right now, so this is the cleaner setup. " + reason
+        reason = f"{_swapped_from} is ranging right now, so it's not a good time to trade it. Suggested instead: {pair_name}."
         _origin_key = _pair_key_from_name(_swapped_from)
         if user_id is not None and _origin_key:
             await asyncio.to_thread(_trend_alert_register, user_id, _origin_key)
-            reason += f" I'll message you when {_swapped_from} is on a clean trend."
+            reason += f" I'll message you when {_swapped_from} is ready to trade."
 
     if direction == "BUY":
         entry_price = round(live_price, decimals)

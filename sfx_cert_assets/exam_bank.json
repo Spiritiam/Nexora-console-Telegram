@@ -1,0 +1,3906 @@
+{
+ "version": 1,
+ "note": "Keep answer_index on the server only. Never send it to the app.",
+ "questions": [
+  {
+   "id": "B-001",
+   "level": "basic",
+   "topic": "Forex basics",
+   "question": "What does 'forex' stand for?",
+   "options": [
+    "Financial exchange",
+    "Forward exchange",
+    "Foreign exchange",
+    "Fixed exchange"
+   ],
+   "answer_index": 2
+  },
+  {
+   "id": "B-002",
+   "level": "basic",
+   "topic": "Forex basics",
+   "question": "What is traded in the forex market?",
+   "options": [
+    "Only company shares",
+    "Only gold",
+    "Only government bonds",
+    "Currencies"
+   ],
+   "answer_index": 3
+  },
+  {
+   "id": "B-003",
+   "level": "basic",
+   "topic": "Forex basics",
+   "question": "What is a currency pair?",
+   "options": [
+    "Two brokers working together",
+    "Two currencies quoted against each other",
+    "A pair of charts",
+    "Two trades opened at once"
+   ],
+   "answer_index": 1
+  },
+  {
+   "id": "B-004",
+   "level": "basic",
+   "topic": "Forex basics",
+   "question": "In EUR/USD, which is the base currency?",
+   "options": [
+    "Neither",
+    "Both",
+    "EUR",
+    "USD"
+   ],
+   "answer_index": 2
+  },
+  {
+   "id": "B-005",
+   "level": "basic",
+   "topic": "Forex basics",
+   "question": "In EUR/USD, which is the quote currency?",
+   "options": [
+    "Both",
+    "USD",
+    "EUR",
+    "Neither"
+   ],
+   "answer_index": 1
+  },
+  {
+   "id": "B-006",
+   "level": "basic",
+   "topic": "Forex basics",
+   "question": "If EUR/USD is 1.1000, what does it mean?",
+   "options": [
+    "The euro rose 1.1%",
+    "You need $1.10 margin",
+    "1 euro costs 1.1000 US dollars",
+    "1 dollar costs 1.1000 euros"
+   ],
+   "answer_index": 2
+  },
+  {
+   "id": "B-007",
+   "level": "basic",
+   "topic": "Forex basics",
+   "question": "Which of these is a major pair?",
+   "options": [
+    "USD/NGN",
+    "AUD/CHF",
+    "EUR/NZD",
+    "GBP/USD"
+   ],
+   "answer_index": 3
+  },
+  {
+   "id": "B-008",
+   "level": "basic",
+   "topic": "Forex basics",
+   "question": "When does the forex market close for the weekend?",
+   "options": [
+    "It never closes",
+    "Friday evening, and it reopens Sunday evening",
+    "Saturday noon",
+    "Wednesday night"
+   ],
+   "answer_index": 1
+  },
+  {
+   "id": "B-009",
+   "level": "basic",
+   "topic": "Forex basics",
+   "question": "Who are the main participants in the forex market?",
+   "options": [
+    "Only retail traders",
+    "Only governments",
+    "Banks, institutions and retail traders",
+    "Only brokers"
+   ],
+   "answer_index": 2
+  },
+  {
+   "id": "B-010",
+   "level": "basic",
+   "topic": "Forex basics",
+   "question": "Why is forex called a decentralised market?",
+   "options": [
+    "It has no rules",
+    "It only trades at night",
+    "Only one bank controls it",
+    "Trading happens across many banks and brokers, not one exchange"
+   ],
+   "answer_index": 3
+  },
+  {
+   "id": "B-011",
+   "level": "basic",
+   "topic": "Pips, lots and spread",
+   "question": "What is a pip on most pairs such as EUR/USD?",
+   "options": [
+    "1.0",
+    "0.0001",
+    "0.01",
+    "0.1"
+   ],
+   "answer_index": 1
+  },
+  {
+   "id": "B-012",
+   "level": "basic",
+   "topic": "Pips, lots and spread",
+   "question": "For JPY pairs, a pip is normally",
+   "options": [
+    "1.0",
+    "0.0001",
+    "0.1",
+    "0.01"
+   ],
+   "answer_index": 3
+  },
+  {
+   "id": "B-013",
+   "level": "basic",
+   "topic": "Pips, lots and spread",
+   "question": "A move of EUR/USD from 1.1000 to 1.1025 is how many pips?",
+   "options": [
+    "0.25",
+    "250",
+    "25",
+    "2.5"
+   ],
+   "answer_index": 2
+  },
+  {
+   "id": "B-014",
+   "level": "basic",
+   "topic": "Pips, lots and spread",
+   "question": "What is a standard lot?",
+   "options": [
+    "10,000 units",
+    "1,000,000 units",
+    "100,000 units of the base currency",
+    "1,000 units"
+   ],
+   "answer_index": 2
+  },
+  {
+   "id": "B-015",
+   "level": "basic",
+   "topic": "Pips, lots and spread",
+   "question": "What is a mini lot?",
+   "options": [
+    "100,000 units",
+    "100 units",
+    "1,000 units",
+    "10,000 units"
+   ],
+   "answer_index": 3
+  },
+  {
+   "id": "B-016",
+   "level": "basic",
+   "topic": "Pips, lots and spread",
+   "question": "What is a micro lot?",
+   "options": [
+    "1,000 units",
+    "10,000 units",
+    "100,000 units",
+    "10 units"
+   ],
+   "answer_index": 0
+  },
+  {
+   "id": "B-017",
+   "level": "basic",
+   "topic": "Pips, lots and spread",
+   "question": "What is the spread?",
+   "options": [
+    "The difference between the buy price and the sell price",
+    "The profit on a trade",
+    "The broker's monthly fee",
+    "The daily price range"
+   ],
+   "answer_index": 0
+  },
+  {
+   "id": "B-018",
+   "level": "basic",
+   "topic": "Pips, lots and spread",
+   "question": "When does the spread usually widen?",
+   "options": [
+    "Only on weekends",
+    "During major news or low liquidity",
+    "During the London lunch hour only",
+    "When you use a small lot"
+   ],
+   "answer_index": 1
+  },
+  {
+   "id": "B-019",
+   "level": "basic",
+   "topic": "Pips, lots and spread",
+   "question": "A bigger lot size means",
+   "options": [
+    "Guaranteed profit",
+    "Each pip is worth more money, for profit and for loss",
+    "Lower spread",
+    "Smaller risk"
+   ],
+   "answer_index": 1
+  },
+  {
+   "id": "B-020",
+   "level": "basic",
+   "topic": "Pips, lots and spread",
+   "question": "What is the approximate pip value of 1 standard lot on EUR/USD?",
+   "options": [
+    "$100 per pip",
+    "$1 per pip",
+    "$0.10 per pip",
+    "$10 per pip"
+   ],
+   "answer_index": 3
+  },
+  {
+   "id": "B-021",
+   "level": "basic",
+   "topic": "Buying and selling",
+   "question": "What does going long mean?",
+   "options": [
+    "Buying, expecting the price to rise",
+    "Holding a trade overnight",
+    "Selling, expecting the price to fall",
+    "Opening a large lot"
+   ],
+   "answer_index": 0
+  },
+  {
+   "id": "B-022",
+   "level": "basic",
+   "topic": "Buying and selling",
+   "question": "What does going short mean?",
+   "options": [
+    "Buying, expecting the price to rise",
+    "Selling, expecting the price to fall",
+    "Opening a small lot",
+    "Closing a trade early"
+   ],
+   "answer_index": 1
+  },
+  {
+   "id": "B-023",
+   "level": "basic",
+   "topic": "Buying and selling",
+   "question": "The Ask price is the price at which you",
+   "options": [
+    "Set a stop loss",
+    "Sell",
+    "Close a trade for free",
+    "Buy"
+   ],
+   "answer_index": 3
+  },
+  {
+   "id": "B-024",
+   "level": "basic",
+   "topic": "Buying and selling",
+   "question": "The Bid price is the price at which you",
+   "options": [
+    "Deposit money",
+    "Sell",
+    "Open an account",
+    "Buy"
+   ],
+   "answer_index": 1
+  },
+  {
+   "id": "B-025",
+   "level": "basic",
+   "topic": "Buying and selling",
+   "question": "You buy EUR/USD at 1.1000 and price rises to 1.1050. Your trade is",
+   "options": [
+    "Closed automatically",
+    "In profit",
+    "In loss",
+    "At break-even"
+   ],
+   "answer_index": 1
+  },
+  {
+   "id": "B-026",
+   "level": "basic",
+   "topic": "Buying and selling",
+   "question": "You sell GBP/USD at 1.2500 and price rises to 1.2550. Your trade is",
+   "options": [
+    "Closed automatically",
+    "In profit",
+    "At break-even",
+    "In loss"
+   ],
+   "answer_index": 3
+  },
+  {
+   "id": "B-027",
+   "level": "basic",
+   "topic": "Buying and selling",
+   "question": "What is a market order?",
+   "options": [
+    "An order executed immediately at the current price",
+    "An order that waits for a set price",
+    "An order with no stop loss allowed",
+    "An order that only works on Monday"
+   ],
+   "answer_index": 0
+  },
+  {
+   "id": "B-028",
+   "level": "basic",
+   "topic": "Buying and selling",
+   "question": "What is a pending order?",
+   "options": [
+    "An order that opens only when price reaches a level you set",
+    "An order that has been cancelled",
+    "An order the broker rejected",
+    "An order that is already closed"
+   ],
+   "answer_index": 0
+  },
+  {
+   "id": "B-029",
+   "level": "basic",
+   "topic": "Buying and selling",
+   "question": "A Buy Limit order is placed",
+   "options": [
+    "At the current price only",
+    "Above the current price",
+    "Only on Fridays",
+    "Below the current price"
+   ],
+   "answer_index": 3
+  },
+  {
+   "id": "B-030",
+   "level": "basic",
+   "topic": "Buying and selling",
+   "question": "A Sell Limit order is placed",
+   "options": [
+    "Below the current price",
+    "Above the current price",
+    "At the current price only",
+    "Only on Mondays"
+   ],
+   "answer_index": 1
+  },
+  {
+   "id": "B-031",
+   "level": "basic",
+   "topic": "Stop loss and take profit",
+   "question": "What does a stop loss do?",
+   "options": [
+    "Increases your lot size",
+    "Closes the trade at a set profit",
+    "Opens a second trade",
+    "Closes the trade automatically at a set loss"
+   ],
+   "answer_index": 3
+  },
+  {
+   "id": "B-032",
+   "level": "basic",
+   "topic": "Stop loss and take profit",
+   "question": "What does a take profit do?",
+   "options": [
+    "Closes the trade automatically at a set profit",
+    "Cancels the spread",
+    "Closes the trade at a set loss",
+    "Moves your stop loss"
+   ],
+   "answer_index": 0
+  },
+  {
+   "id": "B-033",
+   "level": "basic",
+   "topic": "Stop loss and take profit",
+   "question": "Why should every trade have a stop loss?",
+   "options": [
+    "To increase leverage",
+    "To guarantee a win",
+    "To limit the loss if the market moves against you",
+    "To avoid paying the spread"
+   ],
+   "answer_index": 2
+  },
+  {
+   "id": "B-034",
+   "level": "basic",
+   "topic": "Stop loss and take profit",
+   "question": "A buy trade at 1.1000 with a stop loss should place the stop",
+   "options": [
+    "Above 1.1000",
+    "Anywhere, it does not matter",
+    "Below 1.1000",
+    "At exactly 1.1000"
+   ],
+   "answer_index": 2
+  },
+  {
+   "id": "B-035",
+   "level": "basic",
+   "topic": "Stop loss and take profit",
+   "question": "A sell trade at 1.1000 with a stop loss should place the stop",
+   "options": [
+    "Below 1.1000",
+    "At exactly 1.1000",
+    "Above 1.1000",
+    "Anywhere, it does not matter"
+   ],
+   "answer_index": 2
+  },
+  {
+   "id": "B-036",
+   "level": "basic",
+   "topic": "Stop loss and take profit",
+   "question": "What is a good habit once price moves in your favour?",
+   "options": [
+    "Remove the stop loss",
+    "Close your account",
+    "Consider moving the stop loss to break-even",
+    "Double the lot size"
+   ],
+   "answer_index": 2
+  },
+  {
+   "id": "B-037",
+   "level": "basic",
+   "topic": "Stop loss and take profit",
+   "question": "Moving your stop loss further away after the trade goes against you is",
+   "options": [
+    "A dangerous habit that increases risk",
+    "Required by brokers",
+    "A smart way to avoid losses",
+    "A way to lower the spread"
+   ],
+   "answer_index": 0
+  },
+  {
+   "id": "B-038",
+   "level": "basic",
+   "topic": "Stop loss and take profit",
+   "question": "What is a trailing stop?",
+   "options": [
+    "A stop that never triggers",
+    "A stop that moves against you",
+    "A stop only used on pending orders",
+    "A stop that follows price as the trade moves into profit"
+   ],
+   "answer_index": 3
+  },
+  {
+   "id": "B-039",
+   "level": "basic",
+   "topic": "Stop loss and take profit",
+   "question": "What is the risk to reward ratio?",
+   "options": [
+    "The potential loss compared with the potential profit",
+    "The spread compared with the lot size",
+    "Wins compared with losses",
+    "Balance compared with equity"
+   ],
+   "answer_index": 0
+  },
+  {
+   "id": "B-040",
+   "level": "basic",
+   "topic": "Stop loss and take profit",
+   "question": "A trade risks 20 pips to make 60 pips. The risk to reward is",
+   "options": [
+    "1:3",
+    "1:1",
+    "1:6",
+    "3:1"
+   ],
+   "answer_index": 0
+  },
+  {
+   "id": "B-041",
+   "level": "basic",
+   "topic": "Leverage and margin",
+   "question": "What is leverage?",
+   "options": [
+    "Using borrowed funds from the broker to control a larger position",
+    "A type of chart",
+    "A free bonus from the broker",
+    "A guaranteed profit tool"
+   ],
+   "answer_index": 0
+  },
+  {
+   "id": "B-042",
+   "level": "basic",
+   "topic": "Leverage and margin",
+   "question": "With 1:100 leverage, $1,000 can control a position of up to",
+   "options": [
+    "$1,100",
+    "$1,000,000",
+    "$100,000",
+    "$10,000"
+   ],
+   "answer_index": 2
+  },
+  {
+   "id": "B-043",
+   "level": "basic",
+   "topic": "Leverage and margin",
+   "question": "What is margin?",
+   "options": [
+    "Your total profit",
+    "The spread",
+    "The amount of your money held to keep a trade open",
+    "The broker's profit"
+   ],
+   "answer_index": 2
+  },
+  {
+   "id": "B-044",
+   "level": "basic",
+   "topic": "Leverage and margin",
+   "question": "What is free margin?",
+   "options": [
+    "The spread refunded",
+    "Profit already withdrawn",
+    "Equity not used as margin, available for new trades",
+    "Money the broker gives free"
+   ],
+   "answer_index": 2
+  },
+  {
+   "id": "B-045",
+   "level": "basic",
+   "topic": "Leverage and margin",
+   "question": "What is a margin call?",
+   "options": [
+    "A warning that your equity is too low to support open trades",
+    "A bonus offer",
+    "A new trade opening",
+    "A call to join a signal group"
+   ],
+   "answer_index": 0
+  },
+  {
+   "id": "B-046",
+   "level": "basic",
+   "topic": "Leverage and margin",
+   "question": "What is a stop out?",
+   "options": [
+    "A pending order cancelled",
+    "The trader closes all trades by choice",
+    "A stop loss moved",
+    "The broker automatically closes trades when equity falls too low"
+   ],
+   "answer_index": 3
+  },
+  {
+   "id": "B-047",
+   "level": "basic",
+   "topic": "Leverage and margin",
+   "question": "High leverage mainly",
+   "options": [
+    "Magnifies both profits and losses",
+    "Reduces risk",
+    "Guarantees profit",
+    "Removes the spread"
+   ],
+   "answer_index": 0
+  },
+  {
+   "id": "B-048",
+   "level": "basic",
+   "topic": "Leverage and margin",
+   "question": "Equity is",
+   "options": [
+    "Only deposits",
+    "Balance plus or minus floating profit and loss",
+    "The broker's money",
+    "The same as free margin"
+   ],
+   "answer_index": 1
+  },
+  {
+   "id": "B-049",
+   "level": "basic",
+   "topic": "Leverage and margin",
+   "question": "Balance is",
+   "options": [
+    "Your account money without open trade profit or loss",
+    "Balance plus floating profit",
+    "Margin used",
+    "Free margin"
+   ],
+   "answer_index": 0
+  },
+  {
+   "id": "B-050",
+   "level": "basic",
+   "topic": "Leverage and margin",
+   "question": "Which beginner approach to leverage is safest?",
+   "options": [
+    "Use modest position sizes and do not use maximum leverage",
+    "Ignore margin",
+    "Always use maximum leverage",
+    "Open as many trades as possible"
+   ],
+   "answer_index": 0
+  },
+  {
+   "id": "B-051",
+   "level": "basic",
+   "topic": "Risk management",
+   "question": "A commonly taught risk per trade for beginners is",
+   "options": [
+    "The whole account",
+    "50% of the account",
+    "25% of the account",
+    "1% to 2% of the account"
+   ],
+   "answer_index": 3
+  },
+  {
+   "id": "B-052",
+   "level": "basic",
+   "topic": "Risk management",
+   "question": "On a $1,000 account, risking 1% means risking",
+   "options": [
+    "$100",
+    "$1",
+    "$50",
+    "$10"
+   ],
+   "answer_index": 3
+  },
+  {
+   "id": "B-053",
+   "level": "basic",
+   "topic": "Risk management",
+   "question": "What is the best way to protect an account?",
+   "options": [
+    "Trade without a stop loss",
+    "Use a stop loss and a controlled lot size on every trade",
+    "Use maximum leverage",
+    "Trade bigger after a loss"
+   ],
+   "answer_index": 1
+  },
+  {
+   "id": "B-054",
+   "level": "basic",
+   "topic": "Risk management",
+   "question": "What is revenge trading?",
+   "options": [
+    "Trading on Sundays",
+    "Copying a signal",
+    "Trading only news",
+    "Trading emotionally to win back a loss quickly"
+   ],
+   "answer_index": 3
+  },
+  {
+   "id": "B-055",
+   "level": "basic",
+   "topic": "Risk management",
+   "question": "After several losses in a row, a disciplined trader should",
+   "options": [
+    "Double the lot size",
+    "Remove the stop loss",
+    "Switch to a random pair",
+    "Stop, review and trade only when the plan is met"
+   ],
+   "answer_index": 3
+  },
+  {
+   "id": "B-056",
+   "level": "basic",
+   "topic": "Risk management",
+   "question": "What does over-trading mean?",
+   "options": [
+    "Using a demo account",
+    "Trading only one pair",
+    "Holding one trade for a week",
+    "Taking too many trades or too large positions"
+   ],
+   "answer_index": 3
+  },
+  {
+   "id": "B-057",
+   "level": "basic",
+   "topic": "Risk management",
+   "question": "Why is a trading plan important?",
+   "options": [
+    "It replaces a stop loss",
+    "It guarantees profit",
+    "It removes the spread",
+    "It gives clear rules for entries, exits and risk"
+   ],
+   "answer_index": 3
+  },
+  {
+   "id": "B-058",
+   "level": "basic",
+   "topic": "Risk management",
+   "question": "What is drawdown?",
+   "options": [
+    "The fall in account value from a peak",
+    "A type of order",
+    "The spread",
+    "Profit made in a day"
+   ],
+   "answer_index": 0
+  },
+  {
+   "id": "B-059",
+   "level": "basic",
+   "topic": "Risk management",
+   "question": "Which is a sign of poor risk management?",
+   "options": [
+    "Risking a large part of the account on one trade",
+    "Using a stop loss",
+    "Trading a small lot",
+    "Keeping a trading journal"
+   ],
+   "answer_index": 0
+  },
+  {
+   "id": "B-060",
+   "level": "basic",
+   "topic": "Risk management",
+   "question": "Why keep a trading journal?",
+   "options": [
+    "To avoid taxes",
+    "To remove the spread",
+    "To review results and improve",
+    "To get a bonus"
+   ],
+   "answer_index": 2
+  },
+  {
+   "id": "B-061",
+   "level": "basic",
+   "topic": "Charts and candlesticks",
+   "question": "What does one candlestick show?",
+   "options": [
+    "Open, high, low and close for a period",
+    "Only the volume",
+    "Only the closing price",
+    "Only the spread"
+   ],
+   "answer_index": 0
+  },
+  {
+   "id": "B-062",
+   "level": "basic",
+   "topic": "Charts and candlesticks",
+   "question": "A bullish candle closes",
+   "options": [
+    "At the low",
+    "Higher than it opened",
+    "Lower than it opened",
+    "With no body"
+   ],
+   "answer_index": 1
+  },
+  {
+   "id": "B-063",
+   "level": "basic",
+   "topic": "Charts and candlesticks",
+   "question": "A bearish candle closes",
+   "options": [
+    "At the high",
+    "With no wick",
+    "Lower than it opened",
+    "Higher than it opened"
+   ],
+   "answer_index": 2
+  },
+  {
+   "id": "B-064",
+   "level": "basic",
+   "topic": "Charts and candlesticks",
+   "question": "The thin lines above and below a candle body are called",
+   "options": [
+    "Gaps",
+    "Wicks or shadows",
+    "Spreads",
+    "Pips"
+   ],
+   "answer_index": 1
+  },
+  {
+   "id": "B-065",
+   "level": "basic",
+   "topic": "Charts and candlesticks",
+   "question": "A timeframe of H1 means each candle is",
+   "options": [
+    "One week",
+    "One day",
+    "One minute",
+    "One hour"
+   ],
+   "answer_index": 3
+  },
+  {
+   "id": "B-066",
+   "level": "basic",
+   "topic": "Charts and candlesticks",
+   "question": "Which timeframe candle is formed each day?",
+   "options": [
+    "W1",
+    "D1",
+    "H4",
+    "M5"
+   ],
+   "answer_index": 1
+  },
+  {
+   "id": "B-067",
+   "level": "basic",
+   "topic": "Charts and candlesticks",
+   "question": "Which chart type shows only a line connecting closing prices?",
+   "options": [
+    "Candlestick chart",
+    "Line chart",
+    "Heikin Ashi only",
+    "Bar chart"
+   ],
+   "answer_index": 1
+  },
+  {
+   "id": "B-068",
+   "level": "basic",
+   "topic": "Charts and candlesticks",
+   "question": "A doji candle shows",
+   "options": [
+    "Indecision, open and close nearly equal",
+    "Strong buying",
+    "A broker error",
+    "Strong selling"
+   ],
+   "answer_index": 0
+  },
+  {
+   "id": "B-069",
+   "level": "basic",
+   "topic": "Charts and candlesticks",
+   "question": "A candle with a long lower wick often shows",
+   "options": [
+    "No trading happened",
+    "Buyers pushed price up from the low",
+    "A spread increase",
+    "Sellers took full control"
+   ],
+   "answer_index": 1
+  },
+  {
+   "id": "B-070",
+   "level": "basic",
+   "topic": "Charts and candlesticks",
+   "question": "Why do many traders check a higher timeframe before entering?",
+   "options": [
+    "To lower the spread",
+    "To see the bigger trend direction",
+    "To skip analysis",
+    "To avoid stop losses"
+   ],
+   "answer_index": 1
+  },
+  {
+   "id": "B-071",
+   "level": "basic",
+   "topic": "Trends, support and resistance",
+   "question": "An uptrend is made of",
+   "options": [
+    "Equal highs and lows only",
+    "Gaps only",
+    "Higher highs and higher lows",
+    "Lower highs and lower lows"
+   ],
+   "answer_index": 2
+  },
+  {
+   "id": "B-072",
+   "level": "basic",
+   "topic": "Trends, support and resistance",
+   "question": "A downtrend is made of",
+   "options": [
+    "Equal highs and lows only",
+    "Gaps only",
+    "Lower highs and lower lows",
+    "Higher highs and higher lows"
+   ],
+   "answer_index": 2
+  },
+  {
+   "id": "B-073",
+   "level": "basic",
+   "topic": "Trends, support and resistance",
+   "question": "A sideways market is also called",
+   "options": [
+    "A gap",
+    "A range",
+    "A margin call",
+    "A spike"
+   ],
+   "answer_index": 1
+  },
+  {
+   "id": "B-074",
+   "level": "basic",
+   "topic": "Trends, support and resistance",
+   "question": "What is support?",
+   "options": [
+    "A type of order",
+    "The broker's help desk",
+    "A price area where selling stops a rise",
+    "A price area where buying often stops a fall"
+   ],
+   "answer_index": 3
+  },
+  {
+   "id": "B-075",
+   "level": "basic",
+   "topic": "Trends, support and resistance",
+   "question": "What is resistance?",
+   "options": [
+    "A type of lot",
+    "A price area where buying stops a fall",
+    "A price area where selling often stops a rise",
+    "The spread"
+   ],
+   "answer_index": 2
+  },
+  {
+   "id": "B-076",
+   "level": "basic",
+   "topic": "Trends, support and resistance",
+   "question": "When support breaks, it often becomes",
+   "options": [
+    "Resistance",
+    "Stronger support",
+    "A pip",
+    "A trend line"
+   ],
+   "answer_index": 0
+  },
+  {
+   "id": "B-077",
+   "level": "basic",
+   "topic": "Trends, support and resistance",
+   "question": "When resistance breaks, it often becomes",
+   "options": [
+    "Stronger resistance",
+    "A lot",
+    "Support",
+    "A spread"
+   ],
+   "answer_index": 2
+  },
+  {
+   "id": "B-078",
+   "level": "basic",
+   "topic": "Trends, support and resistance",
+   "question": "What is a breakout?",
+   "options": [
+    "A stop loss moved",
+    "A broker closing your account",
+    "A new broker",
+    "Price moving beyond a support or resistance level"
+   ],
+   "answer_index": 3
+  },
+  {
+   "id": "B-079",
+   "level": "basic",
+   "topic": "Trends, support and resistance",
+   "question": "What is a false breakout?",
+   "options": [
+    "A broker error",
+    "Price breaks a level but quickly returns back inside",
+    "A gap on Monday",
+    "A confirmed breakout"
+   ],
+   "answer_index": 1
+  },
+  {
+   "id": "B-080",
+   "level": "basic",
+   "topic": "Trends, support and resistance",
+   "question": "The more times a level is tested",
+   "options": [
+    "The stronger it always becomes",
+    "The more traders watch it, but it may eventually break",
+    "The weaker it never becomes",
+    "The less important it is"
+   ],
+   "answer_index": 1
+  },
+  {
+   "id": "B-081",
+   "level": "basic",
+   "topic": "Indicators",
+   "question": "A moving average",
+   "options": [
+    "Smooths price to show the trend direction",
+    "Predicts the exact future price",
+    "Sets your stop loss",
+    "Shows the broker spread"
+   ],
+   "answer_index": 0
+  },
+  {
+   "id": "B-082",
+   "level": "basic",
+   "topic": "Indicators",
+   "question": "A price above a rising moving average usually suggests",
+   "options": [
+    "A downtrend",
+    "A margin call",
+    "No market",
+    "An uptrend"
+   ],
+   "answer_index": 3
+  },
+  {
+   "id": "B-083",
+   "level": "basic",
+   "topic": "Indicators",
+   "question": "What does RSI measure?",
+   "options": [
+    "The spread",
+    "The strength and speed of price moves",
+    "The lot size",
+    "The broker's liquidity"
+   ],
+   "answer_index": 1
+  },
+  {
+   "id": "B-084",
+   "level": "basic",
+   "topic": "Indicators",
+   "question": "An RSI above 70 is commonly seen as",
+   "options": [
+    "Neutral only",
+    "Oversold",
+    "Overbought",
+    "A buy guarantee"
+   ],
+   "answer_index": 2
+  },
+  {
+   "id": "B-085",
+   "level": "basic",
+   "topic": "Indicators",
+   "question": "An RSI below 30 is commonly seen as",
+   "options": [
+    "Neutral only",
+    "Overbought",
+    "Oversold",
+    "A sell guarantee"
+   ],
+   "answer_index": 2
+  },
+  {
+   "id": "B-086",
+   "level": "basic",
+   "topic": "Indicators",
+   "question": "MACD is mainly used to",
+   "options": [
+    "Measure the spread",
+    "Show momentum and trend changes",
+    "Calculate lot size",
+    "Place orders"
+   ],
+   "answer_index": 1
+  },
+  {
+   "id": "B-087",
+   "level": "basic",
+   "topic": "Indicators",
+   "question": "Are indicators perfect?",
+   "options": [
+    "Only paid ones are accurate",
+    "Yes, on higher timeframes only",
+    "No, they can give false signals",
+    "Yes, they never fail"
+   ],
+   "answer_index": 2
+  },
+  {
+   "id": "B-088",
+   "level": "basic",
+   "topic": "Indicators",
+   "question": "Using too many indicators at once often",
+   "options": [
+    "Removes risk",
+    "Guarantees profit",
+    "Replaces a stop loss",
+    "Creates confusion and conflicting signals"
+   ],
+   "answer_index": 3
+  },
+  {
+   "id": "B-089",
+   "level": "basic",
+   "topic": "Indicators",
+   "question": "Do indicators lead or lag price?",
+   "options": [
+    "Most lag price, since they use past data",
+    "They set the price",
+    "They predict news",
+    "They always lead price"
+   ],
+   "answer_index": 0
+  },
+  {
+   "id": "B-090",
+   "level": "basic",
+   "topic": "Indicators",
+   "question": "A bullish crossover happens when",
+   "options": [
+    "A slower average crosses below a faster one",
+    "RSI reaches 50 only",
+    "A faster moving average crosses above a slower one",
+    "Price touches the spread"
+   ],
+   "answer_index": 2
+  },
+  {
+   "id": "B-091",
+   "level": "basic",
+   "topic": "Fundamentals and news",
+   "question": "Which event can cause large, fast price moves?",
+   "options": [
+    "A change in your lot size",
+    "A change in chart colour",
+    "A broker's holiday message",
+    "Interest rate decisions"
+   ],
+   "answer_index": 3
+  },
+  {
+   "id": "B-092",
+   "level": "basic",
+   "topic": "Fundamentals and news",
+   "question": "NFP stands for",
+   "options": [
+    "Net Funds Position",
+    "Non-Farm Payrolls",
+    "National Fixed Pay",
+    "New Forex Prices"
+   ],
+   "answer_index": 1
+  },
+  {
+   "id": "B-093",
+   "level": "basic",
+   "topic": "Fundamentals and news",
+   "question": "Higher interest rates in a country tend to",
+   "options": [
+    "Have no effect",
+    "Remove the spread",
+    "Strengthen its currency over time",
+    "Weaken its currency always"
+   ],
+   "answer_index": 2
+  },
+  {
+   "id": "B-094",
+   "level": "basic",
+   "topic": "Fundamentals and news",
+   "question": "Inflation data matters because it",
+   "options": [
+    "Controls the spread",
+    "Influences central bank decisions on rates",
+    "Cancels stop losses",
+    "Sets your lot size"
+   ],
+   "answer_index": 1
+  },
+  {
+   "id": "B-095",
+   "level": "basic",
+   "topic": "Fundamentals and news",
+   "question": "What is a central bank?",
+   "options": [
+    "The institution that manages a country's money and interest rates",
+    "A type of chart",
+    "A broker",
+    "A trading platform"
+   ],
+   "answer_index": 0
+  },
+  {
+   "id": "B-096",
+   "level": "basic",
+   "topic": "Fundamentals and news",
+   "question": "Which is a major central bank?",
+   "options": [
+    "Exness",
+    "MetaTrader",
+    "The US Federal Reserve",
+    "Deriv"
+   ],
+   "answer_index": 2
+  },
+  {
+   "id": "B-097",
+   "level": "basic",
+   "topic": "Fundamentals and news",
+   "question": "A smart approach during major news is to",
+   "options": [
+    "Reduce risk or stay out until volatility settles",
+    "Use maximum leverage",
+    "Remove your stop loss",
+    "Trade the biggest lot"
+   ],
+   "answer_index": 0
+  },
+  {
+   "id": "B-098",
+   "level": "basic",
+   "topic": "Fundamentals and news",
+   "question": "What is an economic calendar?",
+   "options": [
+    "A type of order",
+    "A schedule of upcoming news events and data releases",
+    "A trade history",
+    "A list of broker fees"
+   ],
+   "answer_index": 1
+  },
+  {
+   "id": "B-099",
+   "level": "basic",
+   "topic": "Fundamentals and news",
+   "question": "Why does the spread often widen around news?",
+   "options": [
+    "Charts change colour",
+    "Lots get larger",
+    "Brokers take holidays",
+    "Liquidity drops and volatility rises"
+   ],
+   "answer_index": 3
+  },
+  {
+   "id": "B-100",
+   "level": "basic",
+   "topic": "Fundamentals and news",
+   "question": "What is volatility?",
+   "options": [
+    "The broker's commission",
+    "The lot size",
+    "The account balance",
+    "How much and how fast price moves"
+   ],
+   "answer_index": 3
+  },
+  {
+   "id": "B-101",
+   "level": "basic",
+   "topic": "Sessions and market timing",
+   "question": "Which sessions are the main forex trading sessions?",
+   "options": [
+    "Lagos and Cairo only",
+    "Sydney, Tokyo, London and New York",
+    "Only the New York session",
+    "Paris, Rome, Madrid and Berlin only"
+   ],
+   "answer_index": 1
+  },
+  {
+   "id": "B-102",
+   "level": "basic",
+   "topic": "Sessions and market timing",
+   "question": "Which session often has the highest volume?",
+   "options": [
+    "Tokyo lunch only",
+    "Weekend only",
+    "Sydney only",
+    "London and the London-New York overlap"
+   ],
+   "answer_index": 3
+  },
+  {
+   "id": "B-103",
+   "level": "basic",
+   "topic": "Sessions and market timing",
+   "question": "Why is the London-New York overlap popular?",
+   "options": [
+    "Spreads are always zero",
+    "Brokers pay bonuses",
+    "Markets are closed",
+    "High liquidity and strong movement"
+   ],
+   "answer_index": 3
+  },
+  {
+   "id": "B-104",
+   "level": "basic",
+   "topic": "Sessions and market timing",
+   "question": "Which pair is usually most active during the Tokyo session?",
+   "options": [
+    "EUR/MXN",
+    "USD/ZAR",
+    "USD/JPY",
+    "GBP/CAD"
+   ],
+   "answer_index": 2
+  },
+  {
+   "id": "B-105",
+   "level": "basic",
+   "topic": "Sessions and market timing",
+   "question": "Low liquidity usually leads to",
+   "options": [
+    "Narrow spreads always",
+    "Zero risk",
+    "Guaranteed trends",
+    "Wider spreads and unpredictable moves"
+   ],
+   "answer_index": 3
+  },
+  {
+   "id": "B-106",
+   "level": "basic",
+   "topic": "Sessions and market timing",
+   "question": "The best time to trade depends on",
+   "options": [
+    "The broker's name",
+    "The colour of the chart",
+    "Your lot size only",
+    "The pair you trade and its active sessions"
+   ],
+   "answer_index": 3
+  },
+  {
+   "id": "B-107",
+   "level": "basic",
+   "topic": "Sessions and market timing",
+   "question": "Should you trade at all times of day?",
+   "options": [
+    "Yes, every hour",
+    "No, quality setups matter more than constant trading",
+    "Yes, only on weekends",
+    "Yes, only at night"
+   ],
+   "answer_index": 1
+  },
+  {
+   "id": "B-108",
+   "level": "basic",
+   "topic": "Sessions and market timing",
+   "question": "What is a gap?",
+   "options": [
+    "A jump in price between one candle close and the next open",
+    "A stop loss level",
+    "A pause in the broker platform",
+    "A type of lot"
+   ],
+   "answer_index": 0
+  },
+  {
+   "id": "B-109",
+   "level": "basic",
+   "topic": "Sessions and market timing",
+   "question": "Why do gaps often appear on Monday?",
+   "options": [
+    "News during the weekend while markets were closed",
+    "Indicators reset",
+    "Spread settings change",
+    "The broker adds them"
+   ],
+   "answer_index": 0
+  },
+  {
+   "id": "B-110",
+   "level": "basic",
+   "topic": "Sessions and market timing",
+   "question": "What is slippage?",
+   "options": [
+    "A fee for withdrawals",
+    "Getting filled at a different price than requested",
+    "An indicator",
+    "A type of chart"
+   ],
+   "answer_index": 1
+  },
+  {
+   "id": "B-111",
+   "level": "basic",
+   "topic": "Brokers and platforms",
+   "question": "What does a forex broker do?",
+   "options": [
+    "Sets the price of currencies",
+    "Guarantees your profit",
+    "Gives you access to the market to place trades",
+    "Decides your strategy"
+   ],
+   "answer_index": 2
+  },
+  {
+   "id": "B-112",
+   "level": "basic",
+   "topic": "Brokers and platforms",
+   "question": "What is a demo account?",
+   "options": [
+    "A signal service",
+    "A practice account with virtual money",
+    "A real account with a bonus",
+    "A savings account"
+   ],
+   "answer_index": 1
+  },
+  {
+   "id": "B-113",
+   "level": "basic",
+   "topic": "Brokers and platforms",
+   "question": "Why should beginners start on a demo account?",
+   "options": [
+    "To avoid learning",
+    "To practise without risking real money",
+    "To skip a trading plan",
+    "To earn real profit"
+   ],
+   "answer_index": 1
+  },
+  {
+   "id": "B-114",
+   "level": "basic",
+   "topic": "Brokers and platforms",
+   "question": "MetaTrader 5 is",
+   "options": [
+    "A trading platform",
+    "A central bank",
+    "A currency",
+    "A broker"
+   ],
+   "answer_index": 0
+  },
+  {
+   "id": "B-115",
+   "level": "basic",
+   "topic": "Brokers and platforms",
+   "question": "What is an Expert Advisor (EA)?",
+   "options": [
+    "A news calendar",
+    "A human mentor",
+    "A broker employee",
+    "An automated trading program on MetaTrader"
+   ],
+   "answer_index": 3
+  },
+  {
+   "id": "B-116",
+   "level": "basic",
+   "topic": "Brokers and platforms",
+   "question": "Which is a sign of a safer broker?",
+   "options": [
+    "It asks for your password",
+    "It is properly regulated",
+    "It hides its fees",
+    "It promises guaranteed profits"
+   ],
+   "answer_index": 1
+  },
+  {
+   "id": "B-117",
+   "level": "basic",
+   "topic": "Brokers and platforms",
+   "question": "Can anyone guarantee profit in forex?",
+   "options": [
+    "Yes, good signals can",
+    "Yes, a robot can",
+    "No, all trading carries risk",
+    "Yes, with high leverage"
+   ],
+   "answer_index": 2
+  },
+  {
+   "id": "B-118",
+   "level": "basic",
+   "topic": "Brokers and platforms",
+   "question": "What is a withdrawal?",
+   "options": [
+    "Closing a chart",
+    "Moving money from your trading account out to you",
+    "Opening a trade",
+    "Adding a deposit"
+   ],
+   "answer_index": 1
+  },
+  {
+   "id": "B-119",
+   "level": "basic",
+   "topic": "Brokers and platforms",
+   "question": "What is a deposit?",
+   "options": [
+    "Closing a trade",
+    "Changing leverage",
+    "Adding money into your trading account",
+    "Taking profit out"
+   ],
+   "answer_index": 2
+  },
+  {
+   "id": "B-120",
+   "level": "basic",
+   "topic": "Brokers and platforms",
+   "question": "You should never share which detail with anyone?",
+   "options": [
+    "Your account password",
+    "Your favourite pair",
+    "Your account country",
+    "Your broker's name"
+   ],
+   "answer_index": 0
+  },
+  {
+   "id": "B-121",
+   "level": "basic",
+   "topic": "Trading psychology and signals",
+   "question": "Which emotion most often damages traders?",
+   "options": [
+    "Fear and greed",
+    "Discipline",
+    "Planning",
+    "Patience"
+   ],
+   "answer_index": 0
+  },
+  {
+   "id": "B-122",
+   "level": "basic",
+   "topic": "Trading psychology and signals",
+   "question": "Discipline in trading means",
+   "options": [
+    "Chasing every move",
+    "Trading every day",
+    "Ignoring your stop loss",
+    "Following your rules even when you feel tempted not to"
+   ],
+   "answer_index": 3
+  },
+  {
+   "id": "B-123",
+   "level": "basic",
+   "topic": "Trading psychology and signals",
+   "question": "FOMO in trading means",
+   "options": [
+    "A broker bonus",
+    "A chart pattern",
+    "A type of order",
+    "Fear of missing out, entering trades late and emotionally"
+   ],
+   "answer_index": 3
+  },
+  {
+   "id": "B-124",
+   "level": "basic",
+   "topic": "Trading psychology and signals",
+   "question": "What is a good approach to losses?",
+   "options": [
+    "Hide them from yourself",
+    "Accept them as part of trading and manage risk",
+    "Double up to recover",
+    "Stop using a stop loss"
+   ],
+   "answer_index": 1
+  },
+  {
+   "id": "B-125",
+   "level": "basic",
+   "topic": "Trading psychology and signals",
+   "question": "When using trading signals you should still",
+   "options": [
+    "Control your own risk and lot size",
+    "Ignore the stop loss",
+    "Use the maximum lot",
+    "Trade every signal at any size"
+   ],
+   "answer_index": 0
+  },
+  {
+   "id": "B-126",
+   "level": "basic",
+   "topic": "Trading psychology and signals",
+   "question": "A signal usually includes",
+   "options": [
+    "Only the pair",
+    "Only the profit",
+    "Only the broker name",
+    "Pair, direction, entry, stop loss and take profit"
+   ],
+   "answer_index": 3
+  },
+  {
+   "id": "B-127",
+   "level": "basic",
+   "topic": "Trading psychology and signals",
+   "question": "What does copy trading do?",
+   "options": [
+    "Removes all risk",
+    "Guarantees the same profit",
+    "Skips the broker",
+    "Copies another trader's or system's trades onto your account"
+   ],
+   "answer_index": 3
+  },
+  {
+   "id": "B-128",
+   "level": "basic",
+   "topic": "Trading psychology and signals",
+   "question": "Past performance of a signal provider",
+   "options": [
+    "Guarantees future results",
+    "Is illegal to share",
+    "Does not guarantee future results",
+    "Is always wrong"
+   ],
+   "answer_index": 2
+  },
+  {
+   "id": "B-129",
+   "level": "basic",
+   "topic": "Trading psychology and signals",
+   "question": "Which is a healthy trading mindset?",
+   "options": [
+    "Trade larger when angry",
+    "Get rich fast",
+    "Focus on consistency and process, not one big win",
+    "Never take a loss"
+   ],
+   "answer_index": 2
+  },
+  {
+   "id": "B-130",
+   "level": "basic",
+   "topic": "Trading psychology and signals",
+   "question": "After a winning streak, a trader should",
+   "options": [
+    "Skip the plan",
+    "Stay with the same risk rules",
+    "Raise risk sharply",
+    "Remove stop losses"
+   ],
+   "answer_index": 1
+  },
+  {
+   "id": "A-001",
+   "level": "advanced",
+   "topic": "Market structure",
+   "question": "What is a break of structure (BOS)?",
+   "options": [
+    "Price closes beyond a previous swing high or low, confirming trend continuation",
+    "Price touches a moving average",
+    "The spread widens",
+    "A new candle opens with a gap"
+   ],
+   "answer_index": 0
+  },
+  {
+   "id": "A-002",
+   "level": "advanced",
+   "topic": "Market structure",
+   "question": "What is a change of character (CHoCH)?",
+   "options": [
+    "A news spike",
+    "A broker platform error",
+    "Any large candle",
+    "The first break against the prevailing trend structure, hinting at a possible reversal"
+   ],
+   "answer_index": 3
+  },
+  {
+   "id": "A-003",
+   "level": "advanced",
+   "topic": "Market structure",
+   "question": "In an uptrend, a valid pullback usually ends",
+   "options": [
+    "At the all-time high",
+    "Above the previous higher low",
+    "At a random price",
+    "Below the previous higher low"
+   ],
+   "answer_index": 1
+  },
+  {
+   "id": "A-004",
+   "level": "advanced",
+   "topic": "Market structure",
+   "question": "A swing high is",
+   "options": [
+    "Any candle high",
+    "A candle with a long body",
+    "A high with lower highs on both sides",
+    "The highest price of the year"
+   ],
+   "answer_index": 2
+  },
+  {
+   "id": "A-005",
+   "level": "advanced",
+   "topic": "Market structure",
+   "question": "Trading with the higher timeframe trend generally",
+   "options": [
+    "Removes the need for a stop loss",
+    "Is only useful for scalping",
+    "Improves the odds because you trade with the dominant flow",
+    "Guarantees profit"
+   ],
+   "answer_index": 2
+  },
+  {
+   "id": "A-006",
+   "level": "advanced",
+   "topic": "Market structure",
+   "question": "What is a range-bound market?",
+   "options": [
+    "Price has no volume",
+    "The market is closed",
+    "Price moves only up",
+    "Price moves between a defined high and low without a clear trend"
+   ],
+   "answer_index": 3
+  },
+  {
+   "id": "A-007",
+   "level": "advanced",
+   "topic": "Market structure",
+   "question": "A lower high followed by a break of the last low signals",
+   "options": [
+    "A news event",
+    "A confirmed bullish trend",
+    "Possible bearish structure shift",
+    "A broker issue"
+   ],
+   "answer_index": 2
+  },
+  {
+   "id": "A-008",
+   "level": "advanced",
+   "topic": "Market structure",
+   "question": "What does 'internal structure' mean?",
+   "options": [
+    "The spread inside a candle",
+    "Smaller swings inside a larger swing or trend leg",
+    "The broker's server data",
+    "Indicator values"
+   ],
+   "answer_index": 1
+  },
+  {
+   "id": "A-009",
+   "level": "advanced",
+   "topic": "Market structure",
+   "question": "An impulsive move is typically",
+   "options": [
+    "Slow and overlapping",
+    "Always a reversal",
+    "Made only of dojis",
+    "Strong, directional and made of large candles with small pullbacks"
+   ],
+   "answer_index": 3
+  },
+  {
+   "id": "A-010",
+   "level": "advanced",
+   "topic": "Market structure",
+   "question": "A corrective move is typically",
+   "options": [
+    "Always larger than the impulse",
+    "Faster than the impulse",
+    "Without any candles",
+    "Overlapping and slower than the impulse that came before it"
+   ],
+   "answer_index": 3
+  },
+  {
+   "id": "A-011",
+   "level": "advanced",
+   "topic": "Liquidity and smart money concepts",
+   "question": "What is liquidity in price action terms?",
+   "options": [
+    "The broker's cash reserves",
+    "The spread size",
+    "The leverage level",
+    "Clusters of resting orders, such as stop losses above highs and below lows"
+   ],
+   "answer_index": 3
+  },
+  {
+   "id": "A-012",
+   "level": "advanced",
+   "topic": "Liquidity and smart money concepts",
+   "question": "Equal highs on a chart are often seen as",
+   "options": [
+    "A pool of buy stops that price may target",
+    "A guaranteed reversal point",
+    "A broker signal",
+    "A news level"
+   ],
+   "answer_index": 0
+  },
+  {
+   "id": "A-013",
+   "level": "advanced",
+   "topic": "Liquidity and smart money concepts",
+   "question": "What is a liquidity sweep?",
+   "options": [
+    "Price briefly runs past a high or low to trigger stops, then reverses",
+    "A news release",
+    "A change of lot size",
+    "A broker closing trades"
+   ],
+   "answer_index": 0
+  },
+  {
+   "id": "A-014",
+   "level": "advanced",
+   "topic": "Liquidity and smart money concepts",
+   "question": "What is an order block?",
+   "options": [
+    "The last opposite candle before a strong move, seen as an area of institutional orders",
+    "A blocked order on MT5",
+    "A candle with a long wick only",
+    "The broker's order book"
+   ],
+   "answer_index": 0
+  },
+  {
+   "id": "A-015",
+   "level": "advanced",
+   "topic": "Liquidity and smart money concepts",
+   "question": "A bullish order block is commonly marked as",
+   "options": [
+    "Any doji",
+    "The first candle of the week",
+    "The last bullish candle before a fall",
+    "The last bearish candle before a strong upward move"
+   ],
+   "answer_index": 3
+  },
+  {
+   "id": "A-016",
+   "level": "advanced",
+   "topic": "Liquidity and smart money concepts",
+   "question": "What is a fair value gap (FVG)?",
+   "options": [
+    "A gap on Monday only",
+    "The spread at news",
+    "A gap between two brokers",
+    "A three-candle imbalance where the first and third candle wicks do not overlap"
+   ],
+   "answer_index": 3
+  },
+  {
+   "id": "A-017",
+   "level": "advanced",
+   "topic": "Liquidity and smart money concepts",
+   "question": "Price often returns to an imbalance because",
+   "options": [
+    "Indicators demand it",
+    "Brokers force it back",
+    "Orders were left unfilled in the fast move",
+    "It is a rule of MT5"
+   ],
+   "answer_index": 2
+  },
+  {
+   "id": "A-018",
+   "level": "advanced",
+   "topic": "Liquidity and smart money concepts",
+   "question": "What is premium and discount in a range?",
+   "options": [
+    "Expensive and cheap brokers",
+    "Prices set by brokers",
+    "Weekend pricing",
+    "Above 50% of the range is premium, below 50% is discount"
+   ],
+   "answer_index": 3
+  },
+  {
+   "id": "A-019",
+   "level": "advanced",
+   "topic": "Liquidity and smart money concepts",
+   "question": "Buying in a discount zone within an uptrend aims to",
+   "options": [
+    "Enter at a better price relative to the range",
+    "Pay a higher spread",
+    "Avoid a stop loss",
+    "Trade against the trend"
+   ],
+   "answer_index": 0
+  },
+  {
+   "id": "A-020",
+   "level": "advanced",
+   "topic": "Liquidity and smart money concepts",
+   "question": "Why do many traders wait for a sweep plus a structure shift before entering?",
+   "options": [
+    "It removes all risk",
+    "It adds confirmation that the move may have been a liquidity grab",
+    "It increases the lot size",
+    "Brokers require it"
+   ],
+   "answer_index": 1
+  },
+  {
+   "id": "A-021",
+   "level": "advanced",
+   "topic": "Fibonacci and retracements",
+   "question": "Which retracement levels are most commonly used?",
+   "options": [
+    "90%, 95% and 99%",
+    "38.2%, 50% and 61.8%",
+    "5%, 15% and 25%",
+    "10%, 20% and 30%"
+   ],
+   "answer_index": 1
+  },
+  {
+   "id": "A-022",
+   "level": "advanced",
+   "topic": "Fibonacci and retracements",
+   "question": "What is the 'golden zone' often cited by traders?",
+   "options": [
+    "The area between 61.8% and 78.6% retracement",
+    "100% to 161.8%",
+    "The 50% line only",
+    "0% to 23.6%"
+   ],
+   "answer_index": 0
+  },
+  {
+   "id": "A-023",
+   "level": "advanced",
+   "topic": "Fibonacci and retracements",
+   "question": "Fibonacci extensions such as 127.2% and 161.8% are used to",
+   "options": [
+    "Set the spread",
+    "Choose a broker",
+    "Find the lot size",
+    "Estimate possible take profit targets"
+   ],
+   "answer_index": 3
+  },
+  {
+   "id": "A-024",
+   "level": "advanced",
+   "topic": "Fibonacci and retracements",
+   "question": "To draw a Fibonacci retracement on an uptrend, you draw from",
+   "options": [
+    "The weekly open to the monthly open",
+    "The swing high to the swing low",
+    "Open to close of one candle",
+    "The swing low to the swing high"
+   ],
+   "answer_index": 3
+  },
+  {
+   "id": "A-025",
+   "level": "advanced",
+   "topic": "Fibonacci and retracements",
+   "question": "A retracement that goes beyond 100% of the previous move usually",
+   "options": [
+    "Confirms the trend",
+    "Means price is at a discount",
+    "Invalidates the original structure idea",
+    "Is a news signal"
+   ],
+   "answer_index": 2
+  },
+  {
+   "id": "A-026",
+   "level": "advanced",
+   "topic": "Fibonacci and retracements",
+   "question": "Confluence in trading means",
+   "options": [
+    "A larger stop loss",
+    "Using more leverage",
+    "Trading more pairs",
+    "Several independent reasons aligning at the same area"
+   ],
+   "answer_index": 3
+  },
+  {
+   "id": "A-027",
+   "level": "advanced",
+   "topic": "Fibonacci and retracements",
+   "question": "Fibonacci levels work best when",
+   "options": [
+    "They are used alone with no context",
+    "They line up with structure, support or resistance",
+    "Used only on M1",
+    "Drawn on random candles"
+   ],
+   "answer_index": 1
+  },
+  {
+   "id": "A-028",
+   "level": "advanced",
+   "topic": "Fibonacci and retracements",
+   "question": "What is the 50% level of a range called?",
+   "options": [
+    "Margin",
+    "Spread",
+    "Equilibrium",
+    "Pivot only"
+   ],
+   "answer_index": 2
+  },
+  {
+   "id": "A-029",
+   "level": "advanced",
+   "topic": "Fibonacci and retracements",
+   "question": "A shallow retracement of about 23.6% in a strong trend suggests",
+   "options": [
+    "Reversal guaranteed",
+    "No liquidity",
+    "Strong momentum with little counter pressure",
+    "Weak trend"
+   ],
+   "answer_index": 2
+  },
+  {
+   "id": "A-030",
+   "level": "advanced",
+   "topic": "Fibonacci and retracements",
+   "question": "Fibonacci levels are",
+   "options": [
+    "Broker-set limits",
+    "Exact reversal points",
+    "Reference zones, not guaranteed turning points",
+    "Required by the exchange"
+   ],
+   "answer_index": 2
+  },
+  {
+   "id": "A-031",
+   "level": "advanced",
+   "topic": "Multi-timeframe analysis",
+   "question": "Top-down analysis means",
+   "options": [
+    "Start on a higher timeframe for direction, then refine entries on lower ones",
+    "Use only indicators",
+    "Start on M1 and never look higher",
+    "Trade only the weekly chart"
+   ],
+   "answer_index": 0
+  },
+  {
+   "id": "A-032",
+   "level": "advanced",
+   "topic": "Multi-timeframe analysis",
+   "question": "A common top-down combination for intraday trading is",
+   "options": [
+    "M1 for bias only",
+    "No timeframes",
+    "H4 for bias, H1 for structure, M15 for entry",
+    "W1 for entry only"
+   ],
+   "answer_index": 2
+  },
+  {
+   "id": "A-033",
+   "level": "advanced",
+   "topic": "Multi-timeframe analysis",
+   "question": "If H4 is bullish and M15 shows a bearish move, the M15 move is most likely",
+   "options": [
+    "A broker error",
+    "A pullback inside the larger trend",
+    "A news event always",
+    "The new major trend"
+   ],
+   "answer_index": 1
+  },
+  {
+   "id": "A-034",
+   "level": "advanced",
+   "topic": "Multi-timeframe analysis",
+   "question": "Why can lower timeframes give more false signals?",
+   "options": [
+    "They have no candles",
+    "They use different prices",
+    "Brokers manipulate them",
+    "More noise and random fluctuations"
+   ],
+   "answer_index": 3
+  },
+  {
+   "id": "A-035",
+   "level": "advanced",
+   "topic": "Multi-timeframe analysis",
+   "question": "Which timeframe typically carries more weight?",
+   "options": [
+    "The one with the most indicators",
+    "They are always equal",
+    "The lower timeframe",
+    "The higher timeframe"
+   ],
+   "answer_index": 3
+  },
+  {
+   "id": "A-036",
+   "level": "advanced",
+   "topic": "Multi-timeframe analysis",
+   "question": "When timeframes conflict, a prudent trader",
+   "options": [
+    "Trades randomly",
+    "Removes the stop loss",
+    "Waits for alignment or reduces risk",
+    "Doubles the lot"
+   ],
+   "answer_index": 2
+  },
+  {
+   "id": "A-037",
+   "level": "advanced",
+   "topic": "Multi-timeframe analysis",
+   "question": "A key level from the daily chart on an M15 chart is",
+   "options": [
+    "Only valid on weekends",
+    "Replaced by indicators",
+    "Invalid because the timeframe changed",
+    "Still valid and often respected"
+   ],
+   "answer_index": 3
+  },
+  {
+   "id": "A-038",
+   "level": "advanced",
+   "topic": "Multi-timeframe analysis",
+   "question": "Swing trading usually uses",
+   "options": [
+    "Tick charts only",
+    "H4 to Weekly timeframes",
+    "Only monthly candles",
+    "M1 and M5 only"
+   ],
+   "answer_index": 1
+  },
+  {
+   "id": "A-039",
+   "level": "advanced",
+   "topic": "Multi-timeframe analysis",
+   "question": "Scalping usually uses",
+   "options": [
+    "Monthly only",
+    "Weekly only",
+    "M1 to M15 timeframes",
+    "Yearly only"
+   ],
+   "answer_index": 2
+  },
+  {
+   "id": "A-040",
+   "level": "advanced",
+   "topic": "Multi-timeframe analysis",
+   "question": "Entering on a lower timeframe inside a higher timeframe zone helps to",
+   "options": [
+    "Remove the spread",
+    "Get a tighter stop loss and a better risk to reward",
+    "Avoid analysis",
+    "Guarantee a win"
+   ],
+   "answer_index": 1
+  },
+  {
+   "id": "A-041",
+   "level": "advanced",
+   "topic": "Position sizing and money management",
+   "question": "The position size formula for risk is",
+   "options": [
+    "Balance divided by leverage",
+    "Stop loss divided by balance",
+    "Spread times lot",
+    "Risk amount divided by (stop loss in pips times pip value)"
+   ],
+   "answer_index": 3
+  },
+  {
+   "id": "A-042",
+   "level": "advanced",
+   "topic": "Position sizing and money management",
+   "question": "You risk $50 with a 25 pip stop on EUR/USD ($10 per pip per lot). The lot size is",
+   "options": [
+    "0.20",
+    "0.02",
+    "2.00",
+    "0.50"
+   ],
+   "answer_index": 0
+  },
+  {
+   "id": "A-043",
+   "level": "advanced",
+   "topic": "Position sizing and money management",
+   "question": "You risk $20 with a 40 pip stop, pip value $10 per lot. The lot size is",
+   "options": [
+    "0.005",
+    "0.05",
+    "0.20",
+    "0.50"
+   ],
+   "answer_index": 1
+  },
+  {
+   "id": "A-044",
+   "level": "advanced",
+   "topic": "Position sizing and money management",
+   "question": "Why does a wider stop loss require a smaller lot size at the same risk?",
+   "options": [
+    "Leverage rises",
+    "Brokers demand it",
+    "Spread increases",
+    "Each pip lost costs money, so total risk must stay fixed"
+   ],
+   "answer_index": 3
+  },
+  {
+   "id": "A-045",
+   "level": "advanced",
+   "topic": "Position sizing and money management",
+   "question": "What is expectancy?",
+   "options": [
+    "The spread",
+    "The average amount you expect to make or lose per trade over many trades",
+    "The broker's fee",
+    "The next trade's result"
+   ],
+   "answer_index": 1
+  },
+  {
+   "id": "A-046",
+   "level": "advanced",
+   "topic": "Position sizing and money management",
+   "question": "A system with a 40% win rate and 1:3 risk to reward is",
+   "options": [
+    "Impossible",
+    "Break-even exactly",
+    "Profitable over time, before costs",
+    "Always losing"
+   ],
+   "answer_index": 2
+  },
+  {
+   "id": "A-047",
+   "level": "advanced",
+   "topic": "Position sizing and money management",
+   "question": "A 50% loss on an account needs what gain to recover?",
+   "options": [
+    "25%",
+    "50%",
+    "75%",
+    "100%"
+   ],
+   "answer_index": 3
+  },
+  {
+   "id": "A-048",
+   "level": "advanced",
+   "topic": "Position sizing and money management",
+   "question": "A 20% loss needs what gain to recover?",
+   "options": [
+    "40%",
+    "10%",
+    "20%",
+    "25%"
+   ],
+   "answer_index": 3
+  },
+  {
+   "id": "A-049",
+   "level": "advanced",
+   "topic": "Position sizing and money management",
+   "question": "What is the risk of ruin?",
+   "options": [
+    "The chance of a bad day",
+    "The leverage limit",
+    "The spread at news",
+    "The probability of losing enough capital to stop trading"
+   ],
+   "answer_index": 3
+  },
+  {
+   "id": "A-050",
+   "level": "advanced",
+   "topic": "Position sizing and money management",
+   "question": "Fixed fractional position sizing means",
+   "options": [
+    "Risking the same percentage of current equity per trade",
+    "Doubling after a loss",
+    "Risking all balance",
+    "Using the same lot always"
+   ],
+   "answer_index": 0
+  },
+  {
+   "id": "A-051",
+   "level": "advanced",
+   "topic": "Correlation and currency strength",
+   "question": "Positive correlation between two pairs means",
+   "options": [
+    "They never move",
+    "They share a broker",
+    "They move opposite",
+    "They tend to move in the same direction"
+   ],
+   "answer_index": 3
+  },
+  {
+   "id": "A-052",
+   "level": "advanced",
+   "topic": "Correlation and currency strength",
+   "question": "EUR/USD and GBP/USD are generally",
+   "options": [
+    "Negatively correlated",
+    "Fixed together",
+    "Not related at all",
+    "Positively correlated"
+   ],
+   "answer_index": 3
+  },
+  {
+   "id": "A-053",
+   "level": "advanced",
+   "topic": "Correlation and currency strength",
+   "question": "EUR/USD and USD/CHF are generally",
+   "options": [
+    "Not related",
+    "Negatively correlated",
+    "Positively correlated",
+    "Always equal"
+   ],
+   "answer_index": 1
+  },
+  {
+   "id": "A-054",
+   "level": "advanced",
+   "topic": "Correlation and currency strength",
+   "question": "Buying EUR/USD and GBP/USD at the same time mostly",
+   "options": [
+    "Hedges your risk",
+    "Reduces the spread",
+    "Doubles your exposure to USD weakness",
+    "Removes USD risk"
+   ],
+   "answer_index": 2
+  },
+  {
+   "id": "A-055",
+   "level": "advanced",
+   "topic": "Correlation and currency strength",
+   "question": "Why monitor correlation?",
+   "options": [
+    "To avoid taking the same risk several times",
+    "To avoid stop losses",
+    "To reduce spreads",
+    "To raise leverage"
+   ],
+   "answer_index": 0
+  },
+  {
+   "id": "A-056",
+   "level": "advanced",
+   "topic": "Correlation and currency strength",
+   "question": "What is the US Dollar Index (DXY)?",
+   "options": [
+    "A broker fee index",
+    "A measure of the dollar against a basket of major currencies",
+    "A single pair",
+    "A stock index"
+   ],
+   "answer_index": 1
+  },
+  {
+   "id": "A-057",
+   "level": "advanced",
+   "topic": "Correlation and currency strength",
+   "question": "A falling DXY often supports",
+   "options": [
+    "EUR/USD and GBP/USD rising",
+    "EUR/USD falling",
+    "USD/CHF rising",
+    "No pair changes"
+   ],
+   "answer_index": 0
+  },
+  {
+   "id": "A-058",
+   "level": "advanced",
+   "topic": "Correlation and currency strength",
+   "question": "Currency strength analysis compares",
+   "options": [
+    "Brokers' fees",
+    "Chart colours",
+    "Lot sizes",
+    "How strong or weak each currency is against the others"
+   ],
+   "answer_index": 3
+  },
+  {
+   "id": "A-059",
+   "level": "advanced",
+   "topic": "Correlation and currency strength",
+   "question": "Best pairing idea using strength is",
+   "options": [
+    "Trade two similar strengths",
+    "Trade with no analysis",
+    "Trade only the dollar",
+    "Trade the strongest currency against the weakest"
+   ],
+   "answer_index": 3
+  },
+  {
+   "id": "A-060",
+   "level": "advanced",
+   "topic": "Correlation and currency strength",
+   "question": "Correlations",
+   "options": [
+    "Can change over time and are not fixed",
+    "Apply only on weekends",
+    "Never change",
+    "Are set by brokers"
+   ],
+   "answer_index": 0
+  },
+  {
+   "id": "A-061",
+   "level": "advanced",
+   "topic": "Swaps, carry and costs",
+   "question": "What is a swap (rollover) fee?",
+   "options": [
+    "A deposit fee",
+    "A signal fee",
+    "Interest paid or earned for holding a position overnight",
+    "The spread"
+   ],
+   "answer_index": 2
+  },
+  {
+   "id": "A-062",
+   "level": "advanced",
+   "topic": "Swaps, carry and costs",
+   "question": "What is the carry trade?",
+   "options": [
+    "Holding no position",
+    "Copying a signal",
+    "Carrying cash to the broker",
+    "Buying a higher-yielding currency against a lower-yielding one to earn the interest difference"
+   ],
+   "answer_index": 3
+  },
+  {
+   "id": "A-063",
+   "level": "advanced",
+   "topic": "Swaps, carry and costs",
+   "question": "Triple swap on Wednesday is charged because",
+   "options": [
+    "Brokers are on holiday",
+    "It is a penalty",
+    "Volatility is higher",
+    "It covers the weekend settlement days"
+   ],
+   "answer_index": 3
+  },
+  {
+   "id": "A-064",
+   "level": "advanced",
+   "topic": "Swaps, carry and costs",
+   "question": "A negative swap means",
+   "options": [
+    "You pay to hold that position overnight",
+    "The trade is closed",
+    "You earn interest",
+    "No cost applies"
+   ],
+   "answer_index": 0
+  },
+  {
+   "id": "A-065",
+   "level": "advanced",
+   "topic": "Swaps, carry and costs",
+   "question": "Which cost applies on every trade at entry?",
+   "options": [
+    "The spread",
+    "Nothing",
+    "The swap only",
+    "Only commission on withdrawals"
+   ],
+   "answer_index": 0
+  },
+  {
+   "id": "A-066",
+   "level": "advanced",
+   "topic": "Swaps, carry and costs",
+   "question": "Commission accounts usually offer",
+   "options": [
+    "No costs at all",
+    "Free withdrawals only",
+    "Higher spreads and no fee",
+    "Lower spreads plus a per-lot fee"
+   ],
+   "answer_index": 3
+  },
+  {
+   "id": "A-067",
+   "level": "advanced",
+   "topic": "Swaps, carry and costs",
+   "question": "Scalpers care most about spread because",
+   "options": [
+    "It sets leverage",
+    "They hold for weeks",
+    "Their profit per trade is small",
+    "They never use stops"
+   ],
+   "answer_index": 2
+  },
+  {
+   "id": "A-068",
+   "level": "advanced",
+   "topic": "Swaps, carry and costs",
+   "question": "A swing trader holding a position for weeks should check",
+   "options": [
+    "The broker's logo",
+    "Nothing",
+    "Only the spread",
+    "The swap rates"
+   ],
+   "answer_index": 3
+  },
+  {
+   "id": "A-069",
+   "level": "advanced",
+   "topic": "Swaps, carry and costs",
+   "question": "Interest rate differentials mainly drive",
+   "options": [
+    "Lot sizes",
+    "Spreads",
+    "Candlestick shapes",
+    "Carry trade flows"
+   ],
+   "answer_index": 3
+  },
+  {
+   "id": "A-070",
+   "level": "advanced",
+   "topic": "Swaps, carry and costs",
+   "question": "An islamic or swap-free account",
+   "options": [
+    "Needs no margin",
+    "Charges no swap but may have other fees",
+    "Has no spreads",
+    "Guarantees profit"
+   ],
+   "answer_index": 1
+  },
+  {
+   "id": "A-071",
+   "level": "advanced",
+   "topic": "Divergence and momentum",
+   "question": "Bullish divergence happens when",
+   "options": [
+    "The indicator is flat",
+    "Price makes a higher high",
+    "Price makes a lower low but the indicator makes a higher low",
+    "Price and indicator both fall"
+   ],
+   "answer_index": 2
+  },
+  {
+   "id": "A-072",
+   "level": "advanced",
+   "topic": "Divergence and momentum",
+   "question": "Bearish divergence happens when",
+   "options": [
+    "Price makes a higher high but the indicator makes a lower high",
+    "The indicator is flat",
+    "Price makes a lower low",
+    "Price and indicator both rise"
+   ],
+   "answer_index": 0
+  },
+  {
+   "id": "A-073",
+   "level": "advanced",
+   "topic": "Divergence and momentum",
+   "question": "Divergence suggests",
+   "options": [
+    "A news event",
+    "A guaranteed reversal",
+    "Momentum is weakening and a reversal or pullback may follow",
+    "A strong continuation"
+   ],
+   "answer_index": 2
+  },
+  {
+   "id": "A-074",
+   "level": "advanced",
+   "topic": "Divergence and momentum",
+   "question": "Hidden bullish divergence is seen in",
+   "options": [
+    "Any gap",
+    "A downtrend only",
+    "A flat market only",
+    "An uptrend, signalling possible continuation"
+   ],
+   "answer_index": 3
+  },
+  {
+   "id": "A-075",
+   "level": "advanced",
+   "topic": "Divergence and momentum",
+   "question": "Which indicators are commonly used for divergence?",
+   "options": [
+    "RSI and MACD",
+    "Lot and margin",
+    "Bid and ask",
+    "Spread and swap"
+   ],
+   "answer_index": 0
+  },
+  {
+   "id": "A-076",
+   "level": "advanced",
+   "topic": "Divergence and momentum",
+   "question": "Divergence is best used",
+   "options": [
+    "As a stand-alone signal",
+    "Without a stop",
+    "With structure and confirmation, not alone",
+    "Only on M1"
+   ],
+   "answer_index": 2
+  },
+  {
+   "id": "A-077",
+   "level": "advanced",
+   "topic": "Divergence and momentum",
+   "question": "RSI can stay overbought during",
+   "options": [
+    "Only weekends",
+    "Only a range",
+    "Never",
+    "A strong trend"
+   ],
+   "answer_index": 3
+  },
+  {
+   "id": "A-078",
+   "level": "advanced",
+   "topic": "Divergence and momentum",
+   "question": "What does the MACD histogram show?",
+   "options": [
+    "The swap",
+    "The difference between the MACD line and the signal line",
+    "The spread",
+    "The lot size"
+   ],
+   "answer_index": 1
+  },
+  {
+   "id": "A-079",
+   "level": "advanced",
+   "topic": "Divergence and momentum",
+   "question": "A MACD line crossing above the signal line is generally seen as",
+   "options": [
+    "Bullish momentum",
+    "No meaning",
+    "Bearish momentum",
+    "A margin call"
+   ],
+   "answer_index": 0
+  },
+  {
+   "id": "A-080",
+   "level": "advanced",
+   "topic": "Divergence and momentum",
+   "question": "Momentum slowing near resistance often suggests",
+   "options": [
+    "A broker issue",
+    "Sellers are losing strength",
+    "Buyers are losing strength",
+    "A news event"
+   ],
+   "answer_index": 2
+  },
+  {
+   "id": "A-081",
+   "level": "advanced",
+   "topic": "Candlestick and chart patterns",
+   "question": "A bullish engulfing candle",
+   "options": [
+    "Is the first candle of the week",
+    "Has no body",
+    "Is a small doji",
+    "Fully covers the previous bearish candle's body and closes higher"
+   ],
+   "answer_index": 3
+  },
+  {
+   "id": "A-082",
+   "level": "advanced",
+   "topic": "Candlestick and chart patterns",
+   "question": "A pin bar (hammer) at support shows",
+   "options": [
+    "Strong selling",
+    "No trading",
+    "Rejection of lower prices",
+    "A gap"
+   ],
+   "answer_index": 2
+  },
+  {
+   "id": "A-083",
+   "level": "advanced",
+   "topic": "Candlestick and chart patterns",
+   "question": "A shooting star at resistance shows",
+   "options": [
+    "A gap",
+    "Strong buying",
+    "No trading",
+    "Rejection of higher prices"
+   ],
+   "answer_index": 3
+  },
+  {
+   "id": "A-084",
+   "level": "advanced",
+   "topic": "Candlestick and chart patterns",
+   "question": "A morning star pattern signals",
+   "options": [
+    "No change",
+    "A possible bullish reversal",
+    "A bearish reversal",
+    "A range"
+   ],
+   "answer_index": 1
+  },
+  {
+   "id": "A-085",
+   "level": "advanced",
+   "topic": "Candlestick and chart patterns",
+   "question": "A double top is",
+   "options": [
+    "A broker setup",
+    "Two peaks at about the same level, a bearish reversal pattern",
+    "Two valleys, a bullish pattern",
+    "A news pattern"
+   ],
+   "answer_index": 1
+  },
+  {
+   "id": "A-086",
+   "level": "advanced",
+   "topic": "Candlestick and chart patterns",
+   "question": "A double bottom is",
+   "options": [
+    "Two lows at about the same level, a bullish reversal pattern",
+    "A news pattern",
+    "Two peaks, bearish",
+    "A broker setup"
+   ],
+   "answer_index": 0
+  },
+  {
+   "id": "A-087",
+   "level": "advanced",
+   "topic": "Candlestick and chart patterns",
+   "question": "A head and shoulders pattern",
+   "options": [
+    "Is a continuation pattern",
+    "Is an indicator",
+    "Signals a bullish reversal",
+    "Signals a possible bearish reversal after an uptrend"
+   ],
+   "answer_index": 3
+  },
+  {
+   "id": "A-088",
+   "level": "advanced",
+   "topic": "Candlestick and chart patterns",
+   "question": "A bull flag is",
+   "options": [
+    "A gap",
+    "A bearish reversal",
+    "A news candle",
+    "A continuation pattern after a sharp rise"
+   ],
+   "answer_index": 3
+  },
+  {
+   "id": "A-089",
+   "level": "advanced",
+   "topic": "Candlestick and chart patterns",
+   "question": "A symmetrical triangle usually",
+   "options": [
+    "Only breaks down",
+    "Is a broker tool",
+    "Breaks out in either direction, often following the prior trend",
+    "Never breaks"
+   ],
+   "answer_index": 2
+  },
+  {
+   "id": "A-090",
+   "level": "advanced",
+   "topic": "Candlestick and chart patterns",
+   "question": "Candlestick patterns are most useful",
+   "options": [
+    "At key levels with confirmation",
+    "In the middle of nowhere",
+    "Alone on any chart",
+    "Only on Sundays"
+   ],
+   "answer_index": 0
+  },
+  {
+   "id": "A-091",
+   "level": "advanced",
+   "topic": "News and fundamentals (advanced)",
+   "question": "A hawkish central bank is",
+   "options": [
+    "More likely to raise or keep rates high to fight inflation",
+    "Neutral always",
+    "Closed",
+    "More likely to cut rates"
+   ],
+   "answer_index": 0
+  },
+  {
+   "id": "A-092",
+   "level": "advanced",
+   "topic": "News and fundamentals (advanced)",
+   "question": "A dovish central bank is",
+   "options": [
+    "Closed",
+    "More likely to raise rates",
+    "Neutral always",
+    "More likely to cut rates or keep them low"
+   ],
+   "answer_index": 3
+  },
+  {
+   "id": "A-093",
+   "level": "advanced",
+   "topic": "News and fundamentals (advanced)",
+   "question": "A hawkish surprise usually",
+   "options": [
+    "Closes the market",
+    "Strengthens that currency",
+    "Has no effect",
+    "Weakens that currency"
+   ],
+   "answer_index": 1
+  },
+  {
+   "id": "A-094",
+   "level": "advanced",
+   "topic": "News and fundamentals (advanced)",
+   "question": "What does CPI measure?",
+   "options": [
+    "Credit scores",
+    "Company profits",
+    "Currency pairs",
+    "Consumer price inflation"
+   ],
+   "answer_index": 3
+  },
+  {
+   "id": "A-095",
+   "level": "advanced",
+   "topic": "News and fundamentals (advanced)",
+   "question": "What is the forex impact of strong GDP growth?",
+   "options": [
+    "Always weakens it",
+    "Often supports the currency through stronger rate expectations",
+    "No effect",
+    "Closes the market"
+   ],
+   "answer_index": 1
+  },
+  {
+   "id": "A-096",
+   "level": "advanced",
+   "topic": "News and fundamentals (advanced)",
+   "question": "'Buy the rumour, sell the fact' means",
+   "options": [
+    "Never trade news",
+    "Price often moves before news and reverses once it is released",
+    "Always trade the news candle",
+    "News has no effect"
+   ],
+   "answer_index": 1
+  },
+  {
+   "id": "A-097",
+   "level": "advanced",
+   "topic": "News and fundamentals (advanced)",
+   "question": "A forecast versus actual difference is called",
+   "options": [
+    "A pip",
+    "A spread",
+    "A surprise",
+    "A swap"
+   ],
+   "answer_index": 2
+  },
+  {
+   "id": "A-098",
+   "level": "advanced",
+   "topic": "News and fundamentals (advanced)",
+   "question": "Trading directly into a high-impact release is risky because of",
+   "options": [
+    "Spikes, wide spreads and slippage",
+    "Zero spreads",
+    "Low volatility",
+    "No volume"
+   ],
+   "answer_index": 0
+  },
+  {
+   "id": "A-099",
+   "level": "advanced",
+   "topic": "News and fundamentals (advanced)",
+   "question": "A safe haven currency tends to",
+   "options": [
+    "Strengthen during global risk-off periods",
+    "Always rise",
+    "Weaken during risk-off",
+    "Never move"
+   ],
+   "answer_index": 0
+  },
+  {
+   "id": "A-100",
+   "level": "advanced",
+   "topic": "News and fundamentals (advanced)",
+   "question": "Which are commonly viewed as safe haven currencies?",
+   "options": [
+    "AUD, NZD and CAD",
+    "USD, JPY and CHF",
+    "MXN, ZAR and TRY",
+    "None"
+   ],
+   "answer_index": 1
+  },
+  {
+   "id": "A-101",
+   "level": "advanced",
+   "topic": "Risk-on / risk-off and sentiment",
+   "question": "In risk-on periods, traders tend to buy",
+   "options": [
+    "Higher-yielding currencies such as AUD and NZD",
+    "Nothing",
+    "Safe havens only",
+    "Only gold"
+   ],
+   "answer_index": 0
+  },
+  {
+   "id": "A-102",
+   "level": "advanced",
+   "topic": "Risk-on / risk-off and sentiment",
+   "question": "Risk-off is typically driven by",
+   "options": [
+    "Strong optimism",
+    "Low volatility",
+    "Holiday periods only",
+    "Fear, uncertainty or crises"
+   ],
+   "answer_index": 3
+  },
+  {
+   "id": "A-103",
+   "level": "advanced",
+   "topic": "Risk-on / risk-off and sentiment",
+   "question": "Retail sentiment is often used as",
+   "options": [
+    "A broker order",
+    "A guaranteed signal",
+    "A pip value",
+    "A contrarian indicator, as most retail traders lose"
+   ],
+   "answer_index": 3
+  },
+  {
+   "id": "A-104",
+   "level": "advanced",
+   "topic": "Risk-on / risk-off and sentiment",
+   "question": "The Commitment of Traders (COT) report shows",
+   "options": [
+    "Positions held by large traders in futures markets",
+    "Spread levels",
+    "Chart patterns",
+    "Retail broker fees"
+   ],
+   "answer_index": 0
+  },
+  {
+   "id": "A-105",
+   "level": "advanced",
+   "topic": "Risk-on / risk-off and sentiment",
+   "question": "Which asset often moves opposite to the USD?",
+   "options": [
+    "USD/CAD always",
+    "Gold",
+    "The DXY",
+    "A stock index only"
+   ],
+   "answer_index": 1
+  },
+  {
+   "id": "A-106",
+   "level": "advanced",
+   "topic": "Risk-on / risk-off and sentiment",
+   "question": "Gold usually rises when",
+   "options": [
+    "Markets are calm always",
+    "Rates spike without fear",
+    "The dollar weakens or fear increases",
+    "The dollar strengthens strongly"
+   ],
+   "answer_index": 2
+  },
+  {
+   "id": "A-107",
+   "level": "advanced",
+   "topic": "Risk-on / risk-off and sentiment",
+   "question": "Oil prices commonly affect which currency?",
+   "options": [
+    "JPY",
+    "CAD",
+    "NZD",
+    "CHF"
+   ],
+   "answer_index": 1
+  },
+  {
+   "id": "A-108",
+   "level": "advanced",
+   "topic": "Risk-on / risk-off and sentiment",
+   "question": "A rising US 10-year yield often",
+   "options": [
+    "Closes forex",
+    "Weakens the dollar always",
+    "Supports the US dollar",
+    "Has no effect"
+   ],
+   "answer_index": 2
+  },
+  {
+   "id": "A-109",
+   "level": "advanced",
+   "topic": "Risk-on / risk-off and sentiment",
+   "question": "Market sentiment is",
+   "options": [
+    "A broker fee",
+    "The overall attitude of traders toward a market",
+    "A pip",
+    "A chart type"
+   ],
+   "answer_index": 1
+  },
+  {
+   "id": "A-110",
+   "level": "advanced",
+   "topic": "Risk-on / risk-off and sentiment",
+   "question": "Following the crowd at extreme sentiment can be",
+   "options": [
+    "Illegal",
+    "Always safe",
+    "Required",
+    "Dangerous because reversals often occur"
+   ],
+   "answer_index": 3
+  },
+  {
+   "id": "A-111",
+   "level": "advanced",
+   "topic": "Strategy and backtesting",
+   "question": "What is backtesting?",
+   "options": [
+    "Waiting for news",
+    "Testing a strategy on historical data to see how it would have performed",
+    "Trading with real money only",
+    "Using a demo account only"
+   ],
+   "answer_index": 1
+  },
+  {
+   "id": "A-112",
+   "level": "advanced",
+   "topic": "Strategy and backtesting",
+   "question": "What is forward testing?",
+   "options": [
+    "Testing a strategy in live market conditions, often on a demo account",
+    "Testing without rules",
+    "Testing on old data only",
+    "Testing with no stop loss"
+   ],
+   "answer_index": 0
+  },
+  {
+   "id": "A-113",
+   "level": "advanced",
+   "topic": "Strategy and backtesting",
+   "question": "Overfitting means",
+   "options": [
+    "Using a stop loss",
+    "Trading too little",
+    "Using too small a lot",
+    "Tuning a strategy so closely to past data that it fails on new data"
+   ],
+   "answer_index": 3
+  },
+  {
+   "id": "A-114",
+   "level": "advanced",
+   "topic": "Strategy and backtesting",
+   "question": "A valid backtest sample should include",
+   "options": [
+    "Five trades",
+    "Only winning months",
+    "Enough trades and varied market conditions",
+    "One week"
+   ],
+   "answer_index": 2
+  },
+  {
+   "id": "A-115",
+   "level": "advanced",
+   "topic": "Strategy and backtesting",
+   "question": "What is a profit factor?",
+   "options": [
+    "Win rate times lot",
+    "Spread divided by pip",
+    "Balance divided by equity",
+    "Gross profit divided by gross loss"
+   ],
+   "answer_index": 3
+  },
+  {
+   "id": "A-116",
+   "level": "advanced",
+   "topic": "Strategy and backtesting",
+   "question": "A profit factor above 1 means",
+   "options": [
+    "The strategy made more than it lost",
+    "It broke even exactly",
+    "It lost money",
+    "It is a scam"
+   ],
+   "answer_index": 0
+  },
+  {
+   "id": "A-117",
+   "level": "advanced",
+   "topic": "Strategy and backtesting",
+   "question": "Maximum drawdown measures",
+   "options": [
+    "The biggest lot",
+    "The largest peak-to-trough fall in equity",
+    "The best trade",
+    "The spread"
+   ],
+   "answer_index": 1
+  },
+  {
+   "id": "A-118",
+   "level": "advanced",
+   "topic": "Strategy and backtesting",
+   "question": "Why use a trading journal with screenshots?",
+   "options": [
+    "To avoid risk",
+    "To skip analysis",
+    "To review decisions and improve consistently",
+    "To impress others"
+   ],
+   "answer_index": 2
+  },
+  {
+   "id": "A-119",
+   "level": "advanced",
+   "topic": "Strategy and backtesting",
+   "question": "A good strategy should have",
+   "options": [
+    "Clear entry, exit, stop loss and risk rules",
+    "Vague feelings",
+    "No rules",
+    "Only indicators"
+   ],
+   "answer_index": 0
+  },
+  {
+   "id": "A-120",
+   "level": "advanced",
+   "topic": "Strategy and backtesting",
+   "question": "Why test changes one at a time?",
+   "options": [
+    "To avoid rules",
+    "To save time",
+    "To increase lots",
+    "To know which change improved or hurt results"
+   ],
+   "answer_index": 3
+  },
+  {
+   "id": "A-121",
+   "level": "advanced",
+   "topic": "Psychology and discipline (advanced)",
+   "question": "Loss aversion makes traders",
+   "options": [
+    "Hold winners longer",
+    "Hold losers too long and cut winners too early",
+    "Cut losers early",
+    "Trade less"
+   ],
+   "answer_index": 1
+  },
+  {
+   "id": "A-122",
+   "level": "advanced",
+   "topic": "Psychology and discipline (advanced)",
+   "question": "Confirmation bias is",
+   "options": [
+    "Checking many sources",
+    "Testing a strategy",
+    "Using a stop",
+    "Looking only for information that supports your existing view"
+   ],
+   "answer_index": 3
+  },
+  {
+   "id": "A-123",
+   "level": "advanced",
+   "topic": "Psychology and discipline (advanced)",
+   "question": "Decision fatigue can lead to",
+   "options": [
+    "More discipline",
+    "Poor trades after too many decisions or screen time",
+    "Lower risk",
+    "Better trades"
+   ],
+   "answer_index": 1
+  },
+  {
+   "id": "A-124",
+   "level": "advanced",
+   "topic": "Psychology and discipline (advanced)",
+   "question": "A pre-trade checklist helps by",
+   "options": [
+    "Predicting the market",
+    "Raising leverage",
+    "Forcing consistent, rule-based decisions",
+    "Replacing stops"
+   ],
+   "answer_index": 2
+  },
+  {
+   "id": "A-125",
+   "level": "advanced",
+   "topic": "Psychology and discipline (advanced)",
+   "question": "What is the 'gambler's fallacy'?",
+   "options": [
+    "Using proper risk",
+    "Using a plan",
+    "Taking profit",
+    "Believing a win is due after a run of losses"
+   ],
+   "answer_index": 3
+  },
+  {
+   "id": "A-126",
+   "level": "advanced",
+   "topic": "Psychology and discipline (advanced)",
+   "question": "Which is the best response to a string of losses?",
+   "options": [
+    "Remove the stop loss",
+    "Raise the lot size",
+    "Switch strategy daily",
+    "Reduce size or pause and review the process"
+   ],
+   "answer_index": 3
+  },
+  {
+   "id": "A-127",
+   "level": "advanced",
+   "topic": "Psychology and discipline (advanced)",
+   "question": "Journaling emotions helps to",
+   "options": [
+    "Find patterns in your behaviour",
+    "Avoid brokers",
+    "Raise leverage",
+    "Predict price"
+   ],
+   "answer_index": 0
+  },
+  {
+   "id": "A-128",
+   "level": "advanced",
+   "topic": "Psychology and discipline (advanced)",
+   "question": "Why set a daily loss limit?",
+   "options": [
+    "To raise profits",
+    "To stop emotional spirals and protect the account",
+    "To avoid spreads",
+    "To meet broker rules"
+   ],
+   "answer_index": 1
+  },
+  {
+   "id": "A-129",
+   "level": "advanced",
+   "topic": "Psychology and discipline (advanced)",
+   "question": "Patience in trading means",
+   "options": [
+    "Using maximum lot",
+    "Trading every candle",
+    "Removing stops",
+    "Waiting for your setup rather than forcing trades"
+   ],
+   "answer_index": 3
+  },
+  {
+   "id": "A-130",
+   "level": "advanced",
+   "topic": "Psychology and discipline (advanced)",
+   "question": "Consistency is built by",
+   "options": [
+    "Following the same rules and risk on every trade",
+    "Chasing big wins",
+    "Ignoring losses",
+    "Changing rules often"
+   ],
+   "answer_index": 0
+  },
+  {
+   "id": "A-131",
+   "level": "advanced",
+   "topic": "Automation, signals and copy trading",
+   "question": "An Expert Advisor can",
+   "options": [
+    "Predict news",
+    "Execute trading rules automatically on MetaTrader",
+    "Remove all risk",
+    "Guarantee profit"
+   ],
+   "answer_index": 1
+  },
+  {
+   "id": "A-132",
+   "level": "advanced",
+   "topic": "Automation, signals and copy trading",
+   "question": "Before running an EA live you should",
+   "options": [
+    "Remove the stop loss",
+    "Use maximum lot",
+    "Skip testing",
+    "Test it on a demo account and review its drawdown"
+   ],
+   "answer_index": 3
+  },
+  {
+   "id": "A-133",
+   "level": "advanced",
+   "topic": "Automation, signals and copy trading",
+   "question": "A signal provider's track record should be judged by",
+   "options": [
+    "Verified results, drawdown and consistency, not one big win",
+    "Screenshots only",
+    "The highest single trade",
+    "Marketing claims"
+   ],
+   "answer_index": 0
+  },
+  {
+   "id": "A-134",
+   "level": "advanced",
+   "topic": "Automation, signals and copy trading",
+   "question": "When copy trading, the biggest risk is",
+   "options": [
+    "Weekend gaps only",
+    "Copying with a lot size too large for your account",
+    "The broker logo",
+    "The spread"
+   ],
+   "answer_index": 1
+  },
+  {
+   "id": "A-135",
+   "level": "advanced",
+   "topic": "Automation, signals and copy trading",
+   "question": "A good copy-trading risk setting is",
+   "options": [
+    "Triple the provider's lot",
+    "No stop loss",
+    "Fixed lot or a small percentage that matches your balance",
+    "Maximum leverage"
+   ],
+   "answer_index": 2
+  },
+  {
+   "id": "A-136",
+   "level": "advanced",
+   "topic": "Automation, signals and copy trading",
+   "question": "Can a bot guarantee profit?",
+   "options": [
+    "Yes, if paid",
+    "Yes, if on high leverage",
+    "No, any strategy can lose",
+    "Yes, if on a VPS"
+   ],
+   "answer_index": 2
+  },
+  {
+   "id": "A-137",
+   "level": "advanced",
+   "topic": "Automation, signals and copy trading",
+   "question": "Why use a VPS for an EA?",
+   "options": [
+    "To keep it running 24/7 without your computer",
+    "To remove spread",
+    "To avoid margin",
+    "To raise profit"
+   ],
+   "answer_index": 0
+  },
+  {
+   "id": "A-138",
+   "level": "advanced",
+   "topic": "Automation, signals and copy trading",
+   "question": "Slippage on copy trades happens because",
+   "options": [
+    "Signals are wrong always",
+    "Spreads are zero",
+    "The broker copies wrong",
+    "Orders are filled at a slightly different price than the signal"
+   ],
+   "answer_index": 3
+  },
+  {
+   "id": "A-139",
+   "level": "advanced",
+   "topic": "Automation, signals and copy trading",
+   "question": "Pausing auto-trade before major news is",
+   "options": [
+    "Illegal",
+    "A reasonable way to reduce risk",
+    "Always harmful",
+    "Pointless"
+   ],
+   "answer_index": 1
+  },
+  {
+   "id": "A-140",
+   "level": "advanced",
+   "topic": "Automation, signals and copy trading",
+   "question": "Account protection for automated trading should include",
+   "options": [
+    "Larger lots after loss",
+    "No limits",
+    "A daily loss limit or equity stop",
+    "No stop loss"
+   ],
+   "answer_index": 2
+  },
+  {
+   "id": "A-141",
+   "level": "advanced",
+   "topic": "Advanced order types and execution",
+   "question": "A Buy Stop order is placed",
+   "options": [
+    "Above the current price to catch a breakout",
+    "At the current price only",
+    "Below the current price",
+    "Only on Fridays"
+   ],
+   "answer_index": 0
+  },
+  {
+   "id": "A-142",
+   "level": "advanced",
+   "topic": "Advanced order types and execution",
+   "question": "A Sell Stop order is placed",
+   "options": [
+    "At the current price only",
+    "Only on Mondays",
+    "Below the current price to catch a breakdown",
+    "Above the current price"
+   ],
+   "answer_index": 2
+  },
+  {
+   "id": "A-143",
+   "level": "advanced",
+   "topic": "Advanced order types and execution",
+   "question": "What is a stop-limit order?",
+   "options": [
+    "A trailing stop",
+    "A market order",
+    "A deposit",
+    "A stop order that becomes a limit order at a set price"
+   ],
+   "answer_index": 3
+  },
+  {
+   "id": "A-144",
+   "level": "advanced",
+   "topic": "Advanced order types and execution",
+   "question": "Partial take profit means",
+   "options": [
+    "Doubling the lot",
+    "Closing part of the position at a target and leaving the rest running",
+    "Cancelling the stop",
+    "Closing at a loss"
+   ],
+   "answer_index": 1
+  },
+  {
+   "id": "A-145",
+   "level": "advanced",
+   "topic": "Advanced order types and execution",
+   "question": "Scaling in means",
+   "options": [
+    "Removing the stop",
+    "Adding to a position in steps as it moves in your favour or at planned levels",
+    "Opening on weekends only",
+    "Closing early"
+   ],
+   "answer_index": 1
+  },
+  {
+   "id": "A-146",
+   "level": "advanced",
+   "topic": "Advanced order types and execution",
+   "question": "Moving the stop to break-even after a partial take profit",
+   "options": [
+    "Is not allowed",
+    "Protects the remaining position from turning into a loss",
+    "Raises spread",
+    "Removes risk of any gap"
+   ],
+   "answer_index": 1
+  },
+  {
+   "id": "A-147",
+   "level": "advanced",
+   "topic": "Advanced order types and execution",
+   "question": "Slippage is more likely during",
+   "options": [
+    "Calm trading only",
+    "High volatility or low liquidity",
+    "Weekends only",
+    "Small lots only"
+   ],
+   "answer_index": 1
+  },
+  {
+   "id": "A-148",
+   "level": "advanced",
+   "topic": "Advanced order types and execution",
+   "question": "What is a requote?",
+   "options": [
+    "The broker offers a new price because the requested one is no longer available",
+    "A news event",
+    "A deposit",
+    "A trade cancellation fee"
+   ],
+   "answer_index": 0
+  },
+  {
+   "id": "A-149",
+   "level": "advanced",
+   "topic": "Advanced order types and execution",
+   "question": "A guaranteed stop loss",
+   "options": [
+    "Is free always",
+    "Is the same as market stop",
+    "Never executes",
+    "Closes at exactly the set price but usually costs a premium"
+   ],
+   "answer_index": 3
+  },
+  {
+   "id": "A-150",
+   "level": "advanced",
+   "topic": "Advanced order types and execution",
+   "question": "Expiration time on a pending order means",
+   "options": [
+    "It opens at that time",
+    "It closes a trade",
+    "It is cancelled automatically if not triggered by that time",
+    "It changes lot"
+   ],
+   "answer_index": 2
+  },
+  {
+   "id": "A-151",
+   "level": "advanced",
+   "topic": "Account management and compounding",
+   "question": "Compounding means",
+   "options": [
+    "Withdrawing all profit",
+    "Taking no profit",
+    "Using maximum lot",
+    "Growing the account by reinvesting profits and recalculating risk on a larger balance"
+   ],
+   "answer_index": 3
+  },
+  {
+   "id": "A-152",
+   "level": "advanced",
+   "topic": "Account management and compounding",
+   "question": "Withdrawing profit regularly",
+   "options": [
+    "Raises leverage",
+    "Always hurts",
+    "Secures gains and reduces emotional pressure",
+    "Is illegal"
+   ],
+   "answer_index": 2
+  },
+  {
+   "id": "A-153",
+   "level": "advanced",
+   "topic": "Account management and compounding",
+   "question": "A realistic monthly goal for a new trader is",
+   "options": [
+    "Consistency and capital protection first, not huge returns",
+    "100% a week",
+    "Never losing",
+    "Doubling every month"
+   ],
+   "answer_index": 0
+  },
+  {
+   "id": "A-154",
+   "level": "advanced",
+   "topic": "Account management and compounding",
+   "question": "Why avoid risking more to speed up growth?",
+   "options": [
+    "It reduces spread",
+    "Larger risk raises drawdown and the chance of blowing the account",
+    "It lowers swap",
+    "Brokers refuse"
+   ],
+   "answer_index": 1
+  },
+  {
+   "id": "A-155",
+   "level": "advanced",
+   "topic": "Account management and compounding",
+   "question": "Which account stat best shows real risk taken?",
+   "options": [
+    "Number of trades",
+    "Win rate alone",
+    "Spread",
+    "Maximum drawdown"
+   ],
+   "answer_index": 3
+  },
+  {
+   "id": "A-156",
+   "level": "advanced",
+   "topic": "Account management and compounding",
+   "question": "A prop firm challenge is",
+   "options": [
+    "A broker bonus",
+    "An EA type",
+    "A paid evaluation to trade a funded account under strict rules",
+    "A free account"
+   ],
+   "answer_index": 2
+  },
+  {
+   "id": "A-157",
+   "level": "advanced",
+   "topic": "Account management and compounding",
+   "question": "Prop firm rules usually include",
+   "options": [
+    "No profit target",
+    "Unlimited leverage",
+    "No limits",
+    "Daily loss and maximum drawdown limits"
+   ],
+   "answer_index": 3
+  },
+  {
+   "id": "A-158",
+   "level": "advanced",
+   "topic": "Account management and compounding",
+   "question": "Overleveraging an account most often leads to",
+   "options": [
+    "Fast drawdown and possible blow-up",
+    "Lower spread",
+    "Steady profit",
+    "Zero risk"
+   ],
+   "answer_index": 0
+  },
+  {
+   "id": "A-159",
+   "level": "advanced",
+   "topic": "Account management and compounding",
+   "question": "What does ROI mean?",
+   "options": [
+    "Range of instruments",
+    "Risk of income",
+    "Return on investment",
+    "Rate of interest"
+   ],
+   "answer_index": 2
+  },
+  {
+   "id": "A-160",
+   "level": "advanced",
+   "topic": "Account management and compounding",
+   "question": "Which is the better way to measure growth?",
+   "options": [
+    "Trade count",
+    "Time on the chart",
+    "Dollar profit only",
+    "Percentage return relative to risk taken"
+   ],
+   "answer_index": 3
+  },
+  {
+   "id": "A-161",
+   "level": "advanced",
+   "topic": "Synthetic indices and volatility",
+   "question": "Synthetic indices such as Volatility 75 are",
+   "options": [
+    "Gold futures",
+    "Simulated markets driven by random number generators, available 24/7",
+    "Real company stocks",
+    "Currency pairs"
+   ],
+   "answer_index": 1
+  },
+  {
+   "id": "A-162",
+   "level": "advanced",
+   "topic": "Synthetic indices and volatility",
+   "question": "Do synthetic indices react to real world news?",
+   "options": [
+    "No",
+    "Only on Fridays",
+    "Only in London",
+    "Yes, always"
+   ],
+   "answer_index": 0
+  },
+  {
+   "id": "A-163",
+   "level": "advanced",
+   "topic": "Synthetic indices and volatility",
+   "question": "A higher volatility index number such as V100 compared with V10 means",
+   "options": [
+    "A closed market",
+    "Larger and faster price moves",
+    "Smaller moves",
+    "No moves"
+   ],
+   "answer_index": 1
+  },
+  {
+   "id": "A-164",
+   "level": "advanced",
+   "topic": "Synthetic indices and volatility",
+   "question": "Boom and Crash indices are known for",
+   "options": [
+    "News-driven moves",
+    "Zero volatility",
+    "Weekend closure",
+    "Spikes in one direction with a drift in the other"
+   ],
+   "answer_index": 3
+  },
+  {
+   "id": "A-165",
+   "level": "advanced",
+   "topic": "Synthetic indices and volatility",
+   "question": "The main risk of trading volatility indices is",
+   "options": [
+    "Fast moves can hit stops and wipe accounts without strict risk control",
+    "No liquidity",
+    "Closed weekends",
+    "Slow price action"
+   ],
+   "answer_index": 0
+  },
+  {
+   "id": "A-166",
+   "level": "advanced",
+   "topic": "Synthetic indices and volatility",
+   "question": "Proper lot sizing on synthetics should consider",
+   "options": [
+    "Their large point moves and your stop distance",
+    "News events",
+    "The weekend",
+    "Only the spread"
+   ],
+   "answer_index": 0
+  },
+  {
+   "id": "A-167",
+   "level": "advanced",
+   "topic": "Synthetic indices and volatility",
+   "question": "Technical analysis on synthetics",
+   "options": [
+    "Needs news",
+    "Is impossible",
+    "Is widely used since they have no fundamentals",
+    "Needs a calendar"
+   ],
+   "answer_index": 2
+  },
+  {
+   "id": "A-168",
+   "level": "advanced",
+   "topic": "Synthetic indices and volatility",
+   "question": "A step index moves",
+   "options": [
+    "In fixed step sizes up or down",
+    "Not at all",
+    "Only on news",
+    "Randomly in huge spikes only"
+   ],
+   "answer_index": 0
+  },
+  {
+   "id": "A-169",
+   "level": "advanced",
+   "topic": "Synthetic indices and volatility",
+   "question": "Why test a strategy on a demo of the same synthetic index first?",
+   "options": [
+    "Demo is useless",
+    "It saves spread",
+    "They are all identical",
+    "Each index behaves differently and risk varies"
+   ],
+   "answer_index": 3
+  },
+  {
+   "id": "A-170",
+   "level": "advanced",
+   "topic": "Synthetic indices and volatility",
+   "question": "Trading synthetic indices is available",
+   "options": [
+    "Only weekdays",
+    "Only London hours",
+    "24 hours a day, 7 days a week",
+    "Only New York hours"
+   ],
+   "answer_index": 2
+  }
+ ]
+}

@@ -264,6 +264,34 @@ async def status_handler(request):
     return _j(await asyncio.to_thread(_status_sync, me))
 
 
+def _perm(attempt_id, qid, n):
+    """Display order of a question's options for one attempt (same on start and submit)."""
+    order = list(range(n))
+    random.Random(f"{attempt_id}:{qid}").shuffle(order)
+    return order
+
+
+def _seen_ids(user_key):
+    code, rows = _sb(f"sfx_cert_attempts?user_key=eq.{requests.utils.quote(str(user_key), safe='')}&select=question_ids&order=created_at.desc&limit=3")
+    seen = set()
+    if code == 200 and isinstance(rows, list):
+        for r in rows:
+            for i in (r.get("question_ids") or []):
+                seen.add(i)
+    return seen
+
+
+def _pick(pool, n, seen):
+    fresh = [q for q in pool if q["id"] not in seen]
+    random.shuffle(fresh)
+    out = fresh[:n]
+    if len(out) < n:
+        rest = [q for q in pool if q not in out]
+        random.shuffle(rest)
+        out += rest[:n - len(out)]
+    return out
+
+
 def _start_sync(me, confirmed):
     st = _status_sync(me)
     if st["issued"]:
@@ -279,15 +307,21 @@ def _start_sync(me, confirmed):
     bank = _load_bank()
     basic = [q for q in bank.values() if q["level"] == "basic"]
     adv = [q for q in bank.values() if q["level"] == "advanced"]
-    picked = random.sample(basic, EXAM_BASIC) + random.sample(adv, EXAM_ADVANCED)
+    seen = _seen_ids(me["key"])
+    picked = _pick(basic, EXAM_BASIC, seen) + _pick(adv, EXAM_ADVANCED, seen)
     random.shuffle(picked)
     ids = [q["id"] for q in picked]
     code, rows = _sb("sfx_cert_attempts", "POST", {"user_key": me["key"], "question_ids": ids}, prefer="return=representation")
     if code not in (200, 201) or not rows:
         return {"error": "server", "message": "Could not start the exam. Try again."}, 503
-    return {"attempt_id": rows[0]["id"], "pass_percent": PASS_PERCENT,
-            "time_limit_seconds": EXAM_TIME_LIMIT_SECONDS,
-            "questions": [{"id": q["id"], "question": q["question"], "options": q["options"]} for q in picked]}, 200
+    aid = rows[0]["id"]
+    qs = []
+    for q in picked:
+        opts = list(q["options"])
+        order = _perm(aid, q["id"], len(opts))
+        qs.append({"id": q["id"], "question": q["question"], "options": [opts[k] for k in order]})
+    return {"attempt_id": aid, "pass_percent": PASS_PERCENT,
+            "time_limit_seconds": EXAM_TIME_LIMIT_SECONDS, "questions": qs}, 200
 
 
 async def start_handler(request):
@@ -328,8 +362,10 @@ def _submit_sync(me, attempt_id, answers):
     right = 0
     for i, qid in enumerate(ids):
         try:
-            if i < len(answers) and int(answers[i]) == int(bank[qid]["answer_index"]):
-                right += 1
+            if i < len(answers):
+                order = _perm(at["id"], qid, len(bank[qid]["options"]))
+                if order[int(answers[i])] == int(bank[qid]["answer_index"]):
+                    right += 1
         except Exception:
             pass
     total = len(ids)

@@ -211,14 +211,16 @@ def _eligibility(me):
     or when the Beginner and Advanced lessons are all finished."""
     counts = _class_counts(me)
     vids = _video_progress(me["key"])
-    # Forex Class lessons and tutor videos (any tutor, any language) add up per level.
-    b_all = (counts or {}).get("beginner", 0) + vids["beginner"]
-    a_all = (counts or {}).get("advanced", 0) + vids["advanced"]
-    b_done = b_all >= BEGINNER_TOTAL or vids["full_course"]["beginner"]
-    a_done = a_all >= ADVANCED_TOTAL or vids["full_course"]["advanced"]
-    by_progress = b_done and a_done
-    ok = bool(me["eligible"]) or by_progress
-    source = "flag" if me["eligible"] else ("progress" if by_progress else None)
+    # Two things are both required: the AI Tutor lessons (Forex Class) and tutor videos
+    # (any tutor, any language, 80% watched). A full course of 8+ videos can also
+    # complete a level on the video side.
+    lesson_b = (counts or {}).get("beginner", 0)
+    lesson_a = (counts or {}).get("advanced", 0)
+    lessons_done = bool(counts) and lesson_b >= BEGINNER_TOTAL and lesson_a >= ADVANCED_TOTAL
+    vid_b_done = vids["beginner"] >= BEGINNER_TOTAL or vids["full_course"]["beginner"]
+    vid_a_done = vids["advanced"] >= ADVANCED_TOTAL or vids["full_course"]["advanced"]
+    ok = lessons_done and vid_b_done and vid_a_done
+    source = "progress" if ok else None
     try:
         row = {"user_key": me["key"], "name": me["name"], "uname": me["uname"], "eligible": ok,
                "eligible_source": source, "updated_at": datetime.now(timezone.utc).isoformat()}
@@ -228,10 +230,10 @@ def _eligibility(me):
     except Exception:
         pass
     shown = dict(counts or {})
-    shown["beginner_all"] = BEGINNER_TOTAL if b_done else min(b_all, BEGINNER_TOTAL)
-    shown["advanced_all"] = ADVANCED_TOTAL if a_done else min(a_all, ADVANCED_TOTAL)
-    shown["videos_beginner"] = vids["beginner"]
-    shown["videos_advanced"] = vids["advanced"]
+    shown["lessons_beginner"] = min(lesson_b, BEGINNER_TOTAL)
+    shown["lessons_advanced"] = min(lesson_a, ADVANCED_TOTAL)
+    shown["videos_beginner"] = BEGINNER_TOTAL if vid_b_done else min(vids["beginner"], BEGINNER_TOTAL)
+    shown["videos_advanced"] = ADVANCED_TOTAL if vid_a_done else min(vids["advanced"], ADVANCED_TOTAL)
     return ok, source, shown
 
 
@@ -248,10 +250,11 @@ def _status_sync(me):
             "can_start": ok and wait == 0, "wait_seconds": wait,
             "pass_percent": PASS_PERCENT, "questions": EXAM_BASIC + EXAM_ADVANCED,
             "time_limit_seconds": EXAM_TIME_LIMIT_SECONDS,
-            "progress": {"beginner": (counts or {}).get("beginner_all", 0), "beginner_total": BEGINNER_TOTAL,
-                         "advanced": (counts or {}).get("advanced_all", 0), "advanced_total": ADVANCED_TOTAL,
+            "progress": {"lessons_beginner": (counts or {}).get("lessons_beginner", 0),
+                         "lessons_advanced": (counts or {}).get("lessons_advanced", 0),
                          "videos_beginner": (counts or {}).get("videos_beginner", 0),
-                         "videos_advanced": (counts or {}).get("videos_advanced", 0)}}
+                         "videos_advanced": (counts or {}).get("videos_advanced", 0),
+                         "beginner_total": BEGINNER_TOTAL, "advanced_total": ADVANCED_TOTAL}}
 
 
 async def status_handler(request):
@@ -266,7 +269,7 @@ def _start_sync(me, confirmed):
     if st["issued"]:
         return {"error": "done", "message": "You already have your certificate."}, 409
     if not st["eligible"]:
-        return {"error": "not_eligible", "message": "Finish the Beginner and Advanced courses first."}, 403
+        return {"error": "not_eligible", "message": "Finish the AI Tutor lessons and the Beginner and Advanced videos first."}, 403
     if not confirmed:
         return {"error": "confirm", "message": "Please confirm the name that will be printed on your certificate."}, 400
     if not me["name"]:
@@ -311,7 +314,7 @@ def _submit_sync(me, attempt_id, answers):
     if time.time() - _ts(at["created_at"]) > EXAM_MAX_AGE_SECONDS:
         return {"error": "expired", "message": "This exam expired. Start a new one."}, 410
     if not _existing_cert(me["key"]) and not _eligibility(me)[0]:
-        return {"error": "not_eligible", "message": "Finish the Beginner and Advanced courses first."}, 403
+        return {"error": "not_eligible", "message": "Finish the AI Tutor lessons and the Beginner and Advanced videos first."}, 403
     bank = _load_bank()
     ids = at["question_ids"]
     if not isinstance(answers, list):

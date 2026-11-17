@@ -35704,6 +35704,15 @@ def main():
         except Exception as _e:
             print(f"[RESEARCH] could not start: {type(_e).__name__}: {_e}")
 
+    # Read-only burst study on 1-minute candles (no trades), only while BURST_RESEARCH=1 is set.
+    if os.getenv("BURST_RESEARCH") == "1":
+        try:
+            import subprocess as _sp
+            _sp.Popen([sys.executable, os.path.join(os.path.dirname(os.path.abspath(__file__)), "burst_research.py")])
+            print("[BURST] process started")
+        except Exception as _e:
+            print(f"[BURST] could not start: {type(_e).__name__}: {_e}")
+
     try:
         _napp_install_push_bridge()
     except Exception as _e:

@@ -34794,7 +34794,50 @@ async def _post_init_capture_loop(app):
         _main_loop.create_task(_dbs())
     if os.getenv("REDRAW_CHART"):
         _main_loop.create_task(_redraw_chart_once(app, os.getenv("REDRAW_CHART")))
+    if os.getenv("REPLACE_PHOTO"):
+        _main_loop.create_task(_replace_signal_photo_once(app, os.getenv("REPLACE_PHOTO")))
     await catch_up_missed_signals(app)
+
+
+async def _replace_signal_photo_once(app, spec):
+    """One-off: spec = 'chat_id|message_id|pair|BUY|entry|sl|tp|tp1|cutoff-UTC-iso'. Draws the signal's chart on 5-minute
+    candles and swaps it into that already-posted channel message, keeping the caption and button. Runs once per spec."""
+    try:
+        key = "replace_" + __import__("hashlib").md5(spec.encode()).hexdigest()[:12]
+        if await asyncio.to_thread(_napp_state_get, key):
+            return
+        await asyncio.to_thread(_napp_state_set, key, "done")
+        chat_id, msg_id, pair, direction, entry, sl, tp, tp1, cutoff = [x.strip() for x in spec.split("|")]
+        chat_id, msg_id = int(chat_id), int(msg_id)
+        entry, sl, tp, tp1 = float(entry), float(sl), float(tp), float(tp1)
+        cfg = PAIR_CONFIG[pair]
+        candles = await asyncio.to_thread(get_cached_candles, pair, cfg, "5min", outputsize=1000, force_fresh=True)
+        cut = datetime.fromisoformat(cutoff)
+        times = _chart_to_mpl_time(candles)
+        keep = [c for c, t in zip(candles, times) if (t.replace(tzinfo=None) if hasattr(t, "replace") else t) <= cut]
+        if len(keep) < 110:
+            keep = candles
+        path = os.path.join(CHART_OUTPUT_DIR, f"replace_{pair}_{int(time.time())}.png")
+        ok = await asyncio.to_thread(generate_signal_chart, cfg["display"], "Momentum", direction, keep,
+                                     entry, sl, tp, path, 70, True, tp1)
+        if not ok:
+            print("[REPLACE] chart not made", flush=True)
+            return
+        # Read the live caption (text + links) by forwarding the post to the admin, then remove that copy.
+        fwd = await app.bot.forward_message(chat_id=int(ADMIN_USER_ID), from_chat_id=chat_id, message_id=msg_id)
+        caption, ents = fwd.caption, fwd.caption_entities
+        try:
+            await app.bot.delete_message(chat_id=int(ADMIN_USER_ID), message_id=fwd.message_id)
+        except Exception:
+            pass
+        with open(path, "rb") as fh:
+            await app.bot.edit_message_media(
+                chat_id=chat_id, message_id=msg_id,
+                media=InputMediaPhoto(fh, caption=caption, caption_entities=ents),
+                reply_markup=(get_channel_button() if chat_id in (int(CHANNEL_1_ID), int(CHANNEL_3_ID)) else None))
+        print(f"[REPLACE] swapped picture in {chat_id}/{msg_id}", flush=True)
+    except Exception as e:
+        print(f"[REPLACE] failed: {type(e).__name__}: {str(e)[:150]}", flush=True)
 
 
 async def _redraw_chart_once(app, spec):

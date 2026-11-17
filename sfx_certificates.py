@@ -26,6 +26,8 @@ EXAM_ADVANCED = 12
 PASS_PERCENT = 70
 RETRY_WAIT_SECONDS = 6 * 3600
 EXAM_MAX_AGE_SECONDS = 3 * 3600
+EXAM_TIME_LIMIT_SECONDS = 20 * 60   # 20 questions, 20 minutes
+EXAM_TIME_GRACE_SECONDS = 30        # covers network delay at the start and the end
 PUBLIC_BASE = os.getenv("PUBLIC_BASE_URL", "https://nexora-console-telegram-production.up.railway.app").rstrip("/")
 
 _deps = {}
@@ -245,6 +247,7 @@ def _status_sync(me):
     return {"eligible": ok, "issued": None, "name": me["name"],
             "can_start": ok and wait == 0, "wait_seconds": wait,
             "pass_percent": PASS_PERCENT, "questions": EXAM_BASIC + EXAM_ADVANCED,
+            "time_limit_seconds": EXAM_TIME_LIMIT_SECONDS,
             "progress": {"beginner": (counts or {}).get("beginner_all", 0), "beginner_total": BEGINNER_TOTAL,
                          "advanced": (counts or {}).get("advanced_all", 0), "advanced_total": ADVANCED_TOTAL,
                          "videos_beginner": (counts or {}).get("videos_beginner", 0),
@@ -280,6 +283,7 @@ def _start_sync(me, confirmed):
     if code not in (200, 201) or not rows:
         return {"error": "server", "message": "Could not start the exam. Try again."}, 503
     return {"attempt_id": rows[0]["id"], "pass_percent": PASS_PERCENT,
+            "time_limit_seconds": EXAM_TIME_LIMIT_SECONDS,
             "questions": [{"id": q["id"], "question": q["question"], "options": q["options"]} for q in picked]}, 200
 
 
@@ -312,6 +316,12 @@ def _submit_sync(me, attempt_id, answers):
     ids = at["question_ids"]
     if not isinstance(answers, list):
         answers = []
+    if time.time() - _ts(at["created_at"]) > EXAM_TIME_LIMIT_SECONDS + EXAM_TIME_GRACE_SECONDS:
+        # Time ran out: the attempt is used up and nothing is scored.
+        _sb(f"sfx_cert_attempts?id=eq.{at['id']}", "PATCH",
+            {"submitted_at": datetime.now(timezone.utc).isoformat(), "score": 0})
+        return {"score": 0, "total": len(ids), "percent": 0, "passed": False,
+                "pass_percent": PASS_PERCENT, "timed_out": True}, 200
     right = 0
     for i, qid in enumerate(ids):
         try:

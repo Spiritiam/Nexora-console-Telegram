@@ -6047,13 +6047,26 @@ def _napp_float(v):
 
 
 async def _napp_build_signal_chart(pair_key, direction, entry, sl, tp):
+    # Same as the Telegram pictures: the entry follows the 5-minute EMA trend, so draw 5-minute candles
+    # (hourly only as a fallback if the 5-minute data is unavailable).
+    candles = None
     if pair_key in SYNTHETIC_CONFIG:
         config = {"display": SYNTHETIC_CONFIG[pair_key]["display"]}
-        candles = await get_cached_synthetic_candles(
-            pair_key, SYNTHETIC_CONFIG[pair_key]["symbol"], "1h", 3600, 210)
+        try:
+            candles = await get_cached_synthetic_candles(pair_key, SYNTHETIC_CONFIG[pair_key]["symbol"], "5m", 300, 300)
+        except Exception:
+            candles = None
+        if not candles or len(candles) < 110:
+            candles = await get_cached_synthetic_candles(
+                pair_key, SYNTHETIC_CONFIG[pair_key]["symbol"], "1h", 3600, 210)
     else:
         config = PAIR_CONFIG[pair_key]
-        candles = await asyncio.to_thread(get_cached_candles, pair_key, config, "1h", outputsize=210)
+        try:
+            candles = await asyncio.to_thread(get_cached_candles, pair_key, config, "5min", outputsize=300)
+        except Exception:
+            candles = None
+        if not candles or len(candles) < 110:
+            candles = await asyncio.to_thread(get_cached_candles, pair_key, config, "1h", outputsize=210)
     if not candles or len(candles) < 30:
         return None
     os.makedirs(CHART_OUTPUT_DIR, exist_ok=True)

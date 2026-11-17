@@ -13288,6 +13288,13 @@ async def _build_synthetic_signal_response_inner(index_key, min_agree=2, manual=
     chart_strategy_name = winning_votes[0]["strategy_name"] if winning_votes else "Momentum"
     if chart_strategy_name:
         chart_candles = m1_candles if chart_strategy_name in M1_BASED_STRATEGIES else h1_candles
+        if _tdir:  # the entry follows the 5-minute EMA trend, so draw those candles and EMAs
+            try:
+                _c5 = await get_cached_synthetic_candles(index_key, config["symbol"], "5m", 300, 300)
+                if _c5 and len(_c5) >= 110:
+                    chart_candles, chart_strategy_name = _c5, "Momentum"
+            except Exception as _e:
+                print(f"[CHART] {config['display']}: 5-minute candles unavailable, using the usual ones: {type(_e).__name__}")
         chart_path = os.path.join(CHART_OUTPUT_DIR, f"{index_key}_{int(time.time())}.png")
         chart_ok = await asyncio.to_thread(
             generate_signal_chart,
@@ -24212,9 +24219,19 @@ async def build_signal_response(question, user_id=None, retry_mismatch=False, _s
         # entry/SL/TP lines, exactly like every other chart).
         chart_strategy_name = winning_votes[0]["strategy_name"] if winning_votes else "Momentum"
         chart_path = os.path.join(CHART_OUTPUT_DIR, f"{matched_key}_{int(time.time())}.png")
+        # The entry follows the 5-minute EMA trend, so the picture shows those same 5-minute candles
+        # and EMAs (the hourly chart showed a different trend and looked wrong next to the signal).
+        _chart_candles, _chart_name = h1_candles, chart_strategy_name
+        if _tdir:
+            try:
+                _c5 = await asyncio.to_thread(get_cached_candles, matched_key, config, "5min", outputsize=300)
+                if _c5 and len(_c5) >= 110:
+                    _chart_candles, _chart_name = _c5, "Momentum"
+            except Exception as _e:
+                print(f"[CHART] {display}: 5-minute candles unavailable, using hourly: {type(_e).__name__}")
         chart_ok = await asyncio.to_thread(
             generate_signal_chart,
-            display, chart_strategy_name, direction, h1_candles,
+            display, _chart_name, direction, _chart_candles,
             entry_price, stop_loss, take_profit, chart_path,
             70, True, take_profit_1,
         )

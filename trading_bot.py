@@ -7881,9 +7881,10 @@ def _napp_push_broadcast_sync(kind, title, body, data):
     creds, project = _napp_fcm_load()
     if not creds or not project:
         return 0
-    col = "signals_on" if kind == "signals" else "tips_on"
+    # News alerts (a few a month) go to every registered phone; signals and tips follow their switches.
+    flt = "" if kind == "news" else f"{'signals_on' if kind == 'signals' else 'tips_on'}=eq.true&"
     try:
-        rows = requests.get(f"{SUPABASE_URL}/rest/v1/app_push_tokens?{col}=eq.true&select=fcm_token&limit=10000",
+        rows = requests.get(f"{SUPABASE_URL}/rest/v1/app_push_tokens?{flt}select=fcm_token&limit=10000",
                             headers=sb_headers(), timeout=15).json()
         tokens = sorted({r["fcm_token"] for r in rows if isinstance(r, dict) and r.get("fcm_token")}) if isinstance(rows, list) else []
     except Exception as e:
@@ -7976,6 +7977,54 @@ def _napp_send_learning_tip_sync():
         "tips", "Keep learning with SpiritFX",
         f"{c['title']} by {c['tutor']}: {c['video_count']} lessons. Tap to start watching.",
         {"type": "tip", "cid": c["course_id"], "lvl": c["lvl"]})
+
+
+# Big US releases that move gold, oil, BTC and the dollar. Matched on the calendar title.
+_NEWS_ALERT_EVENTS = (
+    ("non-farm employment change", "NFP"),
+    ("federal funds rate", "FOMC rate decision"),
+    ("cpi m/m", "US CPI"),
+)
+
+
+def _napp_send_news_alerts_sync():
+    """About 1 hour before NFP / FOMC / US CPI: one alert per event, opens Nexora AI with the question ready."""
+    try:
+        data = requests.get("https://nfs.faireconomy.media/ff_calendar_thisweek.json", timeout=12).json()
+    except Exception as e:
+        print(f"[PUSH] news alerts: calendar fetch failed: {type(e).__name__}")
+        return
+    if not isinstance(data, list):
+        return
+    now = datetime.now(timezone.utc)
+    for ev in data:
+        try:
+            if ev.get("country") != "USD" or str(ev.get("impact", "")).lower() != "high":
+                continue
+            title = str(ev.get("title", "")).lower()
+            label = next((lb for key, lb in _NEWS_ALERT_EVENTS if key in title), None)
+            if not label:
+                continue
+            when = datetime.fromisoformat(ev["date"])
+            if when.tzinfo is None:
+                when = when.replace(tzinfo=timezone.utc)
+            mins = (when.astimezone(timezone.utc) - now).total_seconds() / 60.0
+            if not (0 < mins <= 65):
+                continue
+            key = f"news_{when.astimezone(timezone.utc).strftime('%Y%m%d%H%M')}_{label.replace(' ', '_')}"
+            if _napp_state_get(key):
+                continue
+            _napp_state_set(key, "sent")
+            _napp_push_broadcast_sync(
+                "news", f"{label} in about 1 hour",
+                "Big US news is coming and it can move gold, oil, Bitcoin and the dollar. Tap to see what it could do.",
+                {"type": "news", "q": f"What could the US {label} do to the market?"})
+        except Exception as e:
+            print(f"[PUSH] news alert skipped: {type(e).__name__}")
+
+
+async def run_news_alert_job(context):
+    await asyncio.to_thread(_napp_send_news_alerts_sync)
 
 
 async def run_learning_tip_job(context):
@@ -36289,6 +36338,7 @@ def main():
     job_queue.run_repeating(run_bad_key_notify, interval=60, first=75, name="exness_bad_key_notify")
     job_queue.run_repeating(run_dsc_tick, interval=3, first=62, name="deriv_scalper_straddle")
     job_queue.run_daily(run_learning_tip_job, time=datetime.strptime("09:00", "%H:%M").time().replace(tzinfo=timezone.utc), name="learning_tip_push")
+    job_queue.run_repeating(run_news_alert_job, interval=300, first=120, name="news_alert_push")
     job_queue.run_repeating(run_bot_migration, interval=600, first=20, name="bot_lineup_migration")
     job_queue.run_repeating(run_trend_alerts, interval=120, first=90, name="trend_alerts")
 

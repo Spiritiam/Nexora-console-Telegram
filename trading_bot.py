@@ -34792,7 +34792,40 @@ async def _post_init_capture_loop(app):
             except Exception as _e:
                 print(f"[DBURST] failed: {type(_e).__name__}: {str(_e)[:150]}", flush=True)
         _main_loop.create_task(_dbs())
+    if os.getenv("REDRAW_CHART"):
+        _main_loop.create_task(_redraw_chart_once(app, os.getenv("REDRAW_CHART")))
     await catch_up_missed_signals(app)
+
+
+async def _redraw_chart_once(app, spec):
+    """One-off: spec = 'pair|BUY|entry|sl|tp|tp1|cutoff-UTC-iso'. Draws that signal's chart on 5-minute candles
+    up to the cutoff and sends the picture to the admin only. Runs once per spec (remembered in app_push_state)."""
+    try:
+        key = "redraw_" + __import__("hashlib").md5(spec.encode()).hexdigest()[:12]
+        if await asyncio.to_thread(_napp_state_get, key):
+            return
+        await asyncio.to_thread(_napp_state_set, key, "done")
+        pair, direction, entry, sl, tp, tp1, cutoff = [x.strip() for x in spec.split("|")]
+        entry, sl, tp, tp1 = float(entry), float(sl), float(tp), float(tp1)
+        cfg = PAIR_CONFIG[pair]
+        candles = await asyncio.to_thread(get_cached_candles, pair, cfg, "5min", outputsize=1000, force_fresh=True)
+        cut = datetime.fromisoformat(cutoff)
+        times = _chart_to_mpl_time(candles)
+        keep = [c for c, t in zip(candles, times) if (t.replace(tzinfo=None) if hasattr(t, "replace") else t) <= cut]
+        if len(keep) < 110:
+            keep = candles
+        path = os.path.join(CHART_OUTPUT_DIR, f"redraw_{pair}_{int(time.time())}.png")
+        ok = await asyncio.to_thread(generate_signal_chart, cfg["display"], "Momentum", direction, keep,
+                                     entry, sl, tp, path, 70, True, tp1)
+        if ok and ADMIN_USER_ID:
+            with open(path, "rb") as fh:
+                await app.bot.send_photo(chat_id=int(ADMIN_USER_ID), photo=fh,
+                                         caption=f"{cfg['display']} {direction} - 5-minute EMAs")
+            print("[REDRAW] sent chart to admin", flush=True)
+        else:
+            print(f"[REDRAW] chart not made (ok={ok})", flush=True)
+    except Exception as e:
+        print(f"[REDRAW] failed: {type(e).__name__}: {str(e)[:150]}", flush=True)
 
 
 async def catch_up_missed_signals(app):

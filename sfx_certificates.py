@@ -168,11 +168,53 @@ def _class_counts(me):
         return None
 
 
+WATCH_PERCENT = 0.8          # a video counts once 80% of it has really been played
+MIN_VIDEO_SECONDS = 30       # ignore clips shorter than this
+MIN_FULL_COURSE = 8          # a tutor course with at least this many videos can complete a level on its own
+
+
+def _level_key(lvl):
+    l = str(lvl or "").strip().lower()
+    return l if l in ("beginner", "advanced") else ""
+
+
+def _video_progress(user_key):
+    """Watched tutor videos for this student, from any tutor or language.
+    Returns {"beginner": n, "advanced": n, "full_course": {"beginner": bool, "advanced": bool}}."""
+    out = {"beginner": 0, "advanced": 0, "full_course": {"beginner": False, "advanced": False}}
+    try:
+        code, rows = _sb(f"sfx_video_events?user_key=eq.{requests.utils.quote(user_key, safe='')}"
+                         "&watched=eq.true&select=course_id,video_id,lvl,course_total&limit=5000")
+        if code != 200 or not isinstance(rows, list):
+            return out
+        per_course = {}
+        for r in rows:
+            lv = _level_key(r.get("lvl"))
+            if not lv:
+                continue
+            out[lv] += 1
+            c = per_course.setdefault(r.get("course_id"), {"lvl": lv, "n": 0, "total": 0})
+            c["n"] += 1
+            c["total"] = max(c["total"], _to_int(r.get("course_total")))
+        for c in per_course.values():
+            if c["total"] >= MIN_FULL_COURSE and c["n"] >= c["total"]:
+                out["full_course"][c["lvl"]] = True
+    except Exception:
+        pass
+    return out
+
+
 def _eligibility(me):
     """(eligible, source, counts). Eligible when spiritfx.org marks the student eligible,
     or when the Beginner and Advanced lessons are all finished."""
     counts = _class_counts(me)
-    by_progress = bool(counts) and counts["beginner"] >= BEGINNER_TOTAL and counts["advanced"] >= ADVANCED_TOTAL
+    vids = _video_progress(me["key"])
+    # Forex Class lessons and tutor videos (any tutor, any language) add up per level.
+    b_all = (counts or {}).get("beginner", 0) + vids["beginner"]
+    a_all = (counts or {}).get("advanced", 0) + vids["advanced"]
+    b_done = b_all >= BEGINNER_TOTAL or vids["full_course"]["beginner"]
+    a_done = a_all >= ADVANCED_TOTAL or vids["full_course"]["advanced"]
+    by_progress = b_done and a_done
     ok = bool(me["eligible"]) or by_progress
     source = "flag" if me["eligible"] else ("progress" if by_progress else None)
     try:
@@ -183,7 +225,12 @@ def _eligibility(me):
         _sb("sfx_progress", "POST", row, prefer="resolution=merge-duplicates")
     except Exception:
         pass
-    return ok, source, counts
+    shown = dict(counts or {})
+    shown["beginner_all"] = BEGINNER_TOTAL if b_done else min(b_all, BEGINNER_TOTAL)
+    shown["advanced_all"] = ADVANCED_TOTAL if a_done else min(a_all, ADVANCED_TOTAL)
+    shown["videos_beginner"] = vids["beginner"]
+    shown["videos_advanced"] = vids["advanced"]
+    return ok, source, shown
 
 
 def _status_sync(me):
@@ -198,8 +245,10 @@ def _status_sync(me):
     return {"eligible": ok, "issued": None, "name": me["name"],
             "can_start": ok and wait == 0, "wait_seconds": wait,
             "pass_percent": PASS_PERCENT, "questions": EXAM_BASIC + EXAM_ADVANCED,
-            "progress": {"beginner": (counts or {}).get("beginner", 0), "beginner_total": BEGINNER_TOTAL,
-                         "advanced": (counts or {}).get("advanced", 0), "advanced_total": ADVANCED_TOTAL}}
+            "progress": {"beginner": (counts or {}).get("beginner_all", 0), "beginner_total": BEGINNER_TOTAL,
+                         "advanced": (counts or {}).get("advanced_all", 0), "advanced_total": ADVANCED_TOTAL,
+                         "videos_beginner": (counts or {}).get("videos_beginner", 0),
+                         "videos_advanced": (counts or {}).get("videos_advanced", 0)}}
 
 
 async def status_handler(request):
@@ -538,9 +587,45 @@ def _video_event_sync(me, data):
     vid = str(data.get("video_id") or "").strip()[:80]
     if not cid or not vid:
         return {"error": "bad_request", "message": "Missing course or video."}, 400
-    _sb("sfx_video_events", "POST", {"user_key": me["key"], "course_id": cid, "video_id": vid},
-        prefer="resolution=ignore-duplicates")
-    return {"ok": True}, 200
+    lvl = str(data.get("lvl") or "").strip()[:20]
+    total = _to_int(data.get("course_total"))
+    row = {"user_key": me["key"], "course_id": cid, "video_id": vid}
+    if lvl:
+        row["lvl"] = lvl
+    if 0 < total < 1000:
+        row["course_total"] = total
+    try:
+        duration = float(data.get("duration") or 0)
+        played = float(data.get("played") or 0)
+    except Exception:
+        duration, played = 0.0, 0.0
+    # Counts as watched only when the student really played 80% of the video.
+    if duration >= MIN_VIDEO_SECONDS and played >= WATCH_PERCENT * duration and played <= duration * 4:
+        row["watched"] = True
+        row["watched_at"] = datetime.now(timezone.utc).isoformat()
+        _sb("sfx_video_events?on_conflict=user_key,course_id,video_id", "POST", row,
+            prefer="resolution=merge-duplicates")
+        return {"ok": True, "watched": True}, 200
+    _sb("sfx_video_events", "POST", row, prefer="resolution=ignore-duplicates")
+    return {"ok": True, "watched": False}, 200
+
+
+def _watched_sync(me):
+    code, rows = _sb(f"sfx_video_events?user_key=eq.{requests.utils.quote(me['key'], safe='')}"
+                     "&watched=eq.true&select=course_id,video_id&limit=5000")
+    out = {}
+    if code == 200 and isinstance(rows, list):
+        for r in rows:
+            out.setdefault(str(r.get("course_id")), []).append(str(r.get("video_id")))
+    return {"watched": out}, 200
+
+
+async def watched_handler(request):
+    me, err = await _auth(request)
+    if err:
+        return err
+    body, status = await asyncio.to_thread(_watched_sync, me)
+    return _j(body, status)
 
 
 async def progress_event_handler(request):
@@ -561,6 +646,7 @@ def register(app, sb_headers, supabase_url, validate_token, user_url):
     app.router.add_post("/api/nexora/cert/exam/start", start_handler)
     app.router.add_post("/api/nexora/cert/exam/submit", submit_handler)
     app.router.add_post("/api/nexora/progress", progress_event_handler)
+    app.router.add_get("/api/nexora/progress/watched", watched_handler)
     app.router.add_get("/api/nexora/profile", profile_get_handler)
     app.router.add_post("/api/nexora/profile", profile_save_handler)
     app.router.add_get("/cert/{no}", image_handler)

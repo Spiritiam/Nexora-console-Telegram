@@ -3384,6 +3384,7 @@ BURST_ENTRY_LIVE = os.getenv("BURST_ENTRY_LIVE", "1") == "1"
 BURST_RULES = {
     "xauusd": {"side": "follow", "trend": True, "kv": 3, "kr": 3},
     "btcusd": {"side": "fade", "trend": False, "kv": 3, "kr": 0},
+    "usoil": {"side": "follow", "trend": True, "kv": 3, "kr": 3},
 }
 _BURST_DEC = {}
 _BURST_LOCKS = {}
@@ -34560,6 +34561,20 @@ async def _post_init_capture_loop(app):
     then runs the normal startup catch-up."""
     global _main_loop
     _main_loop = asyncio.get_running_loop()
+    if os.getenv("DERIV_BURST_STUDY") == "1":
+        async def _dbs():
+            try:
+                import deriv_burst_study
+
+                async def _url():
+                    acc = await deriv_get_options_accounts(DERIV_SERVICE_TOKEN)
+                    lst = (acc or {}).get("data") or (acc or {}).get("accounts") or []
+                    aid = lst[0].get("account_id") or lst[0].get("loginid") or lst[0].get("id")
+                    return await deriv_get_otp_url(DERIV_SERVICE_TOKEN, aid)
+                await deriv_burst_study.run(_url)
+            except Exception as _e:
+                print(f"[DBURST] failed: {type(_e).__name__}: {str(_e)[:150]}", flush=True)
+        _main_loop.create_task(_dbs())
     await catch_up_missed_signals(app)
 
 

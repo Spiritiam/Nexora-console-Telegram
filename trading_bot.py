@@ -7881,8 +7881,8 @@ def _napp_push_broadcast_sync(kind, title, body, data):
     creds, project = _napp_fcm_load()
     if not creds or not project:
         return 0
-    # News alerts (a few a month) go to every registered phone; signals and tips follow their switches.
-    flt = "" if kind == "news" else f"{'signals_on' if kind == 'signals' else 'tips_on'}=eq.true&"
+    col = {"signals": "signals_on", "tips": "tips_on", "news": "news_on"}.get(kind, "tips_on")
+    flt = f"{col}=eq.true&"
     try:
         rows = requests.get(f"{SUPABASE_URL}/rest/v1/app_push_tokens?{flt}select=fcm_token&limit=10000",
                             headers=sb_headers(), timeout=15).json()
@@ -8043,15 +8043,15 @@ async def nexora_app_push_prefs_handler(request):
             body = await request.json()
         except Exception:
             return _napp_json({"error": "bad_request", "message": "Could not read that."}, 400)
-        patch = {k: bool(body[k]) for k in ("signals_on", "tips_on") if isinstance(body, dict) and k in body}
+        patch = {k: bool(body[k]) for k in ("signals_on", "tips_on", "news_on") if isinstance(body, dict) and k in body}
         if patch:
             await asyncio.to_thread(lambda: requests.patch(base, headers=sb_headers(), json=patch, timeout=10))
     try:
-        rows = await asyncio.to_thread(lambda: requests.get(base + "&select=signals_on,tips_on&limit=1", headers=sb_headers(), timeout=10).json())
+        rows = await asyncio.to_thread(lambda: requests.get(base + "&select=signals_on,tips_on,news_on&limit=1", headers=sb_headers(), timeout=10).json())
     except Exception:
         rows = []
     r0 = rows[0] if isinstance(rows, list) and rows else {}
-    return _napp_json({"signals_on": r0.get("signals_on", True), "tips_on": r0.get("tips_on", True)})
+    return _napp_json({"signals_on": r0.get("signals_on", True), "tips_on": r0.get("tips_on", True), "news_on": r0.get("news_on", True)})
 
 
 class _AppMsg:
@@ -8150,11 +8150,12 @@ async def nexora_app_push_register_handler(request):
         row = {"fcm_token": token, "synthetic_id": synth, "platform": platform,
                "updated_at": datetime.utcnow().isoformat() + "Z"}
         try:  # a new phone token keeps the switches the user already chose
-            old = requests.get(f"{SUPABASE_URL}/rest/v1/app_push_tokens?synthetic_id=eq.{synth}&select=signals_on,tips_on&limit=1",
+            old = requests.get(f"{SUPABASE_URL}/rest/v1/app_push_tokens?synthetic_id=eq.{synth}&select=signals_on,tips_on,news_on&limit=1",
                                headers=sb_headers(), timeout=10).json()
             if isinstance(old, list) and old:
                 row["signals_on"] = old[0].get("signals_on", True)
                 row["tips_on"] = old[0].get("tips_on", True)
+                row["news_on"] = old[0].get("news_on", True)
         except Exception:
             pass
         return requests.post(

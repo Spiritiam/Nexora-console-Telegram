@@ -1419,7 +1419,7 @@ def apply_sltp_override(account, pair_key, direction, entry_price, stop_loss, ta
 
     DISABLED by default (SLTP_OVERRIDE_ENABLED=1 turns it back on): every
     copier now follows the signal's own SL / TP1 / TP2 exactly."""
-    if os.getenv("SLTP_OVERRIDE_ENABLED", "0") != "1" and not _is_prop_id(account.get("user_id")):
+    if os.getenv("SLTP_OVERRIDE_ENABLED", "1") == "0" and not _is_prop_id(account.get("user_id")):
         return stop_loss, take_profit
     try:
         sl_pips = account.get("sl_override_pips")
@@ -3533,7 +3533,10 @@ async def _ema5_pick_deriv(origin_key):
 
 # Same stop distance as the normal (scheduled / manual) signals, in each pair's own pip unit:
 # gold 100 ($10), oil 50 ($0.50), BTC 50 (~$496). Silver is no longer traded by these bots.
-SC_SIGNAL_SL_PIPS = {"xauusd": 100, "xauusd247": 100, "btcusd": 50, "usoil": 50, "xagusd": 50}
+# Aggressive Scalper / Account Flip stops (halved from 100 gold / 50 others).
+SC_SIGNAL_SL_PIPS = {"xauusd": 50, "xauusd247": 50, "btcusd": 25, "usoil": 25, "xagusd": 25}
+# Lowest custom stop (in these bots' own pips) a user may set on Aggressive Scalper / Account Flip.
+SC_MIN_CUSTOM_SL_PIPS = 20
 SC_CFG = {
     # Trailing starts once the trade is as far in profit as the stop is away (100 pips on gold): the stop moves to
     # break-even, then follows price at half the stop distance. 0/None = use the fixed pips below instead.
@@ -3562,7 +3565,7 @@ SC_MODES = {
     # Account Flip: support/resistance on the 1-hour chart, entry from the 30-minute chart.
     # Stop 100 pips on gold, 50 on silver; at +20 pips break-even + trailing 10 behind;
     # one more trade every further 20 pips (max 5) once the earlier ones are protected.
-    "flip_sr": dict(SC_CFG, entry="mlsim", sl_pips=100, sl_pips_by_pair=SC_SIGNAL_SL_PIPS,
+    "flip_sr": dict(SC_CFG, entry="mlsim", sl_pips=50, sl_pips_by_pair=SC_SIGNAL_SL_PIPS,
                     trail_activate_pips=20, trail_pips=10, max_layers=5, add_pips=20,
                     label="🚀 Account Flip"),
 }
@@ -3834,6 +3837,12 @@ async def _sc_tick_one(context, account):
         pc = SC_PAIR_CFG[pair_key]
         pip = pc["pip"]
         sl_pips = _sc_sl_pips(cfg, pair_key)
+        try:
+            _ov = float(account.get("sl_override_pips") or 0)
+            if _ov >= SC_MIN_CUSTOM_SL_PIPS:
+                sl_pips = _ov  # the user's own stop; trailing scales from it as before
+        except Exception:
+            pass
         pair_config = PAIR_CONFIG[pair_key]
         decimals = pair_config["decimals"]
         now = time.time()
@@ -7397,10 +7406,21 @@ async def nexora_app_exness_config_handler(request):
                           "flip_base_lot": base, "flip_disclaimer_accepted": True, **d}
             else:
                 return bad("Pick a mode.")
+            if fields.get("bot_choice") in SC_MODES or fields.get("bot_choice") == "account_flip":
+                fields["tp_override_pips"] = None  # no take profit on trailing bots
+                _old_sl = (row or {}).get("sl_override_pips")
+                if _old_sl is not None and float(_old_sl) < SC_MIN_CUSTOM_SL_PIPS:
+                    fields["sl_override_pips"] = None
             done = "Mode updated."
 
     elif action == "sltp":
         fields = {}
+        _bot_now = (row or {}).get("bot_choice")
+        _is_sc = _bot_now in SC_MODES or _bot_now == "account_flip"
+        if _is_sc and body.get("tp_pips") not in (None, "", 0):
+            return bad("Aggressive Scalper and Account Flip use a trailing stop, so they have no take profit.")
+        if _is_sc:
+            body = dict(body, tp_pips=None)
         for key, col in (("sl_pips", "sl_override_pips"), ("tp_pips", "tp_override_pips")):
             if key not in body:
                 continue
@@ -7410,6 +7430,8 @@ async def nexora_app_exness_config_handler(request):
             v = _napp_exness_num(body, key, NAPP_EXNESS_PIPS_MIN, NAPP_EXNESS_PIPS_MAX, 1)
             if v is None:
                 return bad(f"Pips must be {NAPP_EXNESS_PIPS_MIN:g} to {NAPP_EXNESS_PIPS_MAX:g}, or empty to use Nexora's own.")
+            if _is_sc and col == "sl_override_pips" and v < SC_MIN_CUSTOM_SL_PIPS:
+                return bad(f"The stop loss can be no lower than {SC_MIN_CUSTOM_SL_PIPS} pips on this bot.")
             fields[col] = v
         if not fields:
             return bad("Nothing to change.")
@@ -7654,6 +7676,12 @@ async def nexora_app_prop_config_handler(request):
             if v is None:
                 return bad(f"Stop loss and take profit must be {NAPP_EXNESS_PIPS_MIN:g} to {NAPP_EXNESS_PIPS_MAX:g} pips, or empty to use Nexora's own.")
             fields[col] = v
+        if fields.get("bot_choice") in SC_MODES:
+            if fields.get("tp_override_pips") is not None:
+                return bad("Aggressive Scalper and Account Flip use a trailing stop, so they have no take profit.")
+            _sl = fields.get("sl_override_pips")
+            if _sl is not None and _sl < SC_MIN_CUSTOM_SL_PIPS:
+                return bad(f"The stop loss can be no lower than {SC_MIN_CUSTOM_SL_PIPS} pips on this bot.")
         done = "Saved. It applies to the next trade."
     else:
         return bad("Unknown action.")

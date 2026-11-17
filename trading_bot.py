@@ -6433,11 +6433,7 @@ async def exness_unlink_for_telegram(user_id):
     has_account = bool(row and (row.get("metaapi_account_id") or row.get("account_number")))
     if not (verified or has_account):
         return "nothing", {}
-    used, uok = await asyncio.to_thread(_napp_exness_unlinks_used_sync, uid)
-    if not uok:
-        return "error", {}
-    if used >= NAPP_EXNESS_UNLINKS_PER_MONTH:
-        return "limit", {"reset": _napp_ex_next_month_start()}
+    # No monthly unlink limit any more: people may unlink and relink as often as they like.
 
     mt5_login = (row or {}).get("account_number")
     metaapi_id = (row or {}).get("metaapi_account_id")
@@ -6598,7 +6594,7 @@ async def _napp_exness_status_build(synth):
         # Full values for the signed-in user's own account, shown on the app's connected
         # card. The masked keys stay so older app builds keep working.
         "email_full": email or None,
-        "unlinks_left": max(0, NAPP_EXNESS_UNLINKS_PER_MONTH - used) if uok else None,
+        "unlinks_left": None,  # no monthly unlink limit any more
         "subscription": {
             "active": active_sub,
             "days_left": max(0, (expiry - now).days) if active_sub else 0,
@@ -6884,13 +6880,7 @@ async def nexora_app_exness_disconnect_handler(request):
         payload = await _napp_exness_status_build(synth) or {}
         return _napp_ex_reply("nothing_linked", extra=payload)
 
-    used, uok = await asyncio.to_thread(_napp_exness_unlinks_used_sync, synth)
-    if not uok:
-        return _napp_ex_reply("server_error", status=503)
-    if used >= NAPP_EXNESS_UNLINKS_PER_MONTH:
-        reset = _napp_ex_next_month_start()
-        return _napp_ex_reply("unlink_limit_reached", retry_at=reset, extra={"unlinks_left": 0},
-                              limit=NAPP_EXNESS_UNLINKS_PER_MONTH, when=_napp_ex_date_words(reset))
+    # No monthly unlink limit any more: people may unlink and relink as often as they like.
 
     mt5_login = (row or {}).get("account_number")
     metaapi_id = (row or {}).get("metaapi_account_id")
@@ -6984,7 +6974,7 @@ async def nexora_app_exness_disconnect_handler(request):
     payload = await _napp_exness_status_build(synth)
     if payload is None:
         payload = {"enabled": not _napp_exness_killed(), "verified": False, "exness_email": None,
-                   "unlinks_left": max(0, NAPP_EXNESS_UNLINKS_PER_MONTH - used - 1)}
+                   "unlinks_left": None}
     return _napp_ex_reply("unlinked", extra=payload)
 
 
@@ -29667,7 +29657,6 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             + (f"• free your Exness email ({masked}) so you can use it in the SpiritFX Academy app\n" if masked else "")
             + "\n⚠️ Trades already open on your Exness account stay open, but Nexora "
             "stops managing them (including any Account Flip stack).\n\n"
-            f"You can unlink up to {NAPP_EXNESS_UNLINKS_PER_MONTH} times a month. "
             "Any subscription days you have left are kept.",
             parse_mode=ParseMode.HTML,
             reply_markup=InlineKeyboardMarkup([

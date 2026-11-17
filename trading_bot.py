@@ -7862,12 +7862,147 @@ def _napp_push_send_sync(synth, title, body):
 
 def _napp_push_split(text):
     plain = _napp_strip_html(text or "")
+    # The app never shows the Nexora name: say SpiritFX instead (other Nexora products keep their names).
+    plain = re.sub(r"Nexora(?: AI)?(?! Bets| CoinPilot)", "SpiritFX", plain)
     lines = [ln.strip() for ln in plain.splitlines() if ln.strip()]
     if not lines:
-        return "Nexora", ""
+        return "SpiritFX", ""
     title = re.sub(r"\s+", " ", lines[0])[:70]
     body = re.sub(r"\s+", " ", " ".join(lines[1:]))[:230]
     return title, body or title
+
+
+# ---- Push to every app user: new signal and learning tips (each can be switched off in the app) ----
+_NAPP_PUSH_SIGNAL_SEEN = set()
+
+
+def _napp_push_broadcast_sync(kind, title, body, data):
+    """kind: 'signals' or 'tips'. Sends to every phone whose owner has that switch on."""
+    creds, project = _napp_fcm_load()
+    if not creds or not project:
+        return 0
+    col = "signals_on" if kind == "signals" else "tips_on"
+    try:
+        rows = requests.get(f"{SUPABASE_URL}/rest/v1/app_push_tokens?{col}=eq.true&select=fcm_token&limit=10000",
+                            headers=sb_headers(), timeout=15).json()
+        tokens = sorted({r["fcm_token"] for r in rows if isinstance(r, dict) and r.get("fcm_token")}) if isinstance(rows, list) else []
+    except Exception as e:
+        print(f"[PUSH] {kind} token list failed: {type(e).__name__}")
+        return 0
+    if not tokens:
+        print(f"[PUSH] {kind}: no phones registered")
+        return 0
+    try:
+        from google.auth.transport.requests import Request as _GReq
+        if not creds.valid:
+            creds.refresh(_GReq())
+        headers = {"Authorization": f"Bearer {creds.token}", "Content-Type": "application/json"}
+    except Exception as e:
+        print(f"[PUSH] auth refresh failed: {type(e).__name__}")
+        return 0
+    url = f"https://fcm.googleapis.com/v1/projects/{project}/messages:send"
+    payload_data = {k: str(v) for k, v in (data or {}).items()}
+
+    def _one(tok):
+        try:
+            r = requests.post(url, headers=headers, timeout=10, json={"message": {
+                "token": tok,
+                "notification": {"title": title[:80], "body": body[:240]},
+                "data": payload_data,
+                "android": {"priority": "HIGH"},
+                "apns": {"payload": {"aps": {"sound": "default"}}},
+            }})
+            if r.status_code in (404, 410) or (r.status_code == 400 and "INVALID_ARGUMENT" in r.text):
+                _napp_push_drop_token_sync(tok)
+                return 0
+            return 1 if r.status_code == 200 else 0
+        except Exception:
+            return 0
+    from concurrent.futures import ThreadPoolExecutor
+    with ThreadPoolExecutor(max_workers=8) as ex:
+        ok = sum(ex.map(_one, tokens))
+    print(f"[PUSH] {kind}: sent to {ok} of {len(tokens)} phones ({title[:40]})")
+    return ok
+
+
+def _napp_push_new_signal(signal_id, pair_name):
+    """Called when a scheduled signal is posted. Runs in its own thread so posting is never slowed."""
+    if not signal_id or signal_id in _NAPP_PUSH_SIGNAL_SEEN:
+        return
+    _NAPP_PUSH_SIGNAL_SEEN.add(signal_id)
+    import threading
+    threading.Thread(target=_napp_push_broadcast_sync, daemon=True, args=(
+        "signals", f"New Signal: {pair_name}", "A new trade signal has just been posted. Tap to view it.",
+        {"type": "signal", "signal_id": signal_id})).start()
+
+
+def _napp_state_get(key):
+    try:
+        r = requests.get(f"{SUPABASE_URL}/rest/v1/app_push_state?key=eq.{key}&select=value", headers=sb_headers(), timeout=10).json()
+        return r[0]["value"] if isinstance(r, list) and r else None
+    except Exception:
+        return None
+
+
+def _napp_state_set(key, value):
+    try:
+        h = dict(sb_headers())
+        h["Prefer"] = "resolution=merge-duplicates,return=minimal"
+        requests.post(f"{SUPABASE_URL}/rest/v1/app_push_state?on_conflict=key", headers=h, timeout=10,
+                      json={"key": key, "value": str(value), "updated_at": datetime.utcnow().isoformat() + "Z"})
+    except Exception:
+        pass
+
+
+def _napp_send_learning_tip_sync():
+    """Tuesday and Friday 10:00 Lagos: points everyone at the next course in the rotation."""
+    today = datetime.utcnow().strftime("%Y-%m-%d")
+    if _napp_state_get("tip_last_date") == today:
+        return
+    rows = requests.get(f"{SUPABASE_URL}/rest/v1/sfx_courses?active=eq.true&video_count=gt.0&lvl=in.(Beginner,Advanced)"
+                        f"&select=course_id,title,tutor,lvl,video_count&order=lvl.asc,sort.asc,created_at.asc",
+                        headers=sb_headers(), timeout=15).json()
+    if not isinstance(rows, list) or not rows:
+        print("[PUSH] learning tip: no courses found")
+        return
+    try:
+        idx = int(_napp_state_get("tip_idx") or 0)
+    except Exception:
+        idx = 0
+    c = rows[idx % len(rows)]
+    _napp_state_set("tip_last_date", today)
+    _napp_state_set("tip_idx", (idx + 1) % len(rows))
+    _napp_push_broadcast_sync(
+        "tips", "Keep learning with SpiritFX",
+        f"{c['title']} by {c['tutor']}: {c['video_count']} lessons. Tap to start watching.",
+        {"type": "tip", "cid": c["course_id"], "lvl": c["lvl"]})
+
+
+async def run_learning_tip_job(context):
+    if datetime.utcnow().weekday() not in (1, 4):  # Tuesday, Friday
+        return
+    await asyncio.to_thread(_napp_send_learning_tip_sync)
+
+
+async def nexora_app_push_prefs_handler(request):
+    synth, err = await _napp_deriv_auth(request, limit_per_min=30, allow_killed=True)
+    if err:
+        return err
+    base = f"{SUPABASE_URL}/rest/v1/app_push_tokens?synthetic_id=eq.{synth}"
+    if request.method == "POST":
+        try:
+            body = await request.json()
+        except Exception:
+            return _napp_json({"error": "bad_request", "message": "Could not read that."}, 400)
+        patch = {k: bool(body[k]) for k in ("signals_on", "tips_on") if isinstance(body, dict) and k in body}
+        if patch:
+            await asyncio.to_thread(lambda: requests.patch(base, headers=sb_headers(), json=patch, timeout=10))
+    try:
+        rows = await asyncio.to_thread(lambda: requests.get(base + "&select=signals_on,tips_on&limit=1", headers=sb_headers(), timeout=10).json())
+    except Exception:
+        rows = []
+    r0 = rows[0] if isinstance(rows, list) and rows else {}
+    return _napp_json({"signals_on": r0.get("signals_on", True), "tips_on": r0.get("tips_on", True)})
 
 
 class _AppMsg:
@@ -7963,11 +8098,19 @@ async def nexora_app_push_register_handler(request):
     def _save():
         headers = dict(sb_headers())
         headers["Prefer"] = "resolution=merge-duplicates,return=minimal"
+        row = {"fcm_token": token, "synthetic_id": synth, "platform": platform,
+               "updated_at": datetime.utcnow().isoformat() + "Z"}
+        try:  # a new phone token keeps the switches the user already chose
+            old = requests.get(f"{SUPABASE_URL}/rest/v1/app_push_tokens?synthetic_id=eq.{synth}&select=signals_on,tips_on&limit=1",
+                               headers=sb_headers(), timeout=10).json()
+            if isinstance(old, list) and old:
+                row["signals_on"] = old[0].get("signals_on", True)
+                row["tips_on"] = old[0].get("tips_on", True)
+        except Exception:
+            pass
         return requests.post(
             f"{SUPABASE_URL}/rest/v1/app_push_tokens?on_conflict=fcm_token",
-            headers=headers, timeout=10,
-            json={"fcm_token": token, "synthetic_id": synth, "platform": platform,
-                  "updated_at": datetime.utcnow().isoformat() + "Z"})
+            headers=headers, timeout=10, json=row)
     try:
         r = await asyncio.to_thread(_save)
         if r.status_code not in (200, 201, 204):
@@ -8027,6 +8170,8 @@ def run_korapay_webhook_server():
     webhook_app.router.add_get("/api/nexora/signal-chart", nexora_app_signal_chart_handler)
     webhook_app.router.add_post("/api/nexora/push/register", nexora_app_push_register_handler)
     webhook_app.router.add_post("/api/nexora/push/unregister", nexora_app_push_unregister_handler)
+    webhook_app.router.add_get("/api/nexora/push/prefs", nexora_app_push_prefs_handler)
+    webhook_app.router.add_post("/api/nexora/push/prefs", nexora_app_push_prefs_handler)
     port = int(os.getenv("PORT", 8080))
     print(f"[KORAPAY WEBHOOK] Starting webhook server on port {port}...")
     # handle_signals=False - CONFIRMED REAL CRASH via live logs:
@@ -9440,6 +9585,11 @@ def log_signal(signal_data, source="scheduled"):
                 f"[SIGNAL LOG] ✅ Logged {signal_data['pair_name']} "
                 f"{signal_data['direction']} (id={signal_id})"
             )
+            if signal_id and source == "scheduled":
+                try:
+                    _napp_push_new_signal(signal_id, payload["pair_name"])
+                except Exception as _pe:
+                    print(f"[PUSH] signal push failed: {type(_pe).__name__}")
             if signal_id:
                 notify_spiritfx("signal.created", {
                     "id": signal_id,
@@ -36138,6 +36288,7 @@ def main():
     job_queue.run_repeating(run_sc_tick, interval=5, first=58, name="aggressive_scalper_straddle")
     job_queue.run_repeating(run_bad_key_notify, interval=60, first=75, name="exness_bad_key_notify")
     job_queue.run_repeating(run_dsc_tick, interval=3, first=62, name="deriv_scalper_straddle")
+    job_queue.run_daily(run_learning_tip_job, time=datetime.strptime("09:00", "%H:%M").time().replace(tzinfo=timezone.utc), name="learning_tip_push")
     job_queue.run_repeating(run_bot_migration, interval=600, first=20, name="bot_lineup_migration")
     job_queue.run_repeating(run_trend_alerts, interval=120, first=90, name="trend_alerts")
 

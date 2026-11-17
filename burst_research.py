@@ -27,7 +27,10 @@ SYMBOLS = {  # symbol -> stop distance in PRICE units (the bot's own pips: gold 
     "XAUUSDm": 5.0,
     "USOILm": 0.25,
     "BTCUSDm": 25 * 9.918,
+    # BTC priced in gold: stop given as a share of price (0.1%, 0.2%, 0.3%) since its pip size is not known
+    "BTCXAUm@0.001": 0, "BTCXAUm@0.002": 0, "BTCXAUm@0.003": 0,
 }
+ONLY = os.getenv("BURST_ONLY", "").strip()  # e.g. "BTCXAUm": run just that symbol
 DAYS = int(os.getenv("BURST_DAYS", "20"))
 LOOKBACK = 30
 HORIZON = 60
@@ -279,7 +282,12 @@ def main():
     except Exception:
         pass
     log(f"start: {list(SYMBOLS)}, {DAYS} days of 1-minute bars")
-    for sym, stop_d in SYMBOLS.items():
+    for sym_key, stop_d in SYMBOLS.items():
+        sym, _, frac = sym_key.partition("@")
+        if ONLY and sym != ONLY:
+            continue
+        if not ONLY and frac:
+            continue
         try:
             rows = fetch_h1(sym, DAYS, "1m")
         except Exception as e:
@@ -290,6 +298,9 @@ def main():
             continue
         a = np.array(rows, dtype=float)
         t, o, h, l, c, v = a[:, 0], a[:, 1], a[:, 2], a[:, 3], a[:, 4], a[:, 5]
+        if frac:
+            stop_d = float(frac) * float(np.median(c))
+            sym = f"{sym} (stop {float(frac) * 100:.1f}% of price)"
         have_v = float(v.sum()) > 0 and float(np.median(v)) > 0
         days = max(1.0, (t[-1] - t[0]) / 86400.0)
         log(f"{sym}: {len(rows)} bars over {days:.1f} days, tick counts {'available' if have_v else 'MISSING'}, "
@@ -318,7 +329,7 @@ def main():
                 log(f"{sym} | {bl} | {name}: trades={s[0]} ({s[0] / days:.1f}/day) win={s[1]:.0f}% "
                     f"net={s[2] * 100:+.0f}% of stop per trade | first70% net={(a1[2] * 100) if a1 else float('nan'):+.0f}% "
                     f"last30% net={(a2[2] * 100) if a2 else float('nan'):+.0f}%")
-    if os.getenv("BURST_TICKS", "1") == "1":
+    if os.getenv("BURST_TICKS", "1") == "1" and not ONLY:
         for sym, stop_d in TICK_STOPS.items():
             try:
                 tick_study(sym, stop_d)

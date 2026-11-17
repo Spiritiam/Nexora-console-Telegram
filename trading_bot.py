@@ -3379,6 +3379,43 @@ async def _ema5_deriv(index_key, config):
     return await _ema5_decision("deriv", index_key, fetch)
 
 
+# 1-minute burst entry (gold, BTC) for the Aggressive Scalper and Account Flip. BURST_ENTRY_LIVE=0 reverts to the 5-minute EMA entry.
+BURST_ENTRY_LIVE = os.getenv("BURST_ENTRY_LIVE", "1") == "1"
+BURST_RULES = {
+    "xauusd": {"side": "follow", "trend": True, "kv": 3, "kr": 3},
+    "btcusd": {"side": "fade", "trend": False, "kv": 3, "kr": 0},
+}
+_BURST_DEC = {}
+_BURST_LOCKS = {}
+_BURST_LOGGED = {}
+
+
+async def _burst_decision(pair_key, pair_config):
+    """One burst check per instrument per closed 1-minute bar, shared by every account."""
+    import burst_entry
+    slot = int(time.time() // 60)
+    hit = _BURST_DEC.get(pair_key)
+    if hit and hit[0] == slot:
+        return hit[1]
+    lock = _BURST_LOCKS.setdefault(pair_key, asyncio.Lock())
+    async with lock:
+        hit = _BURST_DEC.get(pair_key)
+        if hit and hit[0] == slot:
+            return hit[1]
+        res = None
+        try:
+            candles = await asyncio.to_thread(get_cached_candles, pair_key, pair_config, "1min", outputsize=300, max_age=(time.time() % 60) + 2)
+            if candles:
+                res = await asyncio.to_thread(burst_entry.evaluate, candles, BURST_RULES[pair_key])
+        except Exception as e:
+            print(f"[BURST] {pair_key} failed: {type(e).__name__}: {str(e)[:100]}", flush=True)
+        _BURST_DEC[pair_key] = (slot, res)
+        if res and (res.get("direction") or time.time() - _BURST_LOGGED.get(pair_key, 0) > 900):
+            _BURST_LOGGED[pair_key] = time.time()
+            print(f"[BURST] {pair_key}: {res.get('direction') or '-'} ({res.get('why')})", flush=True)
+        return res
+
+
 # Pairs the scheduled/manual signal scan may swap in (one market group: metals, oil, BTC, forex).
 FX_SCAN_KEYS = ["xauusd", "xagusd", "usoil", "btcusd", "gbpjpy", "eurjpy", "usdjpy", "gbpusd",
                 "eurusd", "audusd", "usdcad", "usdchf", "nzdusd"]
@@ -3956,7 +3993,16 @@ async def _sc_tick_one(context, account):
 
         sig = None
         ml_used = False
-        if cfg.get("entry") == "mlsim":
+        if BURST_ENTRY_LIVE and pair_key in BURST_RULES and (cfg.get("entry") == "mlsim" or account["bot_choice"] == "aggressive_scalper"):
+            # 1-minute burst entry (gold with trend filter, BTC faded); stops, trailing and layers below are unchanged
+            st["phase"] = "armed"
+            _b = await _burst_decision(pair_key, pair_config)
+            if not _b or not _b.get("direction") or st.get("burst_bar") == _b["bar_t"]:
+                return
+            direction = _b["direction"]
+            st["burst_bar"] = _b["bar_t"]
+            ml_used = True
+        elif cfg.get("entry") == "mlsim":
             # Account Flip: hourly ML model + 10,000-path simulation choose the side; stops, trailing
             # and layers below are unchanged.
             if st["phase"] in ("arm", None, "armed"):

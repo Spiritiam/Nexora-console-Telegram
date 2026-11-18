@@ -3386,34 +3386,40 @@ BURST_RULES = {
     "btcusd": {"side": "fade", "trend": False, "kv": 3, "kr": 0},
     "usoil": {"side": "follow", "trend": True, "kv": 3, "kr": 3},
 }
+# Aggressive Scalper only (60-day study): no trend agreement; gold on tick count alone, oil on ticks and range. BTC unchanged.
+BURST_RULES_SCALPER = dict(BURST_RULES,
+                           xauusd={"side": "follow", "trend": False, "kv": 3, "kr": 0},
+                           usoil={"side": "follow", "trend": False, "kv": 3, "kr": 3})
 _BURST_DEC = {}
 _BURST_LOCKS = {}
 _BURST_LOGGED = {}
 
 
-async def _burst_decision(pair_key, pair_config):
-    """One burst check per instrument per closed 1-minute bar, shared by every account."""
+async def _burst_decision(pair_key, pair_config, scalper=False):
+    """One burst check per instrument per closed 1-minute bar, shared by every account of the same bot."""
     import burst_entry
+    rules = BURST_RULES_SCALPER if scalper else BURST_RULES
+    cache_key = pair_key + ("|scalper" if scalper else "")
     slot = int(time.time() // 60)
-    hit = _BURST_DEC.get(pair_key)
+    hit = _BURST_DEC.get(cache_key)
     if hit and hit[0] == slot:
         return hit[1]
-    lock = _BURST_LOCKS.setdefault(pair_key, asyncio.Lock())
+    lock = _BURST_LOCKS.setdefault(cache_key, asyncio.Lock())
     async with lock:
-        hit = _BURST_DEC.get(pair_key)
+        hit = _BURST_DEC.get(cache_key)
         if hit and hit[0] == slot:
             return hit[1]
         res = None
         try:
             candles = await asyncio.to_thread(get_cached_candles, pair_key, pair_config, "1min", outputsize=300, max_age=(time.time() % 60) + 2)
             if candles:
-                res = await asyncio.to_thread(burst_entry.evaluate, candles, BURST_RULES[pair_key])
+                res = await asyncio.to_thread(burst_entry.evaluate, candles, rules[pair_key])
         except Exception as e:
             print(f"[BURST] {pair_key} failed: {type(e).__name__}: {str(e)[:100]}", flush=True)
-        _BURST_DEC[pair_key] = (slot, res)
-        if res and (res.get("direction") or time.time() - _BURST_LOGGED.get(pair_key, 0) > 900):
-            _BURST_LOGGED[pair_key] = time.time()
-            print(f"[BURST] {pair_key}: {res.get('direction') or '-'} ({res.get('why')})", flush=True)
+        _BURST_DEC[cache_key] = (slot, res)
+        if res and (res.get("direction") or time.time() - _BURST_LOGGED.get(cache_key, 0) > 900):
+            _BURST_LOGGED[cache_key] = time.time()
+            print(f"[BURST] {cache_key}: {res.get('direction') or '-'} ({res.get('why')})", flush=True)
         return res
 
 
@@ -3999,7 +4005,7 @@ async def _sc_tick_one(context, account):
         if BURST_ENTRY_LIVE and pair_key in BURST_RULES and (cfg.get("entry") == "mlsim" or account["bot_choice"] == "aggressive_scalper"):
             # 1-minute burst entry (gold with trend filter, BTC faded); stops, trailing and layers below are unchanged
             st["phase"] = "armed"
-            _b = await _burst_decision(pair_key, pair_config)
+            _b = await _burst_decision(pair_key, pair_config, scalper=(account["bot_choice"] == "aggressive_scalper"))
             if not _b or not _b.get("direction") or st.get("burst_bar") == _b["bar_t"]:
                 return
             direction = _b["direction"]

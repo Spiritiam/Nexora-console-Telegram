@@ -3389,7 +3389,8 @@ BURST_RULES = {
 # Aggressive Scalper only (60-day study): no trend agreement; gold on tick count alone, oil on ticks and range. BTC unchanged.
 BURST_RULES_SCALPER = dict(BURST_RULES,
                            xauusd={"side": "follow", "trend": False, "kv": 3, "kr": 0},
-                           usoil={"side": "follow", "trend": False, "kv": 3, "kr": 3})
+                           usoil={"side": "follow", "trend": False, "kv": 3, "kr": 3},
+                           btcusd={"side": "fade", "trend": False, "kv": 2.5, "kr": 0})
 _BURST_DEC = {}
 _BURST_LOCKS = {}
 _BURST_LOGGED = {}

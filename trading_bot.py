@@ -3573,6 +3573,8 @@ async def _ema5_pick_deriv(origin_key):
 # gold 100 ($10), oil 50 ($0.50), BTC 50 (~$496). Silver is no longer traded by these bots.
 # Aggressive Scalper / Account Flip stops (halved from 100 gold / 50 others).
 SC_SIGNAL_SL_PIPS = {"xauusd": 50, "xauusd247": 50, "btcusd": 25, "usoil": 25, "xagusd": 25}
+# Account Flip only: wider stops (gold 50, oil 30, BTC 30). The Aggressive Scalper keeps SC_SIGNAL_SL_PIPS.
+FLIP_SIGNAL_SL_PIPS = dict(SC_SIGNAL_SL_PIPS, btcusd=30, usoil=30)
 # Lowest custom stop (in these bots' own pips) a user may set on Aggressive Scalper / Account Flip.
 SC_MIN_CUSTOM_SL_PIPS = 20
 SC_CFG = {
@@ -3603,7 +3605,7 @@ SC_MODES = {
     # Account Flip: support/resistance on the 1-hour chart, entry from the 30-minute chart.
     # Stop 100 pips on gold, 50 on silver; at +20 pips break-even + trailing 10 behind;
     # one more trade every further 20 pips (max 5) once the earlier ones are protected.
-    "flip_sr": dict(SC_CFG, entry="mlsim", sl_pips=50, sl_pips_by_pair=SC_SIGNAL_SL_PIPS,
+    "flip_sr": dict(SC_CFG, entry="mlsim", sl_pips=50, sl_pips_by_pair=FLIP_SIGNAL_SL_PIPS,
                     trail_activate_pips=20, trail_pips=10, max_layers=5, add_pips=20,
                     label="🚀 Account Flip"),
 }

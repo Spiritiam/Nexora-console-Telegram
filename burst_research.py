@@ -305,6 +305,25 @@ def main():
         days = max(1.0, (t[-1] - t[0]) / 86400.0)
         log(f"{sym}: {len(rows)} bars over {days:.1f} days, tick counts {'available' if have_v else 'MISSING'}, "
             f"stop {stop_d:g} price units")
+        if os.getenv("BURST_BTC_TEST") == "1" and sym == "BTCUSDm":
+            global BODY_FRAC
+            keep = BODY_FRAC
+            for body in (0.6, 0.4):
+                BODY_FRAC = body
+                for kv, kr in [(3, 0), (2.5, 0), (2, 0), (1.5, 0), (2, 2), (2, 1.5), (0, 2)]:
+                    tr = simulate(t, o, h, l, c, v, kv, kr, stop_d, have_v, "fade", False, 0.0)
+                    s = stats(tr)
+                    bl = f"body>={body:g} ticks>={kv:g}x range>={kr:g}x"
+                    if not s or s[0] < 15:
+                        log(f"{sym} | {bl} | fade the burst: too few trades ({0 if not s else s[0]})")
+                        continue
+                    cut = int(len(tr) * 0.7)
+                    a1, a2 = stats(tr[:cut]), stats(tr[cut:])
+                    log(f"{sym} | {bl} | fade the burst: trades={s[0]} ({s[0] / days:.1f}/day) win={s[1]:.0f}% "
+                        f"net={s[2] * 100:+.0f}% of stop per trade | first70% net={(a1[2] * 100) if a1 else float('nan'):+.0f}% "
+                        f"last30% net={(a2[2] * 100) if a2 else float('nan'):+.0f}%")
+            BODY_FRAC = keep
+            continue
         VARIANTS = [  # (name, side, trend, envelope %)
             ("follow the burst", "follow", False, 0.0),
             ("fade the burst", "fade", False, 0.0),

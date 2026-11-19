@@ -446,12 +446,16 @@ def verify_korapay_signature(data_dict, signature_header):
     """
     if not KORAPAY_SECRET_KEY or not signature_header:
         return False
-    computed = hmac.new(
-        KORAPAY_SECRET_KEY.encode(),
-        json.dumps(data_dict, separators=(",", ":")).encode(),
-        hashlib.sha256,
-    ).hexdigest()
-    return hmac.compare_digest(computed, signature_header)
+    # JS JSON.stringify keeps non-ASCII characters as they are, Python escapes them by default: accept either form.
+    for ascii_only in (True, False):
+        computed = hmac.new(
+            KORAPAY_SECRET_KEY.encode(),
+            json.dumps(data_dict, separators=(",", ":"), ensure_ascii=ascii_only).encode(),
+            hashlib.sha256,
+        ).hexdigest()
+        if hmac.compare_digest(computed, signature_header):
+            return True
+    return False
 
 
 def log_korapay_transaction(reference, user_id, amount, currency):
@@ -4687,6 +4691,16 @@ async def korapay_webhook_handler(request):
     if not verify_korapay_signature(data, signature):
         print("[KORAPAY WEBHOOK] ❌ Signature verification failed - ignoring, possible spoofed request.")
         return web.Response(status=401, text="invalid signature")
+
+    _ref0 = str(data.get("reference") or data.get("payment_reference") or "")
+    if _ref0.startswith("CERT-"):
+        # SpiritFX certificate fee: handled in sfx_certificates (verified above); always answer 200.
+        try:
+            import sfx_certificates
+            await asyncio.to_thread(sfx_certificates.handle_korapay_event, payload)
+        except Exception as _ce:
+            print(f"[CERT PAY] webhook handler error: {type(_ce).__name__}: {_ce}", flush=True)
+        return web.Response(status=200, text="ok")
 
     if payload.get("event") == "charge.success":
         reference = data.get("reference") or data.get("payment_reference")

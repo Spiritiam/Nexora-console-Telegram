@@ -11,6 +11,8 @@ import time
 import random
 import hashlib
 import asyncio
+import re
+import threading
 from datetime import datetime, timezone
 
 import requests
@@ -94,7 +96,7 @@ def _profile_sync(token):
     user_key = _deps["validate_token"](token)
     if not user_key:
         return None
-    base_name, base_uname, since, cert = "", "", "", ""
+    base_name, base_uname, since, cert, base_email = "", "", "", "", ""
     try:
         r = requests.get(_deps["user_url"], headers={"Authorization": f"Bearer {token}", "Accept": "application/json"}, timeout=10)
         body = r.json()
@@ -103,6 +105,7 @@ def _profile_sync(token):
         since = str(_find(body, "datetime") or "").strip()
         c = _find(body, "certificate")
         cert = str(c) if c is not None else ""
+        base_email = str(_find(body, "email") or "").strip()
     except Exception:
         pass
     ov = _overlay(user_key)
@@ -114,7 +117,7 @@ def _profile_sync(token):
             "name": (ov.get("display_name") or base_name or "").strip(),
             "uname": (ov.get("username") or base_uname or "").strip(),
             "since": since, "avatar": ov.get("avatar") or "",
-            "eligible": cert == "1", "token": token}
+            "eligible": cert == "1", "token": token, "email": base_email}
 
 
 async def _auth(request):
@@ -238,9 +241,45 @@ def _eligibility(me):
 
 
 def _status_sync(me):
+    price = _price()
     c = _existing_cert(me["key"])
     if c:
-        return {"eligible": True, "issued": _cert_public(c), "can_start": False, "wait_seconds": 0, "name": c["holder_name"]}
+        pay = _payment_summary(me["key"], issued=True)
+        out = {"eligible": True, "issued": _cert_public(c), "can_start": False, "wait_seconds": 0, "name": c["holder_name"],
+               "passed": True, "paid": True, "price": {"ngn": price}, "payment": pay}
+        out.update(_notice("certificate_issued", price))
+        return out
+    pas = _get_pass(me["key"])
+    if pas:
+        # Self-heal: the payment was confirmed but the certificate could not be saved at that moment.
+        if _paid_row(me["key"]):
+            c = _issue_after_payment(me["key"])
+            if c:
+                pay = _payment_summary(me["key"], issued=True)
+                out = {"eligible": True, "issued": _cert_public(c), "can_start": False, "wait_seconds": 0, "name": c["holder_name"],
+                       "passed": True, "paid": True, "price": {"ngn": price}, "payment": pay}
+                out.update(_notice("certificate_issued", price))
+                return out
+        # Backup for a missed webhook: ask Korapay about the newest pending checkout.
+        pend = _latest_row(me["key"], "pending")
+        if pend:
+            _recheck_pending(pend)
+            c = _existing_cert(me["key"])
+            if c:
+                pay = _payment_summary(me["key"], issued=True)
+                out = {"eligible": True, "issued": _cert_public(c), "can_start": False, "wait_seconds": 0, "name": c["holder_name"],
+                       "passed": True, "paid": True, "price": {"ngn": price}, "payment": pay}
+                out.update(_notice("certificate_issued", price))
+                return out
+        pay = _payment_summary(me["key"])
+        out = {"eligible": True, "issued": None, "name": pas["holder_name"], "can_start": False, "wait_seconds": 0,
+               "pass_percent": PASS_PERCENT, "questions": EXAM_BASIC + EXAM_ADVANCED,
+               "time_limit_seconds": EXAM_TIME_LIMIT_SECONDS,
+               "passed": True, "paid": False, "price": {"ngn": price}, "payment": pay,
+               "score_percent": pas.get("score")}
+        out.update(_notice({"pending": "payment_pending", "failed": "payment_failed"}.get(pay["state"], "passed_payment_required"), price))
+        out["ok"] = True  # a status reply is data, not an error
+        return out
     wait = 0
     last = _last_attempt(me["key"])
     if last and last.get("submitted_at"):
@@ -250,6 +289,7 @@ def _status_sync(me):
             "can_start": ok and wait == 0, "wait_seconds": wait,
             "pass_percent": PASS_PERCENT, "questions": EXAM_BASIC + EXAM_ADVANCED,
             "time_limit_seconds": EXAM_TIME_LIMIT_SECONDS,
+            "passed": False, "paid": False, "price": {"ngn": price}, "payment": {"state": "none", "reference": None},
             "progress": {"lessons_beginner": (counts or {}).get("lessons_beginner", 0),
                          "lessons_advanced": (counts or {}).get("lessons_advanced", 0),
                          "videos_beginner": (counts or {}).get("videos_beginner", 0),
@@ -296,6 +336,8 @@ def _start_sync(me, confirmed):
     st = _status_sync(me)
     if st["issued"]:
         return {"error": "done", "message": "You already have your certificate."}, 409
+    if st.get("passed"):
+        return _reply("already_passed", _price())
     if not st["eligible"]:
         return {"error": "not_eligible", "message": "Finish the AI Tutor lessons and the Beginner and Advanced videos first."}, 403
     if not confirmed:
@@ -376,14 +418,19 @@ def _submit_sync(me, attempt_id, answers):
     out = {"score": right, "total": total, "percent": percent, "passed": passed, "pass_percent": PASS_PERCENT}
     if passed:
         c = _existing_cert(me["key"])
-        if not c:
-            name = me["name"] or "SpiritFX Student"
-            code, rows = _sb("sfx_certificates", "POST",
-                             {"user_key": me["key"], "holder_name": name, "score": percent}, prefer="return=representation")
-            c = rows[0] if code in (200, 201) and rows else None
-        if not c:
-            return {"error": "server", "message": "Passed, but the certificate could not be saved. Open Certificate again."}, 503
-        out["issued"] = _cert_public(c)
+        if c:
+            out["issued"] = _cert_public(c)
+            return out, 200
+        # Not issued yet: the name and score are locked in now; the certificate comes after the fee is paid.
+        name = me["name"] or "SpiritFX Student"
+        code, _rows = _sb("sfx_cert_passes", "POST",
+                          {"user_key": me["key"], "holder_name": name, "score": percent, "attempt_id": at["id"]},
+                          prefer="resolution=ignore-duplicates,return=representation")
+        if code not in (200, 201, 204):
+            return {"error": "server", "message": "You passed, but we could not save your result. Open Certificate again."}, 503
+        price = _price()
+        out.update(_notice("passed_payment_required", price))
+        out.update({"passed": True, "paid": False, "price": {"ngn": price}})
     return out, 200
 
 
@@ -397,6 +444,297 @@ async def submit_handler(request):
         data = {}
     body, status = await asyncio.to_thread(_submit_sync, me, data.get("attempt_id"), data.get("answers"))
     return _j(body, status)
+
+
+# --------------------------------------------------------------------------- certificate fee (Korapay)
+
+KORAPAY_BASE = "https://api.korapay.com/merchant/api/v1"
+CERT_CURRENCY = "NGN"
+PRICE_FALLBACK = 20000
+CHECKOUT_REUSE_SECONDS = 30 * 60
+VERIFY_THROTTLE_SECONDS = 10
+_price_cache = [0.0, PRICE_FALLBACK]
+_verify_seen = {}
+_user_locks = {}
+_user_locks_guard = threading.Lock()
+
+
+def _korapay_key():
+    return os.getenv("KORAPAY_SECRET_KEY") or ""
+
+
+def _price():
+    """Certificate fee in NGN. Kept in the Supabase table sfx_cert_config (key price_ngn) so it can change
+    without an app update or a deploy. Cached for a minute."""
+    now = time.time()
+    if now - _price_cache[0] < 60:
+        return _price_cache[1]
+    val = None
+    try:
+        code, rows = _sb("sfx_cert_config?key=eq.price_ngn&select=value")
+        if code == 200 and isinstance(rows, list) and rows:
+            val = int(float(str(rows[0]["value"]).strip()))
+    except Exception:
+        val = None
+    if not val or val <= 0:
+        try:
+            val = int(os.getenv("CERT_PRICE_NGN") or PRICE_FALLBACK)
+        except Exception:
+            val = PRICE_FALLBACK
+    _price_cache[0], _price_cache[1] = now, val
+    return val
+
+
+def _naira(n):
+    return "\u20a6" + format(int(n), ",")
+
+
+_CODES = {
+    "passed_payment_required": (True, 200, "You passed!", "Pay the {price} certificate fee to receive your SpiritFX certificate.", "pay"),
+    "payment_pending": (True, 200, "Complete your payment", "Your payment is not confirmed yet. Finish paying on the checkout page. Your certificate is issued as soon as the payment is confirmed.", "pay"),
+    "payment_failed": (False, 502, "Payment failed", "The payment did not go through. Please try again.", "pay"),
+    "already_paid": (False, 409, "Already paid", "Your payment is confirmed. Open Certificate to see your certificate.", "open_certificate"),
+    "not_passed": (False, 403, "Pass the exam first", "Pass the certificate exam before you pay the certificate fee.", "start_exam"),
+    "already_passed": (False, 409, "You already passed", "You passed the exam. Pay the {price} certificate fee to receive your certificate.", "pay"),
+    "certificate_issued": (True, 200, "Certificate issued", "Your payment is confirmed and your SpiritFX certificate is ready.", "open_certificate"),
+}
+
+
+def _notice(code, price, message=None):
+    ok, _http, title, msg, action = _CODES[code]
+    return {"ok": ok, "code": code, "title": title,
+            "message": message or msg.format(price=_naira(price)), "action": action}
+
+
+def _reply(code, price, extra=None, message=None):
+    body = _notice(code, price, message)
+    body.update(extra or {})
+    if not body["ok"]:
+        body["error"] = code  # older app builds read "error"
+    return body, _CODES[code][1]
+
+
+def _lock_for(user_key):
+    with _user_locks_guard:
+        return _user_locks.setdefault(user_key, threading.Lock())
+
+
+def _get_pass(user_key):
+    code, rows = _sb(f"sfx_cert_passes?user_key=eq.{_q(user_key)}&select=*")
+    return rows[0] if code == 200 and isinstance(rows, list) and rows else None
+
+
+def _paid_row(user_key):
+    code, rows = _sb(f"sfx_cert_payments?user_key=eq.{_q(user_key)}&state=eq.paid&order=confirmed_at.asc&limit=1&select=*")
+    return rows[0] if code == 200 and isinstance(rows, list) and rows else None
+
+
+def _latest_row(user_key, state=None):
+    flt = f"&state=eq.{state}" if state else ""
+    code, rows = _sb(f"sfx_cert_payments?user_key=eq.{_q(user_key)}{flt}&order=created_at.desc&limit=1&select=*")
+    return rows[0] if code == 200 and isinstance(rows, list) and rows else None
+
+
+def _payment_summary(user_key, issued=False):
+    paid = _paid_row(user_key)
+    if paid:
+        return {"state": "paid", "reference": paid["reference"]}
+    if issued:
+        return {"state": "paid", "reference": None}
+    last = _latest_row(user_key)
+    if not last:
+        return {"state": "none", "reference": None}
+    state = last["state"] if last["state"] in ("pending", "failed") else "none"
+    return {"state": state, "reference": last["reference"]}
+
+
+def _issue_after_payment(user_key):
+    """Creates the certificate from the locked pass record. Only runs when a confirmed payment exists."""
+    c = _existing_cert(user_key)
+    if c:
+        return c
+    if not _paid_row(user_key):
+        print(f"[CERT PAY] refused to issue for {user_key}: no confirmed payment", flush=True)
+        return None
+    pas = _get_pass(user_key)
+    if not pas:
+        print(f"[CERT PAY] paid but no pass record for {user_key}", flush=True)
+        return None
+    code, rows = _sb("sfx_certificates", "POST",
+                     {"user_key": user_key, "holder_name": pas["holder_name"], "score": pas["score"]},
+                     prefer="return=representation")
+    c = rows[0] if code in (200, 201) and isinstance(rows, list) and rows else _existing_cert(user_key)
+    if c:
+        print(f"[CERT PAY] certificate {c['cert_no']} issued to {user_key}", flush=True)
+    else:
+        print(f"[CERT PAY] certificate save FAILED for {user_key} (HTTP {code})", flush=True)
+    return c
+
+
+def _korapay_verify(reference):
+    """Korapay's own record of a charge (GET /charges/{reference}), or None."""
+    key = _korapay_key()
+    if not key:
+        return None
+    try:
+        r = requests.get(f"{KORAPAY_BASE}/charges/{_q(reference)}", headers={"Authorization": f"Bearer {key}"}, timeout=15)
+        j = r.json()
+        d = j.get("data") if isinstance(j, dict) else None
+        return d if isinstance(d, dict) else None
+    except Exception as e:
+        print(f"[CERT PAY] verify error {type(e).__name__}", flush=True)
+        return None
+
+
+def _amount_matches(got, expected):
+    try:
+        return abs(float(got) - float(expected)) < 0.005
+    except Exception:
+        return False
+
+
+def _settle_success(row, data, source):
+    """A success report (verified webhook or Korapay verify call) for one payment row.
+    Checks status, currency and the exact amount, processes each reference once, then issues the certificate."""
+    ref, uk = row["reference"], row["user_key"]
+    if str(data.get("status") or "").lower() != "success":
+        print(f"[CERT PAY] {source} {ref}: status {data.get('status')!r}, not paid", flush=True)
+        return False
+    cur = str(data.get("currency") or "").upper()
+    if cur != CERT_CURRENCY:
+        _sb(f"sfx_cert_payments?reference=eq.{_q(ref)}&state=neq.paid", "PATCH", {"note": f"rejected {source}: currency {cur}"})
+        print(f"[CERT PAY] {source} {ref} user={uk}: REJECTED currency {cur}", flush=True)
+        return False
+    if not _amount_matches(data.get("amount"), row["amount"]):
+        _sb(f"sfx_cert_payments?reference=eq.{_q(ref)}&state=neq.paid", "PATCH",
+            {"note": f"rejected {source}: amount {data.get('amount')} expected {row['amount']}"})
+        print(f"[CERT PAY] {source} {ref} user={uk}: REJECTED amount {data.get('amount')} expected {row['amount']}", flush=True)
+        return False
+    already = _paid_row(uk)
+    note = f"confirmed via {source}"
+    if already and already["reference"] != ref:
+        note = f"DUPLICATE payment (already paid under {already['reference']}) via {source} - refund needed"
+    code, rows = _sb(f"sfx_cert_payments?reference=eq.{_q(ref)}&state=in.(pending,failed)", "PATCH",
+                     {"state": "paid", "korapay_status": "success", "source": source, "note": note,
+                      "confirmed_at": datetime.now(timezone.utc).isoformat()}, prefer="return=representation")
+    if code not in (200, 201, 204) or not rows:
+        print(f"[CERT PAY] {source} {ref}: already processed", flush=True)
+        return True
+    print(f"[CERT PAY] PAID user={uk} ref={ref} amount={row['amount']} {cur} via {source}: {note}", flush=True)
+    _issue_after_payment(uk)
+    return True
+
+
+def _recheck_pending(row):
+    ref = row["reference"]
+    now = time.time()
+    if now - _verify_seen.get(ref, 0) < VERIFY_THROTTLE_SECONDS:
+        return
+    _verify_seen[ref] = now
+    data = _korapay_verify(ref)
+    if not data:
+        return
+    st = str(data.get("status") or "").lower()
+    if st == "success":
+        _settle_success(row, data, "verify")
+    elif st == "failed":
+        _sb(f"sfx_cert_payments?reference=eq.{_q(ref)}&state=eq.pending", "PATCH", {"state": "failed", "korapay_status": "failed", "source": "verify"})
+        print(f"[CERT PAY] FAILED user={row['user_key']} ref={ref} (verify)", flush=True)
+
+
+def handle_korapay_event(payload):
+    """Called by the Korapay webhook (signature already verified) for references starting with CERT-.
+    Never raises; the caller always answers 200."""
+    try:
+        event = str((payload or {}).get("event") or "")
+        data = (payload or {}).get("data") or {}
+        ref = str(data.get("reference") or data.get("payment_reference") or "")
+        code, rows = _sb(f"sfx_cert_payments?reference=eq.{_q(ref)}&select=*")
+        row = rows[0] if code == 200 and isinstance(rows, list) and rows else None
+        if not row:
+            print(f"[CERT PAY] webhook {event}: unknown reference {ref}, ignored", flush=True)
+            return
+        if not _get_pass(row["user_key"]) and event == "charge.success":
+            print(f"[CERT PAY] webhook {event} {ref}: user {row['user_key']} has no pass record, ignored", flush=True)
+            return
+        if event == "charge.success":
+            _settle_success(row, data, "webhook")
+        elif event == "charge.failed":
+            _sb(f"sfx_cert_payments?reference=eq.{_q(ref)}&state=eq.pending", "PATCH",
+                {"state": "failed", "korapay_status": "failed", "source": "webhook"})
+            print(f"[CERT PAY] FAILED user={row['user_key']} ref={ref} (webhook)", flush=True)
+        else:
+            print(f"[CERT PAY] webhook {event} {ref}: ignored", flush=True)
+    except Exception as e:
+        print(f"[CERT PAY] webhook error {type(e).__name__}: {e}", flush=True)
+
+
+def _pay_sync(me):
+    price = _price()
+    uk = me["key"]
+    with _lock_for(uk):
+        if _existing_cert(uk) or _paid_row(uk):
+            _issue_after_payment(uk)
+            return _reply("already_paid", price)
+        if not _get_pass(uk):
+            return _reply("not_passed", price)
+        last = _latest_row(uk, "pending")
+        if last:
+            _recheck_pending(last)
+            if _paid_row(uk):
+                return _reply("already_paid", price)
+            last = _latest_row(uk, "pending")
+        if last and last.get("checkout_url") and _amount_matches(last["amount"], price) \
+                and time.time() - _ts(last["created_at"]) < CHECKOUT_REUSE_SECONDS:
+            return _reply("payment_pending", price, {"url": last["checkout_url"], "reference": last["reference"]})
+        key = _korapay_key()
+        if not key:
+            print("[CERT PAY] KORAPAY_SECRET_KEY missing", flush=True)
+            return _reply("payment_failed", price, message="Payments are not available right now. Please try again later.")
+        safe = re.sub(r"[^A-Za-z0-9]", "", str(uk))[:40] or "user"
+        reference = f"CERT-{safe}-{int(time.time())}"
+        email = (me.get("email") or "").strip()
+        if "@" not in email:
+            email = os.getenv("CERT_FALLBACK_EMAIL") or "spiritfxtradingacademy@gmail.com"
+        body = {"amount": price, "currency": CERT_CURRENCY, "reference": reference,
+                "redirect_url": f"{PUBLIC_BASE}/cert-payment/done",
+                "customer": {"name": me.get("name") or "SpiritFX Student", "email": email},
+                "narration": "SpiritFX Trading Academy certificate fee"}
+        hook = os.getenv("KORAPAY_WEBHOOK_URL")
+        if hook:
+            body["notification_url"] = hook
+        try:
+            r = requests.post(f"{KORAPAY_BASE}/charges/initialize", headers={"Authorization": f"Bearer {key}"}, json=body, timeout=20)
+            j = r.json()
+        except Exception as e:
+            print(f"[CERT PAY] init error {type(e).__name__}", flush=True)
+            return _reply("payment_failed", price, message="We could not reach the payment provider. Please try again.")
+        d = j.get("data") if isinstance(j, dict) else None
+        url = (d or {}).get("checkout_url") if isinstance(d, dict) else None
+        if not (isinstance(j, dict) and j.get("status")) or not url:
+            print(f"[CERT PAY] init failed for {uk}: {str(j)[:200]}", flush=True)
+            return _reply("payment_failed", price, message="We could not start the payment. Please try again.")
+        ref = str((d or {}).get("reference") or reference)
+        _sb("sfx_cert_payments", "POST", {"reference": ref, "user_key": uk, "amount": price, "currency": CERT_CURRENCY,
+                                          "state": "pending", "checkout_url": url})
+        print(f"[CERT PAY] checkout created user={uk} ref={ref} amount={price} {CERT_CURRENCY}", flush=True)
+        return _reply("payment_pending", price, {"url": url, "reference": ref})
+
+
+async def pay_handler(request):
+    me, err = await _auth(request)
+    if err:
+        return err
+    body, status = await asyncio.to_thread(_pay_sync, me)
+    return _j(body, status)
+
+
+async def pay_done_handler(request):
+    page = ("<!doctype html><html><head><meta charset='utf-8'><meta name='viewport' content='width=device-width,initial-scale=1'>"
+            "<title>Payment received</title></head><body style=\"font-family:system-ui,sans-serif;text-align:center;padding:48px 20px;"
+            "background:#0f1422;color:#fff\"><h2>Payment completed</h2><p>You can return to the SpiritFX app now. "
+            "Your certificate appears there as soon as the payment is confirmed.</p></body></html>")
+    return web.Response(text=page, content_type="text/html")
 
 
 # --------------------------------------------------------------------------- image
@@ -694,6 +1032,8 @@ def register(app, sb_headers, supabase_url, validate_token, user_url):
     app.router.add_get("/api/nexora/cert/status", status_handler)
     app.router.add_post("/api/nexora/cert/exam/start", start_handler)
     app.router.add_post("/api/nexora/cert/exam/submit", submit_handler)
+    app.router.add_post("/api/nexora/cert/pay", pay_handler)
+    app.router.add_get("/cert-payment/done", pay_done_handler)
     app.router.add_post("/api/nexora/progress", progress_event_handler)
     app.router.add_get("/api/nexora/progress/watched", watched_handler)
     app.router.add_get("/api/nexora/profile", profile_get_handler)

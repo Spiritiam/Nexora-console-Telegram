@@ -32,8 +32,11 @@ def evaluate(candles, rule, now=None):
     base = {"direction": None, "bar_t": last.get("time"), "bar_ts": _ts(last.get("time"))}
     rng = last["high"] - last["low"]
     body = abs(last["close"] - last["open"])
-    if rng <= 0 or body < BODY_FRAC * rng:
+    bf = rule.get("body", BODY_FRAC)  # "body": 0 = every candle counts (no strong-candle filter)
+    if rng <= 0 or body < bf * rng:
         return dict(base, why="no strong candle")
+    if last["close"] == last["open"]:
+        return dict(base, why="doji, no direction")
     prior = c[-1 - LOOKBACK:-1]
     med_r = statistics.median(x["high"] - x["low"] for x in prior)
     med_v = statistics.median(x["volume"] for x in prior)

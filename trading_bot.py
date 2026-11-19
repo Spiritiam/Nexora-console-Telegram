@@ -3391,10 +3391,18 @@ BURST_RULES = {
     "usoil": {"side": "follow", "trend": True, "kv": 3, "kr": 3},
 }
 # Aggressive Scalper only (60-day study): no trend agreement; gold on tick count alone, oil on ticks and range. BTC unchanged.
-BURST_RULES_SCALPER = dict(BURST_RULES,
-                           xauusd={"side": "follow", "trend": False, "kv": 3, "kr": 0},
-                           usoil={"side": "follow", "trend": False, "kv": 3, "kr": 3},
-                           btcusd={"side": "fade", "trend": False, "kv": 2.5, "kr": 0})
+BURST_RULES_SCALPER_STRICT = dict(BURST_RULES,
+                                  xauusd={"side": "follow", "trend": False, "kv": 3, "kr": 0},
+                                  usoil={"side": "follow", "trend": False, "kv": 3, "kr": 3},
+                                  btcusd={"side": "fade", "trend": False, "kv": 2.5, "kr": 0})
+# Aggressive Scalper, every-candle mode (60-day study, 1-minute): every closed 1-minute candle is a burst, no filter at all.
+# Gold and oil follow the candle colour, BTC fades it. Set BURST_SCALPER_MODE=strict on Railway to go back to the filtered rules above.
+BURST_RULES_SCALPER_EVERY = dict(BURST_RULES,
+                                 xauusd={"side": "follow", "trend": False, "kv": 0, "kr": 0, "body": 0},
+                                 usoil={"side": "follow", "trend": False, "kv": 0, "kr": 0, "body": 0},
+                                 btcusd={"side": "fade", "trend": False, "kv": 0, "kr": 0, "body": 0})
+BURST_RULES_SCALPER = BURST_RULES_SCALPER_STRICT if os.getenv("BURST_SCALPER_MODE", "every") == "strict" else BURST_RULES_SCALPER_EVERY
+print(f"[BURST] scalper mode: {'strict (filtered)' if BURST_RULES_SCALPER is BURST_RULES_SCALPER_STRICT else 'every candle, no filter'}", flush=True)
 _BURST_DEC = {}
 _BURST_LOCKS = {}
 _BURST_LOGGED = {}

@@ -236,6 +236,69 @@ def signals(t, o, h, l, c, mode, strong):
     return out
 
 
+# Fixed stop / take-profit version (HOUR_RR=1): 20-pip stop with a 20-pip target (1 to 1) and a 40-pip target (1 to 2).
+# Pips are the bot's own: gold 0.1, oil 0.01, BTC 9.918 price units. No trailing, no break-even.
+# Same spread and slippage cost per trade as the first study (0.1 of the old Aggressive Scalper stop, in price units).
+RR_STOP = {"XAUUSDm": 20 * 0.1, "USOILm": 20 * 0.01, "BTCUSDm": 20 * 9.918}
+RR_COST = {"XAUUSDm": 0.5, "USOILm": 0.025, "BTCUSDm": 0.1 * 25 * 9.918}
+
+
+def run_fixed(o, h, l, c, i, d, stop_d, tp_d, n, cost):
+    """Enter at the open of bar i. Stop checked before target inside a bar (pessimistic). Closed at market after 1 hour.
+    Returns (result in stops after cost, 'tp' | 'sl' | 'time')."""
+    e = o[i]
+    sl = e - d * stop_d
+    tp = e + d * tp_d
+    end = min(i + HORIZON, n)
+    for j in range(i, end):
+        if d > 0:
+            if o[j] <= sl: return (o[j] - e) / stop_d - cost / stop_d, "sl"
+            if l[j] <= sl: return -1.0 - cost / stop_d, "sl"
+            if h[j] >= tp: return tp_d / stop_d - cost / stop_d, "tp"
+        else:
+            if o[j] >= sl: return (e - o[j]) / stop_d - cost / stop_d, "sl"
+            if h[j] >= sl: return -1.0 - cost / stop_d, "sl"
+            if l[j] <= tp: return tp_d / stop_d - cost / stop_d, "tp"
+    return (c[end - 1] - e) * d / stop_d - cost / stop_d, "time"
+
+
+def rr_study():
+    log(f"RR study start: {list(RR_STOP)}, {DAYS} days, 20-pip stop, target 20 pips (1 to 1) and 40 pips (1 to 2)")
+    for sym, stop_d in RR_STOP.items():
+        try:
+            rows = fetch_5m(sym, DAYS)
+        except Exception as e:
+            log(f"{sym} fetch failed: {type(e).__name__}: {e}")
+            continue
+        if len(rows) < 3000:
+            log(f"{sym}: only {len(rows)} bars, skipped")
+            continue
+        a = np.array(rows, dtype=float)
+        t, o, h, l, c = a[:, 0], a[:, 1], a[:, 2], a[:, 3], a[:, 4]
+        n = len(t)
+        days = (t[-1] - t[0]) / 86400.0
+        cost = RR_COST[sym]
+        log(f"{sym}: {n} bars over {days:.1f} days; stop {stop_d:g} price units, spread+slippage per trade {cost:g}")
+        for mode, label in (("A", "first candle of the hour"), ("B", "last candle of the hour"),
+                            ("C", "1-hour candle just closed")):
+            for strong in (False, True):
+                sigs = signals(t, o, h, l, c, mode, strong)
+                if len(sigs) < 30:
+                    continue
+                for side, sgn in (("follow", 1), ("fade", -1)):
+                    for rr, tp_d in (("1:1", stop_d), ("1:2", 2 * stop_d)):
+                        res = [run_fixed(o, h, l, c, k, d * sgn, stop_d, tp_d, n, cost) for k, d in sigs]
+                        r = np.array([x[0] for x in res])
+                        tp = sum(1 for x in res if x[1] == "tp") / len(res) * 100
+                        sl = sum(1 for x in res if x[1] == "sl") / len(res) * 100
+                        cut = int(len(r) * 0.7)
+                        log(f"{sym} | {label} | {'strong' if strong else 'any'} | {side} | {rr}: trades={len(r)} "
+                            f"({len(r) / days:.1f}/day) target hit={tp:.0f}% stop hit={sl:.0f}% timed out={100 - tp - sl:.0f}% "
+                            f"net={r.mean() * 100:+.0f}% of stop per trade (before spread {(r.mean() + cost / stop_d) * 100:+.0f}%) | first70% {r[:cut].mean() * 100:+.0f}% "
+                            f"last30% {r[cut:].mean() * 100:+.0f}%")
+    log("RR done")
+
+
 def summarize(rows):
     r = np.array(rows, dtype=float)
     return len(r), float((r > 0).mean() * 100), float(r.mean() * 100)
@@ -286,4 +349,4 @@ def main():
 
 
 if __name__ == "__main__":
-    main()
+    rr_study() if os.getenv("HOUR_RR") == "1" else main()

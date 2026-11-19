@@ -94,6 +94,10 @@ def fetch_h1(symbol, days, tf="5m"):
     return [rows[k] for k in sorted(rows)]
 
 
+_CLIENT = {}
+MIN_BARS = 1000 if BAR == 60 else 3000  # Exness only keeps a few days of 1-minute history
+
+
 def fetch_exness_5m(symbol, days):
     """60 days of 5-minute bid candles from the Exness market-data API (pages of 990 bars, newest to oldest)."""
     from datetime import timedelta
@@ -103,8 +107,23 @@ def fetch_exness_5m(symbol, days):
     acct = os.getenv("EXNESS_ACCOUNT_ID", "10000776165")
     if not key or not secret:
         raise RuntimeError("Exness credentials not set")
-    cl = exness_api.ExnessClient(os.getenv("EXNESS_GATEWAY_URL", "api.exness.com"), key, secret, acct)
-    names = {str(n).upper(): str(n) for n in cl.instruments()}
+    cl = _CLIENT.get("cl")
+    if cl is None:  # one client for all symbols: a new one per symbol hit the Exness auth rate limit
+        last = None
+        for attempt in range(6):
+            try:
+                cl = exness_api.ExnessClient(os.getenv("EXNESS_GATEWAY_URL", "api.exness.com"), key, secret, acct)
+                _CLIENT["names"] = {str(n).upper(): str(n) for n in cl.instruments()}
+                _CLIENT["cl"] = cl
+                break
+            except Exception as e:
+                last = e
+                log(f"Exness client setup failed ({type(e).__name__}), retry {attempt + 1}")
+                time.sleep(10 * (attempt + 1))
+        if _CLIENT.get("cl") is None:
+            raise RuntimeError(f"Exness client setup failed: {last}")
+        cl = _CLIENT["cl"]
+    names = _CLIENT["names"]
     want = symbol.upper()
     pick = names.get(want) or next((n for u, n in names.items() if u.startswith(want) or want.startswith(u)), None)
     if not pick:
@@ -154,13 +173,13 @@ def fetch_5m(symbol, days):
 def _fetch_candles(symbol, days):
     try:
         rows = fetch_exness_5m(symbol, days)
-        if len(rows) >= 3000:
+        if len(rows) >= MIN_BARS:
             return rows
         log(f"{symbol}: Exness gave only {len(rows)} bars, trying MetaAPI")
     except Exception as e:
         log(f"{symbol}: Exness feed failed: {type(e).__name__}: {e}")
     if BAR == 60:
-        return fetch_1m(symbol, days, "1m")
+        return []  # MetaAPI 1-minute history is not available right now; the Exness feed is the only source
     return fetch_5m_metaapi(symbol, days)
 
 
@@ -282,7 +301,7 @@ def rr_study():
         except Exception as e:
             log(f"{sym} fetch failed: {type(e).__name__}: {e}")
             continue
-        if len(rows) < 3000:
+        if len(rows) < MIN_BARS:
             log(f"{sym}: only {len(rows)} bars, skipped")
             continue
         a = np.array(rows, dtype=float)
@@ -295,7 +314,7 @@ def rr_study():
                             ("C", "1-hour candle just closed")):
             for strong in (False, True):
                 sigs = signals(t, o, h, l, c, mode, strong)
-                if len(sigs) < 30:
+                if len(sigs) < 15:
                     continue
                 for side, sgn in (("follow", 1), ("fade", -1)):
                     for rr, tp_d in (("1:1", stop_d), ("1:2", 2 * stop_d)):
@@ -328,7 +347,7 @@ def main():
         except Exception as e:
             log(f"{sym} fetch failed: {type(e).__name__}: {e}")
             continue
-        if len(rows) < 3000:
+        if len(rows) < MIN_BARS:
             log(f"{sym}: only {len(rows)} bars, skipped")
             continue
         a = np.array(rows, dtype=float)
@@ -344,7 +363,7 @@ def main():
                             ("C", "1-hour candle just closed")):
             for strong in (False, True):
                 sigs = signals(t, o, h, l, c, mode, strong)
-                if len(sigs) < 30:
+                if len(sigs) < 15:
                     log(f"{sym} | {label} | {'strong' if strong else 'any'}: too few signals ({len(sigs)})")
                     continue
                 same = float(np.mean([1.0 if np.sign(c[k] - o[k]) == d else 0.0 for k, d in sigs]) * 100)

@@ -26,6 +26,7 @@ import numpy as np
 import requests
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from strategy_research import fetch_h1 as fetch_1m  # noqa: E402  (the 1-minute downloader the burst study used)
 
 SYMBOLS = {"XAUUSDm": 5.0, "USOILm": 0.25, "BTCUSDm": 25 * 9.918}
 DAYS = int(os.getenv("HOUR_DAYS", "60"))
@@ -90,6 +91,20 @@ def fetch_h1(symbol, days, tf="5m"):
         pages += 1
         time.sleep(0.5)
     return [rows[k] for k in sorted(rows)]
+
+
+def fetch_5m(symbol, days):
+    """5-minute candles built from 1-minute ones (the 5-minute download itself returned HTTP 504)."""
+    rows = fetch_1m(symbol, days, "1m")
+    buckets = {}
+    for r in rows:
+        k = int(r[0]) // 300 * 300
+        b = buckets.get(k)
+        if b is None:
+            buckets[k] = [k, r[1], r[2], r[3], r[4], 1]
+        else:
+            b[2] = max(b[2], r[2]); b[3] = min(b[3], r[3]); b[4] = r[4]; b[5] += 1
+    return [b[:5] + [0.0] for k, b in sorted(buckets.items()) if b[5] >= 4]
 
 
 def run_trade(o, h, l, c, i, d, stop_d, n):
@@ -175,7 +190,7 @@ def main():
     log(f"start: {list(SYMBOLS)}, {DAYS} days of 5-minute bars")
     for sym, stop_d in SYMBOLS.items():
         try:
-            rows = fetch_h1(sym, DAYS, "5m")
+            rows = fetch_5m(sym, DAYS)
         except Exception as e:
             log(f"{sym} fetch failed: {type(e).__name__}: {e}")
             continue

@@ -19,10 +19,13 @@ Two numbers per row:
 import os
 import sys
 
+import time
+from datetime import datetime, timezone
+
 import numpy as np
+import requests
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-from strategy_research import fetch_h1  # noqa: E402
 
 SYMBOLS = {"XAUUSDm": 5.0, "USOILm": 0.25, "BTCUSDm": 25 * 9.918}
 DAYS = int(os.getenv("HOUR_DAYS", "60"))
@@ -33,6 +36,60 @@ BAR = 300
 
 def log(msg):
     print(f"[HOUR] {msg}", flush=True)
+
+
+HOSTS = [f"https://mt-market-data-client-api-v1.{r}.agiliumtrade.ai" for r in ("new-york", "london", "singapore")]
+
+
+def _ts(t):
+    return datetime.fromisoformat(str(t).replace("Z", "+00:00")).timestamp()
+
+
+def fetch_h1(symbol, days, tf="5m"):
+    """5-minute candles from the MetaAPI market-data API. Smaller pages and three regions, because the large
+    1000-bar request returns HTTP 504 for 5-minute data."""
+    token, acct = os.getenv("METAAPI_TOKEN"), os.getenv("METAAPI_ACCOUNT_ID")
+    if not token or not acct:
+        raise RuntimeError("MetaAPI credentials not set")
+    headers = {"auth-token": token, "Accept": "application/json"}
+    rows = {}
+    target = time.time() - days * 86400
+    cur = time.time()
+    limit, hi, fails, pages = 300, 0, 0, 0
+    while cur > target and pages < 600:
+        start = datetime.fromtimestamp(cur, tz=timezone.utc).strftime("%Y-%m-%dT%H:%M:%S.000Z")
+        url = (f"{HOSTS[hi % len(HOSTS)]}/users/current/accounts/{acct}/historical-market-data/symbols/{symbol}"
+               f"/timeframes/{tf}/candles?startTime={start}&limit={limit}")
+        try:
+            r = requests.get(url, headers=headers, timeout=90)
+            code = r.status_code
+        except Exception as e:
+            code = -1
+            log(f"{symbol} request error {type(e).__name__}")
+        if code != 200:
+            fails += 1
+            hi += 1
+            if code in (504, 502, 503, 429) and limit > 100 and fails % 3 == 0:
+                limit = max(100, limit // 2)
+            log(f"{symbol} HTTP {code}, retry {fails} (limit {limit})")
+            if fails > 12:
+                break
+            time.sleep(min(30, 3 * fails))
+            continue
+        fails = 0
+        raw = r.json()
+        if not raw:
+            break
+        for c in raw:
+            t = int(_ts(c["time"]))
+            rows.setdefault(t, [t, float(c["open"]), float(c["high"]), float(c["low"]), float(c["close"]), 0.0])
+        oldest = min(int(_ts(c["time"])) for c in raw)
+        if oldest >= cur:
+            break
+        cur = oldest - 1
+        pages += 1
+        time.sleep(0.5)
+    return [rows[k] for k in sorted(rows)]
 
 
 def run_trade(o, h, l, c, i, d, stop_d, n):

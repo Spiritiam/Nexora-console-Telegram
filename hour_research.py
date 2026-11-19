@@ -30,9 +30,10 @@ from strategy_research import fetch_h1 as fetch_1m  # noqa: E402  (the 1-minute 
 
 SYMBOLS = {"XAUUSDm": 5.0, "USOILm": 0.25, "BTCUSDm": 25 * 9.918}
 DAYS = int(os.getenv("HOUR_DAYS", "60"))
-HORIZON = 12  # 5-minute bars = 1 hour
+BAR = int(os.getenv("HOUR_BAR", "300"))  # candle length in seconds: 300 = 5-minute, 60 = 1-minute
+HZ = 3600 // BAR  # candles in one hour
+HORIZON = HZ  # a trade is closed at market after 1 hour
 COST_R = 0.10
-BAR = 300
 
 
 def log(msg):
@@ -57,7 +58,7 @@ def fetch_h1(symbol, days, tf="5m"):
     target = time.time() - days * 86400
     cur = time.time()
     limit, hi, fails, pages = 300, 0, 0, 0
-    while cur > target and pages < 600:
+    while cur > target and pages < 1200:
         start = datetime.fromtimestamp(cur, tz=timezone.utc).strftime("%Y-%m-%dT%H:%M:%S.000Z")
         url = (f"{HOSTS[hi % len(HOSTS)]}/users/current/accounts/{acct}/historical-market-data/symbols/{symbol}"
                f"/timeframes/{tf}/candles?startTime={start}&limit={limit}")
@@ -115,7 +116,7 @@ def fetch_exness_5m(symbol, days):
     fails = pages = 0
     while end.timestamp() > target and pages < 60:
         start = end - timedelta(seconds=990 * BAR)
-        q = urlencode({"instrument": pick, "price_type": "bid", "timeframe": "M5",
+        q = urlencode({"instrument": pick, "price_type": "bid", "timeframe": "M5" if BAR == 300 else "M1",
                        "from": start.strftime("%Y-%m-%dT%H:%M:%SZ"), "to": end.strftime("%Y-%m-%dT%H:%M:%SZ")})
         try:
             code, d = cl._call("GET", f"/v1/market-data/accounts/{cl.account_id}/candles?{q}")
@@ -141,7 +142,16 @@ def fetch_exness_5m(symbol, days):
     return [rows[k] for k in sorted(rows)]
 
 
+_CACHE = {}
+
+
 def fetch_5m(symbol, days):
+    if symbol not in _CACHE:
+        _CACHE[symbol] = _fetch_candles(symbol, days)
+    return _CACHE[symbol]
+
+
+def _fetch_candles(symbol, days):
     try:
         rows = fetch_exness_5m(symbol, days)
         if len(rows) >= 3000:
@@ -149,6 +159,8 @@ def fetch_5m(symbol, days):
         log(f"{symbol}: Exness gave only {len(rows)} bars, trying MetaAPI")
     except Exception as e:
         log(f"{symbol}: Exness feed failed: {type(e).__name__}: {e}")
+    if BAR == 60:
+        return fetch_1m(symbol, days, "1m")
     return fetch_5m_metaapi(symbol, days)
 
 
@@ -207,12 +219,12 @@ def signals(t, o, h, l, c, mode, strong):
         ts = int(t[k])
         if mode == "A" and ts % 3600 == 0:
             sig = k
-        elif mode == "B" and ts % 3600 == 3300:
+        elif mode == "B" and ts % 3600 == 3600 - BAR:
             sig = k
         elif mode == "C" and ts % 3600 == 0:
             # the hour that just closed: 12 five-minute bars from ts-3600
             a = idx.get(ts - 3600)
-            if a is None or k - a != 12:
+            if a is None or k - a != HZ:
                 continue
             ho, hc = o[a], c[k - 1]
             hh, hl = h[a:k].max(), l[a:k].min()
@@ -309,7 +321,7 @@ def main():
         os.nice(10)
     except Exception:
         pass
-    log(f"start: {list(SYMBOLS)}, {DAYS} days of 5-minute bars")
+    log(f"start: {list(SYMBOLS)}, {DAYS} days of {BAR // 60}-minute bars")
     for sym, stop_d in SYMBOLS.items():
         try:
             rows = fetch_5m(sym, DAYS)
@@ -349,4 +361,11 @@ def main():
 
 
 if __name__ == "__main__":
-    rr_study() if os.getenv("HOUR_RR") == "1" else main()
+    _m = os.getenv("HOUR_RR", "0")
+    if _m == "both":
+        main()
+        rr_study()
+    elif _m == "1":
+        rr_study()
+    else:
+        main()

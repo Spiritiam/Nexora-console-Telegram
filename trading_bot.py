@@ -36092,6 +36092,15 @@ def main():
         except Exception as _e:
             print(f"[BURST REC] could not start: {type(_e).__name__}: {_e}")
 
+    # Read-only "take every burst" study on 1-minute candles (no trades), only while BURST_ALL=1 is set.
+    if os.getenv("BURST_ALL") == "1":
+        try:
+            import subprocess as _sp
+            _sp.Popen([sys.executable, os.path.join(os.path.dirname(os.path.abspath(__file__)), "burst_all.py")])
+            print("[BURSTALL] process started")
+        except Exception as _e:
+            print(f"[BURSTALL] could not start: {type(_e).__name__}: {_e}")
+
     # Read-only "hour candle" study on 5-minute candles (no trades), only while HOUR_RESEARCH=1 is set.
     if os.getenv("HOUR_RESEARCH") == "1":
         try:

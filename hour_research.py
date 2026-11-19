@@ -93,7 +93,66 @@ def fetch_h1(symbol, days, tf="5m"):
     return [rows[k] for k in sorted(rows)]
 
 
+def fetch_exness_5m(symbol, days):
+    """60 days of 5-minute bid candles from the Exness market-data API (pages of 990 bars, newest to oldest)."""
+    from datetime import timedelta
+    from urllib.parse import urlencode
+    import exness_api
+    key, secret = os.getenv("EXNESS_API_KEY"), os.getenv("EXNESS_SECRET_KEY")
+    acct = os.getenv("EXNESS_ACCOUNT_ID", "10000776165")
+    if not key or not secret:
+        raise RuntimeError("Exness credentials not set")
+    cl = exness_api.ExnessClient(os.getenv("EXNESS_GATEWAY_URL", "api.exness.com"), key, secret, acct)
+    names = {str(n).upper(): str(n) for n in cl.instruments()}
+    want = symbol.upper()
+    pick = names.get(want) or next((n for u, n in names.items() if u.startswith(want) or want.startswith(u)), None)
+    if not pick:
+        raise RuntimeError(f"{symbol} not found in Exness instruments")
+    log(f"{symbol}: using Exness instrument {pick}")
+    rows = {}
+    target = time.time() - days * 86400
+    end = datetime.now(timezone.utc) + timedelta(seconds=BAR)
+    fails = pages = 0
+    while end.timestamp() > target and pages < 60:
+        start = end - timedelta(seconds=990 * BAR)
+        q = urlencode({"instrument": pick, "price_type": "bid", "timeframe": "M5",
+                       "from": start.strftime("%Y-%m-%dT%H:%M:%SZ"), "to": end.strftime("%Y-%m-%dT%H:%M:%SZ")})
+        try:
+            code, d = cl._call("GET", f"/v1/market-data/accounts/{cl.account_id}/candles?{q}")
+        except Exception as e:
+            code, d = -1, str(e)
+        if code != 200:
+            fails += 1
+            log(f"{symbol} Exness HTTP {code} {str(d)[:100]} (retry {fails})")
+            if fails > 8:
+                break
+            time.sleep(min(20, 2 * fails))
+            continue
+        fails = 0
+        got = d.get("candles") or []
+        if not got:
+            break
+        for r in got:
+            t = int(_ts(r["time"]))
+            rows.setdefault(t, [t, float(r["open"]), float(r["high"]), float(r["low"]), float(r["close"]), 0.0])
+        pages += 1
+        end = start
+        time.sleep(0.4)
+    return [rows[k] for k in sorted(rows)]
+
+
 def fetch_5m(symbol, days):
+    try:
+        rows = fetch_exness_5m(symbol, days)
+        if len(rows) >= 3000:
+            return rows
+        log(f"{symbol}: Exness gave only {len(rows)} bars, trying MetaAPI")
+    except Exception as e:
+        log(f"{symbol}: Exness feed failed: {type(e).__name__}: {e}")
+    return fetch_5m_metaapi(symbol, days)
+
+
+def fetch_5m_metaapi(symbol, days):
     """5-minute candles built from 1-minute ones (the 5-minute download itself returned HTTP 504)."""
     rows = fetch_1m(symbol, days, "1m")
     buckets = {}

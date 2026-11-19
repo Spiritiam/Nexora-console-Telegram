@@ -246,7 +246,7 @@ def _status_sync(me):
     if c:
         pay = _payment_summary(me["key"], issued=True)
         out = {"eligible": True, "issued": _cert_public(c), "can_start": False, "wait_seconds": 0, "name": c["holder_name"],
-               "passed": True, "paid": True, "price": {"ngn": price}, "payment": pay}
+               "passed": True, "paid": True, "price": _price_out(), "payment": pay}
         out.update(_notice("certificate_issued", price))
         return out
     pas = _get_pass(me["key"])
@@ -257,7 +257,7 @@ def _status_sync(me):
             if c:
                 pay = _payment_summary(me["key"], issued=True)
                 out = {"eligible": True, "issued": _cert_public(c), "can_start": False, "wait_seconds": 0, "name": c["holder_name"],
-                       "passed": True, "paid": True, "price": {"ngn": price}, "payment": pay}
+                       "passed": True, "paid": True, "price": _price_out(), "payment": pay}
                 out.update(_notice("certificate_issued", price))
                 return out
         # Backup for a missed webhook: ask Korapay about the newest pending checkout.
@@ -268,14 +268,14 @@ def _status_sync(me):
             if c:
                 pay = _payment_summary(me["key"], issued=True)
                 out = {"eligible": True, "issued": _cert_public(c), "can_start": False, "wait_seconds": 0, "name": c["holder_name"],
-                       "passed": True, "paid": True, "price": {"ngn": price}, "payment": pay}
+                       "passed": True, "paid": True, "price": _price_out(), "payment": pay}
                 out.update(_notice("certificate_issued", price))
                 return out
         pay = _payment_summary(me["key"])
         out = {"eligible": True, "issued": None, "name": pas["holder_name"], "can_start": False, "wait_seconds": 0,
                "pass_percent": PASS_PERCENT, "questions": EXAM_BASIC + EXAM_ADVANCED,
                "time_limit_seconds": EXAM_TIME_LIMIT_SECONDS,
-               "passed": True, "paid": False, "price": {"ngn": price}, "payment": pay,
+               "passed": True, "paid": False, "price": _price_out(), "payment": pay,
                "score_percent": pas.get("score")}
         out.update(_notice({"pending": "payment_pending", "failed": "payment_failed"}.get(pay["state"], "passed_payment_required"), price))
         out["ok"] = True  # a status reply is data, not an error
@@ -289,7 +289,7 @@ def _status_sync(me):
             "can_start": ok and wait == 0, "wait_seconds": wait,
             "pass_percent": PASS_PERCENT, "questions": EXAM_BASIC + EXAM_ADVANCED,
             "time_limit_seconds": EXAM_TIME_LIMIT_SECONDS,
-            "passed": False, "paid": False, "price": {"ngn": price}, "payment": {"state": "none", "reference": None},
+            "passed": False, "paid": False, "price": _price_out(), "payment": {"state": "none", "reference": None},
             "progress": {"lessons_beginner": (counts or {}).get("lessons_beginner", 0),
                          "lessons_advanced": (counts or {}).get("lessons_advanced", 0),
                          "videos_beginner": (counts or {}).get("videos_beginner", 0),
@@ -430,7 +430,7 @@ def _submit_sync(me, attempt_id, answers):
             return {"error": "server", "message": "You passed, but we could not save your result. Open Certificate again."}, 503
         price = _price()
         out.update(_notice("passed_payment_required", price))
-        out.update({"passed": True, "paid": False, "price": {"ngn": price}})
+        out.update({"passed": True, "paid": False, "price": _price_out()})
     return out, 200
 
 
@@ -449,11 +449,11 @@ async def submit_handler(request):
 # --------------------------------------------------------------------------- certificate fee (Korapay)
 
 KORAPAY_BASE = "https://api.korapay.com/merchant/api/v1"
-CERT_CURRENCY = "NGN"
-PRICE_FALLBACK = 20000
+CERT_CURRENCY = "USD"
+PRICE_FALLBACK = 15
 CHECKOUT_REUSE_SECONDS = 30 * 60
 VERIFY_THROTTLE_SECONDS = 10
-_price_cache = [0.0, PRICE_FALLBACK]
+_price_cache = [0.0, PRICE_FALLBACK, CERT_CURRENCY]
 _verify_seen = {}
 _user_locks = {}
 _user_locks_guard = threading.Lock()
@@ -463,30 +463,56 @@ def _korapay_key():
     return os.getenv("KORAPAY_SECRET_KEY") or ""
 
 
-def _price():
-    """Certificate fee in NGN. Kept in the Supabase table sfx_cert_config (key price_ngn) so it can change
-    without an app update or a deploy. Cached for a minute."""
+def _price_cfg():
+    """(amount, currency) of the certificate fee. Kept in the Supabase table sfx_cert_config
+    (keys price_amount and price_currency) so it can change without an app update or a deploy.
+    Cached for a minute."""
     now = time.time()
     if now - _price_cache[0] < 60:
-        return _price_cache[1]
-    val = None
+        return _price_cache[1], _price_cache[2]
+    amount, cur = None, None
     try:
-        code, rows = _sb("sfx_cert_config?key=eq.price_ngn&select=value")
-        if code == 200 and isinstance(rows, list) and rows:
-            val = int(float(str(rows[0]["value"]).strip()))
+        code, rows = _sb("sfx_cert_config?key=in.(price_amount,price_currency)&select=key,value")
+        if code == 200 and isinstance(rows, list):
+            vals = {r["key"]: str(r["value"]).strip() for r in rows}
+            if vals.get("price_amount"):
+                amount = float(vals["price_amount"])
+            cur = (vals.get("price_currency") or "").upper() or None
     except Exception:
-        val = None
-    if not val or val <= 0:
+        amount, cur = None, None
+    if not amount or amount <= 0:
         try:
-            val = int(os.getenv("CERT_PRICE_NGN") or PRICE_FALLBACK)
+            amount = float(os.getenv("CERT_PRICE_AMOUNT") or PRICE_FALLBACK)
         except Exception:
-            val = PRICE_FALLBACK
-    _price_cache[0], _price_cache[1] = now, val
-    return val
+            amount = float(PRICE_FALLBACK)
+    if not cur or len(cur) != 3:
+        cur = (os.getenv("CERT_PRICE_CURRENCY") or CERT_CURRENCY).upper()
+    amount = int(amount) if float(amount).is_integer() else round(float(amount), 2)
+    _price_cache[0], _price_cache[1], _price_cache[2] = now, amount, cur
+    return amount, cur
 
 
-def _naira(n):
-    return "\u20a6" + format(int(n), ",")
+def _price():
+    return _price_cfg()[0]
+
+
+def _currency():
+    return _price_cfg()[1]
+
+
+_SYMBOLS = {"USD": "$", "NGN": "\u20a6", "GBP": "\u00a3", "EUR": "\u20ac"}
+
+
+def _money(amount, cur=None):
+    cur = cur or _currency()
+    sym = _SYMBOLS.get(cur)
+    txt = format(amount, ",") if isinstance(amount, int) else format(amount, ",.2f")
+    return f"{sym}{txt}" if sym else f"{txt} {cur}"
+
+
+def _price_out():
+    amount, cur = _price_cfg()
+    return {"amount": amount, "currency": cur, "display": _money(amount, cur), cur.lower(): amount}
 
 
 _CODES = {
@@ -503,7 +529,7 @@ _CODES = {
 def _notice(code, price, message=None):
     ok, _http, title, msg, action = _CODES[code]
     return {"ok": ok, "code": code, "title": title,
-            "message": message or msg.format(price=_naira(price)), "action": action}
+            "message": message or msg.format(price=_money(price)), "action": action}
 
 
 def _reply(code, price, extra=None, message=None):
@@ -601,7 +627,7 @@ def _settle_success(row, data, source):
         print(f"[CERT PAY] {source} {ref}: status {data.get('status')!r}, not paid", flush=True)
         return False
     cur = str(data.get("currency") or "").upper()
-    if cur != CERT_CURRENCY:
+    if cur != str(row.get("currency") or "").upper():
         _sb(f"sfx_cert_payments?reference=eq.{_q(ref)}&state=neq.paid", "PATCH", {"note": f"rejected {source}: currency {cur}"})
         print(f"[CERT PAY] {source} {ref} user={uk}: REJECTED currency {cur}", flush=True)
         return False
@@ -670,7 +696,7 @@ def handle_korapay_event(payload):
 
 
 def _pay_sync(me):
-    price = _price()
+    price, pcur = _price_cfg()
     uk = me["key"]
     with _lock_for(uk):
         if _existing_cert(uk) or _paid_row(uk):
@@ -685,6 +711,7 @@ def _pay_sync(me):
                 return _reply("already_paid", price)
             last = _latest_row(uk, "pending")
         if last and last.get("checkout_url") and _amount_matches(last["amount"], price) \
+                and str(last.get("currency") or "").upper() == pcur \
                 and time.time() - _ts(last["created_at"]) < CHECKOUT_REUSE_SECONDS:
             return _reply("payment_pending", price, {"url": last["checkout_url"], "reference": last["reference"]})
         key = _korapay_key()
@@ -696,7 +723,7 @@ def _pay_sync(me):
         email = (me.get("email") or "").strip()
         if "@" not in email:
             email = os.getenv("CERT_FALLBACK_EMAIL") or "spiritfxtradingacademy@gmail.com"
-        body = {"amount": price, "currency": CERT_CURRENCY, "reference": reference,
+        body = {"amount": price, "currency": pcur, "reference": reference,
                 "redirect_url": f"{PUBLIC_BASE}/cert-payment/done",
                 "customer": {"name": me.get("name") or "SpiritFX Student", "email": email},
                 "narration": "SpiritFX Trading Academy certificate fee"}
@@ -715,9 +742,9 @@ def _pay_sync(me):
             print(f"[CERT PAY] init failed for {uk}: {str(j)[:200]}", flush=True)
             return _reply("payment_failed", price, message="We could not start the payment. Please try again.")
         ref = str((d or {}).get("reference") or reference)
-        _sb("sfx_cert_payments", "POST", {"reference": ref, "user_key": uk, "amount": price, "currency": CERT_CURRENCY,
+        _sb("sfx_cert_payments", "POST", {"reference": ref, "user_key": uk, "amount": price, "currency": pcur,
                                           "state": "pending", "checkout_url": url})
-        print(f"[CERT PAY] checkout created user={uk} ref={ref} amount={price} {CERT_CURRENCY}", flush=True)
+        print(f"[CERT PAY] checkout created user={uk} ref={ref} amount={price} {pcur}", flush=True)
         return _reply("payment_pending", price, {"url": url, "reference": ref})
 
 

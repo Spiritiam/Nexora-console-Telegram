@@ -9804,6 +9804,8 @@ def attach_mt5_order_id(signal_id, order_id):
 # TP2, both sharing the same SL. When the TP1 leg closes in profit, the
 # TP2 leg's SL is moved to just past entry (see manage_break_even).
 # Set TP_SPLIT_ENABLED=0 on Railway to go back to one 0.1-lot trade.
+PERSONAL_RETRY_WINDOW_S = int(os.getenv("PERSONAL_RETRY_WINDOW_S", "120"))  # keep retrying a disconnected MT5 for this long
+PERSONAL_RETRY_EVERY_S = int(os.getenv("PERSONAL_RETRY_EVERY_S", "20"))
 PERSONAL_LOT = 0.1
 TP_SPLIT_ENABLED = os.getenv("TP_SPLIT_ENABLED", "1") != "0"
 
@@ -9829,6 +9831,7 @@ async def place_and_link_mt5_trade(signal_id, signal_data):
     separately for the break-even move.
     """
     _PERSONAL_COPY_LAST_FAILURE["reason"] = None
+    early_redeploy = None
     split = bool(TP_SPLIT_ENABLED and signal_id and signal_data.get("tp1") is not None and PERSONAL_LOT >= 0.02)
     half = round(PERSONAL_LOT / 2, 2)
     if split:
@@ -9846,16 +9849,34 @@ async def place_and_link_mt5_trade(signal_id, signal_data):
         explicit_rejection = bool(reason) and not _personal_copy_looks_disconnected(reason)
         mt5_symbol = signal_data.get("mt5_symbol")
         if mt5_symbol and not explicit_rejection:
+            # MetaAPI lost the broker link: ask it to redeploy right away, then retry every 20 seconds for up to
+            # 2 minutes. Before each new attempt the account's open positions are read; a retry is only sent when
+            # that read succeeds and shows this signal is NOT already open (never a duplicate order).
+            early_redeploy = await _personal_copy_redeploy_now()
             since_dt = datetime.utcnow() - timedelta(minutes=15)
-            for _ in range(15):
-                await asyncio.sleep(10)
+            deadline = time.time() + PERSONAL_RETRY_WINDOW_S
+            while not order_id and time.time() < deadline:
+                await asyncio.sleep(PERSONAL_RETRY_EVERY_S)
                 res = await check_for_matching_recent_position(
                     METAAPI_ACCOUNT_ID, mt5_symbol, first_comment, since_dt
                 )
-                if res and res != "CHECK_FAILED":
+                if res == "CHECK_FAILED":
+                    continue  # still disconnected: try again in 20s
+                if res:
                     order_id = res.get("id", "unknown")
                     print(f"[MT5 PERSONAL COPY] ✅ Signal {signal_id} filled late - position {order_id}; no failure alert sent.")
                     break
+                _PERSONAL_COPY_LAST_FAILURE["reason"] = None
+                if split:
+                    order_id = await place_mt5_trade(signal_data, signal_id=signal_id, leg="TP1", volume=half)
+                else:
+                    order_id = await place_mt5_trade(signal_data, signal_id=signal_id)
+                if order_id:
+                    print(f"[MT5 PERSONAL COPY] ✅ Signal {signal_id} placed on a retry after the connection came back - position {order_id}")
+                    break
+                _r = (_PERSONAL_COPY_LAST_FAILURE.get("reason") or "").lower()
+                if _r and not _personal_copy_looks_disconnected(_r):
+                    break  # a real rejection (margin, market closed...): retrying will not help
     second_id = None
     if split and order_id:
         second_id = await place_mt5_trade(signal_data, signal_id=signal_id, leg="TP2", volume=half)
@@ -9875,7 +9896,7 @@ async def place_and_link_mt5_trade(signal_id, signal_data):
         attach_second_leg(signal_id, second_id)
         _BE_PENDING[str(signal_id)] = {"stage": "wait", "a": str(order_id), "b": str(second_id), "tries": 0, "tp2": signal_data.get("take_profit")}
     if not order_id:
-        await handle_personal_copy_failure(signal_id, signal_data)
+        await handle_personal_copy_failure(signal_id, signal_data, early_redeploy=early_redeploy)
 
 
 # Filled in by place_mt5_trade whenever the admin's own copy fails, so the
@@ -9889,7 +9910,20 @@ def _personal_copy_looks_disconnected(reason):
             or "timeouterror" in t or "502" in t or "503" in t)
 
 
-async def handle_personal_copy_failure(signal_id, signal_data):
+async def _personal_copy_redeploy_now():
+    """Ask MetaAPI to redeploy the admin account now (once per cooldown). Returns (ok, detail), or None if one was already requested recently."""
+    st = _METAAPI_SELFHEAL
+    if time.time() - st["last_redeploy"] < METAAPI_SELFHEAL_COOLDOWN_SECONDS:
+        return None
+    st["last_redeploy"] = time.time()
+    st["first_failure"] = None
+    st["last_failure"] = None
+    ok, detail = await asyncio.to_thread(_metaapi_redeploy_admin_account)
+    print(f"[METAAPI SELFHEAL] redeploy requested at once after failed personal copy: ok={ok} ({detail})")
+    return (ok, detail)
+
+
+async def handle_personal_copy_failure(signal_id, signal_data, early_redeploy=None):
     """
     The admin's own MT5 copy did not go through. Tell the admin right away
     (it used to be silent) and, if the failure looks like MetaAPI losing its
@@ -9901,7 +9935,16 @@ async def handle_personal_copy_failure(signal_id, signal_data):
     import html as _html
     reason = _PERSONAL_COPY_LAST_FAILURE.get("reason") or "unknown reason"
     redeploy_note = ""
-    if _personal_copy_looks_disconnected(reason):
+    if early_redeploy is not None:
+        _ok, _detail = early_redeploy
+        redeploy_note = (
+            "\n\n🔧 I asked MetaAPI to redeploy your account straight away and retried every 20 seconds for 2 minutes, "
+            "but it did not reconnect in time."
+            if _ok else
+            f"\n\n🔧 MetaAPI looks disconnected and my redeploy request was refused: {_detail}. "
+            "I retried every 20 seconds for 2 minutes. Please press Redeploy at app.metaapi.cloud."
+        )
+    elif _personal_copy_looks_disconnected(reason):
         st = _METAAPI_SELFHEAL
         if time.time() - st["last_redeploy"] >= METAAPI_SELFHEAL_COOLDOWN_SECONDS:
             st["last_redeploy"] = time.time()
@@ -9932,7 +9975,7 @@ async def handle_personal_copy_failure(signal_id, signal_data):
                 f"(#{signal_id})\n"
                 f"Reason: {_html.escape(str(reason)[:300])}"
                 f"{redeploy_note}\n\n"
-                f"<i>The trade is not retried automatically because the signal price is no longer current.</i>"
+                f"<i>I will not retry any more for this signal; the entry price has moved too far by now.</i>"
             ),
             parse_mode=ParseMode.HTML,
         )

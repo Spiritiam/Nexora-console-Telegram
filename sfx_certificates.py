@@ -18,6 +18,8 @@ from datetime import datetime, timezone
 import requests
 from aiohttp import web
 
+import sfx_translate as _tr
+
 HERE = os.path.dirname(os.path.abspath(__file__))
 ASSETS = os.path.join(HERE, "sfx_cert_assets")
 PROGRAMME = "SpiritFX Trading Academy Program"
@@ -332,7 +334,7 @@ def _pick(pool, n, seen):
     return out
 
 
-def _start_sync(me, confirmed):
+def _start_sync(me, confirmed, lang=None):
     st = _status_sync(me)
     if st["issued"]:
         return {"error": "done", "message": "You already have your certificate."}, 409
@@ -362,7 +364,25 @@ def _start_sync(me, confirmed):
         opts = list(q["options"])
         order = _perm(aid, q["id"], len(opts))
         qs.append({"id": q["id"], "question": q["question"], "options": [opts[k] for k in order]})
-    return {"attempt_id": aid, "pass_percent": PASS_PERCENT,
+    used = "English"
+    canon = _tr.resolve_language(lang)
+    if canon:
+        # Only the words are translated. Question order, option order and the answer key are untouched,
+        # so grading works exactly as in English.
+        flat = []
+        for q in qs:
+            flat.append(q["question"])
+            flat.extend(q["options"])
+        out, ok = _tr.translate_texts(flat, canon, _sb)
+        if ok:
+            k = 0
+            for q in qs:
+                n = len(q["options"])
+                q["question"] = out[k]
+                q["options"] = out[k + 1:k + 1 + n]
+                k += 1 + n
+            used = canon
+    return {"attempt_id": aid, "pass_percent": PASS_PERCENT, "language": used,
             "time_limit_seconds": EXAM_TIME_LIMIT_SECONDS, "questions": qs}, 200
 
 
@@ -374,8 +394,37 @@ async def start_handler(request):
         data = await request.json()
     except Exception:
         data = {}
-    body, status = await asyncio.to_thread(_start_sync, me, bool(data.get("confirmed_name")))
+    lang = data.get("lang") if isinstance(data, dict) else None
+    body, status = await asyncio.to_thread(_start_sync, me, bool(data.get("confirmed_name")), lang)
     return _j(body, status)
+
+
+def _translate_sync(texts, lang):
+    canon = _tr.resolve_language(lang)
+    if not canon:
+        return {"language": "English", "texts": texts, "translated": False}, 200
+    out, ok = _tr.translate_texts(texts, canon, _sb)
+    return {"language": canon if ok else "English", "texts": out if ok else texts, "translated": bool(ok)}, 200
+
+
+async def translate_handler(request):
+    me, err = await _auth(request)
+    if err:
+        return err
+    try:
+        data = await request.json()
+    except Exception:
+        data = {}
+    texts = data.get("texts") if isinstance(data, dict) else None
+    if not isinstance(texts, list) or not texts or len(texts) > _tr.MAX_TEXTS_PER_CALL \
+            or sum(len(t) for t in texts if isinstance(t, str)) > _tr.MAX_CHARS_PER_CALL:
+        return _j({"error": "bad_request", "message": "Nothing to translate."}, 400)
+    body, status = await asyncio.to_thread(_translate_sync, [t if isinstance(t, str) else "" for t in texts], data.get("lang"))
+    return _j(body, status)
+
+
+async def languages_handler(request):
+    return _j({"languages": _tr.languages_out()})
 
 
 def _submit_sync(me, attempt_id, answers):
@@ -1059,6 +1108,8 @@ def register(app, sb_headers, supabase_url, validate_token, user_url):
     app.router.add_get("/api/nexora/cert/status", status_handler)
     app.router.add_post("/api/nexora/cert/exam/start", start_handler)
     app.router.add_post("/api/nexora/cert/exam/submit", submit_handler)
+    app.router.add_post("/api/nexora/translate", translate_handler)
+    app.router.add_get("/api/nexora/languages", languages_handler)
     app.router.add_post("/api/nexora/cert/pay", pay_handler)
     app.router.add_get("/cert-payment/done", pay_done_handler)
     app.router.add_post("/api/nexora/progress", progress_event_handler)

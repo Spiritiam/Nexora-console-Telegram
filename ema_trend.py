@@ -106,4 +106,5 @@ def evaluate(candles, secs=300, now=None):
             (last["high"] >= e50[-1] - tol and last["close"] < e50[-1]))
         direction = "SELL"
     return {"state": side, "direction": direction if bounce else None, "trigger": bool(bounce),
-            "bar_t": bar_t, "why": "bounce" if bounce else "trending, waiting for a bounce"}
+            "bar_t": bar_t, "why": "bounce" if bounce else "trending, waiting for a bounce",
+            "close": last["close"], "e25": e25[-1]}

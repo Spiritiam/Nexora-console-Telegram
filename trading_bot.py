@@ -3550,7 +3550,14 @@ def _ema_trend_dir(e):
     """BUY/SELL from the trend itself (bounce or not), None when ranging / no data."""
     if not e:
         return None
-    return {"up": "BUY", "down": "SELL"}.get(e.get("state"))
+    d = {"up": "BUY", "down": "SELL"}.get(e.get("state"))
+    # The EMA stack lags a sharp reversal: if price has already crossed back over the 25 EMA against the stack
+    # (a SELL with price above the 25, a BUY with price below it), it is not a clean trend any more.
+    _c, _e25 = e.get("close"), e.get("e25")
+    if d and _c is not None and _e25 is not None:
+        if (d == "SELL" and _c >= _e25) or (d == "BUY" and _c <= _e25):
+            return None
+    return d
 
 
 async def _ema5_pick_pairs(origin_key, scheduled=True, origin_busy=False):

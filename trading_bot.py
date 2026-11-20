@@ -289,6 +289,8 @@ MT5_BOT_PAIRS = {
 }
 # "auto": no pair chosen - the bot watches these four and fires on the first EMA bounce (one trade at a time).
 SC_AUTO_PAIRS = ["xauusd", "btcusd", "usoil"]
+# Aggressive Scalper only: pairs it must not open NEW trades on (Account Flip is unaffected; open trades are still managed). Env SC_SCALPER_SKIP, comma separated, empty = trade all.
+SC_SCALPER_SKIP = [x.strip() for x in os.getenv("SC_SCALPER_SKIP", "xauusd").split(",") if x.strip()]
 # Silver is no longer traded by the auto bots; it is only looked at so a position opened earlier is still managed to its close.
 SC_LEGACY_PAIRS = ["xagusd"]
 AUTO_LABEL = "\U0001F500 Auto (all pairs)"
@@ -4006,6 +4008,9 @@ async def _sc_tick_one(context, account):
         if now < st.get("backoff_until", 0):
             return
 
+        if account["bot_choice"] == "aggressive_scalper" and pair_key in SC_SCALPER_SKIP:
+            st["phase"] = "arm"
+            return  # paused for the Aggressive Scalper: no new entries on this pair
         quote = await _sc_quote(resolved)
         if not quote:
             return
@@ -4158,6 +4163,8 @@ async def _sc_auto_targets(a):
         return list(SC_AUTO_PAIRS) + list(SC_LEGACY_PAIRS)
     closed = _xc_market_closed()
     for p in SC_AUTO_PAIRS:
+        if mode == "aggressive_scalper" and p in SC_SCALPER_SKIP:
+            continue
         if closed and p not in WEEKEND_PAIRS:
             continue
         e = await _ema5_exness(p, PAIR_CONFIG[p])

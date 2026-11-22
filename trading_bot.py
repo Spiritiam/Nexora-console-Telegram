@@ -24327,7 +24327,7 @@ async def build_signal_response(question, user_id=None, retry_mismatch=False, _s
         # The entry follows the 5-minute EMA trend, so the picture shows those same 5-minute candles
         # and EMAs (the hourly chart showed a different trend and looked wrong next to the signal).
         _chart_candles, _chart_name = h1_candles, chart_strategy_name
-        if _tdir:
+        if True:  # always 5-minute candles: on hourly candles the entry/SL/TP zone looked tiny
             try:
                 _c5 = await asyncio.to_thread(get_cached_candles, matched_key, config, "5min", outputsize=300)
                 if _c5 and len(_c5) >= 110:

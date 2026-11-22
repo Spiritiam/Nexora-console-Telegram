@@ -13379,7 +13379,7 @@ async def _build_synthetic_signal_response_inner(index_key, min_agree=2, manual=
     chart_strategy_name = winning_votes[0]["strategy_name"] if winning_votes else "Momentum"
     if chart_strategy_name:
         chart_candles = m1_candles if chart_strategy_name in M1_BASED_STRATEGIES else h1_candles
-        if _tdir:  # the entry follows the 5-minute EMA trend, so draw those candles and EMAs
+        if True:  # always draw the 5-minute candles and EMAs (hourly made the entry/SL/TP zone look tiny)
             try:
                 _c5 = await get_cached_synthetic_candles(index_key, config["symbol"], "5m", 300, 300)
                 if _c5 and len(_c5) >= 110:

@@ -13391,6 +13391,7 @@ async def _build_synthetic_signal_response_inner(index_key, min_agree=2, manual=
             generate_signal_chart,
             config["display"], chart_strategy_name, direction, chart_candles,
             entry_price, sl_price, tp_price, chart_path,
+            show_emas=bool(_tdir),
         )
         if not chart_ok:
             # RETRY: same reasoning as the forex/crypto path - chart
@@ -23223,7 +23224,7 @@ def _generate_daily_line_chart_unlocked(display_name, direction, daily_history, 
         return False
 
 
-def _generate_signal_chart_unlocked(display_name, strategy_name, direction, candles, entry, sl, tp, save_path, display_window=70, anchor_live=True, tp1=None):
+def _generate_signal_chart_unlocked(display_name, strategy_name, direction, candles, entry, sl, tp, save_path, display_window=70, anchor_live=True, tp1=None, show_emas=True):
     """
     Generates one chart PNG for a signal. candles = the SAME candle
     list the winning strategy actually used (h1_candles for most
@@ -23561,7 +23562,7 @@ def _generate_signal_chart_unlocked(display_name, strategy_name, direction, cand
             sub_ax.fill_between(x, 0, 25, color="#22c55e", alpha=0.06, zorder=0)
             sub_ax.set_ylim(0, 100)
 
-        for _n, _col in ((25, "#d97706"), (50, "#0284c7"), (100, "#c026d3")):
+        for _n, _col in (((25, "#d97706"), (50, "#0284c7"), (100, "#c026d3")) if show_emas else ()):
             _v = _emas.get(_n)
             if _v and len(_v) == len(x) and any(t is not None for t in _v):
                 ax.plot(x, _v, color=_col, linewidth=1.2, alpha=0.95, label=f"EMA {_n}", zorder=4)
@@ -24338,7 +24339,7 @@ async def build_signal_response(question, user_id=None, retry_mismatch=False, _s
             generate_signal_chart,
             display, _chart_name, direction, _chart_candles,
             entry_price, stop_loss, take_profit, chart_path,
-            70, True, take_profit_1,
+            70, True, take_profit_1, bool(_tdir),
         )
         if not chart_ok:
             # RETRY: per explicit instruction, after a real

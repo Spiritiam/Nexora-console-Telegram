@@ -22947,6 +22947,28 @@ def _consistent_or_random(pair_key):
 CHART_OUTPUT_DIR = "/tmp/nexora_charts"
 os.makedirs(CHART_OUTPUT_DIR, exist_ok=True)
 
+# Light chart theme (signal pictures for the Telegram bot and the app share it).
+_CH = dict(
+    fig="#ffffff", plot="#fbfcfe", grid="#eef2f6", spine="#e3e9f0", text="#1f2d46", sub="#6b778c",
+    up="#16876a", down="#d9546a", sl="#d9546a", entry="#e8b043", entry_txt="#3a2a00", tp="#16876a",
+)
+
+
+def _chart_tf_label(times):
+    """Timeframe label (M5, H1, D1) from the spacing of the real candle times."""
+    try:
+        if not times or not isinstance(times[0], datetime) or len(times) < 3:
+            return ""
+        gaps = sorted((times[i + 1] - times[i]).total_seconds() for i in range(len(times) - 1))
+        g = gaps[len(gaps) // 2]
+        if g < 3600:
+            return f"M{int(round(g / 60))}"
+        if g < 86400:
+            return f"H{int(round(g / 3600))}"
+        return "D1"
+    except Exception:
+        return ""
+
 
 def _chart_to_mpl_time(candles):
     """
@@ -22993,8 +23015,8 @@ def _chart_draw_candles(ax, candles, times):
         width = 0.6
     min_body = (max(c["high"] for c in candles) - min(c["low"] for c in candles)) * 0.001
     for i, c in enumerate(candles):
-        color = "#22c55e" if c["close"] >= c["open"] else "#ef4444"
-        ax.plot([x[i], x[i]], [c["low"], c["high"]], color=color, linewidth=1, zorder=2)
+        color = _CH["up"] if c["close"] >= c["open"] else _CH["down"]
+        ax.plot([x[i], x[i]], [c["low"], c["high"]], color=color, linewidth=1.2, zorder=2)
         rect = Rectangle(
             (x[i] - width / 2, min(c["open"], c["close"])),
             width, max(abs(c["close"] - c["open"]), min_body),
@@ -23010,111 +23032,103 @@ def _chart_fmt_price(value, all_values):
 
 
 def _chart_finish(fig, ax, x, times, candles, entry, sl, tp, title, save_path, sub_ax=None, tp1=None):
-    # Per explicit instruction - filled, colored label backgrounds
-    # instead of a uniform dark box for all three, so each level
-    # actually stands out and is instantly distinguishable at a
-    # glance, not just readable by its text color. Entry gets its own
-    # distinct accent color (amber) rather than plain gray, which
-    # tended to blend into the candle wicks and grid.
-    entry_color = "#f59e0b"
-    sl_color = "#ef4444"
-    tp_color = "#22c55e"
-    entry_box = dict(boxstyle="round,pad=0.35", facecolor=entry_color, edgecolor="none")
-    sl_box = dict(boxstyle="round,pad=0.35", facecolor=sl_color, edgecolor="none")
-    tp_box = dict(boxstyle="round,pad=0.35", facecolor=tp_color, edgecolor="none")
-    x_right = x[-1] + (x[-1] - x[0]) * 0.01 if len(x) > 1 else x[-1] + 1
+    C = _CH
+    n = len(x)
+    span = (x[-1] - x[0]) if n > 1 else 1
+    zone_w = max(span * 0.14, 2)
+    zx0 = x[-1] + 0.5
+    zx1 = zx0 + zone_w
 
     all_lows = [c["low"] for c in candles]
     all_highs = [c["high"] for c in candles]
     level_values = [v for v in (entry, sl, tp1, tp) if v is not None]
     all_price_values = all_lows + all_highs + level_values
+    full_range = (max(all_price_values) - min(all_price_values)) or 1.0
 
-    full_range = max(all_price_values) - min(all_price_values)
-    min_gap = full_range * 0.035
-    points = sorted([(v, name) for v, name in [(entry, "entry"), (sl, "sl"), (tp1, "tp1"), (tp, "tp")] if v is not None])
-    adjusted = {name: v for v, name in points}
-    for i in range(1, len(points)):
-        prev_v, prev_name = points[i - 1]
-        curr_v, curr_name = points[i]
-        if adjusted[curr_name] - adjusted[prev_name] < min_gap:
-            adjusted[curr_name] = adjusted[prev_name] + min_gap
-
-    # Slightly thicker lines than before (1 -> 1.4) so they read as
-    # clearly intentional markers, not just another grid line.
-    if entry is not None:
-        ax.axhline(entry, color=entry_color, linewidth=1.4, linestyle="--", zorder=1)
-        ax.text(x_right, adjusted["entry"], f" Entry {_chart_fmt_price(entry, all_price_values)} ", color="#0f1115", fontsize=9, fontweight="bold", va="center", bbox=entry_box, zorder=5)
-    if sl is not None:
-        ax.axhline(sl, color=sl_color, linewidth=1.4, linestyle="--", zorder=1)
-        ax.text(x_right, adjusted["sl"], f" SL {_chart_fmt_price(sl, all_price_values)} ", color="#0f1115", fontsize=9, fontweight="bold", va="center", bbox=sl_box, zorder=5)
-    if tp1 is not None:
-        ax.axhline(tp1, color=tp_color, linewidth=1.2, linestyle=":", zorder=1)
-        ax.text(x_right, adjusted["tp1"], f" TP1 {_chart_fmt_price(tp1, all_price_values)} ", color="#0f1115", fontsize=9, fontweight="bold", va="center", bbox=tp_box, zorder=5)
-    if tp is not None:
-        ax.axhline(tp, color=tp_color, linewidth=1.4, linestyle="--", zorder=1)
-        tp_label = "TP2" if tp1 is not None else "TP"
-        ax.text(x_right, adjusted["tp"], f" {tp_label} {_chart_fmt_price(tp, all_price_values)} ", color="#0f1115", fontsize=9, fontweight="bold", va="center", bbox=tp_box, zorder=5)
-
-    xlim_left = x[0] - (x[-1] - x[0]) * 0.02 if len(x) > 1 else x[0] - 1
-    xlim_right = x_right + (x[-1] - x[0]) * 0.12 if len(x) > 1 else x_right + 2
-    ax.set_xlim(xlim_left, xlim_right)
+    xlim_left = x[0] - span * 0.02 if n > 1 else x[0] - 1
+    ax.set_xlim(xlim_left, zx1)
     y_pad = full_range * 0.08
     ax.set_ylim(min(all_price_values) - y_pad, max(all_price_values) + y_pad)
 
-    # FIX: per explicit instruction - x is now always plain candle
-    # INDEX (see _chart_draw_candles), not a real matplotlib date
-    # value, so the old xaxis_date()/DateFormatter approach (which
-    # requires real date values to work) no longer applies. Real
-    # datetimes are still used here, just to build the LABEL TEXT at
-    # a manually-chosen, evenly-spaced subset of tick positions -
-    # showing a label on every single candle would be unreadably
-    # dense, so this picks roughly 7-8 ticks across the visible range.
-    is_datetime = isinstance(times[0], datetime)
-    if is_datetime and sub_ax is None:
-        n = len(times)
-        step = max(1, n // 7)
-        tick_positions = list(range(0, n, step))
-        if tick_positions[-1] != n - 1:
-            tick_positions.append(n - 1)
-        ax.set_xticks(tick_positions)
-        ax.set_xticklabels([times[i].strftime("%d %b %Hh") for i in tick_positions])
-        plt.setp(ax.get_xticklabels(), rotation=20)
-    elif sub_ax is not None:
-        ax.tick_params(labelbottom=False)
+    # Red zone entry -> SL, green zone entry -> final TP, projected to the right of the last candle.
+    if entry is not None and sl is not None:
+        ax.add_patch(Rectangle((zx0, min(entry, sl)), zx1 - zx0, abs(sl - entry), facecolor=C["sl"], alpha=0.12,
+                               edgecolor=C["sl"], linewidth=0.8, zorder=1))
+    if entry is not None and tp is not None:
+        ax.add_patch(Rectangle((zx0, min(entry, tp)), zx1 - zx0, abs(tp - entry), facecolor=C["tp"], alpha=0.11,
+                               edgecolor=C["tp"], linewidth=0.8, zorder=1))
 
-    ax.tick_params(colors="#9ca3af", labelsize=8)
-    for spine in ax.spines.values():
-        spine.set_color("#2d3139")
+    tags = []
+    if sl is not None:
+        tags.append((sl, "SL", C["sl"], "#ffffff", ":"))
+    if entry is not None:
+        tags.append((entry, "ENTRY", C["entry"], C["entry_txt"], "-"))
+    if tp1 is not None:
+        tags.append((tp1, "TP1", C["tp"], "#ffffff", ":"))
+    if tp is not None:
+        tags.append((tp, "TP2" if tp1 is not None else "TP", C["tp"], "#ffffff", ":"))
+    for v, _name, col, _tc, ls in tags:
+        ax.axhline(v, color=col, linewidth=1.0, linestyle=ls, alpha=0.75, zorder=2)
 
-    handles, labels = ax.get_legend_handles_labels()
-    if handles:
-        ax.legend(loc="upper left", facecolor="#0f1115", edgecolor="#2d3139", labelcolor="#e5e7eb", fontsize=9)
-    ax.set_title(title, color="#e5e7eb", fontsize=12, fontweight="bold", loc="left", pad=12)
-    ax.grid(color="#1f2329", linewidth=0.5, alpha=0.5)
+    # Price tags on the right, nudged apart so they never overlap.
+    tags.sort(key=lambda t: -t[0])
+    ymin, ymax = ax.get_ylim()
+    gap = (ymax - ymin) * 0.055
+    placed = []
+    for v, *_ in tags:
+        p = v
+        if placed and placed[-1] - p < gap:
+            p = placed[-1] - gap
+        placed.append(p)
+    tr = ax.get_yaxis_transform()
+    for (v, name, col, tc, _ls), p in zip(tags, placed):
+        ax.plot([1.0, 1.012], [v, p], color=col, linewidth=1.0, transform=tr, clip_on=False)
+        ax.text(1.012, p, f"{name} {_chart_fmt_price(v, all_price_values)}", transform=tr, clip_on=False,
+                va="center", ha="left", fontsize=9.5, fontweight="bold", color=tc, zorder=6,
+                bbox=dict(boxstyle="round,pad=0.35,rounding_size=0.25", facecolor=col, edgecolor="none"))
 
-    if sub_ax is not None:
-        sub_ax.set_xlim(xlim_left, xlim_right)
+    def _ticks(a):
+        is_datetime = isinstance(times[0], datetime)
         if is_datetime:
-            n = len(times)
-            step = max(1, n // 7)
-            tick_positions = list(range(0, n, step))
-            if tick_positions[-1] != n - 1:
-                tick_positions.append(n - 1)
-            sub_ax.set_xticks(tick_positions)
-            sub_ax.set_xticklabels([times[i].strftime("%d %b %Hh") for i in tick_positions])
-            plt.setp(sub_ax.get_xticklabels(), rotation=20)
-        sub_ax.tick_params(colors="#9ca3af", labelsize=8)
-        for spine in sub_ax.spines.values():
-            spine.set_color("#2d3139")
-        sub_handles, sub_labels = sub_ax.get_legend_handles_labels()
-        if sub_handles:
-            sub_ax.legend(loc="upper left", facecolor="#0f1115", edgecolor="#2d3139", labelcolor="#e5e7eb", fontsize=8)
-        sub_ax.grid(color="#1f2329", linewidth=0.5, alpha=0.5)
+            step = max(1, n // 6)
+            pos = list(range(0, n, step))
+            a.set_xticks(pos)
+            intraday = n > 2 and (times[1] - times[0]).total_seconds() < 86400
+            fmt = "%d %b %H:%M" if intraday else "%d %b"
+            a.set_xticklabels([times[i].strftime(fmt) for i in pos])
 
-    if sub_ax is None:
-        fig.tight_layout()
+    for a in [ax] + ([sub_ax] if sub_ax is not None else []):
+        a.set_facecolor(C["plot"])
+        a.tick_params(colors=C["sub"], labelsize=8, length=0)
+        for spine in a.spines.values():
+            spine.set_color(C["spine"])
+        a.grid(color=C["grid"], linewidth=0.8)
+        a.set_axisbelow(True)
+        handles, _labels = a.get_legend_handles_labels()
+        if handles:
+            a.legend(loc="upper left", facecolor="#ffffff", edgecolor=C["spine"], labelcolor=C["text"], fontsize=8)
+    if sub_ax is not None:
+        sub_ax.set_xlim(xlim_left, zx1)
+        _ticks(sub_ax)
+        ax.tick_params(labelbottom=False)
+    else:
+        _ticks(ax)
+
+    ax.set_title(title, color=C["text"], fontsize=15, fontweight="bold", loc="left", pad=12)
+    tf = _chart_tf_label(times)
+    if tf:
+        ax.set_title(f"{tf} \u00b7 UTC", color=C["sub"], fontsize=10, loc="right", pad=12)
+
     try:
-        fig.savefig(save_path, facecolor="#0f1115")
+        fig.set_layout_engine("none")
+    except Exception:
+        pass
+    if sub_ax is None:
+        fig.subplots_adjust(left=0.08, right=0.80, top=0.89, bottom=0.11)
+    else:
+        fig.subplots_adjust(left=0.08, right=0.80, top=0.92, bottom=0.09, hspace=0.08)
+    try:
+        fig.savefig(save_path, facecolor=C["fig"])
     finally:
         plt.close(fig)
 
@@ -23478,14 +23492,14 @@ def _generate_signal_chart_unlocked(display_name, strategy_name, direction, cand
             fig, (ax, sub_ax) = plt.subplots(
                 2, 1, figsize=(10, 7.5), dpi=150,
                 gridspec_kw={"height_ratios": [3, 1], "hspace": 0.08},
-                sharex=True, layout="constrained",
+                sharex=True,
             )
-            sub_ax.set_facecolor("#0f1115")
+            sub_ax.set_facecolor(_CH["plot"])
         else:
             fig, ax = plt.subplots(figsize=(10, 6), dpi=150)
             sub_ax = None
-        fig.patch.set_facecolor("#0f1115")
-        ax.set_facecolor("#0f1115")
+        fig.patch.set_facecolor(_CH["fig"])
+        ax.set_facecolor(_CH["plot"])
 
         x = _chart_draw_candles(ax, candles, times)
         title_suffix = f"{display_name} — {direction}"
@@ -23547,7 +23561,7 @@ def _generate_signal_chart_unlocked(display_name, strategy_name, direction, cand
             sub_ax.fill_between(x, 0, 25, color="#22c55e", alpha=0.06, zorder=0)
             sub_ax.set_ylim(0, 100)
 
-        for _n, _col in ((25, "#facc15"), (50, "#38bdf8"), (100, "#e879f9")):
+        for _n, _col in ((25, "#d97706"), (50, "#0284c7"), (100, "#c026d3")):
             _v = _emas.get(_n)
             if _v and len(_v) == len(x) and any(t is not None for t in _v):
                 ax.plot(x, _v, color=_col, linewidth=1.2, alpha=0.95, label=f"EMA {_n}", zorder=4)

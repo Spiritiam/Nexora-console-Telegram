@@ -23594,7 +23594,8 @@ def _generate_signal_chart_unlocked(display_name, strategy_name, direction, cand
         ax.set_facecolor(_CH["plot"])
 
         x = _chart_draw_candles(ax, candles, times)
-        title_suffix = f"{display_name} — {direction}" + (f" — {title_note}" if title_note else "")
+        _plain_name = re.sub(r"[^\x20-\x7E]", "", str(display_name)).strip()   # flag emoji draw as empty boxes in the chart font
+        title_suffix = f"{_plain_name} — {direction}" + (f" — {title_note}" if title_note else "")
 
         if ma20 is not None:
             ax.plot(x, ma20, color="#60a5fa", linewidth=1.6, label="MA20", zorder=4)

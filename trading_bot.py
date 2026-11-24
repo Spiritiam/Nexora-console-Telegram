@@ -23198,7 +23198,7 @@ def _chart_finish(fig, ax, x, times, candles, entry, sl, tp, title, save_path, s
             pos = list(range(0, n, step))
             a.set_xticks(pos)
             intraday = n > 2 and (times[1] - times[0]).total_seconds() < 86400
-            fmt = "%d %b %H:%M" if intraday else "%d %b"
+            fmt = "%H:%M" if intraday else "%d %b"
             a.set_xticklabels([times[i].strftime(fmt) for i in pos])
 
     for a in [ax] + ([sub_ax] if sub_ax is not None else []):
@@ -23228,9 +23228,9 @@ def _chart_finish(fig, ax, x, times, candles, entry, sl, tp, title, save_path, s
     except Exception:
         pass
     if sub_ax is None:
-        fig.subplots_adjust(left=0.08, right=0.80, top=0.89, bottom=0.11)
+        fig.subplots_adjust(left=0.095, right=0.765, top=0.89, bottom=0.11)
     else:
-        fig.subplots_adjust(left=0.08, right=0.80, top=0.92, bottom=0.09, hspace=0.08)
+        fig.subplots_adjust(left=0.095, right=0.765, top=0.92, bottom=0.09, hspace=0.08)
     try:
         fig.savefig(save_path, facecolor=C["fig"])
     finally:
@@ -23594,13 +23594,13 @@ def _generate_signal_chart_unlocked(display_name, strategy_name, direction, cand
         times = _chart_to_mpl_time(candles)
         if needs_subpanel:
             fig, (ax, sub_ax) = plt.subplots(
-                2, 1, figsize=(10, 7.5), dpi=150,
+                2, 1, figsize=(7.4, 6.0), dpi=200,
                 gridspec_kw={"height_ratios": [3, 1], "hspace": 0.08},
                 sharex=True,
             )
             sub_ax.set_facecolor(_CH["plot"])
         else:
-            fig, ax = plt.subplots(figsize=(10, 6), dpi=150)
+            fig, ax = plt.subplots(figsize=(7.4, 5.2), dpi=200)
             sub_ax = None
         fig.patch.set_facecolor(_CH["fig"])
         ax.set_facecolor(_CH["plot"])

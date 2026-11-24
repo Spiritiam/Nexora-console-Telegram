@@ -23127,7 +23127,7 @@ def _chart_finish(fig, ax, x, times, candles, entry, sl, tp, title, save_path, s
     C = _CH
     n = len(x)
     span = (x[-1] - x[0]) if n > 1 else 1
-    zone_w = max(span * 0.14, 2)
+    zone_w = max(span * 0.34, 4)
     zx0 = x[-1] + 0.5
     zx1 = zx0 + zone_w
 
@@ -23315,7 +23315,7 @@ def _generate_daily_line_chart_unlocked(display_name, direction, daily_history, 
         return False
 
 
-def _generate_signal_chart_unlocked(display_name, strategy_name, direction, candles, entry, sl, tp, save_path, display_window=70, anchor_live=True, tp1=None, show_emas=True, title_note=None):
+def _generate_signal_chart_unlocked(display_name, strategy_name, direction, candles, entry, sl, tp, save_path, display_window=45, anchor_live=True, tp1=None, show_emas=True, title_note=None):
     """
     Generates one chart PNG for a signal. candles = the SAME candle
     list the winning strategy actually used (h1_candles for most
@@ -24431,7 +24431,7 @@ async def build_signal_response(question, user_id=None, retry_mismatch=False, _s
             generate_signal_chart,
             display, _chart_name, direction, _chart_candles,
             entry_price, stop_loss, take_profit, chart_path,
-            70, True, take_profit_1, bool(_tdir),
+            45, True, take_profit_1, bool(_tdir),
         )
         if not chart_ok:
             # RETRY: per explicit instruction, after a real
@@ -24455,7 +24455,7 @@ async def build_signal_response(question, user_id=None, retry_mismatch=False, _s
                     generate_signal_chart,
                     display, chart_strategy_name, direction, retry_candles,
                     entry_price, stop_loss, take_profit, chart_path,
-                    70, True, take_profit_1,
+                    45, True, take_profit_1,
                 )
         if chart_ok:
             image_file_id = chart_path
@@ -35212,7 +35212,7 @@ async def _replace_signal_photo_once(app, spec):
             keep = candles
         path = os.path.join(CHART_OUTPUT_DIR, f"replace_{pair}_{int(time.time())}.png")
         ok = await asyncio.to_thread(generate_signal_chart, cfg["display"], "Momentum", direction, keep,
-                                     entry, sl, tp, path, 70, True, tp1)
+                                     entry, sl, tp, path, 45, True, tp1)
         if not ok:
             print("[REPLACE] chart not made", flush=True)
             return
@@ -35252,7 +35252,7 @@ async def _redraw_chart_once(app, spec):
             keep = candles
         path = os.path.join(CHART_OUTPUT_DIR, f"redraw_{pair}_{int(time.time())}.png")
         ok = await asyncio.to_thread(generate_signal_chart, cfg["display"], "Momentum", direction, keep,
-                                     entry, sl, tp, path, 70, True, tp1)
+                                     entry, sl, tp, path, 45, True, tp1)
         if ok and ADMIN_USER_ID:
             with open(path, "rb") as fh:
                 await app.bot.send_photo(chat_id=int(ADMIN_USER_ID), photo=fh,
@@ -35456,7 +35456,7 @@ async def _send_signal_result_picture(sig, candles, upto_t, label):
         tp1 = float(sig["tp1"]) if sig.get("tp1") is not None else None
         ok = await asyncio.to_thread(
             generate_signal_chart, PAIR_CONFIG[pair_key]["display"], "Momentum", sig.get("direction"), keep,
-            entry, sl, tp, path, 70, False, tp1, False, f"{label} HIT",
+            entry, sl, tp, path, 45, False, tp1, False, f"{label} HIT",
         )
         if not ok or not os.path.exists(path):
             return False

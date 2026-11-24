@@ -10171,6 +10171,24 @@ def update_signal_status(signal_id, status, source=None):
         print(f"[SIGNAL LOG] update_signal_status error: {e}")
         return False
 
+async def apply_forced_signal_status(context: ContextTypes.DEFAULT_TYPE):
+    """One-off manual correction: FORCE_SIGNAL_STATUS="id:STATUS[:tp_detail],..." (e.g. "20410:TP_HIT:TP1").
+    Updates signal_log and tells the SpiritFX app. Does nothing when the variable is empty."""
+    raw = (os.getenv("FORCE_SIGNAL_STATUS") or "").strip()
+    if not raw:
+        return
+    for part in raw.split(","):
+        bits = [b.strip() for b in part.split(":")]
+        if len(bits) < 2 or not bits[0].isdigit() or bits[1] not in ("TP_HIT", "SL_HIT", "OPEN"):
+            print(f"[FORCE STATUS] skipped bad entry: {part!r}")
+            continue
+        sid, status = int(bits[0]), bits[1]
+        ok = await asyncio.to_thread(update_signal_status, sid, status)
+        if ok and len(bits) > 2 and bits[2]:
+            await asyncio.to_thread(_patch_signal_sync, sid, {"tp_detail": bits[2]})
+        print(f"[FORCE STATUS] signal {sid} -> {status} {bits[2] if len(bits) > 2 else ''} ok={ok}")
+
+
 def get_signals_since(start_dt):
     """
     Returns scheduled (or legacy NULL-source) signals since start_dt.
@@ -36578,6 +36596,8 @@ def main():
 
     # One-off backfill of Deriv model input readings (does nothing once
     # every row has them).
+    job_queue.run_once(apply_forced_signal_status, when=25, name="forced_signal_status",
+                       job_kwargs={"misfire_grace_time": 600})
     job_queue.run_once(
         backfill_deriv_live_ml_features,
         when=150,

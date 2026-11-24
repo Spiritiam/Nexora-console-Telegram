@@ -18253,6 +18253,10 @@ def get_candles_metaapi(mt5_symbol, interval, outputsize):
     _ex = get_candles_exness(mt5_symbol, interval, outputsize)
     if _ex:
         return _ex
+    if _mtapi_on():
+        _mc = _mtapi_candles(mt5_symbol, interval, outputsize)
+        if _mc:
+            return _mc
     if not METAAPI_TOKEN or not METAAPI_ACCOUNT_ID:
         print("[METAAPI CANDLES] Credentials not set")
         record_metaapi_candles_failure()
@@ -26885,6 +26889,30 @@ def _mtapi_find_in_history(ticket):
     for o in rows:
         net += (_mtapi_float(o.get("profit"), 0.0) or 0.0) + (_mtapi_float(o.get("swap"), 0.0) or 0.0) + (_mtapi_float(o.get("commission"), 0.0) or 0.0)
     return True, net
+
+
+def _mtapi_candles(mt5_symbol, interval, outputsize):
+    """Candles from the master account via MetaTraderAPI.net (oldest first), or None."""
+    tf = {"1min": ("M1", 1), "5min": ("M5", 5), "15min": ("M15", 15), "1h": ("H1", 60), "4h": ("H4", 240), "1day": ("D1", 1440)}.get(interval)
+    if not tf:
+        return None
+    try:
+        span = timedelta(minutes=tf[1] * min(int(outputsize), 1000) * 2.5)   # extra room for weekend gaps
+        now = datetime.utcnow()
+        code, body = _mtapi_get("PriceHistory", symbol=mt5_symbol, timeFrame=tf[0],
+                                **{"from": (now - span).strftime("%Y-%m-%dT%H:%M:%SZ"), "to": (now + timedelta(minutes=5)).strftime("%Y-%m-%dT%H:%M:%SZ")})
+        if code != 200 or not isinstance(body, list) or not body:
+            print(f"[MTAPI CANDLES] {mt5_symbol} {tf[0]} HTTP {code}: {str(body)[:150]}")
+            return None
+        out = [{"time": c.get("time"), "open": float(c["openPrice"]), "high": float(c["highPrice"]),
+                "low": float(c["lowPrice"]), "close": float(c["closePrice"]), "volume": float(c.get("tickVolume") or 0)}
+               for c in body if isinstance(c, dict) and c.get("openPrice") is not None]
+        out.sort(key=lambda c: str(c["time"]))
+        print(f"[MTAPI CANDLES] ✅ {mt5_symbol} {tf[0]} - {len(out)} candles")
+        return out[-int(outputsize):] or None
+    except Exception as e:
+        print(f"[MTAPI CANDLES] {mt5_symbol} failed: {type(e).__name__}: {str(e)[:120]}")
+        return None
 
 
 async def _mtapi_place_trade(signal_data, signal_id, leg, volume):

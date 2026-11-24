@@ -23242,7 +23242,7 @@ def _generate_daily_line_chart_unlocked(display_name, direction, daily_history, 
         return False
 
 
-def _generate_signal_chart_unlocked(display_name, strategy_name, direction, candles, entry, sl, tp, save_path, display_window=70, anchor_live=True, tp1=None, show_emas=True):
+def _generate_signal_chart_unlocked(display_name, strategy_name, direction, candles, entry, sl, tp, save_path, display_window=70, anchor_live=True, tp1=None, show_emas=True, title_note=None):
     """
     Generates one chart PNG for a signal. candles = the SAME candle
     list the winning strategy actually used (h1_candles for most
@@ -23521,7 +23521,7 @@ def _generate_signal_chart_unlocked(display_name, strategy_name, direction, cand
         ax.set_facecolor(_CH["plot"])
 
         x = _chart_draw_candles(ax, candles, times)
-        title_suffix = f"{display_name} — {direction}"
+        title_suffix = f"{display_name} — {direction}" + (f" — {title_note}" if title_note else "")
 
         if ma20 is not None:
             ax.plot(x, ma20, color="#60a5fa", linewidth=1.6, label="MA20", zorder=4)
@@ -35109,6 +35109,143 @@ async def catch_up_missed_signals(app):
 # for older rows still sitting OPEN.
 # ============================================
 
+def _candle_dt(c):
+    """Candle start time as a naive UTC datetime (candle times come as epoch, datetime or ISO text)."""
+    t = c.get("time")
+    try:
+        if isinstance(t, (int, float)):
+            return datetime.utcfromtimestamp(t)
+        if isinstance(t, datetime):
+            d = t
+        elif isinstance(t, str):
+            d = datetime.fromisoformat(t.replace("Z", "+00:00"))
+        else:
+            return None
+        if d.tzinfo:
+            d = d.astimezone(timezone.utc).replace(tzinfo=None)
+        return d
+    except Exception:
+        return None
+
+
+def _walk_signal_candles(sig, candles):
+    """
+    Walks the 5-minute candles after a signal posted and works out how it really went, without any MT5 trade:
+    TP1 first, then either TP2 (win) or back to entry (break-even, counted as TP1). Stop loss first if a single
+    candle touches both sides (the cautious call). Returns {"tp1_t", "final", "final_t"} where final is
+    "TP2", "TP1" (back to break-even), "SL" or None (still running).
+    """
+    try:
+        posted = datetime.fromisoformat(str(sig["posted_at"]).replace("Z", "+00:00")).replace(tzinfo=None)
+        entry, sl, tp = float(sig["entry_price"]), float(sig["stop_loss"]), float(sig["take_profit"])
+        tp1 = float(sig["tp1"]) if sig.get("tp1") is not None else None
+    except Exception:
+        return None
+    buy = sig.get("direction") == "BUY"
+    series = []
+    for c in candles:
+        t = _candle_dt(c)
+        if t is not None and t > posted:
+            series.append((t, float(c["low"]), float(c["high"])))
+    series.sort(key=lambda x: x[0])
+    tp1_t = None
+    for t, low, high in series:
+        hit_sl = (low <= sl) if buy else (high >= sl)
+        hit_tp2 = (high >= tp) if buy else (low <= tp)
+        hit_tp1 = tp1 is not None and ((high >= tp1) if buy else (low <= tp1))
+        if tp1_t is None:
+            if hit_sl:
+                return {"tp1_t": None, "final": "SL", "final_t": t}
+            if hit_tp2:
+                return {"tp1_t": t, "final": "TP2", "final_t": t}
+            if hit_tp1:
+                tp1_t = t
+        else:
+            back_to_entry = (low <= entry) if buy else (high >= entry)
+            if back_to_entry:
+                return {"tp1_t": tp1_t, "final": "TP1", "final_t": t}
+            if hit_tp2:
+                return {"tp1_t": tp1_t, "final": "TP2", "final_t": t}
+    return {"tp1_t": tp1_t, "final": None, "final_t": None}
+
+
+async def _send_signal_result_picture(sig, candles, upto_t, label):
+    """Sends the admin a chart of the signal up to the moment TP1 / TP2 was reached."""
+    if not (ADMIN_USER_ID and _app_instance):
+        return False
+    pair_key = next((k for k, c in PAIR_CONFIG.items() if c["pair_name"] == sig.get("pair_name")), None)
+    if not pair_key:
+        return False
+    try:
+        posted = datetime.fromisoformat(str(sig["posted_at"]).replace("Z", "+00:00")).replace(tzinfo=None)
+        keep = [c for c in candles if (_candle_dt(c) is not None and posted - timedelta(minutes=90) <= _candle_dt(c) <= upto_t)]
+        if len(keep) < 8:
+            return False
+        path = os.path.join(CHART_OUTPUT_DIR, f"result_{sig['id']}_{label}_{int(time.time())}.png")
+        entry, sl, tp = float(sig["entry_price"]), float(sig["stop_loss"]), float(sig["take_profit"])
+        tp1 = float(sig["tp1"]) if sig.get("tp1") is not None else None
+        ok = await asyncio.to_thread(
+            generate_signal_chart, PAIR_CONFIG[pair_key]["display"], "Momentum", sig.get("direction"), keep,
+            entry, sl, tp, path, 70, False, tp1, False, f"{label} HIT",
+        )
+        if not ok or not os.path.exists(path):
+            return False
+        caption = (f"\u2705 {label} hit \u2014 {sig.get('pair_name')} {sig.get('direction')}\n"
+                   f"Entry {sig['entry_price']}  \u2022  {label} {sig['tp1'] if label == 'TP1' else sig['take_profit']}")
+        with open(path, "rb") as fh:
+            await _app_instance.bot.send_photo(chat_id=int(ADMIN_USER_ID), photo=fh, caption=caption)
+        try:
+            os.remove(path)
+        except Exception:
+            pass
+        return True
+    except Exception as e:
+        print(f"[RESULT PIC] {sig.get('id')} {label} failed: {type(e).__name__}: {str(e)[:120]}")
+        return False
+
+
+async def _check_signal_by_candles(sig):
+    """True when the signal was handled from 5-minute candles (so the old price check is skipped)."""
+    try:
+        posted = datetime.fromisoformat(str(sig["posted_at"]).replace("Z", "+00:00")).replace(tzinfo=None)
+    except Exception:
+        return False
+    if datetime.utcnow() - posted > timedelta(hours=24):
+        return False
+    pair_key = next((k for k, c in PAIR_CONFIG.items() if c["pair_name"] == sig.get("pair_name")), None)
+    if not pair_key:
+        return False
+    try:
+        candles = await asyncio.to_thread(get_cached_candles, pair_key, PAIR_CONFIG[pair_key], "5min", outputsize=300)
+    except Exception:
+        candles = None
+    if not candles or len(candles) < 20:
+        return False
+    res = _walk_signal_candles(sig, candles)
+    if not res:
+        return False
+    sid = sig["id"]
+    scheduled = sig.get("source") == "scheduled"
+    if res["tp1_t"] is not None and not sig.get("be_done"):
+        if scheduled:
+            await _send_signal_result_picture(sig, candles, res["tp1_t"] + timedelta(minutes=5), "TP1")
+        await asyncio.to_thread(_patch_signal_sync, sid, {"be_done": True})
+        print(f"[SIGNAL TRACK] {sid} {sig.get('pair_name')} reached TP1")
+    final = res["final"]
+    if final == "TP2":
+        if scheduled:
+            await _send_signal_result_picture(sig, candles, res["final_t"] + timedelta(minutes=5), "TP2")
+        await asyncio.to_thread(_patch_signal_sync, sid, {"tp_detail": "TP2", "be_done": True})
+        update_signal_status(sid, "TP_HIT", sig.get("source"))
+    elif final == "TP1":
+        await asyncio.to_thread(_patch_signal_sync, sid, {"tp_detail": "TP1", "be_done": True})
+        update_signal_status(sid, "TP_HIT", sig.get("source"))
+    elif final == "SL":
+        await asyncio.to_thread(_patch_signal_sync, sid, {"tp_detail": "SL"})
+        update_signal_status(sid, "SL_HIT", sig.get("source"))
+    return True
+
+
 async def check_open_signals(context: ContextTypes.DEFAULT_TYPE):
     open_signals = get_open_signals()
     if not open_signals:
@@ -35134,7 +35271,12 @@ async def check_open_signals(context: ContextTypes.DEFAULT_TYPE):
             # outcome is None -> lookup failed, retry next sweep
             continue
 
-        # No mt5_order_id on this row - fall back to price inference
+        # No mt5_order_id on this row: work it out from the 5-minute candles since the signal posted
+        # (catches TP1 / TP2 / SL even if price moved between sweeps, and sends the TP pictures).
+        if await _check_signal_by_candles(sig):
+            continue
+
+        # Candles unavailable (or an old signal): fall back to price inference
         pair_name = sig.get("pair_name")
         pair_key = next(
             (k for k, c in PAIR_CONFIG.items() if c["pair_name"] == pair_name),
@@ -36580,7 +36722,7 @@ def main():
     # TP/SL monitor - checks every OPEN logged signal every 15 minutes
     job_queue.run_repeating(
         check_open_signals,
-        interval=900,
+        interval=300,
         first=60,
         name="tp_sl_monitor"
     )

@@ -6097,6 +6097,26 @@ def _napp_float(v):
         return None
 
 
+def _napp_lookup_tp1(pair_key, entry, sl, tp):
+    """TP1 of the signal that has these levels (the app only sends entry / SL / TP2), or None."""
+    try:
+        name = (PAIR_CONFIG.get(pair_key) or SYNTHETIC_CONFIG.get(pair_key) or {}).get("pair_name")
+        if not name:
+            return None
+        tol = abs(tp - entry) * 0.002 + 1e-9
+        params = [("pair_name", f"eq.{name}"), ("tp1", "not.is.null"),
+                  ("entry_price", f"gte.{entry - tol}"), ("entry_price", f"lte.{entry + tol}"),
+                  ("stop_loss", f"gte.{sl - tol}"), ("stop_loss", f"lte.{sl + tol}"),
+                  ("take_profit", f"gte.{tp - tol}"), ("take_profit", f"lte.{tp + tol}"),
+                  ("select", "tp1"), ("order", "id.desc"), ("limit", "1")]
+        rows = requests.get(f"{SUPABASE_URL}/rest/v1/signal_log", params=params, headers=sb_headers(), timeout=8).json()
+        if isinstance(rows, list) and rows and rows[0].get("tp1") is not None:
+            return float(rows[0]["tp1"])
+    except Exception as e:
+        print(f"[NEXORA APP] tp1 lookup: {type(e).__name__}")
+    return None
+
+
 async def _napp_build_signal_chart(pair_key, direction, entry, sl, tp):
     # Same as the Telegram pictures: the entry follows the 5-minute EMA trend, so draw 5-minute candles
     # (hourly only as a fallback if the 5-minute data is unavailable).
@@ -6122,9 +6142,10 @@ async def _napp_build_signal_chart(pair_key, direction, entry, sl, tp):
         return None
     os.makedirs(CHART_OUTPUT_DIR, exist_ok=True)
     path = os.path.join(CHART_OUTPUT_DIR, f"app_{pair_key}_{secrets.token_hex(6)}.png")
+    _tp1 = await asyncio.to_thread(_napp_lookup_tp1, pair_key, entry, sl, tp)
     ok = await asyncio.to_thread(
         generate_signal_chart, config["display"], "Nexora", direction, candles, entry, sl, tp, path,
-        70, False)
+        45, False, _tp1)
     if not ok or not os.path.exists(path):
         return None
     try:
@@ -27456,6 +27477,26 @@ async def _be_admin_note(text):
             print(f"[BREAK-EVEN] could not DM admin: {e}")
 
 
+async def _send_result_picture_by_id(sid, label):
+    """TP1 / TP2 chart picture to the admin for a scheduled signal tracked through real MT5 trades."""
+    try:
+        rows = await asyncio.to_thread(
+            lambda: requests.get(f"{SUPABASE_URL}/rest/v1/signal_log?id=eq.{sid}&select=*", headers=sb_headers(), timeout=10).json())
+        if not isinstance(rows, list) or not rows:
+            return
+        sig = rows[0]
+        if sig.get("source") != "scheduled":
+            return
+        pair_key = next((k for k, c in PAIR_CONFIG.items() if c["pair_name"] == sig.get("pair_name")), None)
+        if not pair_key:
+            return
+        candles = await asyncio.to_thread(get_cached_candles, pair_key, PAIR_CONFIG[pair_key], "5min", outputsize=300, force_fresh=True)
+        if candles:
+            await _send_signal_result_picture(sig, candles, datetime.utcnow() + timedelta(minutes=5), label)
+    except Exception as e:
+        print(f"[RESULT PIC] {sid} {label}: {type(e).__name__}: {str(e)[:120]}")
+
+
 async def _be_classify_and_store(sid, info):
     """Once both legs are closed: record how the signal really ended."""
     oa, pa = await get_mt5_trade_outcome(info["a"])
@@ -27471,6 +27512,8 @@ async def _be_classify_and_store(sid, info):
         detail = "SL"
     await asyncio.to_thread(_patch_signal_sync, sid, {"tp_detail": detail, "be_done": True})
     _BE_PENDING.pop(sid, None)
+    if detail == "TP2":
+        await _send_result_picture_by_id(sid, "TP2")
     print(f"[BREAK-EVEN] signal {sid} finished as {detail} (TP1 leg {pa:+.2f}, TP2 leg {pb:+.2f}).")
 
 
@@ -27545,6 +27588,7 @@ async def manage_break_even(context: ContextTypes.DEFAULT_TYPE):
             await asyncio.to_thread(_patch_signal_sync, sid, {"be_done": True})
             print(f"[BREAK-EVEN] signal {sid}: TP1 hit, TP2 leg {info['b']} stop moved to {be_price}.")
             await _be_admin_note(f"🔒 Signal #{sid}: TP1 hit. The TP2 half now has its stop at break-even ({be_price}).")
+            await _send_result_picture_by_id(sid, "TP1")
             continue
         info["tries"] = info.get("tries", 0) + 1
         print(f"[BREAK-EVEN] signal {sid}: stop move failed ({detail}), try {info['tries']}")

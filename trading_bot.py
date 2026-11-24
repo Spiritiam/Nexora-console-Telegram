@@ -22390,14 +22390,14 @@ def get_saturday_card_index(now=None):
 
 
 async def post_weekend_lesson(context: ContextTypes.DEFAULT_TYPE):
-    """Saturday: one short education card with a 3D picture to all three channels."""
+    """Saturday: one short education card with a 3D picture to the Inner Circle channel only."""
     idx = get_saturday_card_index()
     title, bullets = INNER_CIRCLE_KEY_POINTS[idx]
     img = _render_3d_card(_KP_IMAGE[idx % len(_KP_IMAGE)], f"NEXORA AI  ·  TRADING LESSON {idx + 1:02d}", title)
     caption = (f"📘 <b>Nexora AI · Trading Lesson {idx + 1:02d}</b>\n<b>{_esc(title)}</b>\n\n"
                + "\n".join(f"▫️ {_esc(b)}" for b in bullets[:3])
                + "\n\n<i>Education, not financial advice</i>")
-    for ch in [CHANNEL_1_ID, CHANNEL_2_ID, CHANNEL_3_ID]:
+    for ch in [CHANNEL_2_ID]:  # Inner Circle only: no education posts on the SpiritFX Academy and Nexora channels
         try:
             if img and len(caption) <= 1000:
                 await context.bot.send_photo(chat_id=ch, photo=img, caption=caption, parse_mode=ParseMode.HTML,

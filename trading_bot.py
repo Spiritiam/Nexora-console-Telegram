@@ -2438,6 +2438,10 @@ def _xc_fetch_quote(mt5_symbol):
     _q = get_quote_exness(mt5_symbol)
     if _q:
         return float(_q[0]), float(_q[1])
+    if _mtapi_on():
+        _mq = _mtapi_quote(mt5_symbol)
+        if _mq:
+            return float(_mq[0]), float(_mq[1])
     if METAAPI_TOKEN and METAAPI_ACCOUNT_ID:
         try:
             r = requests.get(
@@ -9857,7 +9861,7 @@ async def place_and_link_mt5_trade(signal_id, signal_data):
         reason = (_PERSONAL_COPY_LAST_FAILURE.get("reason") or "").lower()
         explicit_rejection = bool(reason) and not _personal_copy_looks_disconnected(reason)
         mt5_symbol = signal_data.get("mt5_symbol")
-        if mt5_symbol and not explicit_rejection:
+        if mt5_symbol and not explicit_rejection and not _mtapi_on():
             # MetaAPI lost the broker link: ask it to redeploy right away, then retry every 20 seconds for up to
             # 2 minutes. Before each new attempt the account's open positions are read; a retry is only sent when
             # that read succeeds and shows this signal is NOT already open (never a duplicate order).
@@ -17679,6 +17683,11 @@ def get_price_metaapi(mt5_symbol):
     if _q:
         _selfheal_note_price_ok()
         return (_q[0] + _q[1]) / 2
+    if _mtapi_on():
+        _mq = _mtapi_quote(mt5_symbol)
+        if _mq:
+            _selfheal_note_price_ok()
+            return (_mq[0] + _mq[1]) / 2
     if not METAAPI_TOKEN or not METAAPI_ACCOUNT_ID:
         return None
     if _ma_blocked("price"):
@@ -18620,10 +18629,13 @@ async def mtapitest_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     lines = []
     for label, path, prm in (("AccountSummary", "AccountSummary", {}),
                              ("GetQuote BTCUSDm", "GetQuote", {"symbol": "BTCUSDm"}),
-                             ("OpenedOrders", "OpenedOrders", {})):
+                             ("OpenedOrders", "OpenedOrders", {}),
+                             ("OrderHistory 2d", "OrderHistory", {"from": (datetime.utcnow() - timedelta(days=2)).strftime("%Y-%m-%dT%H:%M:%SZ")}),
+                             ("PriceHistory M5", "PriceHistory", {"symbol": "BTCUSDm", "timeFrame": "M5",
+                                                                  "from": (datetime.utcnow() - timedelta(minutes=30)).strftime("%Y-%m-%dT%H:%M:%SZ")})):
         try:
             code, body = await asyncio.to_thread(_mtapi_get, path, **prm)
-            lines.append(f"{label}: HTTP {code}\n{str(body)[:500]}")
+            lines.append(f"{label}: HTTP {code}\n{str(body)[:350]}")
         except Exception as e:
             lines.append(f"{label}: failed - {type(e).__name__}: {str(e)[:200]}")
     await update.message.reply_text("\n\n".join(lines)[:3900])
@@ -26787,6 +26799,142 @@ async def _late_confirm_position(metaapi_account_id, mt5_symbol, comment, since_
     return None
 
 
+# ---------------------------------------------------------------------------
+# MetaTraderAPI.net (master account) - used for trades, positions, outcomes, price and candles whenever
+# MTAPI_KEY + MTAPI_ACCOUNT_ID are set on Railway (MTAPI_TRADING=0 switches it off).
+# ---------------------------------------------------------------------------
+def _mtapi_on():
+    return bool((os.getenv("MTAPI_KEY") or "").strip() and (os.getenv("MTAPI_ACCOUNT_ID") or "").strip()
+                and os.getenv("MTAPI_TRADING", "1") != "0")
+
+
+def _mtapi_float(v, default=None):
+    try:
+        return float(v)
+    except Exception:
+        return default
+
+
+def _mtapi_positions_sync():
+    """Open positions in the same shape MetaApi returned (id, type, symbol, openPrice, currentPrice ...), or None."""
+    try:
+        code, body = _mtapi_get("OpenedOrders")
+    except Exception as e:
+        print(f"[MTAPI] OpenedOrders failed: {type(e).__name__}: {str(e)[:120]}")
+        return None
+    if code != 200:
+        print(f"[MTAPI] OpenedOrders HTTP {code}: {str(body)[:200]}")
+        return None
+    items = body if isinstance(body, list) else (body.get("orders") or body.get("positions") or []) if isinstance(body, dict) else []
+    out = []
+    for o in items:
+        if not isinstance(o, dict) or o.get("orderType") not in (0, 1):
+            continue   # 0 = buy, 1 = sell position; pending orders are skipped
+        out.append({
+            "id": str(o.get("ticket")),
+            "type": "POSITION_TYPE_BUY" if o.get("orderType") == 0 else "POSITION_TYPE_SELL",
+            "symbol": o.get("symbol"),
+            "volume": o.get("lots"),
+            "openPrice": o.get("openPrice"),
+            "currentPrice": o.get("closePrice"),
+            "stopLoss": o.get("stopLoss") or None,
+            "takeProfit": o.get("takeProfit") or None,
+            "profit": o.get("profit"),
+            "comment": o.get("comment") or "",
+            "time": o.get("openTime"),
+        })
+    return out
+
+
+def _mtapi_quote(mt5_symbol):
+    """(bid, ask) from the master account, or None."""
+    try:
+        code, body = _mtapi_get("GetQuote", symbol=mt5_symbol)
+        if code == 200 and isinstance(body, dict):
+            b, a = _mtapi_float(body.get("bid")), _mtapi_float(body.get("ask"))
+            if b and a:
+                return b, a
+    except Exception as e:
+        print(f"[MTAPI] GetQuote {mt5_symbol} failed: {type(e).__name__}: {str(e)[:120]}")
+    return None
+
+
+def _mtapi_find_in_history(ticket):
+    """(closed?, net profit) for a position ticket from OrderHistory. (None, None) if it can't tell."""
+    try:
+        frm = (datetime.utcnow() - timedelta(days=10)).strftime("%Y-%m-%dT%H:%M:%SZ")
+        code, body = _mtapi_get("OrderHistory", **{"from": frm})
+    except Exception as e:
+        print(f"[MTAPI] OrderHistory failed: {type(e).__name__}: {str(e)[:120]}")
+        return None, None
+    if code != 200:
+        return None, None
+    items = body if isinstance(body, list) else []
+    if isinstance(body, dict):
+        for k in ("orders", "deals", "history", "items"):
+            if isinstance(body.get(k), list):
+                items = body[k]; break
+    tk = str(ticket)
+    rows = [o for o in items if isinstance(o, dict) and tk in (str(o.get("ticket")), str(o.get("positionId")), str(o.get("position")))]
+    if not rows:
+        return None, None
+    net = 0.0
+    for o in rows:
+        net += (_mtapi_float(o.get("profit"), 0.0) or 0.0) + (_mtapi_float(o.get("swap"), 0.0) or 0.0) + (_mtapi_float(o.get("commission"), 0.0) or 0.0)
+    return True, net
+
+
+async def _mtapi_place_trade(signal_data, signal_id, leg, volume):
+    """Places one market order on the master account. Returns the position ticket as a string, or None."""
+    direction = signal_data["direction"]
+    mt5_symbol = signal_data["mt5_symbol"]
+    tp_key = "tp1" if leg == "TP1" else "take_profit"
+    trade_comment = f"NexoraAI #{signal_id}" if signal_id else "NexoraAI Signal"
+    if leg and signal_id:
+        trade_comment += f" {leg}"
+    stop_loss = signal_data["stop_loss"]
+    take_profit = signal_data[tp_key]
+    quoted = signal_data["entry_price"]
+    q = await asyncio.to_thread(_mtapi_quote, mt5_symbol)
+    if q:
+        fresh = (q[0] + q[1]) / 2
+        risk = abs(quoted - signal_data["stop_loss"])
+        reward = abs(take_profit - quoted)
+        dec = len(str(signal_data["stop_loss"]).split(".")[-1]) if "." in str(signal_data["stop_loss"]) else 2
+        if direction == "BUY":
+            stop_loss, take_profit = round(fresh - risk, dec), round(fresh + reward, dec)
+        else:
+            stop_loss, take_profit = round(fresh + risk, dec), round(fresh - reward, dec)
+    coid = re.sub(r"[^A-Za-z0-9_.:-]", "-", f"{trade_comment}-{int(time.time() // 60)}")[:64]
+    params = {"symbol": mt5_symbol, "operation": "Buy" if direction == "BUY" else "Sell", "volume": volume,
+              "stoploss": stop_loss, "takeprofit": take_profit, "comment": trade_comment, "clientOrderId": coid}
+    started = datetime.utcnow() - timedelta(minutes=2)
+    last_err = None
+    for attempt in (1, 2, 3):
+        try:
+            code, body = await asyncio.to_thread(_mtapi_get, "OrderSend", **params)
+        except Exception as e:
+            code, body = None, f"{type(e).__name__}: {str(e)[:150]}"
+        if code == 200 and isinstance(body, dict) and body.get("ticket") and body.get("state") == 10009:
+            print(f"[MTAPI] ✅ {trade_comment} placed - ticket {body['ticket']} at {body.get('openPrice')}")
+            return str(body["ticket"])
+        last_err = f"HTTP {code}: {str(body)[:200]}"
+        print(f"[MTAPI] ⚠️ OrderSend attempt {attempt}: {last_err}")
+        if code == 200 and isinstance(body, dict) and body.get("state") not in (None, 10009):
+            break   # the broker refused it (not a connection issue): do not retry
+        # A timeout can still have placed the order: look for it before resending.
+        pos = await asyncio.to_thread(_mtapi_positions_sync)
+        if pos:
+            for p_ in pos:
+                if p_.get("comment") == trade_comment:
+                    print(f"[MTAPI] ✅ found {trade_comment} already open - ticket {p_['id']}")
+                    return p_["id"]
+        await asyncio.sleep(3 * attempt)
+    _PERSONAL_COPY_LAST_FAILURE["reason"] = f"Broker rejected the order: {last_err}"
+    print(f"[MTAPI] ❌ {trade_comment} not placed: {last_err}")
+    return None
+
+
 async def place_mt5_trade(signal_data, signal_id=None, leg=None, volume=0.1):
     """
     Places ONE market position on the personal MT5 account.
@@ -26796,6 +26944,8 @@ async def place_mt5_trade(signal_data, signal_id=None, leg=None, volume=0.1):
     Each leg gets its own order comment ("NexoraAI #123 TP1"), so the
     duplicate-order safety check can never mix the two legs up.
     """
+    if _mtapi_on():
+        return await _mtapi_place_trade(signal_data, signal_id, leg, volume)
     if not METAAPI_TOKEN or not METAAPI_ACCOUNT_ID:
         print("[MT5] MetaAPI credentials not set.")
         return None
@@ -27193,6 +27343,8 @@ def _patch_signal_sync(signal_id, fields):
 
 
 async def _fetch_open_positions(account_id=None):
+    if account_id is None and _mtapi_on():
+        return await asyncio.to_thread(_mtapi_positions_sync)
     if _is_exness_ref(account_id):
         try:
             return await _exness_call(account_id, "positions_metaapi")
@@ -27211,6 +27363,20 @@ async def _fetch_open_positions(account_id=None):
 
 async def _metaapi_trade_action(payload, account_id=None):
     """Returns (ok, detail) for a MetaAPI trade action (modify / close)."""
+    if account_id is None and _mtapi_on():
+        try:
+            act = payload.get("actionType")
+            if act == "POSITION_MODIFY":
+                prm = {"ticket": payload.get("positionId"), "stoploss": payload.get("stopLoss"), "takeprofit": payload.get("takeProfit")}
+                code, body = await asyncio.to_thread(_mtapi_get, "OrderModify", **prm)
+            elif act == "POSITION_CLOSE_ID":
+                code, body = await asyncio.to_thread(_mtapi_get, "OrderClose", ticket=payload.get("positionId"))
+            else:
+                return False, f"unsupported action {act}"
+            ok = code == 200 and isinstance(body, dict) and body.get("state") in (10009, None) and "ticket" in body
+            return ok, f"HTTP {code} {str(body)[:120]}"
+        except Exception as e:
+            return False, f"error: {e}"
     if _is_exness_ref(account_id):
         try:
             ok, detail = await _exness_call(account_id, "trade_action", payload)
@@ -27263,7 +27429,7 @@ async def _be_classify_and_store(sid, info):
 
 
 async def manage_break_even(context: ContextTypes.DEFAULT_TYPE):
-    if not METAAPI_TOKEN or not METAAPI_ACCOUNT_ID:
+    if not _mtapi_on() and (not METAAPI_TOKEN or not METAAPI_ACCOUNT_ID):
         return
     if not _BE_STATE["loaded"]:
         _BE_STATE["loaded"] = await asyncio.to_thread(_load_be_pending_sync)
@@ -27669,6 +27835,14 @@ async def has_real_open_mt5_position(mt5_symbol):
     block: an unreachable MetaAPI account should never silently stall
     the whole schedule forever.
     """
+    if _mtapi_on() and mt5_symbol:
+        positions = await asyncio.to_thread(_mtapi_positions_sync)
+        target = mt5_symbol.upper()
+        for pos in positions or []:
+            ps = (pos.get("symbol") or "").upper()
+            if ps and (ps.startswith(target) or target.startswith(ps)):
+                return True
+        return False
     if not METAAPI_TOKEN or not METAAPI_ACCOUNT_ID or not mt5_symbol:
         return False
     try:
@@ -27704,6 +27878,16 @@ async def get_mt5_trade_outcome(position_id):
     treat None as "couldn't tell, try again next sweep" and NOT close
     out the signal on a failed lookup.
     """
+    if _mtapi_on() and position_id:
+        positions = await asyncio.to_thread(_mtapi_positions_sync)
+        if positions is None:
+            return None, None
+        if any(str(p_.get("id")) == str(position_id) for p_ in positions):
+            return "OPEN", None
+        closed, net = await asyncio.to_thread(_mtapi_find_in_history, position_id)
+        if closed:
+            return "CLOSED", net
+        return None, None
     if not METAAPI_TOKEN or not METAAPI_ACCOUNT_ID or not position_id:
         return None, None
     try:

@@ -3466,6 +3466,8 @@ async def _pair_busy(pair_key, scheduled):
     name = cfg.get("pair_name", pair_key.upper())
     if await asyncio.to_thread(has_open_signal_for_pair, name):
         return True
+    if await asyncio.to_thread(has_scheduled_signal_today, name):
+        return True   # one scheduled signal per pair per day (Lagos day); the slot goes to another pair
     sym = cfg.get("mt5_symbol")
     return bool(sym and await has_real_open_mt5_position(sym))
 
@@ -10108,6 +10110,21 @@ def get_open_signals():
         return []
 
 STALE_OPEN_SIGNAL_HOURS = 24
+
+
+def has_scheduled_signal_today(pair_name):
+    """True if a scheduled signal for this pair was already posted today (day starts 00:00 Lagos time).
+    Stops a trending pair (e.g. BTCUSD) from being sent again and again; the slot goes to another pair."""
+    try:
+        lagos_now = datetime.utcnow() + timedelta(hours=1)
+        start = (lagos_now.replace(hour=0, minute=0, second=0, microsecond=0) - timedelta(hours=1)).strftime("%Y-%m-%dT%H:%M:%S")
+        url = (f"{SUPABASE_URL}/rest/v1/signal_log?pair_name=eq.{pair_name}&source=eq.scheduled"
+               f"&posted_at=gte.{start}&select=id&limit=1")
+        data = requests.get(url, headers=sb_headers(), timeout=10).json()
+        return isinstance(data, list) and len(data) > 0
+    except Exception as e:
+        print(f"[SIGNAL LOG] has_scheduled_signal_today error: {e}")
+        return False
 
 
 def has_open_signal_for_pair(pair_name):

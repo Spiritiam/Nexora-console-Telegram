@@ -23123,7 +23123,7 @@ def _chart_fmt_price(value, all_values):
     return f"{value:.5f}" if ref < 10 else f"{value:.2f}"
 
 
-def _chart_finish(fig, ax, x, times, candles, entry, sl, tp, title, save_path, sub_ax=None, tp1=None):
+def _chart_finish(fig, ax, x, times, candles, entry, sl, tp, title, save_path, sub_ax=None, tp1=None, extra_y=None):
     C = _CH
     n = len(x)
     span = (x[-1] - x[0]) if n > 1 else 1
@@ -23145,8 +23145,10 @@ def _chart_finish(fig, ax, x, times, candles, entry, sl, tp, title, save_path, s
         lv_lo, lv_hi = min(level_values), max(level_values)
         lv_span = (lv_hi - lv_lo) or full_range
         recent = candles[-12:]
-        y_lo = min([lv_lo] + [c["low"] for c in recent]) - lv_span * 0.22
-        y_hi = max([lv_hi] + [c["high"] for c in recent]) + lv_span * 0.22
+        # EMA lines are kept in frame when they are reasonably close to the trade (so they never vanish off the top/bottom)
+        near = [v for v in (extra_y or []) if lv_lo - lv_span * 1.2 <= v <= lv_hi + lv_span * 1.2]
+        y_lo = min([lv_lo] + [c["low"] for c in recent] + near) - lv_span * 0.22
+        y_hi = max([lv_hi] + [c["high"] for c in recent] + near) + lv_span * 0.22
         ax.set_ylim(y_lo, y_hi)
     else:
         y_pad = full_range * 0.08
@@ -23664,12 +23666,14 @@ def _generate_signal_chart_unlocked(display_name, strategy_name, direction, cand
             sub_ax.fill_between(x, 0, 25, color="#22c55e", alpha=0.06, zorder=0)
             sub_ax.set_ylim(0, 100)
 
+        _ema_y = []
         for _n, _col in (((25, "#d97706"), (50, "#0284c7"), (100, "#c026d3")) if show_emas else ()):
             _v = _emas.get(_n)
             if _v and len(_v) == len(x) and any(t is not None for t in _v):
                 ax.plot(x, _v, color=_col, linewidth=1.2, alpha=0.95, label=f"EMA {_n}", zorder=4)
+                _ema_y += [t for t in _v[-12:] if t is not None]
 
-        _chart_finish(fig, ax, x, times, candles, entry, sl, tp, title_suffix, save_path, sub_ax=sub_ax, tp1=tp1)
+        _chart_finish(fig, ax, x, times, candles, entry, sl, tp, title_suffix, save_path, sub_ax=sub_ax, tp1=tp1, extra_y=_ema_y)
         return True
     except Exception as e:
         print(f"[CHART] Failed to generate chart for {display_name}/{strategy_name}: {e}")

@@ -18632,7 +18632,10 @@ async def mtapitest_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
                              ("OpenedOrders", "OpenedOrders", {}),
                              ("OrderHistory 2d", "OrderHistory", {"from": (datetime.utcnow() - timedelta(days=2)).strftime("%Y-%m-%dT%H:%M:%SZ")}),
                              ("PriceHistory M5", "PriceHistory", {"symbol": "BTCUSDm", "timeFrame": "M5",
-                                                                  "from": (datetime.utcnow() - timedelta(minutes=30)).strftime("%Y-%m-%dT%H:%M:%SZ")})):
+                                                                  "from": (datetime.utcnow() - timedelta(minutes=30)).strftime("%Y-%m-%dT%H:%M:%SZ"),
+                                                                  "to": datetime.utcnow().strftime("%Y-%m-%dT%H:%M:%SZ")}),
+                             ("PriceHistory 5", "PriceHistory", {"symbol": "BTCUSDm", "timeFrame": "5",
+                                                                 "from": str(int(time.time()) - 1800), "to": str(int(time.time()))})):
         try:
             code, body = await asyncio.to_thread(_mtapi_get, path, **prm)
             lines.append(f"{label}: HTTP {code}\n{str(body)[:350]}")

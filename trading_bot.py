@@ -18592,6 +18592,43 @@ async def backfill_signal_ml_features(progress_callback=None):
     return results
 
 
+MTAPI_BASE = os.getenv("MTAPI_BASE_URL", "https://api.metatraderapi.net").strip().rstrip("/")
+
+
+def _mtapi_get(path, **params):
+    """GET on MetaTraderAPI.net for the master account. Key / account id come from Railway variables."""
+    key = (os.getenv("MTAPI_KEY") or "").strip()
+    acc = (os.getenv("MTAPI_ACCOUNT_ID") or "").strip()
+    if not key or not acc:
+        raise RuntimeError("MTAPI_KEY / MTAPI_ACCOUNT_ID not set")
+    params = {k: v for k, v in params.items() if v is not None}
+    r = requests.get(f"{MTAPI_BASE}/{path.lstrip('/')}", params={"id": acc, **params},
+                     headers={"x-api-key": key}, timeout=40)
+    try:
+        body = r.json()
+    except Exception:
+        body = r.text[:300]
+    return r.status_code, body
+
+
+async def mtapitest_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Admin-only, READ-ONLY check of the MetaTraderAPI.net connection: balance, a BTC quote, open positions.
+    Places no trade and never prints the key."""
+    user_id = str(update.message.from_user.id)
+    if not ADMIN_USER_ID or user_id != ADMIN_USER_ID:
+        return
+    lines = []
+    for label, path, prm in (("AccountSummary", "AccountSummary", {}),
+                             ("GetQuote BTCUSDm", "GetQuote", {"symbol": "BTCUSDm"}),
+                             ("OpenedOrders", "OpenedOrders", {})):
+        try:
+            code, body = await asyncio.to_thread(_mtapi_get, path, **prm)
+            lines.append(f"{label}: HTTP {code}\n{str(body)[:500]}")
+        except Exception as e:
+            lines.append(f"{label}: failed - {type(e).__name__}: {str(e)[:200]}")
+    await update.message.reply_text("\n\n".join(lines)[:3900])
+
+
 async def exnessapitest_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """
     Admin-only, READ-ONLY check of the Exness Trader API connection:
@@ -36544,6 +36581,7 @@ def main():
     app.add_handler(CommandHandler("backfillmlfeatures", backfillmlfeatures_command))
     app.add_handler(CommandHandler("fliptest", fliptest_command))
     app.add_handler(CommandHandler("exnessapitest", exnessapitest_command))
+    app.add_handler(CommandHandler("mtapitest", mtapitest_command))
     app.add_handler(CommandHandler("exnessapitrade", exnessapitrade_command))
     app.add_handler(CommandHandler("backtestderivbot", backtestderivbot_command))
     app.add_handler(CommandHandler("milestone", milestone_command))

@@ -23139,8 +23139,18 @@ def _chart_finish(fig, ax, x, times, candles, entry, sl, tp, title, save_path, s
 
     xlim_left = x[0] - span * 0.02 if n > 1 else x[0] - 1
     ax.set_xlim(xlim_left, zx1)
-    y_pad = full_range * 0.08
-    ax.set_ylim(min(all_price_values) - y_pad, max(all_price_values) + y_pad)
+    # Frame the picture around the trade (SL..TP) so the zone box fills most of the height; older candles that sit far
+    # outside it are cropped by the frame. The latest candles are always kept inside.
+    if len(level_values) >= 2:
+        lv_lo, lv_hi = min(level_values), max(level_values)
+        lv_span = (lv_hi - lv_lo) or full_range
+        recent = candles[-12:]
+        y_lo = min([lv_lo] + [c["low"] for c in recent]) - lv_span * 0.22
+        y_hi = max([lv_hi] + [c["high"] for c in recent]) + lv_span * 0.22
+        ax.set_ylim(y_lo, y_hi)
+    else:
+        y_pad = full_range * 0.08
+        ax.set_ylim(min(all_price_values) - y_pad, max(all_price_values) + y_pad)
 
     # Red zone entry -> SL, green zone entry -> final TP, projected to the right of the last candle.
     if entry is not None and sl is not None:

@@ -35188,7 +35188,8 @@ async def _post_init_capture_loop(app):
     if os.getenv("REDRAW_CHART"):
         _main_loop.create_task(_redraw_chart_once(app, os.getenv("REDRAW_CHART")))
     if os.getenv("REPLACE_PHOTO"):
-        _main_loop.create_task(_replace_signal_photo_once(app, os.getenv("REPLACE_PHOTO")))
+        for _spec in [x for x in os.getenv("REPLACE_PHOTO").split(";") if x.strip()]:
+            _main_loop.create_task(_replace_signal_photo_once(app, _spec.strip()))
     await catch_up_missed_signals(app)
 
 

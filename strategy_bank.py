@@ -15,6 +15,8 @@ import ema_trend
 K = 3
 LEVEL_BARS = 160
 # Every strategy seen in the Exness / Trading Central cards is in the bank. Highest priority first (used to break ties).
+import os as _os
+MIN_AGREE = int(_os.environ.get("BANK_MIN_AGREE", "2"))
 PRIORITY = ["triple", "trend", "pullback", "breakout", "bbtrend", "pivotrev", "range", "bbrevert"]
 LABELS = {"triple": "RSI + MACD + trend", "trend": "Trend + pivot", "pullback": "Pullback to MA20", "breakout": "Breakout",
           "bbtrend": "Bollinger trend", "pivotrev": "Pivot reversal", "range": "Range bounce",
@@ -233,6 +235,9 @@ def evaluate(candles, tf_secs=900, now=None, only_closed=True):
     sells = [x for x in ideas if x["direction"] == "SELL"]
     group = buys if len(buys) > len(sells) else sells if len(sells) > len(buys) else (buys if PRIORITY.index(buys[0]["name"]) < PRIORITY.index(sells[0]["name"]) else sells)
     group = sorted(group, key=lambda x: PRIORITY.index(x["name"]))
+    # A signal needs at least MIN_AGREE strategies pointing the same way (Exness cards combine 2-3 strategies).
+    if len(group) < MIN_AGREE:
+        return {"best": None, "ideas": ideas, "agree": len(group)}
     return {"best": group[0], "ideas": ideas, "agree": len(group)}
 
 

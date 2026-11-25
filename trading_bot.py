@@ -3634,6 +3634,8 @@ async def _bank_decision(pair_key, pair_config):
         if res and res.get("best"):
             b = res["best"]
             print(f"[BANK] {pair_key}: {b['direction']} via {b['label']} ({res['agree']} agree of {len(res['ideas'])})", flush=True)
+        elif res and res.get("ideas"):
+            print(f"[BANK] {pair_key}: only {res['agree']} strategy agreed of {len(res['ideas'])}, need {strategy_bank.MIN_AGREE}; no bank signal", flush=True)
         else:
             print(f"[BANK] {pair_key}: no strategy fired ({len(candles or [])} candles) | {strategy_bank.explain(candles) if candles else 'no candles'}" if res is not None else f"[BANK] {pair_key}: no result", flush=True)
         return res

@@ -3602,6 +3602,77 @@ async def run_trend_alerts(context):
 
 
 
+# Strategy bank (15-minute candles): scheduled and manual signals ask it first. BANK_LIVE=0 switches it off.
+BANK_LIVE = os.getenv("BANK_LIVE", "1") == "1"
+_BANK_DEC = {}
+_BANK_LOCKS = {}
+
+
+async def _bank_decision(pair_key, pair_config):
+    """One strategy-bank evaluation per instrument per closed 15-minute bar. Returns strategy_bank.evaluate()'s dict or None."""
+    if not BANK_LIVE:
+        return None
+    import strategy_bank
+    slot = int(time.time() // 900)
+    hit = _BANK_DEC.get(pair_key)
+    if hit and hit[0] == slot:
+        return hit[1]
+    lock = _BANK_LOCKS.setdefault(pair_key, asyncio.Lock())
+    async with lock:
+        hit = _BANK_DEC.get(pair_key)
+        if hit and hit[0] == slot:
+            return hit[1]
+        res = None
+        try:
+            candles = await asyncio.to_thread(get_cached_candles, pair_key, pair_config, "15min", outputsize=300, max_age=(time.time() % 900) + 3)
+            if candles:
+                res = await asyncio.to_thread(strategy_bank.evaluate, candles)
+        except Exception as e:
+            print(f"[BANK] {pair_key} failed: {type(e).__name__}: {str(e)[:100]}", flush=True)
+        _BANK_DEC[pair_key] = (slot, res)
+        if res and res.get("best"):
+            b = res["best"]
+            print(f"[BANK] {pair_key}: {b['direction']} via {b['label']} ({res['agree']} agree of {len(res['ideas'])})", flush=True)
+        return res
+
+
+async def _bank_decision_deriv(index_key, config):
+    """Strategy bank on a Deriv synthetic index (15-minute candles). Same result shape as _bank_decision."""
+    if not BANK_LIVE:
+        return None
+    import strategy_bank
+    key = "dv_" + index_key
+    slot = int(time.time() // 900)
+    hit = _BANK_DEC.get(key)
+    if hit and hit[0] == slot:
+        return hit[1]
+    res = None
+    try:
+        candles = await get_cached_synthetic_candles(index_key, config["symbol"], "15m", 900, 300)
+        if candles:
+            res = await asyncio.to_thread(strategy_bank.evaluate, candles)
+    except Exception as e:
+        print(f"[BANK] {index_key} failed: {type(e).__name__}: {str(e)[:100]}", flush=True)
+    _BANK_DEC[key] = (slot, res)
+    if res and res.get("best"):
+        b = res["best"]
+        print(f"[BANK] {index_key}: {b['direction']} via {b['label']} ({res['agree']} agree of {len(res['ideas'])})", flush=True)
+    return res
+
+
+def _bank_valid(best, live_price):
+    """The idea must still make sense at the live price: stop behind it, targets ahead, in order."""
+    try:
+        if not best or not live_price:
+            return None
+        sl, t1, t2 = best["sl"], best["tp1"], best["tp2"]
+        if best["direction"] == "BUY":
+            return best if sl < live_price < t1 < t2 else None
+        return best if t2 < t1 < live_price < sl else None
+    except Exception:
+        return None
+
+
 def _ema_trend_dir(e):
     """BUY/SELL from the trend itself (bounce or not), None when ranging / no data."""
     if not e:
@@ -3627,14 +3698,17 @@ async def _ema5_pick_pairs(origin_key, scheduled=True, origin_busy=False):
     keys = [k for k in pool if k != origin_key and (k == "btcusd" or not closed)]
     res = await asyncio.gather(*[_ema5_exness(k, PAIR_CONFIG[k]) for k in keys], return_exceptions=True)
     busy = await asyncio.gather(*[_pair_busy(k, scheduled) for k in keys], return_exceptions=True)
+    bank = await asyncio.gather(*[_bank_decision(k, PAIR_CONFIG[k]) for k in keys], return_exceptions=True)
     ranked, free = [], []
-    for k, e, b in zip(keys, res, busy):
+    for k, e, b, bk in zip(keys, res, busy, bank):
         if b is True or isinstance(b, Exception):
             continue
         free.append(k)
-        if isinstance(e, Exception) or not _ema_trend_dir(e):
+        _bank_hit = (not isinstance(bk, Exception)) and bool(bk and bk.get("best"))
+        _ema_hit = (not isinstance(e, Exception)) and bool(_ema_trend_dir(e))
+        if not _bank_hit and not _ema_hit:
             continue
-        ranked.append((2 if e.get("trigger") else 1, k))
+        ranked.append(((4 + bk["agree"]) if _bank_hit else (2 if e.get("trigger") else 1), k))
     ranked.sort(key=lambda t: -t[0])
     out = [k for _, k in ranked]
     return out or (free if origin_busy else [])
@@ -6304,9 +6378,25 @@ async def _napp_build_signal_chart(pair_key, direction, entry, sl, tp):
     os.makedirs(CHART_OUTPUT_DIR, exist_ok=True)
     path = os.path.join(CHART_OUTPUT_DIR, f"app_{pair_key}_{secrets.token_hex(6)}.png")
     _tp1 = await asyncio.to_thread(_napp_lookup_tp1, pair_key, entry, sl, tp)
-    ok = await asyncio.to_thread(
-        generate_signal_chart, config["display"], "Nexora", direction, candles, entry, sl, tp, path,
-        45, False, _tp1)
+    ok = False
+    if pair_key not in SYNTHETIC_CONFIG:
+        # Same strategy-bank picture as Telegram when the bank backs this direction.
+        try:
+            _bk = await _bank_decision(pair_key, config)
+            _b = (_bk or {}).get("best")
+            if _b and _b["direction"] == direction:
+                _c15 = await asyncio.to_thread(get_cached_candles, pair_key, config, "15min", outputsize=300)
+                if _c15 and len(_c15) >= 120:
+                    ok = await asyncio.to_thread(
+                        generate_bank_chart, config["display"], direction, _c15, entry, sl, tp, _tp1, path,
+                        _b["label"], _b.get("levels"), _b.get("pivot"))
+        except Exception as _e:
+            print(f"[NEXORA APP] bank chart failed: {type(_e).__name__}")
+            ok = False
+    if not ok:
+        ok = await asyncio.to_thread(
+            generate_signal_chart, config["display"], "Nexora", direction, candles, entry, sl, tp, path,
+            45, False, _tp1)
     if not ok or not os.path.exists(path):
         return None
     try:
@@ -13410,7 +13500,8 @@ async def build_synthetic_signal_response(index_key, min_agree=2, manual=False):
         if EMA5_LIVE and index_key in SYNTHETIC_CONFIG:
             try:
                 _e5 = await _ema5_deriv(index_key, SYNTHETIC_CONFIG[index_key])
-                if not _ema_trend_dir(_e5):
+                _bk = await _bank_decision_deriv(index_key, SYNTHETIC_CONFIG[index_key])
+                if not _ema_trend_dir(_e5) and not (_bk or {}).get("best"):
                     _alt = await _ema5_pick_deriv(index_key)
                     if _alt:
                         print(f"[SIGNAL] {index_key} is ranging -> using {_alt} (trending)", flush=True)
@@ -13502,7 +13593,16 @@ async def _build_synthetic_signal_response_inner(index_key, min_agree=2, manual=
     # ML model's side stands (with the consistency rule for manual requests). No simulation.
     _e5 = await _ema5_deriv(index_key, config) if EMA5_LIVE else None
     _tdir = _ema_trend_dir(_e5)
-    if _tdir:
+    _dbk = (await _bank_decision_deriv(index_key, config) or {}).get("best")
+    if _dbk:
+        # Strategy bank decides direction; Deriv's own multiplier stop/target structure stays as it is.
+        if _dbk["direction"] != direction:
+            direction = _dbk["direction"]
+            agreeing_strategies = []
+            winning_votes = []
+        reason = f"Backed by: {_dbk['label']} \u2192 {direction}."
+        _tdir = None
+    elif _tdir:
         if _tdir != direction:
             direction = _tdir
             agreeing_strategies = []
@@ -13608,12 +13708,23 @@ async def _build_synthetic_signal_response_inner(index_key, min_agree=2, manual=
             except Exception as _e:
                 print(f"[CHART] {config['display']}: 5-minute candles unavailable, using the usual ones: {type(_e).__name__}")
         chart_path = os.path.join(CHART_OUTPUT_DIR, f"{index_key}_{int(time.time())}.png")
-        chart_ok = await asyncio.to_thread(
-            generate_signal_chart,
-            config["display"], chart_strategy_name, direction, chart_candles,
-            entry_price, sl_price, tp_price, chart_path,
-            show_emas=bool(_tdir),
-        )
+        chart_ok = False
+        if _dbk:
+            try:
+                _c15 = await get_cached_synthetic_candles(index_key, config["symbol"], "15m", 900, 300)
+                if _c15 and len(_c15) >= 120:
+                    chart_ok = await asyncio.to_thread(
+                        generate_bank_chart, config["display"], direction, _c15, entry_price, sl_price, tp_price,
+                        None, chart_path, _dbk["label"], _dbk.get("levels"), _dbk.get("pivot"))
+            except Exception as _e:
+                print(f"[CHART] {config['display']}: bank chart failed: {type(_e).__name__}")
+        if not chart_ok:
+            chart_ok = await asyncio.to_thread(
+                generate_signal_chart,
+                config["display"], chart_strategy_name, direction, chart_candles,
+                entry_price, sl_price, tp_price, chart_path,
+                show_emas=bool(_tdir),
+            )
         if not chart_ok:
             # RETRY: same reasoning as the forex/crypto path - chart
             # generation is pure local rendering, no AI/API cost, so a
@@ -23866,6 +23977,87 @@ def _generate_signal_chart_unlocked(display_name, strategy_name, direction, cand
         return False
 
 
+def _generate_bank_chart_unlocked(display_name, direction, candles, entry, sl, tp, tp1, save_path, label="", levels=None, pivot=None, window=80):
+    """15-minute chart for strategy-bank signals: Bollinger Bands, MA20, MA50, support/resistance, RSI and MACD panels,
+    plus the same entry / SL / TP1 / TP2 boxes as every other signal picture."""
+    try:
+        import numpy as np
+        import strategy_bank as sb
+        cs = [dict(c) for c in candles if c.get("high") is not None]
+        cs = [c for c in cs[:-1] if c["high"] > c["low"]] + [cs[-1]]
+        if entry and cs:
+            lc = float(cs[-1]["close"])
+            cs.append({"time": datetime.utcnow(), "open": lc, "high": max(lc, entry), "low": min(lc, entry), "close": entry, "volume": 0})
+        if len(cs) < 80:
+            return False
+        P = sb.indicators(cs)
+        w = min(window, len(cs) - 1)
+        wc = cs[-w:]
+
+        def cut(v):
+            return np.array([np.nan if t is None else t for t in v[-w:]], dtype=float)
+
+        m20, m50, up, lo, rs, mc, sg = (cut(P[k]) for k in ("m20", "m50", "bb_up", "bb_lo", "rsi", "macd", "sig"))
+        times = _chart_to_mpl_time(wc)
+        fig, (ax, rsi_ax, macd_ax) = plt.subplots(
+            3, 1, figsize=(7.4, 7.6), dpi=200, sharex=True,
+            gridspec_kw={"height_ratios": [4.2, 1, 1], "hspace": 0.08})
+        fig.patch.set_facecolor(_CH["fig"])
+        x = _chart_draw_candles(ax, wc, times)
+        ax.fill_between(x, lo, up, color="#fbcaca", alpha=0.45, zorder=1, linewidth=0)
+        ax.plot(x, m20, color="#ef4444", linewidth=1.2, label="MA20 + Bollinger Bands", zorder=4)
+        ax.plot(x, m50, color="#2563eb", linewidth=1.4, label="MA50", zorder=4)
+        for price, kind in (levels or []):
+            ax.axhline(price, color="#7ab87a" if kind == "resistance" else "#e58a8a", linewidth=0.9, alpha=0.7, zorder=1)
+        if pivot:
+            ax.axhline(pivot, color="#2563eb", linewidth=1.1, alpha=0.8, zorder=1)
+        # RSI panel (+ its 9-period average)
+        rsi_avg = np.array([np.nan] * len(rs))
+        for i in range(len(rs)):
+            seg = rs[max(0, i - 8):i + 1]
+            if len(seg) == 9 and not np.isnan(seg).any():
+                rsi_avg[i] = seg.mean()
+        rsi_ax.plot(x, rs, color="#2563eb", linewidth=1.2, label="RSI 14", zorder=3)
+        rsi_ax.plot(x, rsi_avg, color="#ef4444", linewidth=1.0, label="9MA", zorder=3)
+        for lv in (30, 50, 70):
+            rsi_ax.axhline(lv, color="#9ca3af", linewidth=0.6, linestyle=":", zorder=1)
+        rsi_ax.set_ylim(0, 100)
+        rsi_ax.set_yticks([30, 50, 70])
+        # MACD panel
+        macd_ax.plot(x, mc, color="#2563eb", linewidth=1.2, label="MACD", zorder=3)
+        macd_ax.plot(x, sg, color="#16a34a", linewidth=1.2, label="MACD Signal", zorder=3)
+        hist = np.nan_to_num(mc - sg)
+        macd_ax.bar(x, hist, color=["#16a34a" if h >= 0 else "#ef4444" for h in hist], alpha=0.35, width=0.6, zorder=2)
+        macd_ax.axhline(0, color="#9ca3af", linewidth=0.6, alpha=0.6, zorder=1)
+        rsi_ax.set_facecolor(_CH["plot"])
+        rsi_ax.tick_params(colors=_CH["sub"], labelsize=8, length=0, labelbottom=False)
+        for sp in rsi_ax.spines.values():
+            sp.set_color(_CH["spine"])
+        rsi_ax.grid(color=_CH["grid"], linewidth=0.8)
+        rsi_ax.legend(loc="upper left", facecolor="#ffffff", edgecolor=_CH["spine"], labelcolor=_CH["text"], fontsize=7, ncol=2)
+        _plain = re.sub(r"[^\x20-\x7E]", "", str(display_name)).strip()
+        title = f"{_plain} \u2014 {direction}" + (f" \u2014 {label}" if label else "")
+        near = [v for v in list(m20[-12:]) + list(m50[-12:]) if not np.isnan(v)]
+        _chart_finish(fig, ax, x, times, wc, entry, sl, tp, title, save_path, sub_ax=macd_ax, tp1=tp1, extra_y=near)
+        return True
+    except Exception as e:
+        print(f"[CHART] Failed to generate bank chart for {display_name}: {e}")
+        try:
+            plt.close("all")
+        except Exception:
+            pass
+        return False
+
+
+def generate_bank_chart(*args, **kwargs):
+    with _CHART_RENDER_LOCK:
+        try:
+            plt.close("all")
+        except Exception:
+            pass
+        return _generate_bank_chart_unlocked(*args, **kwargs)
+
+
 # Charts are rendered from worker threads (asyncio.to_thread), often several
 # at once when signals fire together. pyplot keeps ONE global "current
 # figure", so concurrent renders were saving/closing each other's figures -
@@ -24133,14 +24325,17 @@ async def build_signal_response(question, user_id=None, retry_mismatch=False, _s
     # EMA TREND FIRST: if this pair is ranging, hand the signal to the best trending pair in the
     # same market group (metals/oil/BTC/forex). If nothing trends, this pair gets the ML fallback.
     _ema = None
+    _bank_best = None
     if EMA5_LIVE and matched_key in FX_SCAN_KEYS:
         try:
             _ema = await _ema5_exness(matched_key, config)
+            _bk = await _bank_decision(matched_key, config)
+            _bank_best = (_bk or {}).get("best")
             _sched = user_id is None
             _busy = await _pair_busy(matched_key, _sched)
             if _busy:
                 print(f"[SIGNAL] {pair_name}: previous signal still open - no double entry", flush=True)
-            if (not _ema_trend_dir(_ema) or _busy) and not _swapped_from:
+            if ((not _ema_trend_dir(_ema) and not _bank_best) or _busy) and not _swapped_from:
                 for _alt in (await _ema5_pick_pairs(matched_key, _sched, _busy))[:4]:
                     print(f"[SIGNAL] {pair_name} is {'busy' if _busy else 'ranging'} -> trying {_alt.upper()}", flush=True)
                     _res = await build_signal_response(_alt, user_id=user_id, retry_mismatch=retry_mismatch,
@@ -24528,7 +24723,17 @@ async def build_signal_response(question, user_id=None, retry_mismatch=False, _s
     # DIRECTION: the EMA trend wins (also over an earlier signal on this pair). With no trend the
     # ML model's direction stands. No simulation.
     _tdir = _ema_trend_dir(_ema) if EMA5_LIVE else None
-    if _tdir:
+    _bank_use = _bank_valid(_bank_best, live_price) if _bank_best else None
+    if _bank_use:
+        # Strategy bank wins: its direction, stop and targets (support/resistance levels) replace the fixed distances.
+        direction = _bank_use["direction"]
+        agreeing_strategies = []
+        sl_multiplier = abs(live_price - _bank_use["sl"]) / pip_size
+        tp1_multiplier = abs(_bank_use["tp1"] - live_price) / pip_size
+        tp_multiplier = abs(_bank_use["tp2"] - live_price) / pip_size
+        reason = f"Backed by: {_bank_use['label']} \u2192 {direction}."
+        _tdir = None
+    elif _tdir:
         if _tdir != direction:
             direction = _tdir
             agreeing_strategies = []
@@ -24623,12 +24828,23 @@ async def build_signal_response(question, user_id=None, retry_mismatch=False, _s
                     _chart_candles, _chart_name = _c5, "Momentum"
             except Exception as _e:
                 print(f"[CHART] {display}: 5-minute candles unavailable, using hourly: {type(_e).__name__}")
-        chart_ok = await asyncio.to_thread(
-            generate_signal_chart,
-            display, _chart_name, direction, _chart_candles,
-            entry_price, stop_loss, take_profit, chart_path,
-            45, True, take_profit_1, bool(_tdir),
-        )
+        chart_ok = False
+        if _bank_use:
+            try:
+                _c15 = await asyncio.to_thread(get_cached_candles, matched_key, config, "15min", outputsize=300)
+                if _c15 and len(_c15) >= 120:
+                    chart_ok = await asyncio.to_thread(
+                        generate_bank_chart, display, direction, _c15, entry_price, stop_loss, take_profit,
+                        take_profit_1, chart_path, _bank_use["label"], _bank_use.get("levels"), _bank_use.get("pivot"))
+            except Exception as _e:
+                print(f"[CHART] {display}: bank chart failed: {type(_e).__name__}: {str(_e)[:100]}")
+        if not chart_ok:
+            chart_ok = await asyncio.to_thread(
+                generate_signal_chart,
+                display, _chart_name, direction, _chart_candles,
+                entry_price, stop_loss, take_profit, chart_path,
+                45, True, take_profit_1, bool(_tdir),
+            )
         if not chart_ok:
             # RETRY: per explicit instruction, after a real
             # occurrence of a DM signal falling back to the static
@@ -24714,7 +24930,7 @@ async def build_signal_response(question, user_id=None, retry_mismatch=False, _s
         # separately), this is what makes "which strategies are
         # actually working" an answerable question with real numbers
         # instead of a guess, the next time it comes up.
-        "agreeing_strategies": agreeing_strategies if bank_result else [],
+        "agreeing_strategies": ([_bank_use["label"]] if _bank_use else (agreeing_strategies if bank_result else [])),
         "confidence": confidence,
         # Inner Circle-only "Why this trade" follow-up text. Built from
         # the same candles/levels as this signal; only the Inner Circle

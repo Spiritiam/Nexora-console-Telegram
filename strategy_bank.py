@@ -196,6 +196,8 @@ def _idea(name, c, P, i, highs, lows):
     if name == "bbrevert":
         t1 = m20
         t2 = m50 if (m50 - px) * d > abs(t1 - px) else px + d * 1.8 * sdist
+        if (t2 - t1) * d <= 0:
+            t2 = t1 + d * 0.8 * sdist
         if (t1 - px) * d < 0.5 * sdist:
             return None
     else:

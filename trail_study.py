@@ -97,6 +97,18 @@ def main():
             s1, s2 = br.stats(tr[:cut]), br.stats(tr[cut:])
             log(f"{sym} | {name}: trades={s[0]} ({s[0] / days:.0f}/day) win={s[1]:.0f}% net={s[2] * 100:+.0f}% of stop per trade | "
                 f"older half {s1[2] * 100:+.0f}% newer half {s2[2] * 100:+.0f}%")
+        if sym == "XAUUSDm" and os.getenv("TRAIL_GOLD_STOPS") == "1":
+            for sd in (2.5, 3.0, 5.0):
+                tr = simulate(t, o, h, l, c, sd, "fade", 1.0, 0.5)
+                s = br.stats(tr)
+                if not s:
+                    continue
+                cut = len(tr) // 2
+                s1, s2 = br.stats(tr[:cut]), br.stats(tr[cut:])
+                per = s[2] * sd  # 0.01 lot of gold = $1 per price unit
+                log(f"XAUUSDm STOP {sd:g} price units (= ${sd:g} on 0.01 lot): trades={s[0]} ({s[0] / days:.0f}/day) win={s[1]:.0f}% "
+                    f"net={s[2] * 100:+.0f}% of stop = ${per:+.2f} per trade, ${per * s[0] / days:+.1f} per day | "
+                    f"older half {s1[2] * 100:+.0f}% newer half {s2[2] * 100:+.0f}%")
     log("done")
 
 

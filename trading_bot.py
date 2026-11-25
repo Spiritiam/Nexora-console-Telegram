@@ -3659,7 +3659,7 @@ async def _bank_raw(pair_key, pair_config):
         _BANK_DEC[pair_key] = (slot, res)
         if res and res.get("best"):
             b = res["best"]
-            print(f"[BANK] {pair_key}: {b['direction']} via {b['label']} ({res['agree']} agree of {len(res['ideas'])})", flush=True)
+            print(f"[BANK] {pair_key}: {b['direction']} via {b['label']} ({res['agree']} agree of {len(res['ideas'])}, 1h bias {res['bias']})", flush=True)
         elif _pa and res is not None:
             print(f"[BANK] {pair_key}: no bank signal | {res.get('why')} | {len(res.get('ideas') or [])} fired, 1h bias {res.get('bias')}", flush=True)
         elif res and res.get("ideas"):
@@ -3703,7 +3703,7 @@ async def _bank_raw_deriv(index_key, config):
     _BANK_DEC[key] = (slot, res)
     if res and res.get("best"):
         b = res["best"]
-        print(f"[BANK] {index_key}: {b['direction']} via {b['label']} ({res['agree']} agree of {len(res['ideas'])})", flush=True)
+        print(f"[BANK] {index_key}: {b['direction']} via {b['label']} ({res['agree']} agree of {len(res['ideas'])}, 1h bias {res['bias']})", flush=True)
     elif _pa and res is not None:
         print(f"[BANK] {index_key}: no bank signal | {res.get('why')} | {len(res.get('ideas') or [])} fired, 1h bias {res.get('bias')}", flush=True)
     return res

@@ -936,14 +936,19 @@ def evaluate_pa(c1h, c15, c5, daily=None, now=None):
         return res
     group = buys if len(buys) > len(sells) else sells
     d = group[0]["direction"]
+    # Opening range breakout and VWAP both just follow a breakout: count them as ONE confirmation
+    names = {i["name"] for i in group}
+    if "orb" in names and "vwap" in names:
+        group = [i for i in group if i["name"] != "vwap"]
+        if len(buys) > len(sells):
+            buys = group
+        else:
+            sells = group
     need = MIN_AGREE + (1 if (X.bias == "up" and d == "SELL") or (X.bias == "down" and d == "BUY") else 0)
     fams = {i["family"] for i in group}
     res["agree"] = len(group)
     if len(group) < need or len(fams) < 2:
         res["why"] = f"{len(group)} {d} ({', '.join(sorted(fams))}), need {need} from 2+ families (1h bias {X.bias})"
-        return res
-    if not trigger_5m(n5, d):
-        res["why"] = f"{len(group)} {d} agree but the 5-minute candle is not confirming yet"
         return res
     order = {f: k for k, f in enumerate(["structure", "levels", "reversal", "retrace", "range", "momentum"])}
     group.sort(key=lambda i: (order[i["family"]], i["name"]))

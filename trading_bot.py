@@ -2507,6 +2507,7 @@ def _xc_daily_count_sync(user_id):
 
 _XC_BAD_KEYS = set()
 _XC_BAD_KEY_NOTIFIED = {}
+_XC_STRIKES = {}
 
 
 def _xc_flag_bad_key(account_ref, err):
@@ -2617,9 +2618,9 @@ async def run_bot_migration(context: ContextTypes.DEFAULT_TYPE):
         print(f"[MIGRATE] error: {type(e).__name__}: {str(e)[:120]}")
 
 
-def _xc_key_still_works(ref):
+def _xc_key_still_works(ref, tries=3):
     """True if a live Exness call succeeds or fails for a reason other than a rejected key."""
-    for i in range(3):
+    for i in range(tries):
         try:
             broker = _exness_broker_sync(ref)
             if broker is None:
@@ -2629,7 +2630,8 @@ def _xc_key_still_works(ref):
         except Exception as e:
             if "AUTH_INVALID_API_KEY" not in str(e):
                 return True
-        time.sleep(3)
+        if i < tries - 1:
+            time.sleep(3)
     return False
 
 
@@ -2651,11 +2653,20 @@ async def run_bad_key_notify(context: ContextTypes.DEFAULT_TYPE):
             uid = a.get("user_id")
             if not uid or now - _XC_BAD_KEY_NOTIFIED.get(ref, 0) < 86400:
                 continue
-            # Exness sometimes answers AUTH_INVALID_API_KEY for a key that still works, so re-check
-            # live (3 tries) and only tell the user if every try is rejected.
-            if await asyncio.to_thread(_xc_key_still_works, ref):
-                print(f"[XC] key check passed for {ref}, no notice sent")
+            # Exness sometimes answers AUTH_INVALID_API_KEY for a key that still works. Re-check live, and only
+            # tell the user after 5 rejected checks spread over at least 30 minutes (one strike per 8+ minutes).
+            if await asyncio.to_thread(_xc_key_still_works, ref, 1):
+                _XC_STRIKES.pop(ref, None)
+                print(f"[XC] key check passed for {ref}, strikes cleared")
                 continue
+            strikes = [t for t in _XC_STRIKES.get(ref, []) if now - t < 5400]
+            if not strikes or now - strikes[-1] >= 480:
+                strikes.append(now)
+            _XC_STRIKES[ref] = strikes
+            print(f"[XC] key rejected for {ref}: strike {len(strikes)}/5")
+            if len(strikes) < 5 or now - strikes[0] < 1800:
+                continue
+            _XC_STRIKES.pop(ref, None)
             _XC_BAD_KEY_NOTIFIED[ref] = now
             try:
                 await context.bot.send_message(

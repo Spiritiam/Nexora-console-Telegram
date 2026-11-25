@@ -6399,7 +6399,7 @@ def _napp_lookup_signal(pair_key, entry, sl, tp):
                   ("entry_price", f"gte.{entry - tol}"), ("entry_price", f"lte.{entry + tol}"),
                   ("stop_loss", f"gte.{sl - tol}"), ("stop_loss", f"lte.{sl + tol}"),
                   ("take_profit", f"gte.{tp - tol}"), ("take_profit", f"lte.{tp + tol}"),
-                  ("select", "id,posted_at,tp1,direction,agreeing_strategies,entry_price,stop_loss,take_profit"),
+                  ("select", "id,posted_at,tp1,direction,agreeing_strategies,entry_price,stop_loss,take_profit,chart_file_id"),
                   ("order", "id.desc"), ("limit", "1")]
         rows = requests.get(f"{SUPABASE_URL}/rest/v1/signal_log", params=params, headers=sb_headers(), timeout=8).json()
         if isinstance(rows, list) and rows:
@@ -6432,10 +6432,62 @@ def _napp_fit_png(png, ratio=1003.0 / 600.0):
         return png
 
 
+async def backfill_signal_chart_ids(context=None):
+    """One-off: find the Telegram picture of past scheduled signals (forward the channel post to the admin, read the
+    photo's file_id, delete the forward) so the app can show the same picture. Safe to run again; skips done rows."""
+    if not (ADMIN_USER_ID and _app_instance):
+        return
+    bot = _app_instance.bot
+    done = failed = 0
+    try:
+        rows = await asyncio.to_thread(lambda: requests.get(
+            f"{SUPABASE_URL}/rest/v1/signal_log",
+            params={"select": "id", "source": "eq.scheduled", "chart_file_id": "is.null", "order": "id.desc", "limit": "600"},
+            headers=sb_headers(), timeout=20).json())
+        for r in rows if isinstance(rows, list) else []:
+            sid = r["id"]
+            cms = await asyncio.to_thread(lambda: requests.get(
+                f"{SUPABASE_URL}/rest/v1/channel_messages",
+                params={"select": "chat_id,message_id", "signal_id": f"eq.{sid}", "order": "message_id.asc", "limit": "3"},
+                headers=sb_headers(), timeout=15).json())
+            fid = None
+            for cm in cms if isinstance(cms, list) else []:
+                try:
+                    fw = await bot.forward_message(chat_id=ADMIN_USER_ID, from_chat_id=int(cm["chat_id"]), message_id=int(cm["message_id"]))
+                    if fw.photo:
+                        fid = fw.photo[-1].file_id
+                    try:
+                        await bot.delete_message(chat_id=ADMIN_USER_ID, message_id=fw.message_id)
+                    except Exception:
+                        pass
+                    if fid:
+                        break
+                except Exception:
+                    continue
+                finally:
+                    await asyncio.sleep(0.6)
+            await asyncio.to_thread(_patch_signal_sync, sid, {"chart_file_id": fid or "-"})
+            if fid:
+                done += 1
+            else:
+                failed += 1
+    except Exception as e:
+        print(f"[CHART BACKFILL] stopped: {type(e).__name__}: {str(e)[:100]}", flush=True)
+    print(f"[CHART BACKFILL] done={done} no_picture={failed}", flush=True)
+
+
 async def _napp_build_signal_chart(pair_key, direction, entry, sl, tp):
     # Draws the signal the way it really happened: 5-minute candles from before it was posted, the box starting at the
     # signal candle, and the candles running on to the hit candle (or to now while it is still open).
     row = await asyncio.to_thread(_napp_lookup_signal, pair_key, entry, sl, tp)
+    _fid = (row or {}).get("chart_file_id")
+    if _fid and _fid != "-" and _app_instance:
+        # The same picture that was posted on Telegram.
+        try:
+            _f = await _app_instance.bot.get_file(_fid)
+            return _napp_fit_png(bytes(await _f.download_as_bytearray()))
+        except Exception as _e:
+            print(f"[NEXORA APP] telegram picture failed: {type(_e).__name__}: {str(_e)[:80]}", flush=True)
     posted = None
     if row:
         try:
@@ -33168,6 +33220,9 @@ async def _post_signal_for_pair(bot, pair_keyword):
             return
 
         signal_id = log_signal(signal_data)
+        if signal_id and image_file_id:
+            # The app shows this exact picture (same one the channels get).
+            await asyncio.to_thread(_patch_signal_sync, signal_id, {"chart_file_id": str(image_file_id)})
 
         ic_signal_message_id = None
         for channel_id in [CHANNEL_1_ID, CHANNEL_2_ID, CHANNEL_3_ID]:
@@ -37663,6 +37718,8 @@ def main():
 
     # One-off backfill of Deriv model input readings (does nothing once
     # every row has them).
+    job_queue.run_once(backfill_signal_chart_ids, when=60, name="signal_chart_backfill",
+                       job_kwargs={"misfire_grace_time": 600})
     job_queue.run_once(apply_forced_signal_status, when=25, name="forced_signal_status",
                        job_kwargs={"misfire_grace_time": 600})
     job_queue.run_once(

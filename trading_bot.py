@@ -3608,35 +3608,13 @@ _BANK_DEC = {}
 _BANK_LOCKS = {}
 
 
-def _bank_gate(res, e, key):
-    """The 3-EMA rule stays above every strategy: BUY only with the 3 EMAs below price trending up, SELL only with
-    them above price trending down (price not crossed back over the 25 EMA). A bank idea against that is dropped."""
-    b = (res or {}).get("best")
-    if not b:
-        return res
-    d = _ema_trend_dir(e)
-    if d == b["direction"]:
-        return res
-    print(f"[BANK] {key}: {b['direction']} via {b['label']} dropped, 3 EMA trend is {d or 'not trending'}", flush=True)
-    return dict(res, best=None)
-
-
 async def _bank_decision(pair_key, pair_config):
-    res = await _bank_raw(pair_key, pair_config)
-    try:
-        e = await _ema5_exness(pair_key, pair_config)
-    except Exception:
-        e = None
-    return _bank_gate(res, e, pair_key)
+    # The strategy bank stands on its own (2+ strategies agreeing). If it finds nothing, the 3 EMA entry runs, then the ML model.
+    return await _bank_raw(pair_key, pair_config)
 
 
 async def _bank_decision_deriv(index_key, config):
-    res = await _bank_raw_deriv(index_key, config)
-    try:
-        e = await _ema5_deriv(index_key, config)
-    except Exception:
-        e = None
-    return _bank_gate(res, e, index_key)
+    return await _bank_raw_deriv(index_key, config)
 
 
 async def _bank_raw(pair_key, pair_config):

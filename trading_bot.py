@@ -36863,6 +36863,15 @@ def main():
         except Exception as _e:
             print(f"[BURSTALL] could not start: {type(_e).__name__}: {_e}")
 
+    # Read-only pivot / support-resistance study on 15-minute candles (no trades), only while PIVOT_STUDY=1 is set.
+    if os.getenv("PIVOT_STUDY") == "1":
+        try:
+            import subprocess as _sp
+            _sp.Popen([sys.executable, os.path.join(os.path.dirname(os.path.abspath(__file__)), "pivot_study.py")])
+            print("[PIVOT] process started")
+        except Exception as _e:
+            print(f"[PIVOT] could not start: {type(_e).__name__}: {_e}")
+
     # Read-only trailing-start study (no trades), only while TRAIL_STUDY=1 is set.
     if os.getenv("TRAIL_STUDY") == "1":
         try:

@@ -106,8 +106,10 @@ def swings(c, i):
 
 def _targets(px, d, sd, highs, lows):
     pool = sorted((x for x in lows if x < px), reverse=True) if d < 0 else sorted(x for x in highs if x > px)
-    t1 = next((x for x in pool if abs(px - x) >= 1.0 * sd), px - d * 1.0 * sd)
-    t2 = next((x for x in pool if abs(px - x) >= 1.8 * sd and abs(x - t1) > 0.2 * sd), px - d * 1.8 * sd)
+    t1 = next((x for x in pool if abs(px - x) >= 1.0 * sd), px + d * 1.0 * sd)
+    t2 = next((x for x in pool if abs(px - x) >= 1.8 * sd and abs(x - t1) > 0.2 * sd), px + d * 1.8 * sd)
+    if (t2 - t1) * d <= 0:
+        t2 = t1 + d * 0.8 * sd
     return t1, t2
 
 

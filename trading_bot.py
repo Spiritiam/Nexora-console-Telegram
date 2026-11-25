@@ -35266,10 +35266,42 @@ async def _post_init_capture_loop(app):
         _main_loop.create_task(_dbs())
     if os.getenv("REDRAW_CHART"):
         _main_loop.create_task(_redraw_chart_once(app, os.getenv("REDRAW_CHART")))
+    if os.getenv("KEY_FALSE_ALARM"):
+        _main_loop.create_task(_key_false_alarm_once(app, os.getenv("KEY_FALSE_ALARM")))
     if os.getenv("REPLACE_PHOTO"):
         for _spec in [x for x in os.getenv("REPLACE_PHOTO").split(";") if x.strip()]:
             _main_loop.create_task(_replace_signal_photo_once(app, _spec.strip()))
     await catch_up_missed_signals(app)
+
+
+async def _key_false_alarm_once(app, spec):
+    """One-off: spec = comma-separated Exness account numbers. Tells each owner the earlier 'API key stopped working'
+    alert was a false alarm, but only if a live check of their key passes now. Runs once per spec."""
+    try:
+        key = "keyfa_" + __import__("hashlib").md5(spec.encode()).hexdigest()[:12]
+        if await asyncio.to_thread(_napp_state_get, key):
+            return
+        await asyncio.to_thread(_napp_state_set, key, "done")
+        for acct in [x.strip() for x in spec.split(",") if x.strip()]:
+            ref = f"{EXNESS_REF_PREFIX}{acct}"
+            rows = await asyncio.to_thread(lambda: requests.get(
+                f"{SUPABASE_URL}/rest/v1/mt5_auto_trade_accounts?metaapi_account_id=eq.{ref}&select=user_id&limit=1",
+                headers=sb_headers(), timeout=10).json())
+            if not isinstance(rows, list) or not rows:
+                print(f"[KEYFA] {acct}: no account row", flush=True)
+                continue
+            if not await asyncio.to_thread(_xc_key_still_works, ref):
+                print(f"[KEYFA] {acct}: key still rejected, no message sent", flush=True)
+                continue
+            await app.bot.send_message(
+                chat_id=int(rows[0]["user_id"]),
+                text=("ℹ️ Please ignore the earlier message saying your Exness API key stopped working. "
+                      "It was sent by mistake: Exness briefly returned an error for a key that is still valid. "
+                      "Your account is connected and Auto-Trade is running normally.\n\n"
+                      "You don't need to do anything. Our system now double-checks before sending that alert."))
+            print(f"[KEYFA] {acct}: message sent", flush=True)
+    except Exception as e:
+        print(f"[KEYFA] failed: {type(e).__name__}: {str(e)[:150]}", flush=True)
 
 
 async def _replace_signal_photo_once(app, spec):

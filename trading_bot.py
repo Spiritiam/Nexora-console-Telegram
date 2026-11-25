@@ -3638,9 +3638,10 @@ async def _ema5_pick_deriv(origin_key):
 # Same stop distance as the normal (scheduled / manual) signals, in each pair's own pip unit:
 # gold 100 ($10), oil 50 ($0.50), BTC 50 (~$496). Silver is no longer traded by these bots.
 # Aggressive Scalper / Account Flip stops (halved from 100 gold / 50 others).
-SC_SIGNAL_SL_PIPS = {"xauusd": 50, "xauusd247": 50, "btcusd": 25, "usoil": 25, "xagusd": 25}
+# Nov 25: Aggressive Scalper gold stop cut from 50 to 25 pips ($2.50 on 0.01 lot) like BTC and oil.
+SC_SIGNAL_SL_PIPS = {"xauusd": 25, "xauusd247": 25, "btcusd": 25, "usoil": 25, "xagusd": 25}
 # Account Flip only: wider stops (gold 50, oil 30, BTC 30). The Aggressive Scalper keeps SC_SIGNAL_SL_PIPS.
-FLIP_SIGNAL_SL_PIPS = dict(SC_SIGNAL_SL_PIPS, btcusd=30, usoil=30)
+FLIP_SIGNAL_SL_PIPS = dict(SC_SIGNAL_SL_PIPS, xauusd=50, xauusd247=50, btcusd=30, usoil=30)
 # Lowest custom stop (in these bots' own pips) a user may set on Aggressive Scalper / Account Flip.
 SC_MIN_CUSTOM_SL_PIPS = 20
 SC_CFG = {
@@ -3665,7 +3666,9 @@ SC_CFG = {
     "label": "🐆 Aggressive Scalper",
 }
 SC_MODES = {
-    "aggressive_scalper": SC_CFG,
+    # Nov 25: the Aggressive Scalper starts trailing at 75% of the stop (60-day study: higher win rate, same or better average).
+    # Account Flip keeps SC_CFG's trailing start unchanged.
+    "aggressive_scalper": dict(SC_CFG, trail_from_stop=float(os.getenv("SC_TRAIL_START", "0.75"))),
     "flip_fast": dict(SC_CFG, trail_from_stop=None, pending_pips=25, sl_pips=15, sl_pips_by_pair={}, trail_activate_pips=15, trail_pips=8,
                       max_layers=5, add_pips=15, label="⚡ Account Flip (Fast)"),
     # Account Flip: support/resistance on the 1-hour chart, entry from the 30-minute chart.

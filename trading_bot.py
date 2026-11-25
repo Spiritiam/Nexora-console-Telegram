@@ -23528,12 +23528,12 @@ def _consistent_or_random(pair_key):
 CHART_OUTPUT_DIR = "/tmp/nexora_charts"
 os.makedirs(CHART_OUTPUT_DIR, exist_ok=True)
 
-# Dark chart theme (signal pictures for the Telegram bot and the app share it). Charts are plain: candles plus the
+# Light chart theme (signal pictures for the Telegram bot and the app share it). Charts are plain: candles plus the
 # entry / SL / TP box. The 3 EMAs are drawn only when the 3 EMA strategy made the signal.
 CHART_PLAIN = True
 _CH = dict(
-    fig="#0e1217", plot="#11161d", grid="#1a212b", spine="#232b36", text="#e6e9ef", sub="#8a94a6",
-    up="#22c38e", down="#f0556a", sl="#f0556a", entry="#e8b043", entry_txt="#1a1300", tp="#22c38e",
+    fig="#ffffff", plot="#fbfcfe", grid="#eef2f6", spine="#e3e9f0", text="#1f2d46", sub="#6b778c",
+    up="#16876a", down="#d9546a", sl="#d9546a", entry="#e8b043", entry_txt="#3a2a00", tp="#16876a",
 )
 
 
@@ -23657,10 +23657,10 @@ def _chart_finish(fig, ax, x, times, candles, entry, sl, tp, title, save_path, s
 
     # Red zone entry -> SL, green zone entry -> final TP, projected to the right of the last candle.
     if entry is not None and sl is not None:
-        ax.add_patch(Rectangle((zx0, min(entry, sl)), zx1 - zx0, abs(sl - entry), facecolor=C["sl"], alpha=0.16,
+        ax.add_patch(Rectangle((zx0, min(entry, sl)), zx1 - zx0, abs(sl - entry), facecolor=C["sl"], alpha=0.12,
                                edgecolor=C["sl"], linewidth=0.8, zorder=1))
     if entry is not None and tp is not None:
-        ax.add_patch(Rectangle((zx0, min(entry, tp)), zx1 - zx0, abs(tp - entry), facecolor=C["tp"], alpha=0.15,
+        ax.add_patch(Rectangle((zx0, min(entry, tp)), zx1 - zx0, abs(tp - entry), facecolor=C["tp"], alpha=0.11,
                                edgecolor=C["tp"], linewidth=0.8, zorder=1))
 
     tags = []
@@ -24170,7 +24170,7 @@ def _generate_signal_chart_unlocked(display_name, strategy_name, direction, cand
             sub_ax.set_ylim(0, 100)
 
         _ema_y = []
-        for _n, _col in (((25, "#f59e0b"), (50, "#38bdf8"), (100, "#e879f9")) if show_emas else ()):
+        for _n, _col in (((25, "#d97706"), (50, "#0284c7"), (100, "#c026d3")) if show_emas else ()):
             _v = _emas.get(_n)
             if _v and len(_v) == len(x) and any(t is not None for t in _v):
                 ax.plot(x, _v, color=_col, linewidth=1.2, alpha=0.95, label=f"EMA {_n}", zorder=4)

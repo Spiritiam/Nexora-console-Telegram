@@ -15,8 +15,8 @@ import ema_trend
 K = 3
 LEVEL_BARS = 160
 # Every strategy seen in the Exness / Trading Central cards is in the bank. Highest priority first (used to break ties).
-PRIORITY = ["trend", "pullback", "breakout", "bbtrend", "pivotrev", "range", "bbrevert"]
-LABELS = {"trend": "Trend + pivot", "pullback": "Pullback to MA20", "breakout": "Breakout",
+PRIORITY = ["triple", "trend", "pullback", "breakout", "bbtrend", "pivotrev", "range", "bbrevert"]
+LABELS = {"triple": "RSI + MACD + trend", "trend": "Trend + pivot", "pullback": "Pullback to MA20", "breakout": "Breakout",
           "bbtrend": "Bollinger trend", "pivotrev": "Pivot reversal", "range": "Range bounce",
           "bbrevert": "Bollinger rebound"}
 
@@ -120,7 +120,13 @@ def _idea(name, c, P, i, highs, lows):
     dn = px < m20 and px < m50 and m20 < m50 and r < 50 and mc < sg
     up = px > m20 and px > m50 and m20 > m50 and r > 50 and mc > sg
     d = sl = pivot = None
-    if name == "trend":
+    # "trend" follows the Exness gold / silver / BTC cards: price on the right side of the moving averages, the stop on the
+    # nearest pivot; RSI and MACD are not required. "triple" is the card that also needs RSI and MACD to agree.
+    t_dn = px < m50 and m20 < m50 and px < m20 + 0.3 * a
+    t_up = px > m50 and m20 > m50 and px > m20 - 0.3 * a
+    if name in ("trend", "triple"):
+        if name == "trend":
+            dn, up = t_dn, t_up
         if dn:
             above = sorted(x for x in highs if x > px + 0.3 * a)
             if above:

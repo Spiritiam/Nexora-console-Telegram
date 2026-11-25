@@ -23436,14 +23436,14 @@ def _chart_finish(fig, ax, x, times, candles, entry, sl, tp, title, save_path, s
     zx0 = x[-1] + 0.5
     zx1 = zx0 + zone_w
     if zone_from is not None:
-        # Result pictures (TP1 / TP2 hit): the box starts at the signal candle and the candles run through it
-        # up to the hit candle, instead of sitting in empty space to the right of the last candle.
+        # TP2 picture: the box stays exactly where it was in the TP1 picture (right after the TP1 candle) and the
+        # candles carry on through it up to the TP2 candle.
         try:
             _i0 = next((i for i, c in enumerate(candles) if (_candle_dt(c) is not None and _candle_dt(c) >= zone_from)), None)
         except Exception:
             _i0 = None
         if _i0 is not None and _i0 < n - 1:
-            zx0 = x[_i0]
+            zx0 = x[_i0] + 0.5
             zx1 = x[-1] + max(span * 0.03, 1.5)
 
     all_lows = [c["low"] for c in candles]
@@ -35925,7 +35925,7 @@ def _walk_signal_candles(sig, candles):
     return {"tp1_t": tp1_t, "final": None, "final_t": None}
 
 
-async def _send_signal_result_picture(sig, candles, upto_t, label):
+async def _send_signal_result_picture(sig, candles, upto_t, label, box_from=None):
     """Sends the admin a chart of the signal up to the moment TP1 / TP2 was reached."""
     if not (ADMIN_USER_ID and _app_instance):
         return False
@@ -35942,7 +35942,7 @@ async def _send_signal_result_picture(sig, candles, upto_t, label):
         tp1 = float(sig["tp1"]) if sig.get("tp1") is not None else None
         ok = await asyncio.to_thread(
             generate_signal_chart, PAIR_CONFIG[pair_key]["display"], "Momentum", sig.get("direction"), keep,
-            entry, sl, tp, path, max(45, len(keep)), False, tp1, False, f"{label} HIT", zone_from=posted,
+            entry, sl, tp, path, max(45, len(keep)), False, tp1, False, f"{label} HIT", zone_from=box_from,
         )
         if not ok or not os.path.exists(path):
             return False
@@ -36003,7 +36003,7 @@ async def _check_signal_by_candles(sig):
     final = res["final"]
     if final == "TP2":
         if scheduled:
-            await _send_signal_result_picture(sig, candles, res["final_t"] + timedelta(minutes=5), "TP2")
+            await _send_signal_result_picture(sig, candles, res["final_t"] + timedelta(minutes=5), "TP2", box_from=res.get("tp1_t"))
         await asyncio.to_thread(_patch_signal_sync, sid, {"tp_detail": "TP2", "be_done": True})
         update_signal_status(sid, "TP_HIT", sig.get("source"))
     elif final == "TP1":

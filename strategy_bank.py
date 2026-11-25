@@ -224,3 +224,24 @@ def evaluate(candles, tf_secs=900, now=None, only_closed=True):
     group = buys if len(buys) > len(sells) else sells if len(sells) > len(buys) else (buys if PRIORITY.index(buys[0]["name"]) < PRIORITY.index(sells[0]["name"]) else sells)
     group = sorted(group, key=lambda x: PRIORITY.index(x["name"]))
     return {"best": group[0], "ideas": ideas, "agree": len(group)}
+
+
+def explain(candles, tf_secs=900, now=None):
+    """One-line reason why nothing fired (for the logs)."""
+    try:
+        c = [{"time": x.get("time"), "open": float(x["open"]), "high": float(x["high"]),
+              "low": float(x["low"]), "close": float(x["close"])} for x in (candles or [])]
+        c = ema_trend.closed_only(c, tf_secs, now)
+        if len(c) < 120:
+            return f"only {len(c)} closed candles"
+        P = indicators(c)
+        i = len(c) - 1
+        px, a, m20, m50, r = P["cl"][i], P["atr"][i], P["m20"][i], P["m50"][i], P["rsi"][i]
+        mc, sg = P["macd"][i], P["sig"][i]
+        highs, lows = swings(c, i)
+        up_p = sorted(x for x in highs if x > px)[:1]
+        dn_p = sorted((x for x in lows if x < px), reverse=True)[:1]
+        return (f"px {px:.2f} ma20 {m20:.2f} ma50 {m50:.2f} rsi {r:.0f} macd>sig {mc > sg} atr {a:.2f} "
+                f"nearest high {up_p} low {dn_p}")
+    except Exception as e:
+        return f"explain failed: {type(e).__name__} {str(e)[:60]}"

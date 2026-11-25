@@ -3635,7 +3635,7 @@ async def _bank_decision(pair_key, pair_config):
             b = res["best"]
             print(f"[BANK] {pair_key}: {b['direction']} via {b['label']} ({res['agree']} agree of {len(res['ideas'])})", flush=True)
         else:
-            print(f"[BANK] {pair_key}: no strategy fired ({len(candles or [])} candles)" if res is not None else f"[BANK] {pair_key}: no result", flush=True)
+            print(f"[BANK] {pair_key}: no strategy fired ({len(candles or [])} candles) | {strategy_bank.explain(candles) if candles else 'no candles'}" if res is not None else f"[BANK] {pair_key}: no result", flush=True)
         return res
 
 

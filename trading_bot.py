@@ -6357,6 +6357,27 @@ def _napp_lookup_tp1(pair_key, entry, sl, tp):
     return None
 
 
+def _napp_lookup_signal(pair_key, entry, sl, tp):
+    """The signal_log row with these levels (the app only sends pair, entry, SL, TP2), or None."""
+    try:
+        name = (PAIR_CONFIG.get(pair_key) or SYNTHETIC_CONFIG.get(pair_key) or {}).get("pair_name")
+        if not name:
+            return None
+        tol = abs(tp - entry) * 0.002 + 1e-9
+        params = [("pair_name", f"eq.{name}"),
+                  ("entry_price", f"gte.{entry - tol}"), ("entry_price", f"lte.{entry + tol}"),
+                  ("stop_loss", f"gte.{sl - tol}"), ("stop_loss", f"lte.{sl + tol}"),
+                  ("take_profit", f"gte.{tp - tol}"), ("take_profit", f"lte.{tp + tol}"),
+                  ("select", "id,posted_at,tp1,direction,agreeing_strategies,entry_price,stop_loss,take_profit"),
+                  ("order", "id.desc"), ("limit", "1")]
+        rows = requests.get(f"{SUPABASE_URL}/rest/v1/signal_log", params=params, headers=sb_headers(), timeout=8).json()
+        if isinstance(rows, list) and rows:
+            return rows[0]
+    except Exception as e:
+        print(f"[NEXORA APP] signal lookup: {type(e).__name__}")
+    return None
+
+
 def _napp_fit_png(png, ratio=1003.0 / 600.0):
     """The app shows the chart in a wide frame and crops anything taller. Pad the picture (never crop it) to that frame shape."""
     try:
@@ -6381,48 +6402,90 @@ def _napp_fit_png(png, ratio=1003.0 / 600.0):
 
 
 async def _napp_build_signal_chart(pair_key, direction, entry, sl, tp):
-    # Same as the Telegram pictures: the entry follows the 5-minute EMA trend, so draw 5-minute candles
-    # (hourly only as a fallback if the 5-minute data is unavailable).
+    # Draws the signal the way it really happened: 5-minute candles from before it was posted, the box starting at the
+    # signal candle, and the candles running on to the hit candle (or to now while it is still open).
+    row = await asyncio.to_thread(_napp_lookup_signal, pair_key, entry, sl, tp)
+    posted = None
+    if row:
+        try:
+            posted = datetime.fromisoformat(str(row["posted_at"]).replace("Z", "+00:00")).replace(tzinfo=None)
+        except Exception:
+            posted = None
+    synthetic = pair_key in SYNTHETIC_CONFIG
+    need = 300
+    if posted is not None:
+        need = max(300, int((datetime.utcnow() - posted).total_seconds() / 300) + 130)
+        if need > 1500:
+            return None  # too old for the price history we keep: better no chart than a wrong one
     candles = None
-    if pair_key in SYNTHETIC_CONFIG:
+    if synthetic:
         config = {"display": SYNTHETIC_CONFIG[pair_key]["display"]}
         try:
-            candles = await get_cached_synthetic_candles(pair_key, SYNTHETIC_CONFIG[pair_key]["symbol"], "5m", 300, 300)
+            candles = await get_cached_synthetic_candles(pair_key, SYNTHETIC_CONFIG[pair_key]["symbol"], "5m", 300, need)
         except Exception:
             candles = None
-        if not candles or len(candles) < 110:
-            candles = await get_cached_synthetic_candles(
-                pair_key, SYNTHETIC_CONFIG[pair_key]["symbol"], "1h", 3600, 210)
     else:
         config = PAIR_CONFIG[pair_key]
         try:
-            candles = await asyncio.to_thread(get_cached_candles, pair_key, config, "5min", outputsize=300)
+            candles = await asyncio.to_thread(get_cached_candles, pair_key, config, "5min", outputsize=need)
         except Exception:
             candles = None
-        if not candles or len(candles) < 110:
-            candles = await asyncio.to_thread(get_cached_candles, pair_key, config, "1h", outputsize=210)
     if not candles or len(candles) < 30:
+        return None
+    zone_from = None
+    end_t = None
+    if posted is not None:
+        first = _candle_dt(candles[0])
+        if first is None or first > posted - timedelta(minutes=30):
+            return None  # the history does not reach back to this signal
+        zone_from = posted
+        sig = dict(row)
+        sig["entry_price"], sig["stop_loss"], sig["take_profit"] = entry, sl, tp
+        res = _walk_signal_candles(sig, candles)
+        if res and res.get("final") in ("TP2", "SL", "TP1") and res.get("final_t") is not None:
+            end_t = res["final_t"] + timedelta(minutes=5)
+        candles = [c for c in candles if (_candle_dt(c) is not None and (end_t is None or _candle_dt(c) <= end_t))]
+    else:
+        # Not in the signal log: only draw it if the price levels belong to the current market.
+        lo = min(float(c["low"]) for c in candles[-300:])
+        hi = max(float(c["high"]) for c in candles[-300:])
+        pad = (hi - lo) * 0.25
+        if not (lo - pad <= entry <= hi + pad):
+            return None
+    if len(candles) < 30:
         return None
     os.makedirs(CHART_OUTPUT_DIR, exist_ok=True)
     path = os.path.join(CHART_OUTPUT_DIR, f"app_{pair_key}_{secrets.token_hex(6)}.png")
-    _tp1 = await asyncio.to_thread(_napp_lookup_tp1, pair_key, entry, sl, tp)
-    ok = False
-    if pair_key not in SYNTHETIC_CONFIG:
-        # Same strategy-bank picture as Telegram when the bank backs this direction.
+    _tp1 = None
+    if row and row.get("tp1") is not None:
         try:
-            _bk = await _bank_decision(pair_key, config)
-            _b = (_bk or {}).get("best")
-            if _b and _b["direction"] == direction and len(candles) >= 110:
+            _tp1 = float(row["tp1"])
+        except Exception:
+            _tp1 = None
+    if _tp1 is None:
+        _tp1 = await asyncio.to_thread(_napp_lookup_tp1, pair_key, entry, sl, tp)
+    ok = False
+    if not synthetic and row and len(candles) >= 110:
+        # Strategy-bank signals get the same strategy-bank picture as Telegram.
+        try:
+            import strategy_bank as _sb
+            _labels = [x for x in (row.get("agreeing_strategies") or []) if x in _sb.LABELS.values()]
+            if _labels:
                 ok = await asyncio.to_thread(
                     generate_bank_chart, config["display"], direction, candles, entry, sl, tp, _tp1, path,
-                    _b["label"], None, None)
+                    _labels[0], None, None, 80, zone_from)
         except Exception as _e:
             print(f"[NEXORA APP] bank chart failed: {type(_e).__name__}")
             ok = False
     if not ok:
+        if zone_from is not None:
+            shown = len([c for c in candles if (_candle_dt(c) is not None and _candle_dt(c) >= zone_from - timedelta(minutes=90))])
+            window = max(45, shown)
+        else:
+            window = 45
         ok = await asyncio.to_thread(
             generate_signal_chart, config["display"], "Nexora", direction, candles, entry, sl, tp, path,
-            45, False, _tp1)
+            window, False, _tp1, True, None, zone_from)
     if not ok or not os.path.exists(path):
         return None
     try:
@@ -24024,7 +24087,7 @@ def _generate_signal_chart_unlocked(display_name, strategy_name, direction, cand
         return False
 
 
-def _generate_bank_chart_unlocked(display_name, direction, candles, entry, sl, tp, tp1, save_path, label="", levels=None, pivot=None, window=80):
+def _generate_bank_chart_unlocked(display_name, direction, candles, entry, sl, tp, tp1, save_path, label="", levels=None, pivot=None, window=80, zone_from=None):
     """15-minute chart for strategy-bank signals: Bollinger Bands, MA20, MA50, support/resistance, RSI and MACD panels,
     plus the same entry / SL / TP1 / TP2 boxes as every other signal picture."""
     try:
@@ -24085,7 +24148,7 @@ def _generate_bank_chart_unlocked(display_name, direction, candles, entry, sl, t
         _plain = re.sub(r"[^\x20-\x7E]", "", str(display_name)).strip()
         title = f"{_plain} \u2014 {direction}" + (f" \u2014 {label}" if label else "")
         near = [v for v in list(m20[-12:]) + list(m50[-12:]) if not np.isnan(v)]
-        _chart_finish(fig, ax, x, times, wc, entry, sl, tp, title, save_path, sub_ax=macd_ax, tp1=tp1, extra_y=near)
+        _chart_finish(fig, ax, x, times, wc, entry, sl, tp, title, save_path, sub_ax=macd_ax, tp1=tp1, extra_y=near, zone_from=zone_from)
         return True
     except Exception as e:
         print(f"[CHART] Failed to generate bank chart for {display_name}: {e}")

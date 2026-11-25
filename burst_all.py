@@ -23,6 +23,9 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import burst_research as br  # noqa: E402
 
 SYMBOLS = {"XAUUSDm": 5.0, "USOILm": 0.25, "BTCUSDm": 25 * 9.918}
+_only = [x.strip().upper() for x in os.getenv("BURSTALL_SYMBOLS", "").split(",") if x.strip()]
+if _only:
+    SYMBOLS = {k: v for k, v in SYMBOLS.items() if k.upper() in _only}
 DAYS = int(os.getenv("BURSTALL_DAYS", "60"))
 BAR = 60
 

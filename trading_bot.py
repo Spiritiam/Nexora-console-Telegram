@@ -290,7 +290,7 @@ MT5_BOT_PAIRS = {
 # "auto": no pair chosen - the bot watches these four and fires on the first EMA bounce (one trade at a time).
 SC_AUTO_PAIRS = ["xauusd", "btcusd", "usoil"]
 # Aggressive Scalper only: pairs it must not open NEW trades on (Account Flip is unaffected; open trades are still managed). Env SC_SCALPER_SKIP, comma separated, empty = trade all.
-SC_SCALPER_SKIP = [x.strip() for x in os.getenv("SC_SCALPER_SKIP", "").split(",") if x.strip()]
+SC_SCALPER_SKIP = [x.strip() for x in os.getenv("SC_SCALPER_SKIP", "xauusd,xauusd247").split(",") if x.strip()]
 # Silver is no longer traded by the auto bots; it is only looked at so a position opened earlier is still managed to its close.
 SC_LEGACY_PAIRS = ["xagusd"]
 AUTO_LABEL = "\U0001F500 Auto (all pairs)"

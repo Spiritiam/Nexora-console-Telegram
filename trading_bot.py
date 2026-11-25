@@ -6357,6 +6357,29 @@ def _napp_lookup_tp1(pair_key, entry, sl, tp):
     return None
 
 
+def _napp_fit_png(png, ratio=1003.0 / 600.0):
+    """The app shows the chart in a wide frame and crops anything taller. Pad the picture (never crop it) to that frame shape."""
+    try:
+        import io
+        from PIL import Image
+        im = Image.open(io.BytesIO(png)).convert("RGB")
+        w, h = im.size
+        bg = im.getpixel((2, 2))
+        if w / h < ratio:
+            nw, nh = int(round(h * ratio)), h
+        else:
+            nw, nh = w, int(round(w / ratio))
+        if (nw, nh) == (w, h):
+            return png
+        canvas = Image.new("RGB", (nw, nh), bg)
+        canvas.paste(im, ((nw - w) // 2, (nh - h) // 2))
+        out = io.BytesIO()
+        canvas.save(out, "PNG")
+        return out.getvalue()
+    except Exception:
+        return png
+
+
 async def _napp_build_signal_chart(pair_key, direction, entry, sl, tp):
     # Same as the Telegram pictures: the entry follows the 5-minute EMA trend, so draw 5-minute candles
     # (hourly only as a fallback if the 5-minute data is unavailable).
@@ -6404,7 +6427,7 @@ async def _napp_build_signal_chart(pair_key, direction, entry, sl, tp):
         return None
     try:
         with open(path, "rb") as fh:
-            return fh.read()
+            return _napp_fit_png(fh.read())
     finally:
         try:
             os.remove(path)

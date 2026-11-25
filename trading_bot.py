@@ -3604,6 +3604,8 @@ async def run_trend_alerts(context):
 
 # Strategy bank (15-minute candles): scheduled and manual signals ask it first. BANK_LIVE=0 switches it off.
 BANK_LIVE = os.getenv("BANK_LIVE", "1") == "1"
+# "pa" = price-action bank checked on 1h / 15m / 5m (default). "exness" = the earlier bank built from the Exness cards.
+BANK_MODE = os.getenv("BANK_MODE", "pa")
 _BANK_DEC = {}
 _BANK_LOCKS = {}
 
@@ -3622,7 +3624,8 @@ async def _bank_raw(pair_key, pair_config):
     if not BANK_LIVE:
         return None
     import strategy_bank
-    slot = int(time.time() // 900)
+    _pa = BANK_MODE == "pa"
+    slot = int(time.time() // (300 if _pa else 900))
     hit = _BANK_DEC.get(pair_key)
     if hit and hit[0] == slot:
         return hit[1]
@@ -3634,15 +3637,31 @@ async def _bank_raw(pair_key, pair_config):
         res = None
         candles = None
         try:
-            candles = await asyncio.to_thread(get_cached_candles, pair_key, pair_config, "15min", outputsize=300, max_age=(time.time() % 900) + 3)
-            if candles:
-                res = await asyncio.to_thread(strategy_bank.evaluate, candles)
+            if _pa:
+                import price_action_bank
+                _now = time.time()
+                c1h, c15, c5, d1 = await asyncio.gather(
+                    asyncio.to_thread(get_cached_candles, pair_key, pair_config, "1h", outputsize=400, max_age=(_now % 3600) + 3),
+                    asyncio.to_thread(get_cached_candles, pair_key, pair_config, "15min", outputsize=300, max_age=(_now % 900) + 3),
+                    asyncio.to_thread(get_cached_candles, pair_key, pair_config, "5min", outputsize=300, max_age=(_now % 300) + 3),
+                    asyncio.to_thread(get_cached_candles, pair_key, pair_config, "1day", outputsize=45),
+                    return_exceptions=True)
+                c1h, c15, c5, d1 = [None if isinstance(x, Exception) else x for x in (c1h, c15, c5, d1)]
+                candles = c15
+                if c15 and c1h:
+                    res = await asyncio.to_thread(price_action_bank.evaluate_pa, c1h, c15, c5 or [], d1 or [])
+            else:
+                candles = await asyncio.to_thread(get_cached_candles, pair_key, pair_config, "15min", outputsize=300, max_age=(time.time() % 900) + 3)
+                if candles:
+                    res = await asyncio.to_thread(strategy_bank.evaluate, candles)
         except Exception as e:
             print(f"[BANK] {pair_key} failed: {type(e).__name__}: {str(e)[:100]}", flush=True)
         _BANK_DEC[pair_key] = (slot, res)
         if res and res.get("best"):
             b = res["best"]
             print(f"[BANK] {pair_key}: {b['direction']} via {b['label']} ({res['agree']} agree of {len(res['ideas'])})", flush=True)
+        elif _pa and res is not None:
+            print(f"[BANK] {pair_key}: no bank signal | {res.get('why')} | {len(res.get('ideas') or [])} fired, 1h bias {res.get('bias')}", flush=True)
         elif res and res.get("ideas"):
             print(f"[BANK] {pair_key}: only {res['agree']} strategy agreed of {len(res['ideas'])}, need {strategy_bank.MIN_AGREE}; no bank signal", flush=True)
         else:
@@ -3655,22 +3674,38 @@ async def _bank_raw_deriv(index_key, config):
     if not BANK_LIVE:
         return None
     import strategy_bank
+    _pa = BANK_MODE == "pa"
     key = "dv_" + index_key
-    slot = int(time.time() // 900)
+    slot = int(time.time() // (300 if _pa else 900))
     hit = _BANK_DEC.get(key)
     if hit and hit[0] == slot:
         return hit[1]
     res = None
     try:
-        candles = await get_cached_synthetic_candles(index_key, config["symbol"], "15m", 900, 300)
-        if candles:
-            res = await asyncio.to_thread(strategy_bank.evaluate, candles)
+        sym = config["symbol"]
+        if _pa:
+            import price_action_bank
+            c1h, c15, c5, d1 = await asyncio.gather(
+                get_cached_synthetic_candles(index_key, sym, "1h", 3600, 400),
+                get_cached_synthetic_candles(index_key, sym, "15m", 900, 300),
+                get_cached_synthetic_candles(index_key, sym, "5m", 300, 300),
+                get_cached_synthetic_candles(index_key, sym, "1day", 86400, 45),
+                return_exceptions=True)
+            c1h, c15, c5, d1 = [None if isinstance(x, Exception) else x for x in (c1h, c15, c5, d1)]
+            if c15 and c1h:
+                res = await asyncio.to_thread(price_action_bank.evaluate_pa, c1h, c15, c5 or [], d1 or [])
+        else:
+            candles = await get_cached_synthetic_candles(index_key, sym, "15m", 900, 300)
+            if candles:
+                res = await asyncio.to_thread(strategy_bank.evaluate, candles)
     except Exception as e:
         print(f"[BANK] {index_key} failed: {type(e).__name__}: {str(e)[:100]}", flush=True)
     _BANK_DEC[key] = (slot, res)
     if res and res.get("best"):
         b = res["best"]
         print(f"[BANK] {index_key}: {b['direction']} via {b['label']} ({res['agree']} agree of {len(res['ideas'])})", flush=True)
+    elif _pa and res is not None:
+        print(f"[BANK] {index_key}: no bank signal | {res.get('why')} | {len(res.get('ideas') or [])} fired, 1h bias {res.get('bias')}", flush=True)
     return res
 
 

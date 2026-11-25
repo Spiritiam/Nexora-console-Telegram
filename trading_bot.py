@@ -290,7 +290,7 @@ MT5_BOT_PAIRS = {
 # "auto": no pair chosen - the bot watches these four and fires on the first EMA bounce (one trade at a time).
 SC_AUTO_PAIRS = ["xauusd", "btcusd", "usoil"]
 # Aggressive Scalper only: pairs it must not open NEW trades on (Account Flip is unaffected; open trades are still managed). Env SC_SCALPER_SKIP, comma separated, empty = trade all.
-SC_SCALPER_SKIP = [x.strip() for x in os.getenv("SC_SCALPER_SKIP", "xauusd").split(",") if x.strip()]
+SC_SCALPER_SKIP = [x.strip() for x in os.getenv("SC_SCALPER_SKIP", "").split(",") if x.strip()]
 # Silver is no longer traded by the auto bots; it is only looked at so a position opened earlier is still managed to its close.
 SC_LEGACY_PAIRS = ["xagusd"]
 AUTO_LABEL = "\U0001F500 Auto (all pairs)"
@@ -3434,10 +3434,10 @@ BURST_RULES_SCALPER_STRICT = dict(BURST_RULES,
                                   usoil={"side": "follow", "trend": False, "kv": 3, "kr": 3},
                                   btcusd={"side": "fade", "trend": False, "kv": 2.5, "kr": 0})
 # Aggressive Scalper, every-candle mode (60-day study, 1-minute): every closed 1-minute candle is a burst, no filter at all.
-# Gold and oil follow the candle colour, BTC fades it. Set BURST_SCALPER_MODE=strict on Railway to go back to the filtered rules above.
+# Nov 25: gold and oil now fade the candle colour like BTC (reverse beat follow in the 60-day study). Set BURST_SCALPER_MODE=strict on Railway to go back to the filtered rules above.
 BURST_RULES_SCALPER_EVERY = dict(BURST_RULES,
-                                 xauusd={"side": "follow", "trend": False, "kv": 0, "kr": 0, "body": 0},
-                                 usoil={"side": "follow", "trend": False, "kv": 0, "kr": 0, "body": 0},
+                                 xauusd={"side": "fade", "trend": False, "kv": 0, "kr": 0, "body": 0},
+                                 usoil={"side": "fade", "trend": False, "kv": 0, "kr": 0, "body": 0},
                                  btcusd={"side": "fade", "trend": False, "kv": 0, "kr": 0, "body": 0})
 BURST_RULES_SCALPER = BURST_RULES_SCALPER_STRICT if os.getenv("BURST_SCALPER_MODE", "every") == "strict" else BURST_RULES_SCALPER_EVERY
 print(f"[BURST] scalper mode: {'strict (filtered)' if BURST_RULES_SCALPER is BURST_RULES_SCALPER_STRICT else 'every candle, no filter'}", flush=True)
@@ -3901,6 +3901,87 @@ async def _sc_notify(context, user_id, text):
         print(f"[SC] Couldn't notify {user_id}: {type(e).__name__}")
 
 
+# Aggressive Scalper daily profit lock (Exness API accounts). Only stops NEW entries until the next UTC day; open trades keep being
+# managed. Stops for the day when the account is up SC_LOCK_TARGET_PCT of its day-start equity, or, once it has been up at least
+# SC_LOCK_ARM_PCT, when it gives back SC_LOCK_GIVEBACK_PCT of that day's peak profit. SC_DAY_LOCK=0 switches it off.
+SC_DAY_LOCK = os.getenv("SC_DAY_LOCK", "1") == "1"
+SC_LOCK_TARGET = float(os.getenv("SC_LOCK_TARGET_PCT", "50")) / 100
+SC_LOCK_ARM = float(os.getenv("SC_LOCK_ARM_PCT", "20")) / 100
+SC_LOCK_GIVEBACK = float(os.getenv("SC_LOCK_GIVEBACK_PCT", "50")) / 100
+_SC_LOCK = {}
+
+
+def _sc_equity_sync(ref):
+    broker = _exness_broker_sync(ref)
+    if broker is None:
+        return None
+    return broker.account_info().get("equity")
+
+
+async def _sc_day_locked(context, account):
+    if not SC_DAY_LOCK:
+        return False
+    ref = account.get("metaapi_account_id")
+    if not _is_exness_ref(ref):
+        return False
+    uid = str(account["user_id"])
+    today = datetime.utcnow().strftime("%Y-%m-%d")
+    st = _SC_LOCK.get(uid)
+    if st is None or st["day"] != today:
+        st = None
+        saved = await asyncio.to_thread(_napp_state_get, f"sclock_{uid}_{today}")
+        if saved:
+            try:
+                st = json.loads(saved)
+                st["checked"] = 0
+            except Exception:
+                st = None
+        if not st:
+            st = {"day": today, "start": None, "peak": None, "locked": False, "checked": 0}
+        _SC_LOCK[uid] = st
+    if st["locked"]:
+        return True
+    now = time.time()
+    if now - st["checked"] < 45:
+        return False
+    st["checked"] = now
+    try:
+        eq = await asyncio.to_thread(_sc_equity_sync, ref)
+        eq = float(eq)
+    except Exception:
+        return False
+    if eq <= 0:
+        return False
+    dirty = False
+    if st["start"] is None:
+        st["start"] = st["peak"] = eq
+        dirty = True
+    if eq > st["peak"]:
+        if eq - st["peak"] >= 0.02 * st["start"]:
+            dirty = True
+        st["peak"] = eq
+    start, peak = st["start"], st["peak"]
+    reason = None
+    if (eq - start) >= SC_LOCK_TARGET * start:
+        reason = "target"
+    elif (peak - start) >= SC_LOCK_ARM * start and (eq - start) <= (peak - start) * (1 - SC_LOCK_GIVEBACK):
+        reason = "giveback"
+    if reason:
+        st["locked"] = True
+        dirty = True
+        print(f"[SC LOCK] user={uid} locked for the day ({reason}): start={start:.2f} peak={peak:.2f} now={eq:.2f}", flush=True)
+        if reason == "target":
+            msg = ("🔒 <b>Daily profit locked</b>\n\nYour account is up well today, so the Aggressive Scalper is resting "
+                   "to protect it. It starts again tomorrow (UTC).")
+        else:
+            msg = ("🔒 <b>Daily profit protection</b>\n\nYour account was up earlier today and has given some of it back, "
+                   "so the Aggressive Scalper is resting to protect what is left. It starts again tomorrow (UTC).")
+        await _sc_notify(context, uid, msg)
+    if dirty:
+        await asyncio.to_thread(_napp_state_set, f"sclock_{uid}_{today}", json.dumps(st))
+    return bool(st["locked"])
+
+
 _FLIP_DEC = {}
 _FLIP_LOCKS = {}
 
@@ -4052,6 +4133,9 @@ async def _sc_tick_one(context, account):
             return
         if now < st.get("backoff_until", 0):
             return
+        if account["bot_choice"] == "aggressive_scalper" and await _sc_day_locked(context, account):
+            st["phase"] = "arm"
+            return  # daily profit lock: no new entries until tomorrow (UTC)
 
         if account["bot_choice"] == "aggressive_scalper" and pair_key in SC_SCALPER_SKIP:
             st["phase"] = "arm"
@@ -36733,6 +36817,15 @@ def main():
             print("[BURSTALL] process started")
         except Exception as _e:
             print(f"[BURSTALL] could not start: {type(_e).__name__}: {_e}")
+
+    # Read-only session study for BTC (no trades), only while SESSION_STUDY=1 is set.
+    if os.getenv("SESSION_STUDY") == "1":
+        try:
+            import subprocess as _sp
+            _sp.Popen([sys.executable, os.path.join(os.path.dirname(os.path.abspath(__file__)), "burst_sessions.py")])
+            print("[SESSIONS] process started")
+        except Exception as _e:
+            print(f"[SESSIONS] could not start: {type(_e).__name__}: {_e}")
 
     # Read-only "hour candle" study on 5-minute candles (no trades), only while HOUR_RESEARCH=1 is set.
     if os.getenv("HOUR_RESEARCH") == "1":

@@ -10025,6 +10025,18 @@ def log_channel_message(signal_id, chat_id, message_id):
         print(f"[CHANNEL LOG] log_channel_message error: {e}")
 
 
+def get_signal_channel_messages(signal_id):
+    """Every (chat_id, message_id) this signal was posted to, from channel_messages."""
+    try:
+        url = (f"{SUPABASE_URL}/rest/v1/channel_messages"
+               f"?signal_id=eq.{signal_id}&select=chat_id,message_id&order=posted_at.asc")
+        data = requests.get(url, headers=sb_headers(), timeout=10).json()
+        return [(int(d["chat_id"]), int(d["message_id"])) for d in data] if isinstance(data, list) else []
+    except Exception as e:
+        print(f"[CHANNEL LOG] get_signal_channel_messages error: {e}")
+        return []
+
+
 def get_last_channel_message(chat_id):
     """
     Looks up the most recently logged signal message for a given
@@ -35928,6 +35940,19 @@ async def _send_signal_result_picture(sig, candles, upto_t, label):
                    f"Entry {sig['entry_price']}  \u2022  {label} {sig['tp1'] if label == 'TP1' else sig['take_profit']}")
         with open(path, "rb") as fh:
             await _app_instance.bot.send_photo(chat_id=int(ADMIN_USER_ID), photo=fh, caption=caption)
+        # Same picture, posted automatically as a reply under the signal in every channel it went to.
+        try:
+            for _cid, _mid in await asyncio.to_thread(get_signal_channel_messages, sig["id"]):
+                try:
+                    with open(path, "rb") as fh2:
+                        await _app_instance.bot.send_photo(
+                            chat_id=_cid, photo=fh2, caption=f"<b>{label} HIT</b> \u2705",
+                            parse_mode=ParseMode.HTML, reply_to_message_id=_mid, allow_sending_without_reply=True)
+                    print(f"[RESULT PIC] {sig['id']} {label} posted to {_cid}")
+                except Exception as _e:
+                    print(f"[RESULT PIC] {sig['id']} {label} channel {_cid} failed: {type(_e).__name__}: {str(_e)[:100]}")
+        except Exception as _e:
+            print(f"[RESULT PIC] channel posting failed: {type(_e).__name__}")
         try:
             os.remove(path)
         except Exception:

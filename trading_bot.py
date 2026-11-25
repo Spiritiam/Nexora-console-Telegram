@@ -1455,7 +1455,21 @@ def apply_sltp_override(account, pair_key, direction, entry_price, stop_loss, ta
         return stop_loss, take_profit
 
 
-def compute_lot_size(account, entry_price, stop_loss):
+# Units per 1.00 lot where the legacy "100,000 x price fraction" estimate is wrong
+# (it overstates the lot for gold by ~4x, so risk-% accounts were sized too big).
+LOT_UNITS = {"xauusd": 100.0, "xauusd247": 100.0, "xagusd": 5000.0, "usoil": 1000.0, "btcusd": 1.0}
+
+
+def risk_at_volume(entry_price, stop_loss, volume, pair_key=None):
+    """Dollar loss if the stop is hit at this volume."""
+    dist = abs(entry_price - stop_loss)
+    units = LOT_UNITS.get(pair_key)
+    if units:
+        return dist * units * volume
+    return (dist / entry_price) * 100000 * volume
+
+
+def compute_lot_size(account, entry_price, stop_loss, pair_key=None):
     """
     Returns a lot size for this trade based on the account's own
     saved mode - either their fixed lot size directly, or computed
@@ -1487,10 +1501,14 @@ def compute_lot_size(account, entry_price, stop_loss):
     if not balance or not entry_price or not stop_loss:
         return 0.01  # safe fallback - smallest reasonable size, never skip sizing silently
 
-    stop_distance_fraction = abs(entry_price - stop_loss) / entry_price
-    notional_per_lot = 100000  # standard lot approximation
     risk_amount = balance * (risk_percent / 100.0)
-    lot_size = risk_amount / (stop_distance_fraction * notional_per_lot)
+    units = LOT_UNITS.get(pair_key)
+    if units:
+        lot_size = risk_amount / (abs(entry_price - stop_loss) * units)
+    else:
+        stop_distance_fraction = abs(entry_price - stop_loss) / entry_price
+        notional_per_lot = 100000  # standard lot approximation
+        lot_size = risk_amount / (stop_distance_fraction * notional_per_lot)
     return round(max(0.01, min(lot_size, 10.0)), 2)  # hard-capped 0.01-10.0 as a sanity bound
 
 
@@ -2169,7 +2187,7 @@ async def run_mt5_autotrade_bot_scan(context: ContextTypes.DEFAULT_TYPE):
                     balance = await get_client_mt5_balance(metaapi_account_id)
                     account["_live_balance"] = balance
 
-                volume = compute_lot_size(account, entry_price, acct_sl)
+                volume = compute_lot_size(account, entry_price, acct_sl, pair_key)
 
                 order_id = await place_client_mt5_trade(
                     metaapi_account_id, resolved_symbol, direction,
@@ -3205,7 +3223,7 @@ async def _ag_enter_one(context, account, bot_key, pair_key, pair_config, direct
             entry, sl = bid, round(bid + stop_dist, decimals)
         if account.get("risk_mode") == "percent":
             account["_live_balance"] = await get_client_mt5_balance(acct_id)
-        volume = compute_lot_size(account, entry, sl)
+        volume = compute_lot_size(account, entry, sl, pair_key)
         order_id = await place_client_mt5_trade(
             acct_id, resolved, direction, volume, sl, None,
             trade_comment=f"NexoraAG-{int(time.time())}",
@@ -4242,7 +4260,7 @@ async def _sc_tick_one(context, account):
         sl = round(fill - sl_dist if direction == "BUY" else fill + sl_dist, decimals)
         if account.get("risk_mode") == "percent":
             account["_live_balance"] = await get_client_mt5_balance(acct_id)
-        volume = compute_lot_size(account, fill, sl)
+        volume = compute_lot_size(account, fill, sl, pair_key)
         order_id = await place_client_mt5_trade(
             acct_id, resolved, direction, volume, sl, None, trade_comment=f"NexoraSC-{int(now)}")
         if not order_id:
@@ -4436,7 +4454,31 @@ async def run_mt5_autotrade_follow_channel_scan(context: ContextTypes.DEFAULT_TY
                 balance = await get_client_mt5_balance(metaapi_account_id)
                 account["_live_balance"] = balance
 
-            volume = compute_lot_size(account, entry_price, acct_sl)
+            volume = compute_lot_size(account, entry_price, acct_sl, pair_key)
+
+            # Risk-% accounts: the smallest lot (0.01) can already risk far more than the
+            # chosen % when the signal's stop is wide and the balance is small. Don't open it.
+            if account.get("risk_mode") == "percent" and account.get("_live_balance"):
+                _want = float(account["_live_balance"]) * float(account.get("risk_percent", 1.0)) / 100.0
+                _real = risk_at_volume(float(entry_price), float(acct_sl), volume, pair_key)
+                if _want > 0 and _real > _want * 1.5:
+                    MT5_AUTOTRADE_COPIED_SIGNALS.add(copy_key)
+                    print(f"[MT5 AUTOTRADE FOLLOW] Signal {signal_id} user {user_id} SKIPPED: min lot risks ${_real:.2f} vs chosen ${_want:.2f}")
+                    try:
+                        await context.bot.send_message(
+                            chat_id=int(user_id),
+                            text=(
+                                f"⚠️ <b>{pair_config['display']} {direction} signal skipped</b>\n\n"
+                                f"Your risk is set to {float(account.get('risk_percent', 1.0)):g}% (about ${_want:.2f}), "
+                                f"but this signal's stop is too wide for your balance. Even the smallest lot (0.01) "
+                                f"would risk about ${_real:.2f}. I did not open it to protect your account.\n\n"
+                                f"Add funds, or raise your risk % in Auto-Trade settings."
+                            ),
+                            parse_mode=ParseMode.HTML,
+                        )
+                    except Exception:
+                        pass
+                    continue
 
             # TP1/TP2 handling (same rules for Copy Channel Signal and Full
             # Signal Coverage). Accounts with their own custom TP keep it.

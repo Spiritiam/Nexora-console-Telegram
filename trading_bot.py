@@ -6581,7 +6581,7 @@ async def _napp_build_signal_chart(pair_key, direction, entry, sl, tp):
             window = 45
         ok = await asyncio.to_thread(
             generate_signal_chart, config["display"], "Nexora", direction, candles, entry, sl, tp, path,
-            window, False, _tp1, True, None, zone_from)
+            window, False, _tp1, False, None, zone_from)
     if not ok or not os.path.exists(path):
         return None
     try:
@@ -23528,10 +23528,12 @@ def _consistent_or_random(pair_key):
 CHART_OUTPUT_DIR = "/tmp/nexora_charts"
 os.makedirs(CHART_OUTPUT_DIR, exist_ok=True)
 
-# Light chart theme (signal pictures for the Telegram bot and the app share it).
+# Dark chart theme (signal pictures for the Telegram bot and the app share it). Charts are plain: candles plus the
+# entry / SL / TP box. The 3 EMAs are drawn only when the 3 EMA strategy made the signal.
+CHART_PLAIN = True
 _CH = dict(
-    fig="#ffffff", plot="#fbfcfe", grid="#eef2f6", spine="#e3e9f0", text="#1f2d46", sub="#6b778c",
-    up="#16876a", down="#d9546a", sl="#d9546a", entry="#e8b043", entry_txt="#3a2a00", tp="#16876a",
+    fig="#0e1217", plot="#11161d", grid="#1a212b", spine="#232b36", text="#e6e9ef", sub="#8a94a6",
+    up="#22c38e", down="#f0556a", sl="#f0556a", entry="#e8b043", entry_txt="#1a1300", tp="#22c38e",
 )
 
 
@@ -23655,10 +23657,10 @@ def _chart_finish(fig, ax, x, times, candles, entry, sl, tp, title, save_path, s
 
     # Red zone entry -> SL, green zone entry -> final TP, projected to the right of the last candle.
     if entry is not None and sl is not None:
-        ax.add_patch(Rectangle((zx0, min(entry, sl)), zx1 - zx0, abs(sl - entry), facecolor=C["sl"], alpha=0.12,
+        ax.add_patch(Rectangle((zx0, min(entry, sl)), zx1 - zx0, abs(sl - entry), facecolor=C["sl"], alpha=0.16,
                                edgecolor=C["sl"], linewidth=0.8, zorder=1))
     if entry is not None and tp is not None:
-        ax.add_patch(Rectangle((zx0, min(entry, tp)), zx1 - zx0, abs(tp - entry), facecolor=C["tp"], alpha=0.11,
+        ax.add_patch(Rectangle((zx0, min(entry, tp)), zx1 - zx0, abs(tp - entry), facecolor=C["tp"], alpha=0.15,
                                edgecolor=C["tp"], linewidth=0.8, zorder=1))
 
     tags = []
@@ -23709,7 +23711,7 @@ def _chart_finish(fig, ax, x, times, candles, entry, sl, tp, title, save_path, s
         a.set_axisbelow(True)
         handles, _labels = a.get_legend_handles_labels()
         if handles:
-            a.legend(loc="upper left", facecolor="#ffffff", edgecolor=C["spine"], labelcolor=C["text"], fontsize=8)
+            a.legend(loc="upper left", facecolor=C["fig"], edgecolor=C["spine"], labelcolor=C["text"], fontsize=8)
     if sub_ax is not None:
         sub_ax.set_xlim(xlim_left, zx1)
         _ticks(sub_ax)
@@ -23850,6 +23852,8 @@ def _generate_signal_chart_unlocked(display_name, strategy_name, direction, cand
     window without ever changing what was actually calculated.
     """
     try:
+        if CHART_PLAIN:
+            strategy_name = "Plain"   # no strategy overlays or indicator panels; only the 3 EMAs when asked for
         # FIX: CONFIRMED REAL, LIVE BUG - H1 candles are cached for a
         # full hour (CANDLE_CACHE_SECONDS), but the live price used
         # for `entry` is always fetched fresh with no caching at all.
@@ -24166,7 +24170,7 @@ def _generate_signal_chart_unlocked(display_name, strategy_name, direction, cand
             sub_ax.set_ylim(0, 100)
 
         _ema_y = []
-        for _n, _col in (((25, "#d97706"), (50, "#0284c7"), (100, "#c026d3")) if show_emas else ()):
+        for _n, _col in (((25, "#f59e0b"), (50, "#38bdf8"), (100, "#e879f9")) if show_emas else ()):
             _v = _emas.get(_n)
             if _v and len(_v) == len(x) and any(t is not None for t in _v):
                 ax.plot(x, _v, color=_col, linewidth=1.2, alpha=0.95, label=f"EMA {_n}", zorder=4)
@@ -24184,11 +24188,9 @@ def _generate_signal_chart_unlocked(display_name, strategy_name, direction, cand
 
 
 def _generate_bank_chart_unlocked(display_name, direction, candles, entry, sl, tp, tp1, save_path, label="", levels=None, pivot=None, window=80, zone_from=None):
-    """15-minute chart for strategy-bank signals: Bollinger Bands, MA20, MA50, support/resistance, RSI and MACD panels,
-    plus the same entry / SL / TP1 / TP2 boxes as every other signal picture."""
+    """Plain chart for strategy-bank signals: candles plus the entry / SL / TP1 / TP2 box, nothing else. The strategy
+    names go in the caption, not on the chart."""
     try:
-        import numpy as np
-        import strategy_bank as sb
         cs = [dict(c) for c in candles if c.get("high") is not None]
         cs = [c for c in cs[:-1] if c["high"] > c["low"]] + [cs[-1]]
         if entry and cs:
@@ -24196,55 +24198,16 @@ def _generate_bank_chart_unlocked(display_name, direction, candles, entry, sl, t
             cs.append({"time": datetime.utcnow(), "open": lc, "high": max(lc, entry), "low": min(lc, entry), "close": entry, "volume": 0})
         if len(cs) < 80:
             return False
-        P = sb.indicators(cs)
         w = min(window, len(cs) - 1)
         wc = cs[-w:]
-
-        def cut(v):
-            return np.array([np.nan if t is None else t for t in v[-w:]], dtype=float)
-
-        m20, m50, up, lo, rs, mc, sg = (cut(P[k]) for k in ("m20", "m50", "bb_up", "bb_lo", "rsi", "macd", "sig"))
         times = _chart_to_mpl_time(wc)
-        fig, (ax, rsi_ax, macd_ax) = plt.subplots(
-            3, 1, figsize=(7.4, 7.6), dpi=200, sharex=True,
-            gridspec_kw={"height_ratios": [4.2, 1, 1], "hspace": 0.08})
+        fig, ax = plt.subplots(figsize=(7.4, 5.2), dpi=200)
         fig.patch.set_facecolor(_CH["fig"])
+        ax.set_facecolor(_CH["plot"])
         x = _chart_draw_candles(ax, wc, times)
-        ax.fill_between(x, lo, up, color="#fbcaca", alpha=0.45, zorder=1, linewidth=0)
-        ax.plot(x, m20, color="#ef4444", linewidth=1.2, label="MA20 + Bollinger Bands", zorder=4)
-        ax.plot(x, m50, color="#2563eb", linewidth=1.4, label="MA50", zorder=4)
-        for price, kind in (levels or []):
-            ax.axhline(price, color="#7ab87a" if kind == "resistance" else "#e58a8a", linewidth=0.9, alpha=0.7, zorder=1)
-        if pivot:
-            ax.axhline(pivot, color="#2563eb", linewidth=1.1, alpha=0.8, zorder=1)
-        # RSI panel (+ its 9-period average)
-        rsi_avg = np.array([np.nan] * len(rs))
-        for i in range(len(rs)):
-            seg = rs[max(0, i - 8):i + 1]
-            if len(seg) == 9 and not np.isnan(seg).any():
-                rsi_avg[i] = seg.mean()
-        rsi_ax.plot(x, rs, color="#2563eb", linewidth=1.2, label="RSI 14", zorder=3)
-        rsi_ax.plot(x, rsi_avg, color="#ef4444", linewidth=1.0, label="9MA", zorder=3)
-        for lv in (30, 50, 70):
-            rsi_ax.axhline(lv, color="#9ca3af", linewidth=0.6, linestyle=":", zorder=1)
-        rsi_ax.set_ylim(0, 100)
-        rsi_ax.set_yticks([30, 50, 70])
-        # MACD panel
-        macd_ax.plot(x, mc, color="#2563eb", linewidth=1.2, label="MACD", zorder=3)
-        macd_ax.plot(x, sg, color="#16a34a", linewidth=1.2, label="MACD Signal", zorder=3)
-        hist = np.nan_to_num(mc - sg)
-        macd_ax.bar(x, hist, color=["#16a34a" if h >= 0 else "#ef4444" for h in hist], alpha=0.35, width=0.6, zorder=2)
-        macd_ax.axhline(0, color="#9ca3af", linewidth=0.6, alpha=0.6, zorder=1)
-        rsi_ax.set_facecolor(_CH["plot"])
-        rsi_ax.tick_params(colors=_CH["sub"], labelsize=8, length=0, labelbottom=False)
-        for sp in rsi_ax.spines.values():
-            sp.set_color(_CH["spine"])
-        rsi_ax.grid(color=_CH["grid"], linewidth=0.8)
-        rsi_ax.legend(loc="upper left", facecolor="#ffffff", edgecolor=_CH["spine"], labelcolor=_CH["text"], fontsize=7, ncol=2)
         _plain = re.sub(r"[^\x20-\x7E]", "", str(display_name)).strip()
-        title = f"{_plain} \u2014 {direction}" + (f" \u2014 {label}" if label else "")
-        near = [v for v in list(m20[-12:]) + list(m50[-12:]) if not np.isnan(v)]
-        _chart_finish(fig, ax, x, times, wc, entry, sl, tp, title, save_path, sub_ax=macd_ax, tp1=tp1, extra_y=near, zone_from=zone_from)
+        title = f"{_plain} \u2014 {direction}"
+        _chart_finish(fig, ax, x, times, wc, entry, sl, tp, title, save_path, tp1=tp1, zone_from=zone_from)
         return True
     except Exception as e:
         print(f"[CHART] Failed to generate bank chart for {display_name}: {e}")

@@ -20,6 +20,9 @@ import ema_trend
 import strategy_bank as sb
 
 MIN_AGREE = int(os.environ.get("BANK_MIN_AGREE", "2"))
+# A signal against the 1-hour trend is skipped when price has already run this many 15-minute ranges (ATR) away from
+# the low (BUY) or high (SELL) of the last 8 hours: it would be buying the top of a bounce / selling the bottom of a drop.
+OVEREXT_ATR = float(os.environ.get("BANK_OVEREXT_ATR", "5"))
 K = 3  # swing strength (bars each side)
 
 
@@ -947,6 +950,13 @@ def evaluate_pa(c1h, c15, c5, daily=None, now=None):
     need = MIN_AGREE + (1 if (X.bias == "up" and d == "SELL") or (X.bias == "down" and d == "BUY") else 0)
     fams = {i["family"] for i in group}
     res["agree"] = len(group)
+    if need > MIN_AGREE and X.a > 0:
+        look = n15[-32:]
+        run = (X.px - min(x["low"] for x in look)) if d == "BUY" else (max(x["high"] for x in look) - X.px)
+        if run > OVEREXT_ATR * X.a:
+            res["why"] = (f"counter-trend {d} skipped: price already ran {run / X.a:.1f} ranges from the 8-hour "
+                          f"{'low' if d == 'BUY' else 'high'} (1h bias {X.bias})")
+            return res
     if len(group) < need or len(fams) < 2:
         res["why"] = f"{len(group)} {d} ({', '.join(sorted(fams))}), need {need} from 2+ families (1h bias {X.bias})"
         return res

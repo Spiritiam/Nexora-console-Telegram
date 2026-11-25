@@ -2617,6 +2617,22 @@ async def run_bot_migration(context: ContextTypes.DEFAULT_TYPE):
         print(f"[MIGRATE] error: {type(e).__name__}: {str(e)[:120]}")
 
 
+def _xc_key_still_works(ref):
+    """True if a live Exness call succeeds or fails for a reason other than a rejected key."""
+    for i in range(3):
+        try:
+            broker = _exness_broker_sync(ref)
+            if broker is None:
+                return False
+            broker.snapshot()
+            return True
+        except Exception as e:
+            if "AUTH_INVALID_API_KEY" not in str(e):
+                return True
+        time.sleep(3)
+    return False
+
+
 async def run_bad_key_notify(context: ContextTypes.DEFAULT_TYPE):
     """Tell users (once a day) when Exness says their API key no longer works."""
     if not _XC_BAD_KEYS:
@@ -2634,6 +2650,11 @@ async def run_bad_key_notify(context: ContextTypes.DEFAULT_TYPE):
                 continue
             uid = a.get("user_id")
             if not uid or now - _XC_BAD_KEY_NOTIFIED.get(ref, 0) < 86400:
+                continue
+            # Exness sometimes answers AUTH_INVALID_API_KEY for a key that still works, so re-check
+            # live (3 tries) and only tell the user if every try is rejected.
+            if await asyncio.to_thread(_xc_key_still_works, ref):
+                print(f"[XC] key check passed for {ref}, no notice sent")
                 continue
             _XC_BAD_KEY_NOTIFIED[ref] = now
             try:

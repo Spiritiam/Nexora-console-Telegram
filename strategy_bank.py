@@ -14,10 +14,11 @@ import ema_trend
 
 K = 3
 LEVEL_BARS = 160
-# Highest priority first. "bbrevert" (return to the middle band) tested clearly negative and is not in the bank.
-PRIORITY = ["trend", "pullback", "breakout", "bbtrend", "range"]
+# Every strategy seen in the Exness / Trading Central cards is in the bank. Highest priority first (used to break ties).
+PRIORITY = ["trend", "pullback", "breakout", "bbtrend", "pivotrev", "range", "bbrevert"]
 LABELS = {"trend": "Trend + pivot", "pullback": "Pullback to MA20", "breakout": "Breakout",
-          "bbtrend": "Bollinger trend", "range": "Range bounce"}
+          "bbtrend": "Bollinger trend", "pivotrev": "Pivot reversal", "range": "Range bounce",
+          "bbrevert": "Bollinger rebound"}
 
 
 def sma(v, n):
@@ -164,12 +165,32 @@ def _idea(name, c, P, i, highs, lows):
             d, sl, pivot = -1, m20, m20
         elif px > m20 + 2 * s and r > 65 and m20 > m50:
             d, sl, pivot = 1, m20, m20
+    elif name == "pivotrev":
+        sup = [x for x in lows if 0 < px - x < 0.5 * a]
+        res = [x for x in highs if 0 < x - px < 0.5 * a]
+        if sup and r < 45 and c[i]["close"] > c[i]["open"]:
+            d, pivot = 1, max(sup)
+            sl = pivot - 0.3 * a
+        elif res and r > 55 and c[i]["close"] < c[i]["open"]:
+            d, pivot = -1, min(res)
+            sl = pivot + 0.3 * a
+    elif name == "bbrevert":
+        if px < m20 - 2 * s and r < 30:
+            d, sl, pivot = 1, px - 0.8 * a, px
+        elif px > m20 + 2 * s and r > 70:
+            d, sl, pivot = -1, px + 0.8 * a, px
     if d is None:
         return None
     sdist = abs(px - sl)
     if not (0.4 * a <= sdist <= 2.5 * a):
         return None
-    t1, t2 = _targets(px, d, sdist, highs, lows)
+    if name == "bbrevert":
+        t1 = m20
+        t2 = m50 if (m50 - px) * d > abs(t1 - px) else px + d * 1.8 * sdist
+        if (t1 - px) * d < 0.5 * sdist:
+            return None
+    else:
+        t1, t2 = _targets(px, d, sdist, highs, lows)
     levels = [(x, "resistance") for x in sorted(x for x in highs if x > px)[:3]] + \
              [(x, "support") for x in sorted((x for x in lows if x < px), reverse=True)[:3]]
     return {"name": name, "label": LABELS[name], "direction": "BUY" if d > 0 else "SELL",

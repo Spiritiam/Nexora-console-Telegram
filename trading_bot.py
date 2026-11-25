@@ -6387,12 +6387,10 @@ async def _napp_build_signal_chart(pair_key, direction, entry, sl, tp):
         try:
             _bk = await _bank_decision(pair_key, config)
             _b = (_bk or {}).get("best")
-            if _b and _b["direction"] == direction:
-                _c15 = await asyncio.to_thread(get_cached_candles, pair_key, config, "15min", outputsize=300)
-                if _c15 and len(_c15) >= 120:
-                    ok = await asyncio.to_thread(
-                        generate_bank_chart, config["display"], direction, _c15, entry, sl, tp, _tp1, path,
-                        _b["label"], _b.get("levels"), _b.get("pivot"))
+            if _b and _b["direction"] == direction and len(candles) >= 110:
+                ok = await asyncio.to_thread(
+                    generate_bank_chart, config["display"], direction, candles, entry, sl, tp, _tp1, path,
+                    _b["label"], None, None)
         except Exception as _e:
             print(f"[NEXORA APP] bank chart failed: {type(_e).__name__}")
             ok = False
@@ -13714,11 +13712,10 @@ async def _build_synthetic_signal_response_inner(index_key, min_agree=2, manual=
         chart_ok = False
         if _dbk:
             try:
-                _c15 = await get_cached_synthetic_candles(index_key, config["symbol"], "15m", 900, 300)
-                if _c15 and len(_c15) >= 120:
+                if chart_candles and len(chart_candles) >= 110 and chart_strategy_name == "Momentum":
                     chart_ok = await asyncio.to_thread(
-                        generate_bank_chart, config["display"], direction, _c15, entry_price, sl_price, tp_price,
-                        None, chart_path, _dbk["label"], _dbk.get("levels"), _dbk.get("pivot"))
+                        generate_bank_chart, config["display"], direction, chart_candles, entry_price, sl_price, tp_price,
+                        None, chart_path, _dbk["label"], None, None)
             except Exception as _e:
                 print(f"[CHART] {config['display']}: bank chart failed: {type(_e).__name__}")
         if not chart_ok:
@@ -24726,14 +24723,11 @@ async def build_signal_response(question, user_id=None, retry_mismatch=False, _s
     # DIRECTION: the EMA trend wins (also over an earlier signal on this pair). With no trend the
     # ML model's direction stands. No simulation.
     _tdir = _ema_trend_dir(_ema) if EMA5_LIVE else None
-    _bank_use = _bank_valid(_bank_best, live_price) if _bank_best else None
+    _bank_use = _bank_best
     if _bank_use:
-        # Strategy bank wins: its direction, stop and targets (support/resistance levels) replace the fixed distances.
+        # Strategy bank decides the DIRECTION only; stop loss and take profits stay our normal fixed distances.
         direction = _bank_use["direction"]
         agreeing_strategies = []
-        sl_multiplier = abs(live_price - _bank_use["sl"]) / pip_size
-        tp1_multiplier = abs(_bank_use["tp1"] - live_price) / pip_size
-        tp_multiplier = abs(_bank_use["tp2"] - live_price) / pip_size
         reason = f"Backed by: {_bank_use['label']} \u2192 {direction}."
         _tdir = None
     elif _tdir:
@@ -24834,11 +24828,10 @@ async def build_signal_response(question, user_id=None, retry_mismatch=False, _s
         chart_ok = False
         if _bank_use:
             try:
-                _c15 = await asyncio.to_thread(get_cached_candles, matched_key, config, "15min", outputsize=300)
-                if _c15 and len(_c15) >= 120:
+                if _chart_candles and len(_chart_candles) >= 110 and _chart_name == "Momentum":
                     chart_ok = await asyncio.to_thread(
-                        generate_bank_chart, display, direction, _c15, entry_price, stop_loss, take_profit,
-                        take_profit_1, chart_path, _bank_use["label"], _bank_use.get("levels"), _bank_use.get("pivot"))
+                        generate_bank_chart, display, direction, _chart_candles, entry_price, stop_loss, take_profit,
+                        take_profit_1, chart_path, _bank_use["label"], None, None)
             except Exception as _e:
                 print(f"[CHART] {display}: bank chart failed: {type(_e).__name__}: {str(_e)[:100]}")
         if not chart_ok:

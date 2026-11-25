@@ -35942,7 +35942,7 @@ async def _send_signal_result_picture(sig, candles, upto_t, label, box_from=None
         tp1 = float(sig["tp1"]) if sig.get("tp1") is not None else None
         ok = await asyncio.to_thread(
             generate_signal_chart, PAIR_CONFIG[pair_key]["display"], "Momentum", sig.get("direction"), keep,
-            entry, sl, tp, path, max(45, len(keep)), False, tp1, False, f"{label} HIT", zone_from=box_from,
+            entry, sl, tp, path, max(45, len(keep)), False, tp1, False, f"{label} HIT", zone_from=(box_from or posted),
         )
         if not ok or not os.path.exists(path):
             return False
@@ -36003,7 +36003,7 @@ async def _check_signal_by_candles(sig):
     final = res["final"]
     if final == "TP2":
         if scheduled:
-            await _send_signal_result_picture(sig, candles, res["final_t"] + timedelta(minutes=5), "TP2", box_from=res.get("tp1_t"))
+            await _send_signal_result_picture(sig, candles, res["final_t"] + timedelta(minutes=5), "TP2")
         await asyncio.to_thread(_patch_signal_sync, sid, {"tp_detail": "TP2", "be_done": True})
         update_signal_status(sid, "TP_HIT", sig.get("source"))
     elif final == "TP1":

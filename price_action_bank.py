@@ -908,18 +908,17 @@ def trigger_5m(c5, direction):
     return x["close"] < x["open"] and x["close"] < y["close"]
 
 
-def evaluate_pa(c1h, c15, c5, daily=None, now=None):
+def scan_pa(c1h, c15, c5, daily=None, now=None, sig_s=900, bias_s=3600, c5_s=300, min_sig=120, min_bias=40):
+    """Runs every strategy once. sig = the chart the strategies run on (15m live), bias = the higher chart that gives the
+    direction (1h live). Returns (X, ideas, n_sig, why); X is None when there are not enough candles."""
     now = now or time.time()
-    n15 = ema_trend.closed_only(_norm(c15), 900, now)
-    n1h = ema_trend.closed_only(_norm(c1h), 3600, now)
-    n5 = ema_trend.closed_only(_norm(c5), 300, now)
+    n15 = ema_trend.closed_only(_norm(c15), sig_s, now)
+    n1h = ema_trend.closed_only(_norm(c1h), bias_s, now)
+    n5 = ema_trend.closed_only(_norm(c5), c5_s, now)
     nd = _norm(daily)
-    res = {"best": None, "ideas": [], "agree": 0, "bias": "range", "why": ""}
-    if len(n15) < 120 or len(n1h) < 40 or any(x["t"] is None for x in n15[-3:]):
-        res["why"] = f"not enough candles (15m {len(n15)}, 1h {len(n1h)})"
-        return res
+    if len(n15) < min_sig or len(n1h) < min_bias or any(x["t"] is None for x in n15[-3:]):
+        return None, [], n15, f"not enough candles (signal chart {len(n15)}, bias chart {len(n1h)})"
     X = build_ctx(n15, n1h, n5, nd, now)
-    res["bias"] = X.bias
     ideas = []
     for name, label, fam, fn in STRATEGIES:
         try:
@@ -928,7 +927,14 @@ def evaluate_pa(c1h, c15, c5, daily=None, now=None):
             d = None
         if d in ("BUY", "SELL"):
             ideas.append({"name": name, "label": label, "family": fam, "direction": d})
-    res["ideas"] = ideas
+    return X, ideas, n15, ""
+
+
+def pick_pa(X, ideas, n15, min_agree=None, look=32, why_tf="1h"):
+    """Chooses the signal from the strategies that fired. Same rules as always: majority side, min_agree from 2+ families,
+    one more against the higher-chart direction, ORB + VWAP count once, counter-trend skipped after a big run."""
+    min_agree = MIN_AGREE if min_agree is None else min_agree
+    res = {"best": None, "ideas": ideas, "agree": 0, "bias": X.bias, "why": ""}
     if not ideas:
         res["why"] = "no strategy fired"
         return res
@@ -943,22 +949,18 @@ def evaluate_pa(c1h, c15, c5, daily=None, now=None):
     names = {i["name"] for i in group}
     if "orb" in names and "vwap" in names:
         group = [i for i in group if i["name"] != "vwap"]
-        if len(buys) > len(sells):
-            buys = group
-        else:
-            sells = group
-    need = MIN_AGREE + (1 if (X.bias == "up" and d == "SELL") or (X.bias == "down" and d == "BUY") else 0)
+    need = min_agree + (1 if (X.bias == "up" and d == "SELL") or (X.bias == "down" and d == "BUY") else 0)
     fams = {i["family"] for i in group}
     res["agree"] = len(group)
-    if need > MIN_AGREE and X.a > 0:
-        look = n15[-32:]
-        run = (X.px - min(x["low"] for x in look)) if d == "BUY" else (max(x["high"] for x in look) - X.px)
+    if need > min_agree and X.a > 0:
+        lk = n15[-look:]
+        run = (X.px - min(x["low"] for x in lk)) if d == "BUY" else (max(x["high"] for x in lk) - X.px)
         if run > OVEREXT_ATR * X.a:
-            res["why"] = (f"counter-trend {d} skipped: price already ran {run / X.a:.1f} ranges from the 8-hour "
-                          f"{'low' if d == 'BUY' else 'high'} (1h bias {X.bias})")
+            res["why"] = (f"counter-trend {d} skipped: price already ran {run / X.a:.1f} ranges from the recent "
+                          f"{'low' if d == 'BUY' else 'high'} ({why_tf} bias {X.bias})")
             return res
     if len(group) < need or len(fams) < 2:
-        res["why"] = f"{len(group)} {d} ({', '.join(sorted(fams))}), need {need} from 2+ families (1h bias {X.bias})"
+        res["why"] = f"{len(group)} {d} ({', '.join(sorted(fams))}), need {need} from 2+ families ({why_tf} bias {X.bias})"
         return res
     order = {f: k for k, f in enumerate(["structure", "levels", "reversal", "retrace", "range", "momentum"])}
     group.sort(key=lambda i: (order[i["family"]], i["name"]))
@@ -966,3 +968,10 @@ def evaluate_pa(c1h, c15, c5, daily=None, now=None):
     res["best"] = {"name": group[0]["name"], "family": group[0]["family"], "direction": d,
                    "label": " + ".join(labels), "agree_labels": [i["label"] for i in group]}
     return res
+
+
+def evaluate_pa(c1h, c15, c5, daily=None, now=None):
+    X, ideas, n15, why = scan_pa(c1h, c15, c5, daily, now)
+    if X is None:
+        return {"best": None, "ideas": [], "agree": 0, "bias": "range", "why": why}
+    return pick_pa(X, ideas, n15)

@@ -37287,6 +37287,15 @@ def main():
         except Exception as _e:
             print(f"[TRAIL] could not start: {type(_e).__name__}: {_e}")
 
+    # Read-only study: strategy bank on the 1-minute chart for the Aggressive Scalper (no trades), only while BANK_SCALPER_STUDY=1 is set.
+    if os.getenv("BANK_SCALPER_STUDY") == "1":
+        try:
+            import subprocess as _sp
+            _sp.Popen([sys.executable, os.path.join(os.path.dirname(os.path.abspath(__file__)), "bank_scalper_study.py")])
+            print("[BSS] process started")
+        except Exception as _e:
+            print(f"[BSS] could not start: {type(_e).__name__}: {_e}")
+
     # Read-only session study for BTC (no trades), only while SESSION_STUDY=1 is set.
     if os.getenv("SESSION_STUDY") == "1":
         try:

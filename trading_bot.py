@@ -23428,13 +23428,23 @@ def _chart_fmt_price(value, all_values):
     return f"{value:.5f}" if ref < 10 else f"{value:.2f}"
 
 
-def _chart_finish(fig, ax, x, times, candles, entry, sl, tp, title, save_path, sub_ax=None, tp1=None, extra_y=None):
+def _chart_finish(fig, ax, x, times, candles, entry, sl, tp, title, save_path, sub_ax=None, tp1=None, extra_y=None, zone_from=None):
     C = _CH
     n = len(x)
     span = (x[-1] - x[0]) if n > 1 else 1
     zone_w = max(span * 0.34, 4)
     zx0 = x[-1] + 0.5
     zx1 = zx0 + zone_w
+    if zone_from is not None:
+        # Result pictures (TP1 / TP2 hit): the box starts at the signal candle and the candles run through it
+        # up to the hit candle, instead of sitting in empty space to the right of the last candle.
+        try:
+            _i0 = next((i for i, c in enumerate(candles) if (_candle_dt(c) is not None and _candle_dt(c) >= zone_from)), None)
+        except Exception:
+            _i0 = None
+        if _i0 is not None and _i0 < n - 1:
+            zx0 = x[_i0]
+            zx1 = x[-1] + max(span * 0.03, 1.5)
 
     all_lows = [c["low"] for c in candles]
     all_highs = [c["high"] for c in candles]
@@ -23632,7 +23642,7 @@ def _generate_daily_line_chart_unlocked(display_name, direction, daily_history, 
         return False
 
 
-def _generate_signal_chart_unlocked(display_name, strategy_name, direction, candles, entry, sl, tp, save_path, display_window=45, anchor_live=True, tp1=None, show_emas=True, title_note=None):
+def _generate_signal_chart_unlocked(display_name, strategy_name, direction, candles, entry, sl, tp, save_path, display_window=45, anchor_live=True, tp1=None, show_emas=True, title_note=None, zone_from=None):
     """
     Generates one chart PNG for a signal. candles = the SAME candle
     list the winning strategy actually used (h1_candles for most
@@ -23978,7 +23988,7 @@ def _generate_signal_chart_unlocked(display_name, strategy_name, direction, cand
                 ax.plot(x, _v, color=_col, linewidth=1.2, alpha=0.95, label=f"EMA {_n}", zorder=4)
                 _ema_y += [t for t in _v[-12:] if t is not None]
 
-        _chart_finish(fig, ax, x, times, candles, entry, sl, tp, title_suffix, save_path, sub_ax=sub_ax, tp1=tp1, extra_y=_ema_y)
+        _chart_finish(fig, ax, x, times, candles, entry, sl, tp, title_suffix, save_path, sub_ax=sub_ax, tp1=tp1, extra_y=_ema_y, zone_from=zone_from)
         return True
     except Exception as e:
         print(f"[CHART] Failed to generate chart for {display_name}/{strategy_name}: {e}")
@@ -35932,7 +35942,7 @@ async def _send_signal_result_picture(sig, candles, upto_t, label):
         tp1 = float(sig["tp1"]) if sig.get("tp1") is not None else None
         ok = await asyncio.to_thread(
             generate_signal_chart, PAIR_CONFIG[pair_key]["display"], "Momentum", sig.get("direction"), keep,
-            entry, sl, tp, path, 45, False, tp1, False, f"{label} HIT",
+            entry, sl, tp, path, max(45, len(keep)), False, tp1, False, f"{label} HIT", zone_from=posted,
         )
         if not ok or not os.path.exists(path):
             return False

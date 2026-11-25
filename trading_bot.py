@@ -36863,6 +36863,15 @@ def main():
         except Exception as _e:
             print(f"[BURSTALL] could not start: {type(_e).__name__}: {_e}")
 
+    # Read-only strategy-bank study on 15/30-minute candles (no trades), only while BANK_STUDY=1 is set.
+    if os.getenv("BANK_STUDY") == "1":
+        try:
+            import subprocess as _sp
+            _sp.Popen([sys.executable, os.path.join(os.path.dirname(os.path.abspath(__file__)), "bank_study.py")])
+            print("[BANK] process started")
+        except Exception as _e:
+            print(f"[BANK] could not start: {type(_e).__name__}: {_e}")
+
     # Read-only pivot / support-resistance study on 15-minute candles (no trades), only while PIVOT_STUDY=1 is set.
     if os.getenv("PIVOT_STUDY") == "1":
         try:

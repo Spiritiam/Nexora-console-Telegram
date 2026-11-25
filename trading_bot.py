@@ -3623,6 +3623,7 @@ async def _bank_decision(pair_key, pair_config):
         if hit and hit[0] == slot:
             return hit[1]
         res = None
+        candles = None
         try:
             candles = await asyncio.to_thread(get_cached_candles, pair_key, pair_config, "15min", outputsize=300, max_age=(time.time() % 900) + 3)
             if candles:
@@ -3633,6 +3634,8 @@ async def _bank_decision(pair_key, pair_config):
         if res and res.get("best"):
             b = res["best"]
             print(f"[BANK] {pair_key}: {b['direction']} via {b['label']} ({res['agree']} agree of {len(res['ideas'])})", flush=True)
+        else:
+            print(f"[BANK] {pair_key}: no strategy fired ({len(candles or [])} candles)" if res is not None else f"[BANK] {pair_key}: no result", flush=True)
         return res
 
 

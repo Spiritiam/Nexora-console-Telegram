@@ -182,7 +182,8 @@ def _idea(name, c, P, i, highs, lows):
     if d is None:
         return None
     sdist = abs(px - sl)
-    if not (0.4 * a <= sdist <= 2.5 * a):
+    # The Exness cards put the stop on the real pivot even when it is far away (gold: 70 points), so the cap is wide.
+    if not (0.4 * a <= sdist <= 12 * a):
         return None
     if name == "bbrevert":
         t1 = m20

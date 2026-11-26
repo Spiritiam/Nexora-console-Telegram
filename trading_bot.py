@@ -3560,7 +3560,7 @@ async def _pick_decision(kind, pair_key, pair_config, strat):
 FX_SCAN_KEYS = ["xauusd", "xagusd", "usoil", "btcusd", "gbpjpy", "eurjpy", "usdjpy", "gbpusd",
                 "eurusd", "audusd", "usdcad", "usdchf", "nzdusd"]
 # Scheduled signals: when a core pair (gold, oil, BTC) is busy, the replacement comes from these.
-SCHED_SWAP_KEYS = ["xauusd", "usoil", "btcusd", "gbpjpy", "gbpusd", "usdchf"]
+SCHED_SWAP_KEYS = ["xauusd", "xagusd", "usoil", "btcusd", "gbpjpy", "eurjpy", "gbpusd", "usdchf"]
 DERIV_SCAN_KEYS = []  # filled from SYNTHETIC_CONFIG at use time
 
 
@@ -3681,7 +3681,7 @@ async def _bank_decision(pair_key, pair_config):
 
 # Nov 26: wait until the pullback has stopped before a bank signal on these markets (60-day test: fewer stop-outs). BANK_PULLBACK=0 switches it off.
 BANK_PULLBACK = os.getenv("BANK_PULLBACK", "1") == "1"
-BANK_PULLBACK_PAIRS = ("xauusd", "usoil", "btcusd")
+BANK_PULLBACK_PAIRS = tuple(k for k in FX_SCAN_KEYS if k != "xagusd")   # silver showed no gain in the test
 BANK_DERIV = os.getenv("BANK_DERIV", "0") == "1"   # Deriv scheduled/manual signals stay on the 3 EMA (then ML) unless set to 1
 
 
@@ -3808,7 +3808,7 @@ def _ema_trend_dir(e):
     return d
 
 
-async def _ema5_pick_pairs(origin_key, scheduled=True, origin_busy=False):
+async def _ema5_pick_pairs(origin_key, scheduled=True, origin_busy=False, bank_only=False):
     """Trending FREE pairs in the SAME market group as origin_key, best first (never crosses groups).
     A pair with a bounce right now ranks above one that is only trending. If none trends but the origin
     is busy, falls back to the free pairs (the ML fallback then decides their side). [] if nothing is free."""
@@ -3827,11 +3827,15 @@ async def _ema5_pick_pairs(origin_key, scheduled=True, origin_busy=False):
         free.append(k)
         _bank_hit = (not isinstance(bk, Exception)) and bool(bk and bk.get("best"))
         _ema_hit = (not isinstance(e, Exception)) and bool(_ema_trend_dir(e))
+        if bank_only and not _bank_hit:
+            continue
         if not _bank_hit and not _ema_hit:
             continue
         ranked.append(((4 + bk["agree"]) if _bank_hit else (2 if e.get("trigger") else 1), k))
     ranked.sort(key=lambda t: -t[0])
     out = [k for _, k in ranked]
+    if bank_only:
+        return out
     return out or (free if origin_busy else [])
 
 
@@ -24561,7 +24565,7 @@ def _recent_signal_direction(pair_name):
     return None
 
 
-async def build_signal_response(question, user_id=None, retry_mismatch=False, _swapped_from=None):
+async def build_signal_response(question, user_id=None, retry_mismatch=False, _swapped_from=None, _swap_bank=False):
     matched_key = match_pair_key(question)
 
     if matched_key is None:
@@ -24603,6 +24607,15 @@ async def build_signal_response(question, user_id=None, retry_mismatch=False, _s
             _busy = await _pair_busy(matched_key, _sched)
             if _busy:
                 print(f"[SIGNAL] {pair_name}: previous signal still open - no double entry", flush=True)
+            if not _bank_best and not _busy and not _swapped_from:
+                # The bank has nothing for this pair right now (strategies not lined up / pullback not over): first look for
+                # another fast pair where the bank does line up. Only when none does, the 3 EMA and then the ML model decide.
+                for _alt in (await _ema5_pick_pairs(matched_key, _sched, False, bank_only=True))[:4]:
+                    print(f"[SIGNAL] {pair_name}: bank has no entry -> trying {_alt.upper()} where it lines up", flush=True)
+                    _res = await build_signal_response(_alt, user_id=user_id, retry_mismatch=retry_mismatch,
+                                                       _swapped_from=pair_name, _swap_bank=True)
+                    if _res and _res[3] is not None:
+                        return _res
             if ((not _ema_trend_dir(_ema) and not _bank_best) or _busy) and not _swapped_from:
                 for _alt in (await _ema5_pick_pairs(matched_key, _sched, _busy))[:4]:
                     print(f"[SIGNAL] {pair_name} is {'busy' if _busy else 'ranging'} -> trying {_alt.upper()}", flush=True)
@@ -25014,7 +25027,12 @@ async def build_signal_response(question, user_id=None, retry_mismatch=False, _s
             reason = _backed_by(reason, direction)
     if _swapped_from and user_id is not None:
         # Only a manual (DM) request is told about the swap; scheduled signals just replace the pair silently.
-        reason = f"{_swapped_from} is ranging right now, so it's not a good time to trade it. Suggested instead: {pair_name}."
+        if _swap_bank:
+            reason = (f"I can't give you {_swapped_from} right now: the strategies haven't lined up on it yet "
+                      f"(the charts don't agree or the pullback isn't over), so it's not a good time to enter. "
+                      f"Here is {pair_name} instead, where they do line up.")
+        else:
+            reason = f"{_swapped_from} is ranging right now, so it's not a good time to trade it. Suggested instead: {pair_name}."
         _origin_key = _pair_key_from_name(_swapped_from)
         if user_id is not None and _origin_key:
             await asyncio.to_thread(_trend_alert_register, user_id, _origin_key)

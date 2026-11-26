@@ -978,7 +978,7 @@ def pullback_over(n15, direction):
     return q["low"] >= p["low"] if direction == "BUY" else q["high"] <= p["high"]
 
 
-def evaluate_pa(c1h, c15, c5, daily=None, now=None, pullback=False):
+def evaluate_pa(c1h, c15, c5, daily=None, now=None, pullback=False, spike=False):
     X, ideas, n15, why = scan_pa(c1h, c15, c5, daily, now)
     if X is None:
         return {"best": None, "ideas": [], "agree": 0, "bias": "range", "why": why}
@@ -986,6 +986,15 @@ def evaluate_pa(c1h, c15, c5, daily=None, now=None, pullback=False):
     if pullback and res.get("best") and not pullback_over(n15, res["best"]["direction"]):
         res["why"] = f"{res['best']['direction']} held back: the pullback has not stopped yet (last candle still making a new {'low' if res['best']['direction'] == 'BUY' else 'high'})"
         res["best"] = None
+    if spike and res.get("best") and X.a:
+        # Nov 26 "strong C": skip when price has already run more than 1.5 ranges away from the recent extreme (late entry)
+        d = res["best"]["direction"]
+        last = n15[-8:]
+        q = last[-1]
+        run = (max(z["high"] for z in last) - q["close"]) if d == "BUY" else (q["close"] - min(z["low"] for z in last))
+        if run > 1.5 * X.a:
+            res["why"] = f"{d} held back: price has already moved too far from its recent {'low' if d == 'BUY' else 'high'}, a late entry"
+            res["best"] = None
     return res
 
 

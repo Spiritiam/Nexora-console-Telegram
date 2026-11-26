@@ -3681,6 +3681,7 @@ async def _bank_decision(pair_key, pair_config):
 
 # Nov 26: wait until the pullback has stopped before a bank signal on these markets (60-day test: fewer stop-outs). BANK_PULLBACK=0 switches it off.
 BANK_PULLBACK = os.getenv("BANK_PULLBACK", "1") == "1"
+BANK_SPIKE_PAIRS = tuple(x for x in os.getenv("BANK_SPIKE_PAIRS", "xauusd").split(",") if x)   # "strong C" extra check, gold only (60-day test)
 BANK_PULLBACK_PAIRS = tuple(k for k in FX_SCAN_KEYS if k != "xagusd")   # silver showed no gain in the test
 BANK_DERIV = os.getenv("BANK_DERIV", "0") == "1"   # Deriv scheduled/manual signals stay on the 3 EMA (then ML) unless set to 1
 
@@ -3721,7 +3722,7 @@ async def _bank_raw(pair_key, pair_config):
                 c1h, c15, c5, d1 = [None if isinstance(x, Exception) else x for x in (c1h, c15, c5, d1)]
                 candles = c15
                 if c15 and c1h:
-                    res = await asyncio.to_thread(price_action_bank.evaluate_pa, c1h, c15, c5 or [], d1 or [], None, BANK_PULLBACK and pair_key in BANK_PULLBACK_PAIRS)
+                    res = await asyncio.to_thread(price_action_bank.evaluate_pa, c1h, c15, c5 or [], d1 or [], None, BANK_PULLBACK and pair_key in BANK_PULLBACK_PAIRS, pair_key in BANK_SPIKE_PAIRS)
             else:
                 candles = await asyncio.to_thread(get_cached_candles, pair_key, pair_config, "15min", outputsize=300, max_age=(time.time() % 900) + 3)
                 if candles:

@@ -975,3 +975,14 @@ def evaluate_pa(c1h, c15, c5, daily=None, now=None):
     if X is None:
         return {"best": None, "ideas": [], "agree": 0, "bias": "range", "why": why}
     return pick_pa(X, ideas, n15)
+
+
+def evaluate_single(name, c_bias, c_sig, daily=None, now=None, sig_s=900, bias_s=3600):
+    """One strategy of the bank on its own. Returns {"direction": "BUY"/"SELL"/None, "why": str, "bias": str}."""
+    X, ideas, n_sig, why = scan_pa(c_bias, c_sig, c_sig, daily, now, sig_s=sig_s, bias_s=bias_s, c5_s=sig_s)
+    if X is None:
+        return {"direction": None, "why": why, "bias": "range"}
+    for i in ideas:
+        if i["name"] == name:
+            return {"direction": i["direction"], "why": f"{i['label']} fired", "bias": X.bias}
+    return {"direction": None, "why": f"{name} not firing", "bias": X.bias}

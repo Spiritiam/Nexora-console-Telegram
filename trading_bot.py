@@ -3492,6 +3492,60 @@ async def _burst_decision(pair_key, pair_config, scalper=False):
         return res
 
 
+# Single-strategy entries picked from the 60-day win % ranking of the price-action bank (Nov 26). PICK_LIVE=0 restores the old entries.
+#   Aggressive Scalper: M1 chart (5-minute chart for direction), the best strategy per market.
+#   Account Flip: 15-minute chart (1-hour chart for direction), the best strategy per market.
+PICK_LIVE = os.getenv("PICK_LIVE", "1") == "1"
+SCALPER_PICK = {"xauusd": "choch", "usoil": "pd_break", "btcusd": "fib"}
+FLIP_PICK = {"xauusd": "doji", "xagusd": "triangle"}
+_PICK_DEC = {}
+_PICK_LOCKS = {}
+
+
+def _pick_strategy(account, cfg, pair_key):
+    """(kind, strategy name) when this account's bot and pair use a picked strategy, else None."""
+    if not PICK_LIVE:
+        return None
+    if account["bot_choice"] == "aggressive_scalper" and pair_key in SCALPER_PICK:
+        return ("scalper", SCALPER_PICK[pair_key])
+    if cfg.get("entry") == "mlsim" and pair_key in FLIP_PICK:
+        return ("flip", FLIP_PICK[pair_key])
+    return None
+
+
+async def _pick_decision(kind, pair_key, pair_config, strat):
+    """One look per closed bar (1 minute for the scalper, 15 minutes for Account Flip), shared by every account."""
+    import price_action_bank
+    step = 60 if kind == "scalper" else 900
+    slot = int(time.time() // step)
+    key = (kind, pair_key)
+    hit = _PICK_DEC.get(key)
+    if hit and hit[0] == slot:
+        return hit[1]
+    lock = _PICK_LOCKS.setdefault(key, asyncio.Lock())
+    async with lock:
+        hit = _PICK_DEC.get(key)
+        if hit and hit[0] == slot:
+            return hit[1]
+        res = None
+        try:
+            tf_sig, tf_bias, sig_s, bias_s = ("1min", "5min", 60, 300) if kind == "scalper" else ("15min", "1h", 900, 3600)
+            c_sig, c_bias, daily = await asyncio.gather(
+                asyncio.to_thread(get_cached_candles, pair_key, pair_config, tf_sig, outputsize=300, max_age=(time.time() % sig_s) + 2),
+                asyncio.to_thread(get_cached_candles, pair_key, pair_config, tf_bias, outputsize=300, max_age=(time.time() % bias_s) + 3),
+                asyncio.to_thread(get_cached_candles, pair_key, pair_config, "1day", outputsize=45))
+            if c_sig and c_bias:
+                r = await asyncio.to_thread(price_action_bank.evaluate_single, strat, c_bias, c_sig, daily, None, sig_s, bias_s)
+                res = {"direction": r["direction"], "bar_t": slot, "why": r["why"], "bias": r["bias"]}
+                if r["direction"] or time.time() - _BURST_LOGGED.get("pick|" + kind + pair_key, 0) > 900:
+                    _BURST_LOGGED["pick|" + kind + pair_key] = time.time()
+                    print(f"[PICK] {kind} {pair_key}: {strat} -> {r['direction'] or '-'} ({r['why']}, {'5m' if kind == 'scalper' else '1h'} bias {r['bias']})", flush=True)
+        except Exception as e:
+            print(f"[PICK] {kind} {pair_key} failed: {type(e).__name__}: {str(e)[:100]}", flush=True)
+        _PICK_DEC[key] = (slot, res)
+        return res
+
+
 # Pairs the scheduled/manual signal scan may swap in (one market group: metals, oil, BTC, forex).
 FX_SCAN_KEYS = ["xauusd", "xagusd", "usoil", "btcusd", "gbpjpy", "eurjpy", "usdjpy", "gbpusd",
                 "eurusd", "audusd", "usdcad", "usdchf", "nzdusd"]
@@ -4293,7 +4347,17 @@ async def _sc_tick_one(context, account):
 
         sig = None
         ml_used = False
-        if BURST_ENTRY_LIVE and pair_key in BURST_RULES and (cfg.get("entry") == "mlsim" or account["bot_choice"] == "aggressive_scalper"):
+        _pk = _pick_strategy(account, cfg, pair_key)
+        if _pk:
+            # Picked strategy (best win % in the 60-day ranking); stops, trailing and layers below are unchanged
+            st["phase"] = "armed"
+            _p = await _pick_decision(_pk[0], pair_key, pair_config, _pk[1])
+            if not _p or not _p.get("direction") or st.get("pick_bar") == _p["bar_t"]:
+                return
+            direction = _p["direction"]
+            st["pick_bar"] = _p["bar_t"]
+            ml_used = True
+        elif BURST_ENTRY_LIVE and pair_key in BURST_RULES and (cfg.get("entry") == "mlsim" or account["bot_choice"] == "aggressive_scalper"):
             # 1-minute burst entry (gold with trend filter, BTC faded); stops, trailing and layers below are unchanged
             st["phase"] = "armed"
             _b = await _burst_decision(pair_key, pair_config, scalper=(account["bot_choice"] == "aggressive_scalper"))

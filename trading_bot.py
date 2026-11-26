@@ -36193,14 +36193,32 @@ async def _send_signal_result_picture(sig, candles, upto_t, label, box_from=None
             for _cid, _mid in await asyncio.to_thread(get_signal_channel_messages, sig["id"]):
                 try:
                     with open(path, "rb") as fh2:
-                        await _app_instance.bot.send_photo(
+                        _sent = await _app_instance.bot.send_photo(
                             chat_id=_cid, photo=fh2, caption=f"<b>{label} HIT</b> \u2705",
                             parse_mode=ParseMode.HTML, reply_to_message_id=_mid, allow_sending_without_reply=True)
                     print(f"[RESULT PIC] {sig['id']} {label} posted to {_cid}")
+                    if label == "TP1":
+                        # remember it (stored under the negative signal id) so the TP2 picture can replace it
+                        await asyncio.to_thread(log_channel_message, -int(sig["id"]), _cid, _sent.message_id)
                 except Exception as _e:
                     print(f"[RESULT PIC] {sig['id']} {label} channel {_cid} failed: {type(_e).__name__}: {str(_e)[:100]}")
         except Exception as _e:
             print(f"[RESULT PIC] channel posting failed: {type(_e).__name__}")
+        if label == "TP2":
+            # TP2 is posted: delete the earlier TP1 picture(s) of this signal so the channels are not spammed
+            try:
+                _old = await asyncio.to_thread(get_signal_channel_messages, -int(sig["id"]))
+                for _cid, _mid in _old:
+                    try:
+                        await _app_instance.bot.delete_message(chat_id=_cid, message_id=_mid)
+                        print(f"[RESULT PIC] {sig['id']} TP1 picture deleted in {_cid}")
+                    except Exception as _e:
+                        print(f"[RESULT PIC] {sig['id']} TP1 delete {_cid} failed: {type(_e).__name__}: {str(_e)[:80]}")
+                if _old:
+                    await asyncio.to_thread(lambda: requests.delete(
+                        f"{SUPABASE_URL}/rest/v1/channel_messages?signal_id=eq.{-int(sig['id'])}", headers=sb_headers(), timeout=10))
+            except Exception as _e:
+                print(f"[RESULT PIC] TP1 cleanup failed: {type(_e).__name__}")
         try:
             os.remove(path)
         except Exception:

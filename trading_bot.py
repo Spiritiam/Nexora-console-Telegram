@@ -5997,13 +5997,14 @@ async def _napp_deriv_auth(request, limit_per_min=20, allow_killed=False):
     if not user_key:
         return None, _napp_json({"error": "auth", "message": "Please log in again."}, 401)
     now = time.time()
-    hits = [t for t in _napp_deriv_hits.get(user_key, []) if now - t < 60]
-    if len(hits) >= limit_per_min:
-        return None, _napp_json({"error": "slow_down", "message": "Too many requests. Wait a minute."}, 429)
-    hits.append(now)
-    if len(_napp_deriv_hits) > 5000:
-        _napp_deriv_hits.clear()
-    _napp_deriv_hits[user_key] = hits
+    if limit_per_min is not None:   # None = no counting at all (unlinking)
+        hits = [t for t in _napp_deriv_hits.get(user_key, []) if now - t < 60]
+        if len(hits) >= limit_per_min:
+            return None, _napp_json({"error": "slow_down", "message": "Too many requests. Wait a minute."}, 429)
+        hits.append(now)
+        if len(_napp_deriv_hits) > 5000:
+            _napp_deriv_hits.clear()
+        _napp_deriv_hits[user_key] = hits
     synth = await asyncio.to_thread(_napp_synth_id_sync, user_key)
     if not synth:
         return None, _napp_json({"error": "server", "message": "Could not set up your account. Try again."}, 500)
@@ -7468,7 +7469,7 @@ def _napp_ex_limit_retry_at(kind, synth):
 
 @_napp_ex_guard
 async def nexora_app_exness_disconnect_handler(request):
-    synth, err = await _napp_ex_auth(request, 10)
+    synth, err = await _napp_ex_auth(request, None)   # unlinking is never counted or limited
     if err:
         return err
     auth = request.headers.get("Authorization", "")

@@ -6530,7 +6530,7 @@ async def backfill_signal_chart_ids(context=None):
     try:
         rows = await asyncio.to_thread(lambda: requests.get(
             f"{SUPABASE_URL}/rest/v1/signal_log",
-            params={"select": "id", "source": "eq.scheduled", "chart_file_id": "is.null", "order": "id.desc", "limit": "600"},
+            params={"select": "id", "source": "eq.scheduled", "or": "(chart_file_id.is.null,chart_file_id.like./*)", "order": "id.desc", "limit": "600"},
             headers=sb_headers(), timeout=20).json())
         for r in rows if isinstance(rows, list) else []:
             sid = r["id"]
@@ -6569,6 +6569,15 @@ async def _napp_build_signal_chart(pair_key, direction, entry, sl, tp):
     # signal candle, and the candles running on to the hit candle (or to now while it is still open).
     row = await asyncio.to_thread(_napp_lookup_signal, pair_key, entry, sl, tp)
     _fid = (row or {}).get("chart_file_id")
+    if _fid and str(_fid).startswith("/"):
+        # Older rows stored the local file path: use the file while it still exists
+        try:
+            if os.path.exists(_fid):
+                with open(_fid, "rb") as _fh:
+                    return _napp_fit_png(_fh.read())
+        except Exception:
+            pass
+        _fid = None
     if _fid and _fid != "-" and _app_instance:
         # The same picture that was posted on Telegram.
         try:
@@ -33271,9 +33280,7 @@ async def _post_signal_for_pair(bot, pair_keyword):
             return
 
         signal_id = log_signal(signal_data)
-        if signal_id and image_file_id:
-            # The app shows this exact picture (same one the channels get).
-            await asyncio.to_thread(_patch_signal_sync, signal_id, {"chart_file_id": str(image_file_id)})
+        _tg_fid_saved = False
 
         ic_signal_message_id = None
         for channel_id in [CHANNEL_1_ID, CHANNEL_2_ID, CHANNEL_3_ID]:
@@ -33294,6 +33301,10 @@ async def _post_signal_for_pair(bot, pair_keyword):
                 if str(channel_id) == str(CHANNEL_2_ID):
                     ic_signal_message_id = sent_msg.message_id
                 log_channel_message(signal_id, sent_msg.chat_id, sent_msg.message_id)
+                if signal_id and sent_msg.photo and not _tg_fid_saved:
+                    # Save Telegram's own id of the posted picture (not the local file path) so the app shows the very same picture
+                    _tg_fid_saved = True
+                    await asyncio.to_thread(_patch_signal_sync, signal_id, {"chart_file_id": sent_msg.photo[-1].file_id})
                 print(
                     f"[AUTO SIGNAL] ✅ {pair_keyword.upper()} "
                     f"posted to {channel_id}"

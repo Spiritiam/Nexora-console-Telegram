@@ -7591,7 +7591,7 @@ async def nexora_app_exness_disconnect_handler(request):
 
 @_napp_ex_guard
 async def nexora_app_exness_verify_handler(request):
-    synth, err = await _napp_ex_auth(request, 20)
+    synth, err = await _napp_ex_auth(request, None)   # email check is never counted or limited
     if err:
         return err
     if _napp_exness_killed():
@@ -7611,10 +7611,6 @@ async def nexora_app_exness_verify_handler(request):
             return _napp_ex_reply("already_verified", extra={"verified": True})
         return _napp_ex_reply("already_linked_other_email", email=_napp_exness_mask_email2(linked_email) or "another email",
                               extra={"verified": True})
-    if _napp_exness_limited("verify", synth, 6):
-        retry = _napp_ex_limit_retry_at("verify", synth)
-        return _napp_ex_reply("too_many_attempts", retry_at=retry,
-                              wait=_napp_ex_wait_words((retry - datetime.utcnow()).total_seconds()))
 
     owner, ook = await asyncio.to_thread(_napp_exness_email_owner_sync, email)
     if not ook:

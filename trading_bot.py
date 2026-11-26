@@ -7318,7 +7318,7 @@ NAPP_EX_CODES = {
                              "Check that the API key was created for this exact account number, with Trading access turned on, and that you copied the secret key in full.",
                              "retry", "bad_request"),
     "exness_api_connected": (True, 200, "Exness account connected",
-                             "Your Exness account is connected and ready. Choose how SpiritFX Academy should trade for you below.",
+                             "Your Exness account is connected and ready. Choose how the bot should trade for you below.",
                              "none", None),
     "invalid_nickname": (False, 400, "Add a nickname",
                          "Give the account a short nickname so you can recognise it.", "retry", "bad_request"),

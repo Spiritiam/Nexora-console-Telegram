@@ -6585,6 +6585,8 @@ async def _napp_build_signal_chart(pair_key, direction, entry, sl, tp):
             return _napp_fit_png(bytes(await _f.download_as_bytearray()))
         except Exception as _e:
             print(f"[NEXORA APP] telegram picture failed: {type(_e).__name__}: {str(_e)[:80]}", flush=True)
+    if os.getenv("APP_OWN_CHART", "0") != "1":
+        return None   # the app only ever shows the picture Telegram posted; it never draws its own chart
     posted = None
     if row:
         try:

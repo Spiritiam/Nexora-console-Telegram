@@ -1674,6 +1674,12 @@ _FAIL_NOTIFIED = {}     # (user_id, kind) -> when the user was last told a trade
 FAIL_NOTICE_COOLDOWN_SECONDS = 6 * 3600
 
 
+def _is_margin_fail(reason):
+    """Not enough free margin / funds on the user's own account: their account, not a fault of ours, so it is not logged."""
+    r = str(reason or "").upper()
+    return "INSUFFICIENT_MARGIN" in r or "NO_MONEY" in r or "NOT ENOUGH MONEY" in r or "MARGIN" in r
+
+
 def _note_trade_fail(account_ref, reason):
     _LAST_TRADE_FAIL[str(account_ref)] = str(reason)[:300]
 
@@ -1761,7 +1767,8 @@ async def place_client_mt5_trade(metaapi_account_id, mt5_symbol, direction, volu
         if pid:
             print(f"[EXNESS] ✅ Trade placed for {metaapi_account_id} - position {pid}")
             return pid
-        print(f"[EXNESS] ❌ Trade failed for {metaapi_account_id}: {detail}")
+        if not _is_margin_fail(detail):
+            print(f"[EXNESS] ❌ Trade failed for {metaapi_account_id}: {detail}")
         _note_trade_fail(metaapi_account_id, detail)
         return None
     if not METAAPI_TOKEN:
@@ -1865,7 +1872,8 @@ async def place_client_mt5_trade(metaapi_account_id, mt5_symbol, direction, volu
                 # visible in every future occurrence, no investigation
                 # required.
                 broker_reason = result.get("message") or result.get("stringCode") or "unknown reason"
-                print(f"[MT5 AUTOTRADE] ⚠️ Trade REJECTED by broker for {metaapi_account_id}: {broker_reason} (full response: {result!r})")
+                if not _is_margin_fail(broker_reason):
+                    print(f"[MT5 AUTOTRADE] ⚠️ Trade REJECTED by broker for {metaapi_account_id}: {broker_reason} (full response: {result!r})")
                 _note_trade_fail(metaapi_account_id, broker_reason)
                 return None
             print(f"[MT5 AUTOTRADE] ✅ Trade placed for {metaapi_account_id} — Order ID: {order_id}")
@@ -4757,7 +4765,8 @@ async def run_mt5_autotrade_follow_channel_scan(context: ContextTypes.DEFAULT_TY
                 # (status code/response body, or exception) - this
                 # just makes clear, at the point a failure actually
                 # happened, which signal/user it was for.
-                print(f"[MT5 AUTOTRADE FOLLOW] ❌ Copy failed for signal {signal_id} ({pair_name} {direction}), user {user_id} - see place_client_mt5_trade's own log line above for the real reason. NOT retried - marked as handled either way.")
+                if not _is_margin_fail(_LAST_TRADE_FAIL.get(str(metaapi_account_id))):
+                    print(f"[MT5 AUTOTRADE FOLLOW] ❌ Copy failed for signal {signal_id} ({pair_name} {direction}), user {user_id} - see place_client_mt5_trade's own log line above for the real reason. NOT retried - marked as handled either way.")
                 await notify_trade_not_opened(context.bot, user_id, metaapi_account_id, pair_config["display"])
 
 

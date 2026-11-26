@@ -986,3 +986,19 @@ def evaluate_single(name, c_bias, c_sig, daily=None, now=None, sig_s=900, bias_s
         if i["name"] == name:
             return {"direction": i["direction"], "why": f"{i['label']} fired", "bias": X.bias}
     return {"direction": None, "why": f"{name} not firing", "bias": X.bias}
+
+
+def evaluate_first(names, c_bias, c_sig, daily=None, now=None, sig_s=900, bias_s=3600):
+    """Several strategies in order of preference (best win % first): the first one firing decides. A single name also works."""
+    if isinstance(names, str):
+        names = [names]
+    X, ideas, n_sig, why = scan_pa(c_bias, c_sig, c_sig, daily, now, sig_s=sig_s, bias_s=bias_s, c5_s=sig_s)
+    if X is None:
+        return {"direction": None, "why": why, "bias": "range"}
+    by = {}
+    for i in ideas:
+        by.setdefault(i["name"], i)
+    for n in names:
+        if n in by:
+            return {"direction": by[n]["direction"], "why": f"{by[n]['label']} fired", "bias": X.bias, "name": n}
+    return {"direction": None, "why": "none firing", "bias": X.bias}

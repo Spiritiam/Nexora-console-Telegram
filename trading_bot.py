@@ -3497,7 +3497,9 @@ async def _burst_decision(pair_key, pair_config, scalper=False):
 #   Account Flip: 15-minute chart (1-hour chart for direction), the best strategy per market.
 PICK_LIVE = os.getenv("PICK_LIVE", "1") == "1"
 SCALPER_PICK = {"xauusd": "choch", "usoil": "pd_break", "btcusd": "fib"}
-FLIP_PICK = {"xauusd": "doji", "xagusd": "triangle"}
+# Account Flip: ordered by win %; the first one firing is used, and when none fires the old entry runs so trades keep happening.
+FLIP_PICK = {"xauusd": ["doji", "inside", "pd_reject", "triangle", "fvg", "fib", "volume"],
+             "xagusd": ["triangle", "vwap", "pd_reject", "atr_break", "pd_break", "hhhl", "fib", "volume"]}
 _PICK_DEC = {}
 _PICK_LOCKS = {}
 
@@ -3509,7 +3511,7 @@ def _pick_strategy(account, cfg, pair_key):
     if account["bot_choice"] == "aggressive_scalper" and pair_key in SCALPER_PICK:
         return ("scalper", SCALPER_PICK[pair_key])
     if cfg.get("entry") == "mlsim" and pair_key in FLIP_PICK:
-        return ("flip", FLIP_PICK[pair_key])
+        return ("flip", list(FLIP_PICK[pair_key]))
     return None
 
 
@@ -3535,11 +3537,11 @@ async def _pick_decision(kind, pair_key, pair_config, strat):
                 asyncio.to_thread(get_cached_candles, pair_key, pair_config, tf_bias, outputsize=300, max_age=(time.time() % bias_s) + 3),
                 asyncio.to_thread(get_cached_candles, pair_key, pair_config, "1day", outputsize=45))
             if c_sig and c_bias:
-                r = await asyncio.to_thread(price_action_bank.evaluate_single, strat, c_bias, c_sig, daily, None, sig_s, bias_s)
+                r = await asyncio.to_thread(price_action_bank.evaluate_first, strat, c_bias, c_sig, daily, None, sig_s, bias_s)
                 res = {"direction": r["direction"], "bar_t": slot, "why": r["why"], "bias": r["bias"]}
                 if r["direction"] or time.time() - _BURST_LOGGED.get("pick|" + kind + pair_key, 0) > 900:
                     _BURST_LOGGED["pick|" + kind + pair_key] = time.time()
-                    print(f"[PICK] {kind} {pair_key}: {strat} -> {r['direction'] or '-'} ({r['why']}, {'5m' if kind == 'scalper' else '1h'} bias {r['bias']})", flush=True)
+                    print(f"[PICK] {kind} {pair_key}: {strat if isinstance(strat, str) else '/'.join(strat)} -> {r['direction'] or '-'} ({r['why']}, {'5m' if kind == 'scalper' else '1h'} bias {r['bias']})", flush=True)
         except Exception as e:
             print(f"[PICK] {kind} {pair_key} failed: {type(e).__name__}: {str(e)[:100]}", flush=True)
         _PICK_DEC[key] = (slot, res)
@@ -3669,7 +3671,12 @@ async def _bank_decision(pair_key, pair_config):
     return await _bank_raw(pair_key, pair_config)
 
 
+BANK_DERIV = os.getenv("BANK_DERIV", "0") == "1"   # Deriv scheduled/manual signals stay on the 3 EMA (then ML) unless set to 1
+
+
 async def _bank_decision_deriv(index_key, config):
+    if not BANK_DERIV:
+        return None
     return await _bank_raw_deriv(index_key, config)
 
 
@@ -3861,9 +3868,8 @@ SC_CFG = {
     "label": "🐆 Aggressive Scalper",
 }
 SC_MODES = {
-    # Nov 25: the Aggressive Scalper starts trailing at 75% of the stop (60-day study: higher win rate, same or better average).
-    # Account Flip keeps SC_CFG's trailing start unchanged.
-    "aggressive_scalper": dict(SC_CFG, trail_from_stop=float(os.getenv("SC_TRAIL_START", "0.75"))),
+    # Nov 26: break-even + trailing start at 100% of the stop again (Henry's call), same as Account Flip; trail distance unchanged.
+    "aggressive_scalper": dict(SC_CFG, trail_from_stop=float(os.getenv("SC_TRAIL_START", "1.0"))),
     "flip_fast": dict(SC_CFG, trail_from_stop=None, pending_pips=25, sl_pips=15, sl_pips_by_pair={}, trail_activate_pips=15, trail_pips=8,
                       max_layers=5, add_pips=15, label="⚡ Account Flip (Fast)"),
     # Account Flip: support/resistance on the 1-hour chart, entry from the 30-minute chart.
@@ -4348,12 +4354,17 @@ async def _sc_tick_one(context, account):
         sig = None
         ml_used = False
         _pk = _pick_strategy(account, cfg, pair_key)
+        _p = None
         if _pk:
             # Picked strategy (best win % in the 60-day ranking); stops, trailing and layers below are unchanged
-            st["phase"] = "armed"
             _p = await _pick_decision(_pk[0], pair_key, pair_config, _pk[1])
-            if not _p or not _p.get("direction") or st.get("pick_bar") == _p["bar_t"]:
+            if _pk[0] == "scalper" and (not _p or not _p.get("direction") or st.get("pick_bar") == _p["bar_t"]):
+                st["phase"] = "armed"
                 return
+            if _pk[0] == "flip" and (not _p or not _p.get("direction") or st.get("pick_bar") == _p["bar_t"]):
+                _p = None   # none of the Account Flip strategies fires: the old entry below runs so trades keep happening
+        if _p:
+            st["phase"] = "armed"
             direction = _p["direction"]
             st["pick_bar"] = _p["bar_t"]
             ml_used = True

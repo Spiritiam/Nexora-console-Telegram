@@ -86,6 +86,12 @@ def evaluate(candles, secs=300, now=None):
     side = "up" if up_ok else ("down" if dn_ok else None)
     if side is None:
         return {"state": "range", "direction": None, "trigger": False, "bar_t": bar_t, "why": "EMAs intertwined"}
+    run = 0   # how many closed bars in a row the lines have stayed in order (looked at up to 200 back)
+    for i in range(n - 1, max(n - 200, 0), -1):
+        ok = (e25[i] > e50[i] > e100[i]) if side == "up" else (e25[i] < e50[i] < e100[i])
+        if not ok:
+            break
+        run += 1
     gap_slow = abs(e50[-1] - e100[-1]) / a
     gap_fast = abs(e25[-1] - e50[-1]) / a
     slope = e100[-1] - e100[-1 - SLOPE_BARS]
@@ -107,4 +113,4 @@ def evaluate(candles, secs=300, now=None):
         direction = "SELL"
     return {"state": side, "direction": direction if bounce else None, "trigger": bool(bounce),
             "bar_t": bar_t, "why": "bounce" if bounce else "trending, waiting for a bounce",
-            "close": last["close"], "e25": e25[-1]}
+            "close": last["close"], "e25": e25[-1], "run": run, "gap_slow": gap_slow, "gap_fast": gap_fast}

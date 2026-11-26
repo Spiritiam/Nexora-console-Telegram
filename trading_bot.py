@@ -3803,11 +3803,20 @@ def _bank_valid(best, live_price):
         return None
 
 
+SIG_EMA_HOLD = int(os.getenv("SIG_EMA_HOLD", "12"))
+SIG_EMA_GAP = float(os.getenv("SIG_EMA_GAP", "0.40"))
+
+
 def _ema_trend_dir(e):
     """BUY/SELL from the trend itself (bounce or not), None when ranging / no data."""
     if not e:
         return None
     d = {"up": "BUY", "down": "SELL"}.get(e.get("state"))
+    # Signals (scheduled and manual) only call a trend once the three lines have really moved apart together:
+    # in order for SIG_EMA_HOLD closed 5-minute bars (default 12 = 1 hour) and 50<->100 gap of at least SIG_EMA_GAP ATR.
+    # Set SIG_EMA_HOLD=0 / SIG_EMA_GAP=0 to go back to the looser rule. The scalper and Account Flip entries are not affected.
+    if d and (e.get("run", 0) < SIG_EMA_HOLD or e.get("gap_slow", 0) < SIG_EMA_GAP):
+        return None
     # The EMA stack lags a sharp reversal: if price has already crossed back over the 25 EMA against the stack
     # (a SELL with price above the 25, a BUY with price below it), it is not a clean trend any more.
     _c, _e25 = e.get("close"), e.get("e25")

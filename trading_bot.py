@@ -3554,7 +3554,7 @@ async def _pick_decision(kind, pair_key, pair_config, strat):
                 asyncio.to_thread(get_cached_candles, pair_key, pair_config, "1day", outputsize=45))
             if c_sig and c_bias:
                 r = await asyncio.to_thread(price_action_bank.evaluate_first, strat, c_bias, c_sig, daily, None, sig_s, bias_s)
-                res = {"direction": r["direction"], "bar_t": slot, "why": r["why"], "bias": r["bias"]}
+                res = {"direction": r["direction"], "bar_t": slot, "why": r["why"], "bias": r["bias"], "name": r.get("name")}
                 if r["direction"] or time.time() - _BURST_LOGGED.get("pick|" + kind + pair_key, 0) > 900:
                     _BURST_LOGGED["pick|" + kind + pair_key] = time.time()
                     print(f"[PICK] {kind} {pair_key}: {strat if isinstance(strat, str) else (strat[0] + '+' + str(len(strat) - 1) + ' more')} -> {r['direction'] or '-'} ({r['why']}, {'5m' if kind == 'scalper' else '1h'} bias {r['bias']})", flush=True)
@@ -4336,7 +4336,7 @@ async def _sc_tick_one(context, account):
                 # everything closed: any trailing stop past entry = win, otherwise a loss
                 won = bool(st.get("trailed"))
                 st["losses"] = 0 if won else st["losses"] + 1
-                print(f"[SC] closed {pair_key} user={user_id} {'win' if won else 'loss'} consecutive_losses={st['losses']}")
+                print(f"[SC] closed {pair_key} user={user_id} {'win' if won else 'loss'} consecutive_losses={st['losses']} strategy={st.get('strat')} mins={round((now - (st.get('opened_ts') or now)) / 60, 1)}")
                 st.update({"phase": "cool", "cool_until": now + cfg["reentry_delay_s"], "pids": [], "trailed": False})
             else:
                 st["phase"] = "arm"
@@ -4489,11 +4489,12 @@ async def _sc_tick_one(context, account):
             st["backoff_until"] = now + cfg["fail_backoff_s"]
             st["phase"] = "arm"
             return
-        st.update({"phase": "open", "pids": [str(order_id)], "dir": direction, "trailed": False})
+        st.update({"phase": "open", "pids": [str(order_id)], "dir": direction, "trailed": False,
+                   "strat": (_p or {}).get("name") or ("ema5" if ml_used else "other"), "opened_ts": now})
         if sig:
             st.update({"sr_bar": sig["bar_t"], "sr_level": sig["level"], "sr_level_at": now})
         st["trades"] += 1
-        print(f"[SC] ✅ {account['bot_choice']} {direction} {resolved} user={user_id} vol={volume} entry~{fill} sl={sl} (trade {st['trades']} today)")
+        print(f"[SC] ✅ {account['bot_choice']} {direction} {resolved} user={user_id} vol={volume} entry~{fill} sl={sl} (trade {st['trades']} today) strategy={st.get('strat')}")
         if not st.get("told"):
             st["told"] = True
             if sig:
@@ -4538,6 +4539,15 @@ async def _sc_auto_targets(a):
         if mode == "aggressive_scalper" and p in SC_SCALPER_SKIP:
             continue
         if closed and p not in WEEKEND_PAIRS:
+            continue
+        if mode == "aggressive_scalper" and PICK_LIVE and p in SCALPER_PICK:
+            # the strategy bank decides (not the 5-minute EMA bounce): look at the market when any of its strategies fires on a new bar
+            try:
+                _d = await _pick_decision("scalper", p, PAIR_CONFIG[p], list(SCALPER_PICK[p]))
+            except Exception:
+                _d = None
+            if _d and _d.get("direction") and (_SC["st"].get((uid, p)) or {}).get("pick_bar") != _d.get("bar_t"):
+                return [p]
             continue
         e = await _ema5_exness(p, PAIR_CONFIG[p])
         if e and e.get("direction"):

@@ -113,4 +113,5 @@ def evaluate(candles, secs=300, now=None):
         direction = "SELL"
     return {"state": side, "direction": direction if bounce else None, "trigger": bool(bounce),
             "bar_t": bar_t, "why": "bounce" if bounce else "trending, waiting for a bounce",
-            "close": last["close"], "e25": e25[-1], "run": run, "gap_slow": gap_slow, "gap_fast": gap_fast}
+            "close": last["close"], "e25": e25[-1], "run": run, "gap_slow": gap_slow, "gap_fast": gap_fast,
+            "atr": a, "high": last["high"], "low": last["low"]}

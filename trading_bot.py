@@ -3504,7 +3504,15 @@ async def _burst_decision(pair_key, pair_config, scalper=False):
 #   Aggressive Scalper: M1 chart (5-minute chart for direction), the best strategy per market.
 #   Account Flip: 15-minute chart (1-hour chart for direction), the best strategy per market.
 PICK_LIVE = os.getenv("PICK_LIVE", "1") == "1"
-SCALPER_PICK = {"xauusd": "choch", "usoil": "pd_break", "btcusd": "fib"}
+# Aggressive Scalper: the whole price-action bank in order of preference (the earlier single pick first, then breakouts, pullbacks,
+# reversals, patterns, momentum); the first one firing on the 1-minute chart decides. Nov 26: was one strategy per market.
+_SC_BANK_ORDER = ["atr_break", "squeeze", "orb", "bos", "pd_break", "pw_levels", "flag", "triangle", "retest", "sweep", "inside",
+                  "volume", "fib", "fvg", "ob", "flip", "pd_reject", "choch", "pin", "engulf", "doji", "exhaustion", "vwap",
+                  "stoch", "rsi_x", "macd_x", "hhhl", "swing", "sr", "zones", "range", "session", "pivots", "round", "star",
+                  "double", "triple", "hns", "wedge", "channel", "rsi_div", "macd_div"]
+def _sc_bank(first):
+    return [first] + [n for n in _SC_BANK_ORDER if n != first]
+SCALPER_PICK = {"xauusd": _sc_bank("choch"), "usoil": _sc_bank("pd_break"), "btcusd": _sc_bank("fib")}
 # Account Flip: ordered by win %; the first one firing is used, and when none fires the old entry runs so trades keep happening.
 FLIP_PICK = {"xauusd": ["doji", "inside", "pd_reject", "triangle", "fvg", "fib", "volume"],
              "xagusd": ["triangle", "vwap", "pd_reject", "atr_break", "pd_break", "hhhl", "fib", "volume"]}
@@ -3517,7 +3525,7 @@ def _pick_strategy(account, cfg, pair_key):
     if not PICK_LIVE:
         return None
     if account["bot_choice"] == "aggressive_scalper" and pair_key in SCALPER_PICK:
-        return ("scalper", SCALPER_PICK[pair_key])
+        return ("scalper", list(SCALPER_PICK[pair_key]))
     if cfg.get("entry") == "mlsim" and pair_key in FLIP_PICK:
         return ("flip", list(FLIP_PICK[pair_key]))
     return None
@@ -3549,7 +3557,7 @@ async def _pick_decision(kind, pair_key, pair_config, strat):
                 res = {"direction": r["direction"], "bar_t": slot, "why": r["why"], "bias": r["bias"]}
                 if r["direction"] or time.time() - _BURST_LOGGED.get("pick|" + kind + pair_key, 0) > 900:
                     _BURST_LOGGED["pick|" + kind + pair_key] = time.time()
-                    print(f"[PICK] {kind} {pair_key}: {strat if isinstance(strat, str) else '/'.join(strat)} -> {r['direction'] or '-'} ({r['why']}, {'5m' if kind == 'scalper' else '1h'} bias {r['bias']})", flush=True)
+                    print(f"[PICK] {kind} {pair_key}: {strat if isinstance(strat, str) else (strat[0] + '+' + str(len(strat) - 1) + ' more')} -> {r['direction'] or '-'} ({r['why']}, {'5m' if kind == 'scalper' else '1h'} bias {r['bias']})", flush=True)
         except Exception as e:
             print(f"[PICK] {kind} {pair_key} failed: {type(e).__name__}: {str(e)[:100]}", flush=True)
         _PICK_DEC[key] = (slot, res)

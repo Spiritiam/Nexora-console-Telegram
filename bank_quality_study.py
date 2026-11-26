@@ -14,6 +14,10 @@ Entry rules compared (all on the same bank signals):
   pullback over  the last closed candle did not make a new low (buy) / new high (sell) against the signal
   both           candle agrees + pullback over
   trend of 3     the close of the last 15-minute candle is not against the signal compared with 3 candles ago
+  strong A       pullback over + the 1-hour direction agrees with the signal
+  strong B       pullback over + candle agrees + 1-hour direction agrees
+  strong C       pullback over + price has not fallen (buy) / risen (sell) more than 1.5 ranges from the last 8 candles' extreme
+  strong D       pullback over + candle agrees + the spike rule of C
 """
 import os
 import sys
@@ -132,7 +136,7 @@ def main():
                 x = bss._X()
                 x.bias, x.px, x.a = X.bias, X.px, X.a
                 look = n_sig[-LOOK:]
-                cache[i] = (x, ideas, [{"low": min(q["low"] for q in look), "high": max(q["high"] for q in look)}], n_sig[-4:])
+                cache[i] = (x, ideas, [{"low": min(q["low"] for q in look), "high": max(q["high"] for q in look)}], n_sig[-8:])
             cnt[0] += 1
             if cnt[0] % 1000 == 0:
                 log(f"{sym}: {cnt[0]} charts checked, {time.time() - t0:.0f}s")
@@ -148,19 +152,26 @@ def main():
                 if not b:
                     return 0
                 d = 1 if b["direction"] == "BUY" else -1
-                if len(last) < 4:
+                if len(last) < 8:
                     return 0
                 q, p = last[-1], last[-2]
                 green_ok = (q["close"] > q["open"]) if d > 0 else (q["close"] < q["open"])
                 over_ok = (q["low"] >= p["low"]) if d > 0 else (q["high"] <= p["high"])
                 trend_ok = (q["close"] >= last[-4]["close"]) if d > 0 else (q["close"] <= last[-4]["close"])
-                ok = {"today": True, "candle agrees": green_ok, "pullback over": over_ok,
+                atr = x.a or 0
+                hi8 = max(z["high"] for z in last) if last else 0
+                spike_ok = True
+                if atr > 0:
+                    spike_ok = ((hi8 - q["close"]) <= 1.5 * atr) if d > 0 else ((q["close"] - min(z["low"] for z in last)) <= 1.5 * atr)
+                bias_ok = (x.bias == "up") if d > 0 else (x.bias == "down")
+                ok = {"strong A": over_ok and bias_ok, "strong B": over_ok and green_ok and bias_ok,
+                      "strong C": over_ok and spike_ok, "strong D": over_ok and green_ok and spike_ok, "today": True, "candle agrees": green_ok, "pullback over": over_ok,
                       "both": green_ok and over_ok, "trend of 3": trend_ok}[rule]
                 return d if ok else 0
             return decide
 
         log(f"{sym}: {len(rows)} candles, {days:.0f} trading days")
-        for rule in ("today", "candle agrees", "pullback over", "both", "trend of 3"):
+        for rule in ("today", "pullback over", "strong A", "strong B", "strong C", "strong D"):
             tr = run_trades(t, o, h, l, c, cfg, mk(rule))
             s = summ(tr, days)
             if not s:

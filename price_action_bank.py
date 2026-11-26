@@ -970,11 +970,23 @@ def pick_pa(X, ideas, n15, min_agree=None, look=32, why_tf="1h"):
     return res
 
 
-def evaluate_pa(c1h, c15, c5, daily=None, now=None):
+def pullback_over(n15, direction):
+    """True when the last closed candle did not make a new low (buy) / new high (sell) against the signal: the pullback has stopped."""
+    if len(n15) < 2:
+        return True
+    q, p = n15[-1], n15[-2]
+    return q["low"] >= p["low"] if direction == "BUY" else q["high"] <= p["high"]
+
+
+def evaluate_pa(c1h, c15, c5, daily=None, now=None, pullback=False):
     X, ideas, n15, why = scan_pa(c1h, c15, c5, daily, now)
     if X is None:
         return {"best": None, "ideas": [], "agree": 0, "bias": "range", "why": why}
-    return pick_pa(X, ideas, n15)
+    res = pick_pa(X, ideas, n15)
+    if pullback and res.get("best") and not pullback_over(n15, res["best"]["direction"]):
+        res["why"] = f"{res['best']['direction']} held back: the pullback has not stopped yet (last candle still making a new {'low' if res['best']['direction'] == 'BUY' else 'high'})"
+        res["best"] = None
+    return res
 
 
 def evaluate_single(name, c_bias, c_sig, daily=None, now=None, sig_s=900, bias_s=3600):

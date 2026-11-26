@@ -3805,7 +3805,7 @@ def _bank_valid(best, live_price):
 
 SIG_EMA_HOLD = int(os.getenv("SIG_EMA_HOLD", "12"))
 SIG_EMA_GAP = float(os.getenv("SIG_EMA_GAP", "0.40"))
-SIG_EMA_NEAR = float(os.getenv("SIG_EMA_NEAR", "0.5"))
+SIG_EMA_NEAR = float(os.getenv("SIG_EMA_NEAR", "0.4"))
 
 
 def _ema_trend_dir(e):
@@ -3818,12 +3818,10 @@ def _ema_trend_dir(e):
     # Set SIG_EMA_HOLD=0 / SIG_EMA_GAP=0 to go back to the looser rule. The scalper and Account Flip entries are not affected.
     if d and (e.get("run", 0) < SIG_EMA_HOLD or e.get("gap_slow", 0) < SIG_EMA_GAP):
         return None
-    # Pullback: price must be touching or close to the 25 EMA (within SIG_EMA_NEAR x ATR) on the last closed 5-minute candle.
-    # SIG_EMA_NEAR=0 switches this off.
-    if d and SIG_EMA_NEAR > 0 and e.get("atr") and e.get("e25") is not None and e.get("high") is not None:
-        _reach = SIG_EMA_NEAR * e["atr"]
-        _edge = e["low"] if d == "BUY" else e["high"]   # the side of the candle that dipped toward the 25 EMA
-        if abs(_edge - e["e25"]) > _reach and not (e["low"] <= e["e25"] <= e["high"]):
+    # Pullback: the last closed 5-minute candle must CLOSE touching or very close to the 25 EMA (within SIG_EMA_NEAR x ATR).
+    # A candle that only dipped to the 25 and closed far above it does not count. SIG_EMA_NEAR=0 switches this off.
+    if d and SIG_EMA_NEAR > 0 and e.get("atr") and e.get("e25") is not None and e.get("close") is not None:
+        if abs(e["close"] - e["e25"]) > SIG_EMA_NEAR * e["atr"]:
             return None
     # The EMA stack lags a sharp reversal: if price has already crossed back over the 25 EMA against the stack
     # (a SELL with price above the 25, a BUY with price below it), it is not a clean trend any more.

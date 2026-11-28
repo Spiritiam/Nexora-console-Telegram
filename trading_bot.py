@@ -8621,6 +8621,7 @@ def _napp_send_learning_tip_sync():
         "tips", "Keep learning with SpiritFX",
         f"{c['title']} by {c['tutor']}: {c['video_count']} lessons. Tap to start watching.",
         {"type": "tip", "cid": c["course_id"], "lvl": c["lvl"]})
+    return c
 
 
 # Big US releases that move gold, oil, BTC and the dollar. Matched on the calendar title.
@@ -8671,10 +8672,32 @@ async def run_news_alert_job(context):
     await asyncio.to_thread(_napp_send_news_alerts_sync)
 
 
+APP_STORE_URL = "https://apps.apple.com/ng/app/spiritfx-academy/id6505009377"
+PLAY_STORE_URL = "https://play.google.com/store/apps/details?id=org.spiritfx.spiritfxacademyapp"
+
+
+async def _post_course_tip_to_channels(context, c):
+    """Same course tip the app pushes, posted to all three Telegram channels with the app download buttons."""
+    text = (f"📚 <b>Keep learning with SpiritFX</b>\n\n"
+            f"<b>{_esc(str(c.get('title', '')))}</b>\nby {_esc(str(c.get('tutor', '')))} · {c.get('video_count', 0)} lessons\n\n"
+            f"Open the SpiritFX Academy app and start watching.\n\n<i>Education, not financial advice</i>")
+    kb = InlineKeyboardMarkup([
+        [InlineKeyboardButton("📲 App Store", url=APP_STORE_URL), InlineKeyboardButton("▶️ Google Play", url=PLAY_STORE_URL)]])
+    for ch in (CHANNEL_1_ID, CHANNEL_2_ID, CHANNEL_3_ID):
+        try:
+            await context.bot.send_message(chat_id=ch, text=text, parse_mode=ParseMode.HTML, reply_markup=kb,
+                                           disable_web_page_preview=True)
+            print(f"[TIP] ✅ course tip posted to {ch}")
+        except Exception as e:
+            print(f"[TIP] ❌ {ch}: {e}")
+
+
 async def run_learning_tip_job(context):
     if datetime.utcnow().weekday() not in (1, 4):  # Tuesday, Friday
         return
-    await asyncio.to_thread(_napp_send_learning_tip_sync)
+    c = await asyncio.to_thread(_napp_send_learning_tip_sync)
+    if c:
+        await _post_course_tip_to_channels(context, c)
 
 
 async def nexora_app_push_prefs_handler(request):

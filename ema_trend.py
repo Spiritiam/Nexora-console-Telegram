@@ -21,6 +21,9 @@ TOUCH_ATR = 0.15          # how close to the EMA counts as a touch
 MIN_CANDLES = 220
 
 
+SWING_BARS = int(os.getenv("EMA_SWING_BARS", "20"))  # recent window (5-min bars) used to tell a real dip from a bounce at the top
+
+
 def ema(values, period):
     if len(values) < period:
         return []
@@ -114,4 +117,5 @@ def evaluate(candles, secs=300, now=None):
     return {"state": side, "direction": direction if bounce else None, "trigger": bool(bounce),
             "bar_t": bar_t, "why": "bounce" if bounce else "trending, waiting for a bounce",
             "close": last["close"], "e25": e25[-1], "run": run, "gap_slow": gap_slow, "gap_fast": gap_fast,
-            "atr": a, "high": last["high"], "low": last["low"]}
+            "atr": a, "high": last["high"], "low": last["low"],
+            "swing_hi": max(x["high"] for x in c[-SWING_BARS:]), "swing_lo": min(x["low"] for x in c[-SWING_BARS:])}

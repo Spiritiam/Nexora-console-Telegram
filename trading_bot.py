@@ -3806,6 +3806,7 @@ def _bank_valid(best, live_price):
 SIG_EMA_HOLD = int(os.getenv("SIG_EMA_HOLD", "12"))
 SIG_EMA_GAP = float(os.getenv("SIG_EMA_GAP", "0.40"))
 SIG_EMA_NEAR = float(os.getenv("SIG_EMA_NEAR", "0.4"))
+SIG_EMA_DIP = float(os.getenv("SIG_EMA_DIP", "0.8"))  # price must sit at least this many ATR back from the recent extreme (0 = off)
 
 
 def _ema_trend_dir(e):
@@ -3823,6 +3824,14 @@ def _ema_trend_dir(e):
     if d and SIG_EMA_NEAR > 0 and e.get("atr") and e.get("e25") is not None and e.get("close") is not None:
         if abs(e["close"] - e["e25"]) > SIG_EMA_NEAR * e["atr"]:
             return None
+    # Real pullback: the entry must be at the bottom of a dip (BUY) / top of a bounce (SELL) back to the 25 EMA, not at the
+    # top of a fresh move. Price has to be at least SIG_EMA_DIP x ATR away from the highest high (BUY) / lowest low (SELL)
+    # of the last EMA_SWING_BARS 5-minute bars. SIG_EMA_DIP=0 switches this off.
+    if d and SIG_EMA_DIP > 0 and e.get("atr") and e.get("close") is not None:
+        if d == "BUY" and e.get("swing_hi") is not None and (e["swing_hi"] - e["close"]) < SIG_EMA_DIP * e["atr"]:
+            return None
+        if d == "SELL" and e.get("swing_lo") is not None and (e["close"] - e["swing_lo"]) < SIG_EMA_DIP * e["atr"]:
+            return None
     # The EMA stack lags a sharp reversal: if price has already crossed back over the 25 EMA against the stack
     # (a SELL with price above the 25, a BUY with price below it), it is not a clean trend any more.
     _c, _e25 = e.get("close"), e.get("e25")
@@ -3839,7 +3848,7 @@ async def _ema5_pick_pairs(origin_key, scheduled=True, origin_busy=False, bank_o
     if origin_key not in FX_SCAN_KEYS:
         return []
     closed = is_forex_market_closed()
-    pool = SCHED_SWAP_KEYS if scheduled else FX_SCAN_KEYS
+    pool = (SCHED_SWAP_KEYS + [k for k in ("usdjpy", "eurusd", "audusd", "usdcad", "nzdusd") if k not in SCHED_SWAP_KEYS]) if scheduled else FX_SCAN_KEYS
     keys = [k for k in pool if k != origin_key and (k == "btcusd" or not closed)]
     res = await asyncio.gather(*[_ema5_exness(k, PAIR_CONFIG[k]) for k in keys], return_exceptions=True)
     busy = await asyncio.gather(*[_pair_busy(k, scheduled) for k in keys], return_exceptions=True)
@@ -24670,7 +24679,7 @@ async def build_signal_response(question, user_id=None, retry_mismatch=False, _s
                     if _res and _res[3] is not None:
                         return _res
             if ((not _ema_trend_dir(_ema) and not _bank_best) or _busy) and not _swapped_from:
-                for _alt in (await _ema5_pick_pairs(matched_key, _sched, _busy))[:4]:
+                for _alt in (await _ema5_pick_pairs(matched_key, _sched, _busy))[:6]:
                     print(f"[SIGNAL] {pair_name} is {'busy' if _busy else 'ranging'} -> trying {_alt.upper()}", flush=True)
                     _res = await build_signal_response(_alt, user_id=user_id, retry_mismatch=retry_mismatch,
                                                        _swapped_from=pair_name)
